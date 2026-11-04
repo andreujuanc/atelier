@@ -169,16 +169,31 @@ func (a *App) Resume(ctx context.Context, ref string) (int, error) {
 // still tagged with the session (e.g. a dead remain-on-exit window) and
 // records the new window, returning its id; on a failed launch it puts the
 // session back to restore (see Resume).
+//
+// It never resumes over a running claude: if the session still has a live
+// tagged window (its row was ended or stopped while claude kept running,
+// e.g. during /clear), that window is recorded and returned instead, and
+// nothing is launched or killed.
 func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir string, restore model.SessionState) (win string, err error) {
 	bg := context.WithoutCancel(ctx)
 	s, err := a.Store.GetSession(bg, id)
 	if err == nil && s.ClaudeSessionID == "" {
 		err = errors.New("no claude session id")
 	}
+	if err == nil && s.Name == "" {
+		s.Name = windowName(s.ID)
+	}
+	var tags map[string]string
 	if err == nil {
-		if s.Name == "" {
-			s.Name = windowName(s.ID)
+		tags, err = a.Tmux.TaggedWindows(bg)
+	}
+	if live, ok := tags[strconv.FormatInt(id, 10)]; ok && err == nil {
+		if err := a.Store.SetSessionLaunch(bg, id, live, s.Name); err != nil {
+			return "", fmt.Errorf("record live window %s: %w", live, err)
 		}
+		return live, nil
+	}
+	if err == nil {
 		win, err = a.launch(ctx, t, s, dir, s.ClaudeSessionID)
 	}
 	if err != nil {

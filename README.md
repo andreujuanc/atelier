@@ -61,22 +61,28 @@ Choosing a project in the form preselects its repos. The form's Base field toggl
 (`space`, `←`/`→`; `enter` moves on) between "auto (dev → develop → default)" and
 "production patch (default branch)".
 
-`enter` on a task with no sessions starts a new Claude session and attaches. If the task
-has sessions, it asks instead of guessing: a picker lists "New session" first, then the
-live sessions (running, waiting, idle with a live window), then the past ones you can
-resume (ended or stopped, with a Claude session id and a transcript file that still
-exists), each group newest activity first. Each row shows the state, how long ago it was
-last active, the conversation title, the window name and, if there is room, the last
-prompt. The title is Claude Code's own (a `/rename` title, else the one it generated),
-else the first prompt, else the window name; it is read from the transcript when the
-picker opens (only the first and last MiB of a large one). `↑`/`↓` move, `enter`
-picks, `esc` cancels and launches nothing. A live session is attached to with its window
-selected; a past one is resumed (`claude --resume <id>`, only that one: other stopped
-sessions are left for `r`) and attached to; "New session" works like `s` and attaches.
-Plain `atl open` (no flags) keeps its old behaviour for scripts: attach if a window is
-live, else resume the stopped sessions, else start a new one. `atl open --session` and
-`--new` are mutually exclusive; `--session` refuses another task's session, sessions
-without a Claude id or whose transcript is gone, and resuming in a closed task.
+`enter` on a task with no openable sessions starts a new Claude session and attaches. If
+the task has openable sessions, it asks instead of guessing: a picker lists "New session"
+first, then the live sessions (any session whose Claude window is still running, even if
+its last hook said it ended, e.g. around `/clear`), then the past ones you can resume
+(ended or stopped, with a Claude session id and a transcript that `claude --resume` run in
+the task dir can find: it still exists and is in Claude's project dir for the task dir, so
+a claude you ran in a subdirectory, or a nested `claude -p`, is not offered; a session
+with no recorded transcript is offered only if atl launched it), each group newest
+activity first. Closed (done or cancelled) tasks offer no past sessions. Each row shows
+the state, how long ago it was last active, the conversation title, the window name and,
+if there is room, the last prompt. The title is Claude Code's own (a `/rename` title, else
+the one it generated), else the first prompt, else the window name; it is read from the
+transcript when the picker opens (only the first and last MiB of a large one). `↑`/`↓`
+move, `enter` picks, `esc` cancels and launches nothing. A live session is attached to
+with its window selected (never resumed over); a past one is resumed (`claude --resume
+<id>`, only that one: other stopped sessions are left for `r`) and attached to; "New
+session" works like `s` and attaches. Plain `atl open` (no flags) keeps its old behaviour
+for scripts: attach if a window is live, else resume the stopped sessions, else start a
+new one. `atl open --session` and `--new` are mutually exclusive; `--session` attaches to
+a session with a live window like the picker, and refuses another task's session, past
+sessions it would not offer (no Claude id, transcript gone or recorded for another
+directory, or no transcript and not launched by atl), and resuming in a closed task.
 
 `<task>` is a slug, numeric id, or unique slug prefix. atelier never pushes:
 push `atl/<slug>` yourself before `atl pr`.

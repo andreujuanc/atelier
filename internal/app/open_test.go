@@ -109,9 +109,21 @@ func TestReadTranscriptInfo(t *testing.T) {
 	}
 }
 
-// transcript writes a small transcript with an AI title and prompts and
-// returns its path.
+// projectDir is Claude Code's transcript dir for dir ($HOME/.claude/projects/<key>).
+func projectDir(dir string) string {
+	return filepath.Join(os.Getenv("HOME"), ".claude", "projects", claudeProjectKey(dir))
+}
+
+// transcript writes a small transcript with an AI title and prompts in
+// Claude's project dir for task t's dir (where `claude --resume` run there
+// finds it) and returns its path.
 func (e *env) transcript(t *testing.T, name, title string, prompts ...string) string {
+	t.Helper()
+	return e.transcriptIn(t, projectDir(e.app.Paths.TaskDir("t")), name, title, prompts...)
+}
+
+// transcriptIn is transcript, written in dir.
+func (e *env) transcriptIn(t *testing.T, dir, name, title string, prompts ...string) string {
 	t.Helper()
 	var lines []string
 	if title != "" {
@@ -121,7 +133,7 @@ func (e *env) transcript(t *testing.T, name, title string, prompts ...string) st
 		b, _ := json.Marshal(p)
 		lines = append(lines, `{"type":"user","message":{"role":"user","content":`+string(b)+`}}`)
 	}
-	path := filepath.Join(filepath.Dir(e.out), "transcripts", name+".jsonl")
+	path := filepath.Join(dir, name+".jsonl")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +183,7 @@ func TestOpenChoices(t *testing.T) {
 	task := e.task(t, "t", model.StatusActive, true)
 	other := e.task(t, "o", model.StatusActive, true)
 	base := time.Now().Add(-time.Hour)
+	proj := projectDir(e.app.Paths.TaskDir("t"))
 
 	live, err := e.app.NewSession(ctx, "t")
 	if err != nil {
@@ -191,9 +204,9 @@ func TestOpenChoices(t *testing.T) {
 	ended := e.pastSession(t, task.ID, model.StateEnded, "cid-e", e.transcript(t, "ended", "Refactor store", "first", "last words"), base.Add(10*time.Minute))
 	stopped := e.pastSession(t, task.ID, model.StateStopped, "cid-s", "", base.Add(20*time.Minute)) // no path recorded: kept
 	older := e.pastSession(t, task.ID, model.StateEnded, "cid-old", e.transcript(t, "older", ""), base)
-	e.pastSession(t, task.ID, model.StateEnded, "", e.transcript(t, "noid", "x", "y"), base.Add(30*time.Minute))       // no claude id
-	e.pastSession(t, task.ID, model.StateEnded, "cid-gone", filepath.Join(e.out, "gone.jsonl"), base.Add(time.Minute)) // transcript gone
-	e.pastSession(t, other.ID, model.StateEnded, "cid-other", "", base.Add(40*time.Minute))                            // another task
+	e.pastSession(t, task.ID, model.StateEnded, "", e.transcript(t, "noid", "x", "y"), base.Add(30*time.Minute))      // no claude id
+	e.pastSession(t, task.ID, model.StateEnded, "cid-gone", filepath.Join(proj, "gone.jsonl"), base.Add(time.Minute)) // transcript gone
+	e.pastSession(t, other.ID, model.StateEnded, "cid-other", "", base.Add(40*time.Minute))                           // another task
 
 	choices, err := e.app.OpenChoices(ctx, "t")
 	if err != nil {
@@ -355,7 +368,7 @@ func TestOpenSessionRefusals(t *testing.T) {
 	now := time.Now()
 	foreign := e.pastSession(t, other.ID, model.StateEnded, "cid-x", "", now)
 	noID := e.pastSession(t, task.ID, model.StateEnded, "", "", now)
-	gone := e.pastSession(t, task.ID, model.StateEnded, "cid-g", filepath.Join(e.out, "gone.jsonl"), now)
+	gone := e.pastSession(t, task.ID, model.StateEnded, "cid-g", filepath.Join(projectDir(e.app.Paths.TaskDir("t")), "gone.jsonl"), now)
 	hookRow := &model.Session{TaskID: task.ID, State: model.StateRunning, ClaudeSessionID: "cid-h"}
 	if err := e.app.Store.CreateSession(ctx, hookRow); err != nil {
 		t.Fatal(err)
@@ -468,5 +481,149 @@ func TestOpenSessionLaunchFailure(t *testing.T) {
 		if got := e.session(t, s.ID); got.State != s.State || got.ClaudeSessionID != s.ClaudeSessionID {
 			t.Errorf("after failed resume: %+v, want state %s", got, s.State)
 		}
+	}
+}
+
+// TestOpenLiveWindowOfPastRow: a session whose row is ended or stopped while
+// its claude still runs in a live tagged window (SessionEnd then SessionStart
+// around /clear) counts as live: it is listed as live, and opening it (the
+// picker, `atl open --session`) or Resume attaches to that window instead of
+// relaunching claude and killing the running one.
+func TestOpenLiveWindowOfPastRow(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.task(t, "t", model.StatusActive, true)
+	s, err := e.app.NewSession(ctx, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s.ID)
+	if err := e.app.Store.SetClaudeSession(ctx, s.ID, "cid-1", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.app.Store.SetTranscriptPath(ctx, s.ID, e.transcript(t, "c", "Live title", "hi")); err != nil {
+		t.Fatal(err)
+	}
+	win := e.session(t, s.ID).TmuxTarget
+	pid := e.tmux(t, "display-message", "-p", "-t", win, "#{pane_pid}")
+	tag := strconv.FormatInt(s.ID, 10)
+	argvFile := filepath.Join(e.out, "argv-"+tag)
+	if err := os.Remove(argvFile); err != nil {
+		t.Fatal(err)
+	}
+	// untouched checks that the original claude still runs, alone, in its
+	// window and was never relaunched.
+	untouched := func(what string) {
+		t.Helper()
+		tags, err := e.app.Tmux.TaggedWindows(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tags[tag] != win {
+			t.Errorf("%s: tagged window = %q, want the running %s", what, tags[tag], win)
+		}
+		if got := e.tmux(t, "display-message", "-p", "-t", win, "#{pane_pid} #{pane_dead}"); got != pid+" 0" {
+			t.Errorf("%s: pane = %q, want %q", what, got, pid+" 0")
+		}
+		if n := len(strings.Split(e.tmux(t, "list-windows", "-t", "=atl-t"), "\n")); n != 1 {
+			t.Errorf("%s: %d windows, want 1", what, n)
+		}
+		if _, err := os.Stat(argvFile); err == nil {
+			t.Errorf("%s: claude was relaunched", what)
+		}
+	}
+
+	for _, st := range []model.SessionState{model.StateEnded, model.StateStopped} {
+		if err := e.app.Store.SetSessionState(ctx, s.ID, st, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		choices, err := e.app.OpenChoices(ctx, "t")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(choices) != 1 || !choices[0].Live || choices[0].Window != win || choices[0].Title != "Live title" {
+			t.Fatalf("%s row with a live window: choices = %+v", st, choices)
+		}
+		cmd, choices, err := e.app.OpenOrChoose(ctx, "t")
+		if err != nil || cmd != nil || len(choices) != 1 || !choices[0].Live {
+			t.Fatalf("%s: OpenOrChoose = %v, %+v, %v", st, cmd, choices, err)
+		}
+		if _, err := e.app.OpenSession(ctx, "t", s.ID); err != nil {
+			t.Fatalf("%s: OpenSession: %v", st, err)
+		}
+		time.Sleep(200 * time.Millisecond) // a relaunched stub would have written its argv by now
+		untouched(string(st) + " OpenSession")
+		if w := e.activeWindow(t, "atl-t"); w != win {
+			t.Errorf("%s: active window = %s, want %s", st, w, win)
+		}
+		if got := e.session(t, s.ID).State; got != st {
+			t.Errorf("%s: OpenSession changed the state to %s", st, got)
+		}
+	}
+
+	// Resume (the r key) claims the stopped row but adopts its live window.
+	if _, err := e.app.Resume(ctx, "t"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	untouched("Resume")
+	if got := e.session(t, s.ID); got.State != model.StateIdle || got.TmuxTarget != win {
+		t.Errorf("after Resume: %+v, want idle in %s", got, win)
+	}
+}
+
+// TestOpenResumableOnlyFromTaskDir: past sessions are offered (and resumed
+// by --session) only if `claude --resume` run in the task dir can find them.
+func TestOpenResumableOnlyFromTaskDir(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	task := e.task(t, "t", model.StatusActive, true)
+	now := time.Now()
+
+	// A claude run in a task subdir (or a nested claude -p): its transcript
+	// is in another project dir.
+	sub := filepath.Join(e.app.Paths.TaskDir("t"), "api")
+	elsewhere := e.pastSession(t, task.ID, model.StateEnded, "cid-sub", e.transcriptIn(t, projectDir(sub), "sub", "Sub title", "x"), now)
+	// A hook-created row with no transcript path and no atl launch.
+	hookRow := &model.Session{TaskID: task.ID, State: model.StateEnded, ClaudeSessionID: "cid-hook", CreatedAt: now, LastEventAt: now}
+	if err := e.app.Store.CreateSession(ctx, hookRow); err != nil {
+		t.Fatal(err)
+	}
+	// No transcript path, but atl launched it (named window): offered.
+	launched := e.pastSession(t, task.ID, model.StateStopped, "cid-l", "", now.Add(-time.Minute))
+	// A transcript in the task dir's project dir: offered.
+	here := e.pastSession(t, task.ID, model.StateEnded, "cid-here", e.transcript(t, "here", "Here", "y"), now.Add(-2*time.Minute))
+
+	choices, err := e.app.OpenChoices(ctx, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := choiceIDs(choices), []int64{launched.ID, here.ID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("choices = %v, want %v (%+v)", got, want, choices)
+	}
+
+	for _, c := range []struct {
+		id   int64
+		want string
+	}{
+		{elsewhere.ID, "is not in Claude's project dir for the task dir"},
+		{hookRow.ID, "was not started by atl and has no recorded transcript"},
+	} {
+		if _, err := e.app.OpenSession(ctx, "t", c.id); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("OpenSession(%d) = %v, want %q", c.id, err, c.want)
+		}
+		if st := e.session(t, c.id).State; st != model.StateEnded {
+			t.Errorf("refused session %d changed to %s", c.id, st)
+		}
+	}
+	if e.app.Tmux.HasSession(ctx, "atl-t") {
+		t.Fatal("a refused OpenSession launched a window")
+	}
+
+	if _, err := e.app.OpenSession(ctx, "t", launched.ID); err != nil {
+		t.Fatal(err)
+	}
+	if argv := e.argv(t, launched.ID); len(argv) < 2 || argv[0] != "--resume" || argv[1] != "cid-l" {
+		t.Errorf("argv = %q", argv)
 	}
 }

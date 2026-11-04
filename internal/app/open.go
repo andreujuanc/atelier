@@ -19,9 +19,10 @@ import (
 // open picker): a live one (attach to its window) or a resumable past one.
 type SessionChoice struct {
 	Session model.Session
-	// Live: the session has a live tagged tmux window (Window); picking it
-	// attaches. Otherwise it is a past (ended or stopped) session that can
-	// be resumed with `claude --resume`.
+	// Live: the session has a live (not dead) tagged tmux window (Window),
+	// whatever its recorded state (an ended row may still have one, e.g.
+	// during /clear); picking it attaches. Otherwise it is a past (ended or
+	// stopped) session that can be resumed with `claude --resume`.
 	Live   bool
 	Window string
 	// Title is Claude Code's title for the conversation (custom, else
@@ -46,10 +47,11 @@ func (a *App) OpenChoices(ctx context.Context, ref string) ([]SessionChoice, err
 }
 
 // sessionChoices lists the task's sessions that can be opened:
-//   - live sessions (running, waiting, idle) with a live tagged tmux window;
-//   - past sessions (ended or stopped) of an open task that have a Claude
-//     session id and whose recorded transcript file still exists (a session
-//     with no recorded transcript path is kept: there is nothing to check).
+//   - live sessions: those with a live (not dead) tagged tmux window, as
+//     TaggedWindows reports, whatever their recorded state;
+//   - past sessions (ended or stopped, without a live window) of an open
+//     task that `claude --resume` run in the task dir can find
+//     (resumableHere) and whose recorded transcript file still exists.
 //
 // Live sessions come first, then past ones; each group is ordered by last
 // activity, newest first. Titles and prompts are read from the transcripts
@@ -59,27 +61,23 @@ func (a *App) sessionChoices(ctx context.Context, t *model.Task) ([]SessionChoic
 	if err != nil {
 		return nil, err
 	}
-	var tags map[string]string
-	for _, s := range sessions {
-		if s.State.Live() {
-			if tags, err = a.Tmux.TaggedWindows(ctx); err != nil {
-				return nil, err
-			}
-			break
-		}
+	if len(sessions) == 0 {
+		return nil, nil
 	}
+	tags, err := a.Tmux.TaggedWindows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	dir := a.Paths.TaskDir(t.Slug)
 	var out []SessionChoice
 	for _, s := range sessions {
 		c := SessionChoice{Session: s}
-		switch {
-		case s.State.Live():
-			win, ok := tags[strconv.FormatInt(s.ID, 10)]
-			if !ok {
-				continue // not launched by atl, or its window is being launched
-			}
+		if win, ok := tags[strconv.FormatInt(s.ID, 10)]; ok {
 			c.Live, c.Window = true, win
-		case resumableState(s.State) && s.ClaudeSessionID != "" && t.Status.Open():
-		default:
+		} else if s.State.Live() {
+			continue // not launched by atl, or its window is being launched
+		} else if !resumableState(s.State) || s.ClaudeSessionID == "" || !t.Status.Open() ||
+			resumableHere(dir, s) != nil {
 			continue
 		}
 		var info transcriptInfo
@@ -114,6 +112,28 @@ func (a *App) sessionChoices(ctx context.Context, t *model.Task) ([]SessionChoic
 
 func resumableState(st model.SessionState) bool {
 	return st == model.StateEnded || st == model.StateStopped
+}
+
+// resumableHere returns nil if `claude --resume` run in the task dir dir can
+// find the past session s's conversation, else why not. Claude Code looks
+// for it only in its project dir for the cwd (claudeProjectDirs), so a
+// session the hooks recorded for a claude run elsewhere (a task subdir, a
+// nested `claude -p` with ATL_TASK set) cannot be resumed from there: its
+// recorded transcript must sit directly in that dir. A row with no recorded
+// transcript path (older rows) is trusted only if atl launched it (it has a
+// window name), since atl always launches claude in the task dir.
+func resumableHere(dir string, s model.Session) error {
+	if s.TranscriptPath == "" {
+		if s.Name == "" {
+			return errors.New("it was not started by atl and has no recorded transcript, so claude --resume in the task dir may not find it")
+		}
+		return nil
+	}
+	if !inClaudeProject(dir, s.TranscriptPath) {
+		return fmt.Errorf("its transcript %s is not in Claude's project dir for the task dir %s (claude ran in another directory), so claude --resume there cannot find it",
+			s.TranscriptPath, dir)
+	}
+	return nil
 }
 
 // sessionName is the session's window name, or the name it would get.
@@ -166,7 +186,8 @@ func (a *App) OpenNew(ctx context.Context, ref string) (*exec.Cmd, error) {
 
 // OpenSession opens one session of the task and returns the command that
 // attaches to the task's tmux session with that session's window selected:
-//   - a live session with a live tagged window is simply selected;
+//   - a session with a live (not dead) tagged window is simply selected,
+//     whatever its recorded state: it is never resumed over;
 //   - a past (ended or stopped) session is resumed with `claude --resume
 //     <claude id>`. It is claimed first with Store.ClaimFrom (a compare-and-
 //     set on the state seen here, bumping launch_seq), so concurrent opens or
@@ -174,8 +195,9 @@ func (a *App) OpenNew(ctx context.Context, ref string) (*exec.Cmd, error) {
 //     to the state it had. Other stopped sessions are left alone.
 //
 // It refuses sessions of other tasks, live sessions without an atelier
-// window, sessions without a Claude id, past sessions whose transcript file
-// is gone, and closed tasks (for resuming).
+// window, sessions without a Claude id, past sessions `claude --resume`
+// cannot find from the task dir (resumableHere) or whose transcript file is
+// gone, and closed tasks (for resuming).
 func (a *App) OpenSession(ctx context.Context, ref string, sessionID int64) (*exec.Cmd, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
@@ -199,22 +221,24 @@ func (a *App) OpenSession(ctx context.Context, ref string, sessionID int64) (*ex
 		return nil, fmt.Errorf("session %d belongs to task %s, not %s", s.ID, other, t.Slug)
 	}
 	attach := a.Tmux.AttachCmd(tmux.SessionName(t.Slug))
-	if s.State.Live() {
-		tags, err := a.Tmux.TaggedWindows(ctx)
-		if err != nil {
-			return nil, err
-		}
-		win, ok := tags[strconv.FormatInt(s.ID, 10)]
-		if !ok {
-			return nil, fmt.Errorf("session %d of task %s is %s but has no live atelier tmux window (not started by atl, or still starting); cannot attach to it",
-				s.ID, t.Slug, s.State)
-		}
+	tags, err := a.Tmux.TaggedWindows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if win, ok := tags[strconv.FormatInt(s.ID, 10)]; ok {
 		a.selectWindow(ctx, s.ID, win)
 		return attach, nil
+	}
+	if s.State.Live() {
+		return nil, fmt.Errorf("session %d of task %s is %s but has no live atelier tmux window (not started by atl, or still starting); cannot attach to it",
+			s.ID, t.Slug, s.State)
 	}
 	if s.ClaudeSessionID == "" {
 		return nil, fmt.Errorf("session %d of task %s is %s and has no Claude session id; it cannot be resumed (use --new for a new session)",
 			s.ID, t.Slug, s.State)
+	}
+	if err := resumableHere(a.Paths.TaskDir(t.Slug), *s); err != nil {
+		return nil, fmt.Errorf("session %d of task %s cannot be resumed: %w (use --new for a new session)", s.ID, t.Slug, err)
 	}
 	if s.TranscriptPath != "" {
 		if _, err := os.Stat(s.TranscriptPath); errors.Is(err, fs.ErrNotExist) {

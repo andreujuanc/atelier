@@ -145,26 +145,60 @@ func claudeProjectKey(dir string) string {
 	return b.String()
 }
 
-// hasClaudeConversation reports whether Claude Code has a recorded
-// conversation (a *.jsonl transcript) for dir, under its absolute or
-// symlink-resolved path.
-func hasClaudeConversation(dir string) bool {
+// claudeProjectDirs returns Claude Code's transcript dirs for dir:
+// <config>/projects/<key> for dir's absolute path and, if different, its
+// symlink-resolved path (nil if the config dir is unknown).
+func claudeProjectDirs(dir string) []string {
 	cfg := claudeConfigDir()
 	if cfg == "" {
-		return false
+		return nil
 	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
-		return false
+		return nil
 	}
 	forms := []string{abs}
 	if r, err := filepath.EvalSymlinks(abs); err == nil && r != abs {
 		forms = append(forms, r)
 	}
+	var out []string
 	for _, d := range forms {
-		entries, _ := os.ReadDir(filepath.Join(cfg, "projects", claudeProjectKey(d)))
+		out = append(out, filepath.Join(cfg, "projects", claudeProjectKey(d)))
+	}
+	return out
+}
+
+// hasClaudeConversation reports whether Claude Code has a recorded
+// conversation (a *.jsonl transcript) for dir, under its absolute or
+// symlink-resolved path.
+func hasClaudeConversation(dir string) bool {
+	for _, d := range claudeProjectDirs(dir) {
+		entries, _ := os.ReadDir(d)
 		for _, e := range entries {
 			if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// inClaudeProject reports whether transcript sits directly in one of
+// Claude Code's transcript dirs for dir (claudeProjectDirs), comparing
+// symlink-resolved paths too: only then can `claude --resume <id>` run in
+// dir find that conversation.
+func inClaudeProject(dir, transcript string) bool {
+	if !filepath.IsAbs(transcript) {
+		return false
+	}
+	td := filepath.Dir(filepath.Clean(transcript))
+	rtd, rerr := filepath.EvalSymlinks(td)
+	for _, p := range claudeProjectDirs(dir) {
+		if td == p {
+			return true
+		}
+		if rerr == nil {
+			if rp, err := filepath.EvalSymlinks(p); err == nil && rp == rtd {
 				return true
 			}
 		}

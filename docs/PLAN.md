@@ -371,9 +371,9 @@ func (a *App) Resume(ctx, ref string) (int, error)  // Recover, then relaunch ev
 func (a *App) Open(ctx, ref string) (*exec.Cmd, error) // ensure tmux session (resume stopped, else NewSession), return AttachCmd (plain `atl open`)
 // open.go: choosing a session (TUI enter, `atl open --session/--new`)
 type SessionChoice struct { Session model.Session; Live bool; Window string; Title, LastPrompt string }
-func (a *App) OpenChoices(ctx, ref string) ([]SessionChoice, error) // Recover; live sessions with a live tagged window, then (open tasks only) ended/stopped with a claude id whose recorded transcript exists (no path recorded = kept); each group last_event_at desc
+func (a *App) OpenChoices(ctx, ref string) ([]SessionChoice, error) // Recover; "openable" sessions: live = a live (not dead) tagged window, whatever the DB state (an ended row keeps one across /clear); then (open tasks only) resumable = ended/stopped, no live window, a claude id, and `claude --resume` in the task dir can find it: recorded transcript exists and sits directly in ${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<task dir, non-[A-Za-z0-9] → '-'> (no path recorded: only if atl launched it, i.e. name set); each group last_event_at desc
 func (a *App) OpenOrChoose(ctx, ref string) (*exec.Cmd, []SessionChoice, error) // choices if any (nothing launched), else OpenNew's attach cmd
-func (a *App) OpenSession(ctx, ref string, sessionID int64) (*exec.Cmd, error) // live → select its window; past → ClaimFrom + claude --resume (failed launch restores the state); then AttachCmd
+func (a *App) OpenSession(ctx, ref string, sessionID int64) (*exec.Cmd, error) // live tagged window (any DB state) → select it, never resume over it; past → refuse unless resumable (as OpenChoices), else ClaimFrom + claude --resume (failed launch restores the state); then AttachCmd. resumeClaimed (also Resume) adopts a still-live tagged window instead of launching
 func (a *App) OpenNew(ctx, ref string) (*exec.Cmd, error)                      // NewSession, select its window, AttachCmd
 // M5 task.go
 func (a *App) NewTask(ctx, o NewTaskOpts) (*model.Task, error)
@@ -464,7 +464,8 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
   attach cmd → tea.ExecProcess; choices → session picker), `s` new session, `r` resume, `d` done / `c` cancel (y/N confirm; if refused because dirty, offer `F`
   force), `p` pr, `D` diff (ExecProcess `$PAGER`), `1-5` set status (`AllStatuses` order, plain SetStatus), `a` add repos to the selected task (picker),
   `/` filter (substring on slug/title), `j/k`/arrows move, `q`/ctrl-c quit.
-- Session picker (`enter` on a task with sessions): row 0 "New session" (`App.OpenNew`), then `App.OpenChoices` order; row =
+- Session picker (`enter` on a task with openable sessions: live, or resumable as `App.OpenChoices` defines; closed tasks offer
+  no past sessions): row 0 "New session" (`App.OpenNew`), then `App.OpenChoices` order; row =
   state, age, title (transcript: newest `custom-title`, else newest `ai-title`/`summary`, else first user prompt, else window
   name; head+tail 1 MiB of a large transcript), window name and last prompt if they fit. ↑/↓ (ctrl+p/n, j/k, pgup/pgdown,
   home/end) move, enter → `App.OpenSession` / `App.OpenNew` then ExecProcess, esc cancels. Same look as the repo picker.
