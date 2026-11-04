@@ -34,6 +34,17 @@ func WriteClaudeMD(taskDir string, t model.Task, repos []RepoInfo) error {
 	return nil
 }
 
+// RewriteClaudeMD replaces <taskDir>/CLAUDE.md like WriteClaudeMD but never
+// creates taskDir: if it is gone (the task was closed meanwhile) it fails
+// and nothing is written.
+func RewriteClaudeMD(taskDir string, t model.Task, repos []RepoInfo) error {
+	path := filepath.Join(taskDir, "CLAUDE.md")
+	if err := writeAtomic(path, []byte(ClaudeMD(t, repos))); err != nil {
+		return fmt.Errorf("gen: write %s: %w", path, err)
+	}
+	return nil
+}
+
 // ClaudeMD renders the CLAUDE.md contents for a task.
 func ClaudeMD(t model.Task, repos []RepoInfo) string {
 	branch := t.Branch

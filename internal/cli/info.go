@@ -2,9 +2,9 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -358,49 +358,74 @@ func (c *cli) noteCmd() *cobra.Command {
 }
 
 func (c *cli) notesCmd() *cobra.Command {
-	var set bool
+	var set, clearNotes bool
 	cmd := &cobra.Command{
-		Use:   "notes <task> [--set]",
-		Short: "Print a task's notes; --set replaces them with stdin (empty stdin clears them)",
+		Use:   "notes <task> [--set] [--clear]",
+		Short: "Print a task's notes; --set replaces them with stdin, --clear clears them",
 		Args:  args(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
 			ap, err := c.App()
 			if err != nil {
 				return err
 			}
+			if !set && !clearNotes {
+				return c.printNotes(cmd, ap, a[0])
+			}
+			// Resolve first: a bad ref fails before stdin is read.
+			t, err := ap.Store.ResolveTask(cmd.Context(), a[0])
+			if err != nil {
+				return err
+			}
+			text := "" // --clear alone
 			if set {
-				// The store checks the sanitised size (\r\n, control
-				// characters and trailing blanks don't count); reading stops
-				// well past the limit so a huge stdin is never fully read.
-				const readMax = 4 * model.MaxNotesLen
-				in := cmd.InOrStdin()
-				if f, ok := in.(*os.File); ok && isTerminal(f) {
-					fmt.Fprintln(c.stderr, "atl: reading the new notes from stdin; end with ctrl-d (empty clears them)")
-				}
-				data, err := io.ReadAll(io.LimitReader(in, readMax+1))
-				if err != nil {
-					return fmt.Errorf("read stdin: %w", err)
-				}
-				if len(data) > readMax {
-					return fmt.Errorf("%w: stdin is over %d bytes, the limit is %d (64 KiB)",
-						model.ErrNotesTooLarge, readMax, model.MaxNotesLen)
-				}
-				text, err := ap.ReplaceNotes(cmd.Context(), a[0], string(data))
+				data, err := c.readNotesStdin(cmd)
 				if err != nil {
 					return err
 				}
-				if text == "" {
-					fmt.Fprintln(c.stdout, "notes cleared")
-				} else {
-					fmt.Fprintf(c.stdout, "notes replaced (%d bytes)\n", len(text))
+				// Empty (once sanitised) only clears with --clear too, so
+				// an empty pipe by mistake never wipes the notes.
+				if !clearNotes && model.SanitizeNotes(data) == "" {
+					return errors.New("stdin is empty: nothing to set (use --clear to clear the notes)")
 				}
-				return nil
+				text = data
 			}
-			return c.printNotes(cmd, ap, a[0])
+			text, err = ap.ReplaceNotes(cmd.Context(), t.Slug, text)
+			if err != nil {
+				return err
+			}
+			if text == "" {
+				fmt.Fprintln(c.stdout, "notes cleared")
+			} else {
+				fmt.Fprintf(c.stdout, "notes replaced (%d bytes)\n", len(text))
+			}
+			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&set, "set", false, "replace the notes with the text read from stdin (empty stdin clears them)")
+	cmd.Flags().BoolVar(&set, "set", false, "replace the notes with the text read from stdin (empty stdin is an error unless --clear is given too)")
+	cmd.Flags().BoolVar(&clearNotes, "clear", false, "clear the notes (alone: stdin is not read; with --set: allow an empty stdin)")
 	return cmd
+}
+
+// readNotesStdin reads the new notes text for `atl notes --set`, with a
+// hint on stderr when stdin is a terminal.
+func (c *cli) readNotesStdin(cmd *cobra.Command) (string, error) {
+	// The store checks the sanitised size (\r\n, control characters and
+	// trailing blanks don't count); reading stops well past the limit so
+	// a huge stdin is never fully read.
+	const readMax = 4 * model.MaxNotesLen
+	in := cmd.InOrStdin()
+	if isTerminal(in) {
+		fmt.Fprintln(c.stderr, "atl: reading the new notes from stdin; end with ctrl-d")
+	}
+	data, err := io.ReadAll(io.LimitReader(in, readMax+1))
+	if err != nil {
+		return "", fmt.Errorf("read stdin: %w", err)
+	}
+	if len(data) > readMax {
+		return "", fmt.Errorf("%w: stdin is over %d bytes, the limit is %d (64 KiB)",
+			model.ErrNotesTooLarge, readMax, model.MaxNotesLen)
+	}
+	return string(data), nil
 }
 
 // writeBlock prints "<head> <text>" wrapped at wrapWidth, each line

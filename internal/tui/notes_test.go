@@ -416,3 +416,249 @@ func TestNotesLayout(t *testing.T) {
 		t.Errorf("notesDisplay = %q", got)
 	}
 }
+
+// TestNotesQuestionsWhileSaving: while a save is in flight, unsaved
+// changes are edits beyond the text being saved; a question asked then
+// stays open until answered, even when the save completes meanwhile.
+func TestNotesQuestionsWhileSaving(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), notesText: map[string]string{"gamma": "g"}}
+
+	// esc during a save, no newer edits: leaves at once, the save goes on
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+	key(m, "m")
+	typeText(m, "1")
+	save := press(m, "ctrl+s")
+	if v := plainView(m); !strings.Contains(v, "Notes saving…") {
+		t.Fatalf("no saving mark:\n%s", v)
+	}
+	key(m, "esc")
+	if m.mode != modeNormal || m.notes != nil || !strings.Contains(m.status, "saving…") {
+		t.Fatalf("esc while saving: mode %v status %q", m.mode, m.status)
+	}
+	drain(m, save)
+	if fb.notesText["gamma"] != "1g" || m.status != "notes of gamma saved" || len(m.busy) != 0 {
+		t.Fatalf("after save: notes %q status %q busy %v", fb.notesText["gamma"], m.status, m.busy)
+	}
+
+	// ctrl+c during a save, no newer edits: no question; quits once saved
+	m, _ = newTest(t, fb)
+	selectTask(t, m, "gamma")
+	key(m, "m")
+	typeText(m, "2")
+	save = press(m, "ctrl+s")
+	if isQuit(press(m, "ctrl+c")) || m.notes != nil || !m.quitRequested {
+		t.Fatalf("ctrl+c while saving: editor %+v quit requested %v", m.notes, m.quitRequested)
+	}
+	if fb.notesText["gamma"] != "1g" {
+		t.Fatal("saved before the save ran")
+	}
+	if msg := save(); !isQuit(func() tea.Cmd { _, c := m.Update(msg); return c }()) || fb.notesText["gamma"] != "21g" {
+		t.Fatalf("no quit after the save, notes %q", fb.notesText["gamma"])
+	}
+
+	// esc during a save with newer edits asks about those; y drops them,
+	// the save in flight still stores what it sent
+	m, _ = newTest(t, fb)
+	selectTask(t, m, "gamma")
+	key(m, "m")
+	typeText(m, "a")
+	save = press(m, "ctrl+s")
+	typeText(m, "b")
+	key(m, "esc")
+	if m.notes == nil || m.notes.ask != askDiscard {
+		t.Fatal("esc with newer edits did not ask")
+	}
+	if v := plainView(m); !strings.Contains(v, "discard your newer edits (the save in progress goes on) to the notes of gamma? y/n") ||
+		!strings.Contains(v, "y discard and leave") {
+		t.Fatalf("question:\n%s", v)
+	}
+	key(m, "y")
+	if m.mode != modeNormal || !strings.Contains(m.status, "newer edits discarded; the save in progress goes on") {
+		t.Fatalf("y: mode %v status %q", m.mode, m.status)
+	}
+	drain(m, save)
+	if fb.notesText["gamma"] != "a21g" {
+		t.Fatalf("notes %q, want the text the save sent", fb.notesText["gamma"])
+	}
+
+	// the save completes while the question is open: it stays open and
+	// the answer still answers it (nothing leaks into normal mode)
+	for _, answer := range []string{"n", "y"} {
+		m, _ = newTest(t, fb)
+		selectTask(t, m, "gamma")
+		key(m, "m")
+		typeText(m, "c")
+		save = press(m, "ctrl+s")
+		typeText(m, "d")
+		key(m, "esc")
+		drain(m, save)
+		if m.mode != modeNotes || m.notes == nil || m.notes.ask != askDiscard || !m.notes.dirty() || m.notes.saving {
+			t.Fatalf("%s: question closed by the save result: mode %v editor %+v", answer, m.mode, m.notes)
+		}
+		if !strings.Contains(plainView(m), "discard your changes to the notes of gamma? y/n") {
+			t.Fatalf("%s: question not shown after the save:\n%s", answer, plainView(m))
+		}
+		key(m, answer)
+		if m.form != nil || m.confirm != nil || fb.count("NewSession") != 0 {
+			t.Fatalf("%s leaked into normal mode", answer)
+		}
+		if answer == "n" {
+			if m.mode != modeNotes || m.notes.ask != askNone || m.notes.ta.Value() != "cda21g" {
+				t.Fatalf("n: mode %v value %q", m.mode, m.notes.ta.Value())
+			}
+		} else if m.mode != modeNormal || m.notes != nil {
+			t.Fatalf("y: mode %v", m.mode)
+		}
+		if fb.notesText["gamma"] != "ca21g" {
+			t.Fatalf("%s: notes %q", answer, fb.notesText["gamma"])
+		}
+		fb.notesText["gamma"] = "a21g"
+	}
+
+	// ctrl+c during a save with newer edits asks to quit; the help says
+	// y quits; the save completing keeps the question; y then quits
+	m, _ = newTest(t, fb)
+	selectTask(t, m, "gamma")
+	key(m, "m")
+	typeText(m, "e")
+	save = press(m, "ctrl+s")
+	typeText(m, "f")
+	if isQuit(press(m, "ctrl+c")) || m.notes.ask != askQuit {
+		t.Fatal("ctrl+c with newer edits did not ask")
+	}
+	v := plainView(m)
+	if !strings.Contains(v, "quit and discard your newer edits (the save in progress goes on) to the notes of gamma? y/n") ||
+		!strings.Contains(v, "y quit atl (unsaved notes are lost)") || strings.Contains(v, "y discard and leave") {
+		t.Fatalf("quit question / help:\n%s", v)
+	}
+	drain(m, save)
+	if m.mode != modeNotes || m.notes.ask != askQuit {
+		t.Fatal("the save result closed the quit question")
+	}
+	if !isQuit(press(m, "y")) || fb.notesText["gamma"] != "ea21g" {
+		t.Fatalf("y did not quit; notes %q", fb.notesText["gamma"])
+	}
+
+	// a ctrl+r reload landing while a question is open keeps it too
+	m, _ = newTest(t, fb)
+	selectTask(t, m, "gamma")
+	key(m, "m")
+	typeText(m, "x")
+	reload := press(m, "ctrl+r")
+	typeText(m, "y")
+	key(m, "esc")
+	drain(m, reload)
+	if m.mode != modeNotes || m.notes.ask != askDiscard {
+		t.Fatal("the reload closed the question")
+	}
+	key(m, "n")
+	if m.mode != modeNotes || m.notes.ask != askNone || m.notes.ta.Value() != "ea21g" {
+		t.Fatalf("n after reload: mode %v value %q", m.mode, m.notes.ta.Value())
+	}
+}
+
+// TestNotesLoading: between m and the text arriving, keys are swallowed
+// (a fast "mjs" must not move or start a session) and esc cancels.
+func TestNotesLoading(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), notesText: map[string]string{"gamma": "g"}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+
+	load := press(m, "m")
+	if m.mode != modeNotesLoading || m.notesLoad == nil || m.notesLoad.slug != "gamma" {
+		t.Fatalf("m: mode %v load %+v", m.mode, m.notesLoad)
+	}
+	if v := plainView(m); !strings.Contains(v, "loading the notes of gamma…  esc cancel") {
+		t.Fatalf("no loading help:\n%s", v)
+	}
+	for _, k := range []string{"j", "s", "n", "d", "q", "t", "/", "enter", "ctrl+s"} {
+		if c := press(m, k); c != nil {
+			t.Fatalf("%s while loading returned a command", k)
+		}
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("js")})
+	if m.mode != modeNotesLoading || m.selected().Task.Slug != "gamma" || m.form != nil || m.confirm != nil ||
+		m.quitRequested || fb.count("NewSession") != 0 || fb.count("GetNotes") != 0 {
+		t.Fatalf("keys leaked while loading: mode %v sel %s", m.mode, m.selected().Task.Slug)
+	}
+	drain(m, load)
+	if m.mode != modeNotes || m.notes == nil || m.notes.ta.Value() != "g" || m.notesLoad != nil || len(m.busy) != 0 {
+		t.Fatalf("after load: mode %v editor %+v", m.mode, m.notes)
+	}
+	key(m, "esc")
+
+	// "mjs" as one burst: m starts loading, j and s are swallowed
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("mjs")})
+	if m.mode != modeNotesLoading || m.selected().Task.Slug != "gamma" || fb.count("NewSession") != 0 {
+		t.Fatalf("burst: mode %v sel %s sessions %d", m.mode, m.selected().Task.Slug, fb.count("NewSession"))
+	}
+	drain(m, cmd)
+	if m.mode != modeNotes || m.notes.ta.Value() != "g" || fb.count("NewSession") != 0 {
+		t.Fatalf("burst after load: mode %v value %q", m.mode, m.notes.ta.Value())
+	}
+	key(m, "esc")
+
+	// esc cancels: the text arriving later opens nothing
+	load = press(m, "m")
+	key(m, "esc")
+	if m.mode != modeNormal || m.notesLoad != nil || !strings.Contains(m.status, "notes gamma: cancelled") {
+		t.Fatalf("esc: mode %v status %q", m.mode, m.status)
+	}
+	if m.busy[3] != "notes gamma" {
+		t.Fatalf("busy until the load returns: %v", m.busy)
+	}
+	drain(m, load)
+	if m.mode != modeNormal || m.notes != nil || len(m.busy) != 0 || !strings.Contains(m.status, "cancelled") {
+		t.Fatalf("cancelled load opened: mode %v status %q busy %v", m.mode, m.status, m.busy)
+	}
+
+	// load failure: back to normal mode with the error
+	fb.notesErr = errors.New("boom")
+	load = press(m, "m")
+	drain(m, load)
+	if m.mode != modeNormal || m.notesLoad != nil || !strings.Contains(m.status, "notes: boom") {
+		t.Fatalf("load error: mode %v status %q", m.mode, m.status)
+	}
+	fb.notesErr = nil
+
+	// ctrl+c while loading: cancels and quits once the load returns
+	load = press(m, "m")
+	if isQuit(press(m, "ctrl+c")) || m.mode != modeNormal || !m.quitRequested {
+		t.Fatalf("ctrl+c while loading: mode %v", m.mode)
+	}
+	if msg := load(); !isQuit(func() tea.Cmd { _, c := m.Update(msg); return c }()) || m.notes != nil {
+		t.Fatal("no quit after the load returned")
+	}
+}
+
+// TestNotesTabs: the TUI editor cannot keep tabs (its textarea turns them
+// into four spaces) or U+FFFD (dropped): opening such notes warns, and
+// saving from the TUI stores the converted text. atl notes --set keeps
+// them (TestNotesSet in internal/cli).
+func TestNotesTabs(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), notesText: map[string]string{"gamma": "a\tb�c", "alpha": "plain"}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "alpha")
+	key(m, "m")
+	if m.status != "" {
+		t.Fatalf("hint for plain notes: %q", m.status)
+	}
+	key(m, "esc")
+	selectTask(t, m, "gamma")
+	key(m, "m")
+	if !strings.Contains(m.status, "saving here turns tabs into 4 spaces and drops � characters (atl notes --set keeps them)") {
+		t.Fatalf("no tabs hint: %q", m.status)
+	}
+	key(m, "esc") // unchanged: nothing saved, tabs stay
+	if fb.count("SetNotes") != 0 || fb.notesText["gamma"] != "a\tb�c" {
+		t.Fatalf("leaving unchanged saved: %q", fb.notesText["gamma"])
+	}
+	key(m, "m")
+	key(m, "ctrl+end")
+	typeText(m, "!")
+	key(m, "ctrl+s")
+	if got := fb.notesText["gamma"]; got != "a    bc!" {
+		t.Fatalf("saved %q, want tabs as 4 spaces and U+FFFD dropped", got)
+	}
+}

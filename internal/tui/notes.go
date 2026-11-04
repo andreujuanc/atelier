@@ -50,8 +50,20 @@ type notesEditor struct {
 	// ctrl+s overwrites them (compares against the text it reported).
 	conflict bool
 	saving   bool // a save is in flight
-	loading  bool // a ctrl+r reload is in flight
-	ask      notesAsk
+	// sending is the text the save in flight sends: while saving, unsaved
+	// changes = the value differs from it.
+	sending string
+	loading bool // a ctrl+r reload is in flight
+	// ask is a pending y/n question: every key answers it (nothing reaches
+	// the editor or normal mode); only an answer or closing the editor
+	// clears it.
+	ask notesAsk
+}
+
+// notesLoad is a pending `m`: the task whose notes are loading.
+type notesLoad struct {
+	id   int64
+	slug string
 }
 
 func newNotesEditor(t app.TaskView, text string) *notesEditor {
@@ -82,12 +94,20 @@ func (e *notesEditor) load(text string) {
 	e.base, e.start, e.conflict = text, e.ta.Value(), false
 }
 
-// dirty reports unsaved changes.
-func (e *notesEditor) dirty() bool { return e.ta.Value() != e.start }
+// dirty reports unsaved changes: edits beyond the save in flight, if any,
+// else beyond the loaded (or last saved) text.
+func (e *notesEditor) dirty() bool {
+	if e.saving {
+		return e.ta.Value() != e.sending
+	}
+	return e.ta.Value() != e.start
+}
 
 // openNotes starts editing task t's notes: their current text is loaded
-// first (the editor opens when it arrives). Like the other operations on
-// a task it is refused while the task is busy (normalKey checks that).
+// first (the editor opens when it arrives). Meanwhile the TUI is in
+// modeNotesLoading, which swallows keys (a fast "mjs" must not run j and
+// s) and esc cancels. Like the other operations on a task it is refused
+// while the task is busy (normalKey checks that).
 func (m *Model) openNotes(t *app.TaskView) tea.Cmd {
 	if m.quitRequested {
 		m.setStatus(quitText(len(m.busyOps())))
@@ -95,6 +115,8 @@ func (m *Model) openNotes(t *app.TaskView) tea.Cmd {
 	}
 	id, slug, be, ctx := t.Task.ID, t.Task.Slug, m.be, m.ctx
 	m.busy[id] = "notes " + slug
+	m.notesLoad = &notesLoad{id: id, slug: slug}
+	m.mode = modeNotesLoading
 	return func() tea.Msg {
 		text, err := be.GetNotes(ctx, slug)
 		return notesLoadedMsg{id: id, slug: slug, text: text, err: err}
@@ -116,17 +138,24 @@ func (m *Model) notesLoaded(msg notesLoadedMsg) tea.Cmd {
 			m.setStatusErr("reload notes: too many lines to edit here; use atl notes "+msg.slug+" --set", true)
 			return nil
 		}
+		// A pending question stays: its answer still means the same.
 		e.load(msg.text)
-		e.ask = askNone
-		m.setStatus("notes of " + msg.slug + " reloaded (your edits were dropped)")
+		if e.ask == askNone {
+			m.setStatus("notes of " + msg.slug + " reloaded (your edits were dropped)" + tabsHint(msg.text))
+		}
 		return nil
 	}
 	delete(m.busy, msg.id)
+	if l := m.notesLoad; l == nil || l.id != msg.id || m.mode != modeNotesLoading {
+		return nil // cancelled (esc, ctrl+c) meanwhile
+	}
+	m.notesLoad = nil
+	m.mode = modeNormal
 	if msg.err != nil {
 		m.setErr(fmt.Errorf("notes: %w", msg.err))
 		return nil
 	}
-	if m.mode != modeNormal || m.quitRequested || m.notes != nil {
+	if m.quitRequested || m.notes != nil { // defensive: the load state prevents both
 		m.setStatus("notes " + msg.slug + ": press m again to edit")
 		return nil
 	}
@@ -142,12 +171,44 @@ func (m *Model) notesLoaded(msg notesLoadedMsg) tea.Cmd {
 	}
 	m.notes = newNotesEditor(tv, msg.text)
 	m.mode = modeNotes
-	m.setStatus("")
+	m.setStatus(strings.TrimPrefix(tabsHint(msg.text), "; "))
 	m.syncNotesSize()
 	return nil
 }
 
-// closeNotes leaves edit mode (any unsaved text is dropped).
+// tabsHint warns (as "; …") when text has characters a save from the
+// editor changes: the textarea turns tabs into four spaces and drops
+// U+FFFD (what invalid UTF-8 was stored as). "" if there are none.
+func tabsHint(text string) string {
+	if !strings.ContainsAny(text, "\t\uFFFD") {
+		return ""
+	}
+	return "; note: saving here turns tabs into 4 spaces and drops \uFFFD characters (atl notes --set keeps them)"
+}
+
+// cancelNotesLoad leaves modeNotesLoading; the load's result is dropped
+// when it arrives (the task stays busy until then).
+func (m *Model) cancelNotesLoad() {
+	m.notesLoad = nil
+	m.mode = modeNormal
+}
+
+// notesLoadingKey handles a key while the notes are loading: esc cancels,
+// every other key is swallowed (ctrl+c is handled by handleKey).
+func (m *Model) notesLoadingKey(msg tea.KeyMsg) tea.Cmd {
+	if msg.String() == "esc" {
+		slug := ""
+		if m.notesLoad != nil {
+			slug = m.notesLoad.slug
+		}
+		m.cancelNotesLoad()
+		m.setStatus("notes " + slug + ": cancelled")
+	}
+	return nil
+}
+
+// closeNotes leaves edit mode (any unsaved text and pending question are
+// dropped with the editor).
 func (m *Model) closeNotes() {
 	m.notes = nil
 	m.mode = modeNormal
@@ -167,14 +228,20 @@ func (m *Model) notesKey(msg tea.KeyMsg) tea.Cmd {
 		ask := e.ask
 		e.ask = askNone
 		if k != "y" && k != "Y" {
-			m.setStatus("back to editing the notes of " + e.slug)
+			if !m.statusErr { // keep a save error that arrived meanwhile
+				m.setStatus("back to editing the notes of " + e.slug)
+			}
 			return nil
 		}
 		m.closeNotes()
 		if ask == askQuit {
 			return m.requestQuit("q")
 		}
-		m.setStatus("notes of " + e.slug + ": changes discarded")
+		if e.saving {
+			m.setStatus("notes of " + e.slug + ": newer edits discarded; the save in progress goes on")
+		} else {
+			m.setStatus("notes of " + e.slug + ": changes discarded")
+		}
 		return nil
 	}
 	switch k {
@@ -197,7 +264,9 @@ func (m *Model) notesKey(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		}
 		m.closeNotes()
-		if !e.saving {
+		if e.saving {
+			m.setStatus("notes of " + e.slug + ": saving…")
+		} else {
 			m.setStatus("notes of " + e.slug + ": no changes")
 		}
 		return nil
@@ -240,8 +309,8 @@ func (m *Model) saveNotes() tea.Cmd {
 		m.setStatus("busy: " + op + "… (ctrl+s again to save)")
 		return nil
 	}
-	e.saving = true
-	id, slug, text, base, be, ctx := e.id, e.slug, e.ta.Value(), e.base, m.be, m.ctx
+	e.saving, e.sending = true, e.ta.Value()
+	id, slug, text, base, be, ctx := e.id, e.slug, e.sending, e.base, m.be, m.ctx
 	m.busy[id] = "save notes " + slug
 	return func() tea.Msg {
 		saved, err := be.SetNotes(ctx, slug, text, base)
@@ -253,9 +322,9 @@ func (m *Model) notesSaved(msg notesSavedMsg) tea.Cmd {
 	delete(m.busy, msg.id)
 	e := m.notes
 	if e == nil || e.id != msg.id {
-		// The editor was left (changes discarded) while saving.
+		// The editor was left while saving.
 		if msg.err != nil {
-			m.setErr(fmt.Errorf("save notes: %w", msg.err))
+			m.setErr(fmt.Errorf("save notes of %s (editor closed, text not saved): %w", msg.slug, msg.err))
 		} else {
 			m.setStatus("notes of " + msg.slug + " saved")
 		}
@@ -273,10 +342,14 @@ func (m *Model) notesSaved(msg notesSavedMsg) tea.Cmd {
 		return nil
 	}
 	e.base, e.conflict = msg.saved, false
-	if e.ta.Value() != msg.sent {
-		// Typed on while saving: keep editing what is left unsaved.
+	if e.ta.Value() != msg.sent || e.ask != askNone {
+		// Typed on while saving: keep editing what is left unsaved. A
+		// question asked meanwhile (about those newer edits) stays open:
+		// closing under it would let its answer leak into normal mode.
 		e.start = msg.sent
-		m.setStatus("notes of " + msg.slug + " saved; newer edits not saved yet (ctrl+s)")
+		if e.ask == askNone {
+			m.setStatus("notes of " + msg.slug + " saved; newer edits not saved yet (ctrl+s)")
+		}
 		return m.reload()
 	}
 	m.closeNotes()
@@ -363,6 +436,8 @@ func (m *Model) notesLines(t *app.TaskView, w, n int) []string {
 		switch {
 		case e.conflict:
 			hdr += errStyle.Render("changed meanwhile: ctrl+s overwrite · ctrl+r reload")
+		case e.saving && !e.dirty():
+			hdr += markStyle.Render("saving…")
 		case e.dirty():
 			hdr += markStyle.Render("editing*") + dimStyle.Render(" · ctrl+s save · esc leave")
 		default:

@@ -46,7 +46,8 @@ atl show fix-login --notes      # only the notes text (same as atl notes; read-o
 atl transcript fix-login [--session ID] [--tail N]  # last N (20; 0 = all) turns of a Claude session
 atl note fix-login waiting on design review [--author user|assistant]  # appends "- YYYY-MM-DD [user] waiting on…"
 atl notes fix-login       # print the task's notes text
-atl notes fix-login --set < notes.md   # replace the notes with stdin (empty stdin clears them)
+atl notes fix-login --set < notes.md   # replace the notes with stdin (an empty stdin is an error)
+atl notes fix-login --clear            # clear the notes
 atl assistant [fix-login] # the atelier assistant (one Claude session for all tasks); attach
 atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
 atl cancel fix-login [--force]
@@ -95,16 +96,24 @@ directory, or no transcript and not launched by atl), and resuming in a closed t
 Each task has one free-form notes text (goal, decisions, where you left off, ...). The TUI
 shows it under the task's details, filling the rest of the details pane (wrapped, from the
 top; "(no notes — press m to write)" when empty). `m` turns that area into an editor
-prefilled with the text; while it is focused every key goes to the editor (`enter` is a new
-line, arrows move, the text scrolls):
+prefilled with the text (until the text has loaded, keys are ignored and `esc` cancels);
+while it is focused every key goes to the editor (`enter` is a new line, arrows move, the
+text scrolls):
 
 - `ctrl+s` saves and leaves the editor. The save only succeeds if the notes are still what
   the editor started from; if something changed them meanwhile (e.g. an agent ran
   `atl note`), the editor stays open with your text and the status line says so: `ctrl+s`
   again overwrites with your text, `ctrl+r` reloads theirs (dropping your edits).
-- `esc` leaves the editor; with unsaved changes it asks first ("discard …? y/n").
+- `esc` leaves the editor; with unsaved changes it asks first ("discard …? y/n"). While a
+  save is in flight, only edits made after `ctrl+s` count as unsaved: leaving lets the save
+  finish, and "discard" drops only those newer edits. A question stays open until you answer
+  it (`y`, or any other key to go back to editing), even if the save finishes meanwhile.
 - `ctrl+r` reloads the stored text (dropping your edits); `ctrl+c` with unsaved changes asks
-  before quitting.
+  before quitting (`y` quits).
+- The editor can't hold tabs: saving from the TUI turns every tab in the text into 4 spaces
+  and drops U+FFFD characters (what invalid UTF-8 was stored as); opening such notes says so
+  in the status line. Leaving without changes saves nothing. `atl notes <task> --set` keeps
+  tabs.
 
 The editor stays on the task it was opened for, even if the selection or the list changes
 meanwhile; like other operations it is refused while the task is busy.
@@ -112,15 +121,21 @@ meanwhile; like other operations it is refused while the task is busy.
 `atl note <task> <text...> [--author user|assistant]` appends a line
 `- YYYY-MM-DD [author] text` (today's local date) at the end, so agents and the assistant can
 add to the notes without touching what you wrote. `atl notes <task>` prints the whole text,
-and `atl notes <task> --set` replaces it with stdin (an empty stdin clears it; only `--set`
-ever reads stdin). Notes are capped at 64 KiB; control characters other than newline and tab
+`atl notes <task> --set` replaces it with stdin, and `atl notes <task> --clear` clears it.
+`--set` with an empty stdin (or only blanks) is an error, so an empty pipe by mistake never
+wipes the notes; `--set --clear` accepts an empty stdin (and clears). Only `--set` ever
+reads stdin, and only after the task is found. Notes are capped at 64 KiB; control characters other than newline and tab
 are dropped. Notes work on closed tasks too. Before this, notes were a list of dated entries:
 upgrading folds them into the text, oldest first, as `- YYYY-MM-DD [author] body` lines.
 
 `atl rename` (TUI `t`) changes only the title, on a task of any status: the title is trimmed,
-space runs are collapsed, and an empty title or one with control characters is rejected. The
-slug never changes, so keep using it (or the id) to refer to the task. An open task's
-generated `CLAUDE.md` is rewritten with the new title.
+space runs are collapsed, and an empty title, one with control characters or one longer
+than 200 characters is rejected (`atl new` has the same 200-character cap, and so do the
+TUI's title inputs). Submitting the `t` input unchanged saves nothing, also for an older
+title over 200 characters, which the input shows cut. The slug never changes, so keep using
+it (or the id) to refer to the task. An open task's generated `CLAUDE.md` is rewritten with
+the new title; if its task dir is gone (the task is being closed) nothing is recreated and
+the rename only warns.
 
 `<task>` is a slug, numeric id, or unique slug prefix. atelier never pushes:
 push `atl/<slug>` yourself before `atl pr`.
@@ -148,9 +163,9 @@ status of X?", "where did I leave off?", "add repo Y to X"). It runs in
 reference, always rewritten) and `.claude/settings.json` (merged): read-only `atl`
 commands (`ls`, `show`, `transcript`, `repos`) and Read/Grep/Glob are allowed,
 every state-changing `atl` command asks first (`atl note` appends; `atl notes --set` replaces
-the notes, and the assistant is told to show you the new text first). All of `atl notes`
-asks, even plain reads: a permission pattern can't reliably tell `atl notes X` from
-`atl notes X --set` (quoting, `--set=true`, flag order), so the assistant reads notes with
+the notes, and the assistant is told to show you the new text first; `atl notes --clear`
+clears them). All of `atl notes` asks, even plain reads: a permission pattern can't reliably
+tell `atl notes X` from `atl notes X --set` (quoting, `--set=true`, flag order), so the assistant reads notes with
 `atl show <task> --notes` (or `--json`), which is allowed; common repo mutators (`git commit`, `push`,
 `checkout`, `reset`, `rebase`, `merge`, `stash`, `rm`, `mv`, `cp`, `sed -i`, `tee`, ...) are
 denied, and the `atl hook AssistantGuard` PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit

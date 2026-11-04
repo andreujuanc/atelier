@@ -62,6 +62,9 @@ func newTaskForm(projects []string) *newForm {
 		ti.Placeholder = placeholders[i]
 		ti.Cursor.SetMode(cursor.CursorStatic)
 		ti.CharLimit = 500
+		if i == fieldTitle {
+			ti.CharLimit = model.MaxTitleLen // as atl new and rename
+		}
 		f.inputs[i] = ti
 	}
 	f.setFocus(fieldTitle)

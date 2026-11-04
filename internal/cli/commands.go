@@ -32,6 +32,9 @@ func (c *cli) newCmd() *cobra.Command {
 			if strings.TrimSpace(o.Title) == "" {
 				return usagef("title is required")
 			}
+			if err := model.CheckTitleLen(strings.Join(strings.Fields(o.Title), " ")); err != nil {
+				return usageError{err}
+			}
 			for _, r := range repos {
 				ra, err := parseRepoArg("--repo", r)
 				if err != nil {
@@ -496,14 +499,27 @@ func (c *cli) diffCmd() *cobra.Command {
 	}
 }
 
-// isTerminal reports whether w is a character device (a TTY).
-func isTerminal(w io.Writer) bool {
-	f, ok := w.(*os.File)
+// notTTYDevices are character devices that are never terminals.
+var notTTYDevices = []string{"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom"}
+
+// isTerminal reports whether v (an io.Reader or io.Writer) is a terminal:
+// an *os.File on a character device other than /dev/null and the like
+// (an ioctl-free check: no terminal library is a dependency).
+func isTerminal(v any) bool {
+	f, ok := v.(*os.File)
 	if !ok {
 		return false
 	}
 	fi, err := f.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	for _, p := range notTTYDevices {
+		if di, err := os.Stat(p); err == nil && os.SameFile(fi, di) {
+			return false
+		}
+	}
+	return true
 }
 
 // paged runs write with stdout piped through $PAGER (default `less -R`)

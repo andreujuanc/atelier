@@ -179,6 +179,10 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 	if title == "" {
 		return nil, errors.New("title is required")
 	}
+	// The same cap as a rename, so `atl rename`/TUI `t` can always resave it.
+	if err := model.CheckTitleLen(title); err != nil {
+		return nil, err
+	}
 	o.Project = strings.TrimSpace(o.Project)
 	repos, err := a.mergeRepos(o)
 	if err != nil {
@@ -568,7 +572,10 @@ func (a *App) Rename(ctx context.Context, ref, title string) (*model.Task, error
 
 // rewriteClaudeMD regenerates an open task's CLAUDE.md from the DB if the
 // file exists (it is never created here: done/cancel remove it). It holds
-// the per-task lock so it cannot interleave with AddRepo's rewrite.
+// the per-task lock so it cannot interleave with AddRepo's rewrite. It
+// never creates the task dir either (finishTask removes it without the
+// lock): a task dir that is gone is an error, which Rename reports as a
+// warning.
 func (a *App) rewriteClaudeMD(ctx context.Context, id int64) error {
 	unlock, err := a.lockTask(ctx, id)
 	if err != nil {
@@ -579,14 +586,29 @@ func (a *App) rewriteClaudeMD(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
+	if !t.Status.Open() {
+		return nil
+	}
 	dir := a.Paths.TaskDir(t.Slug)
-	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); errors.Is(err, os.ErrNotExist) || !t.Status.Open() {
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("task dir %s is gone", dir)
+	} else if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	return gen.WriteClaudeMD(dir, *t, a.repoInfos(t))
+	if beforeClaudeMDRewrite != nil {
+		beforeClaudeMDRewrite(dir)
+	}
+	return gen.RewriteClaudeMD(dir, *t, a.repoInfos(t))
 }
+
+// beforeClaudeMDRewrite, if set (tests only), runs in rewriteClaudeMD
+// between its checks and the write.
+var beforeClaudeMDRewrite func(dir string)
 
 // Done closes a task as done and returns it (with its new status); see
 // finish.

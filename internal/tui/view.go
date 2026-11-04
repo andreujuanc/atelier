@@ -373,9 +373,13 @@ func (m *Model) statusLine(w int) string {
 	case m.mode == modeFilter:
 		return trunc(m.filterInput.View(), w)
 	case m.mode == modeNotes && m.notes != nil && m.notes.ask != askNone:
-		q := "discard your changes to the notes of " + clean(m.notes.slug) + "? y/n"
+		what := "your changes"
+		if m.notes.saving {
+			what = "your newer edits (the save in progress goes on)"
+		}
+		q := "discard " + what + " to the notes of " + clean(m.notes.slug) + "? y/n"
 		if m.notes.ask == askQuit {
-			q = "quit and discard your changes to the notes of " + clean(m.notes.slug) + "? y/n"
+			q = "quit and discard " + what + " to the notes of " + clean(m.notes.slug) + "? y/n"
 		}
 		return trunc(markStyle.Render(q), w)
 	case m.mode == modeRename:
@@ -424,6 +428,8 @@ func (m *Model) helpLine(w int) string {
 		e := m.notes
 		switch {
 		case e == nil:
+		case e.ask == askQuit:
+			s = "y quit atl (unsaved notes are lost)  any other key: back to editing"
 		case e.ask != askNone:
 			s = "y discard and leave  any other key: back to editing"
 		case e.conflict:
@@ -431,6 +437,12 @@ func (m *Model) helpLine(w int) string {
 		default:
 			s = "editing notes of " + clean(e.slug) + ": ctrl+s save  esc leave (asks if unsaved)  ctrl+r reload (drops edits)  enter new line  ↑/↓ move  ctrl+c quit"
 		}
+	case modeNotesLoading:
+		slug := ""
+		if m.notesLoad != nil {
+			slug = m.notesLoad.slug
+		}
+		s = "loading the notes of " + clean(slug) + "…  esc cancel"
 	case modeRename:
 		if m.statusErr && m.status != "" {
 			// a refused title: the error replaces the help until the next edit

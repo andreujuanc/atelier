@@ -97,17 +97,20 @@ func TestAssistantClaudeMD(t *testing.T) {
 	// atl notes --set replaces, both under "Changes state", --set asks first
 	readOnly := ro[strings.Index(ro, "Read-only (run freely):"):]
 	if !strings.Contains(readOnly, "- `atl show <task> --notes` — only the task's notes") ||
-		!strings.Contains(readOnly, "asks for permission here (its `--set` form") ||
+		!strings.Contains(readOnly, "asks for permission here (its `--set` and") ||
+		!strings.Contains(readOnly, "`--clear` forms write)") ||
 		strings.Contains(readOnly, "--set` —") || strings.Contains(readOnly, "atl note <task>") {
 		t.Error("read-only notes commands wrong")
 	}
 	if !strings.Contains(changes, "- `atl note <task> <text> --author assistant` — append a line `- YYYY-MM-DD [assistant] <text>`") ||
 		!strings.Contains(changes, "- `atl notes <task> --set` — REPLACE the whole notes text with stdin") ||
+		!strings.Contains(changes, "(an empty stdin is an error)") ||
+		!strings.Contains(changes, "- `atl notes <task> --clear` — DELETE the whole notes text") ||
 		!strings.Contains(changes, "get their yes first") || !strings.Contains(changes, "use `atl note` instead") {
 		t.Error("notes write commands not described under the state-changing commands")
 	}
-	if !strings.Contains(md, "`cancel`, `note`, `notes --set`)") {
-		t.Error("confirm rule lacks notes --set")
+	if !strings.Contains(md, "`cancel`, `note`, `notes --set`,\n  `notes --clear`)") {
+		t.Error("confirm rule lacks notes --set / --clear")
 	}
 	// always regenerated
 	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("tampered"), 0o644); err != nil {
@@ -225,13 +228,15 @@ func TestAssistantNotesPermissions(t *testing.T) {
 		"atl notes fix --set", "atl notes --set fix", "atl notes fix --set=true", `atl notes fix "--set"`,
 		"atl notes fix '--set'", `atl notes fix --s""et`, "atl notes fix --set < /tmp/x", "atl notes  fix --set",
 		"atl notes\tfix --set", "atl note fix hello", "atl note fix --author assistant hello", "atl notes fix",
+		"atl notes fix --clear", "atl notes --clear fix", "atl notes fix --clear=true", "atl notes fix --set --clear",
 	}
 	for _, c := range asks {
 		if matchesAny(assistantAllow, c) {
 			t.Errorf("allow rule lets %q run without asking", c)
 		}
 	}
-	for _, c := range []string{"atl notes fix --set", "atl notes --set fix", "atl notes fix --set=true", `atl notes fix "--set"`, "atl note fix hello"} {
+	for _, c := range []string{"atl notes fix --set", "atl notes --set fix", "atl notes fix --set=true", `atl notes fix "--set"`, "atl note fix hello",
+		"atl notes fix --clear", "atl notes --clear fix"} {
 		if !matchesAny(assistantAsk, c) {
 			t.Errorf("no ask rule for %q", c)
 		}

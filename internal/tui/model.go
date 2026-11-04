@@ -39,6 +39,9 @@ const (
 	modeNotes // the in-place notes editor (m) has the keyboard
 	modeSessions
 	modeRename
+	// modeNotesLoading: m was pressed and the notes text is loading; keys
+	// are swallowed (esc cancels) until it arrives or fails.
+	modeNotesLoading
 )
 
 // confirmState is a pending done/cancel confirmation.
@@ -221,11 +224,16 @@ type Model struct {
 	// notes is the in-place notes editor (`m`), bound to the task it was
 	// opened on; nil when not editing.
 	notes *notesEditor
+	// notesLoad is the task whose notes are loading (modeNotesLoading).
+	notesLoad *notesLoad
 	// renameInput is the `t` title being edited for task renameID/renameSlug.
 	renameInput textinput.Model
 	renameID    int64
 	renameSlug  string
-	renameOrig  string // the title the input was prefilled with
+	renameOrig  string // the task's title, cleaned for the input
+	// renameFill is the input's value right after prefilling: renameOrig
+	// cut to the input's CharLimit (a legacy title may be longer).
+	renameFill string
 	// pending holds dirty refusals that arrived outside normal mode; they
 	// are shown once back in normal mode.
 	pending []*confirmState
@@ -262,7 +270,7 @@ func New(ctx context.Context, be Backend) *Model {
 	ri.Prompt = "title> "
 	ri.Placeholder = "the task's new title (enter saves, esc cancels)"
 	ri.Cursor.SetMode(cursor.CursorStatic)
-	ri.CharLimit = 500
+	ri.CharLimit = model.MaxTitleLen
 	return &Model{
 		be:  be,
 		ctx: ctx,
@@ -975,6 +983,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		if m.mode == modeNotes && m.notes != nil {
 			return m.notesQuit()
 		}
+		if m.mode == modeNotesLoading {
+			m.cancelNotesLoad()
+		}
 		return m.requestQuit(key)
 	}
 	// Bubble Tea may deliver fast-typed letters as one multi-rune event
@@ -1001,6 +1012,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.filterKey(msg)
 	case modeNotes:
 		return m.notesKey(msg)
+	case modeNotesLoading:
+		return m.notesLoadingKey(msg)
 	case modeRename:
 		return m.renameKey(msg)
 	case modeSessions:
@@ -1018,6 +1031,14 @@ func (m *Model) renameKey(msg tea.KeyMsg) tea.Cmd {
 		m.setStatus("rename cancelled")
 		return nil
 	case "enter":
+		// Submitted as prefilled: nothing to save, even when the input cut
+		// a legacy title longer than its CharLimit.
+		if m.renameInput.Value() == m.renameFill {
+			m.mode = modeNormal
+			m.renameInput.Blur()
+			m.setStatus("rename: title unchanged")
+			return nil
+		}
 		title, err := model.NormalizeTitle(m.renameInput.Value())
 		if errors.Is(err, model.ErrTitleEmpty) {
 			m.setStatusErr("rename: the title cannot be empty (esc cancels)", true)
@@ -1335,6 +1356,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 	case "t":
 		m.renameID, m.renameSlug, m.renameOrig = t.Task.ID, slug, clean(t.Task.Title)
 		m.renameInput.SetValue(m.renameOrig)
+		m.renameFill = m.renameInput.Value()
 		m.renameInput.CursorEnd()
 		m.renameInput.Width = m.renameInputWidth()
 		m.renameInput.Focus()

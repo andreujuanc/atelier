@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/andreujuanc/atelier/internal/gen"
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
@@ -79,6 +81,89 @@ func TestRename(t *testing.T) {
 	}
 	if exists(e.app.Paths.TaskDir("old")) {
 		t.Fatal("rename created a closed task's dir")
+	}
+}
+
+// TestRenameTitleCap checks that atl new and rename share the title cap.
+func TestRenameTitleCap(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	long := strings.Repeat("x", model.MaxTitleLen+1)
+	if _, err := e.app.NewTask(ctx, NewTaskOpts{Title: long, Repos: []RepoArg{{"api", model.ModeRW}}, NoFetch: true}); !errors.Is(err, model.ErrTitleTooLong) {
+		t.Fatalf("NewTask with a %d-char title: %v", len(long), err)
+	}
+	if ts, _ := e.app.List(ctx); len(ts) != 0 {
+		t.Fatalf("a too long title created a task: %+v", ts)
+	}
+	// the cap counts after collapsing spaces, in runes
+	max := strings.Repeat("é", model.MaxTitleLen)
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "  " + max + "\n", Repos: []RepoArg{{"api", model.ModeRW}}, NoFetch: true})
+	if err != nil || task.Title != max {
+		t.Fatalf("NewTask at the cap: %v", err)
+	}
+	if _, err := e.app.Rename(ctx, task.Slug, long); !errors.Is(err, model.ErrTitleTooLong) {
+		t.Fatalf("Rename too long: %v", err)
+	}
+	if got, err := e.app.Rename(ctx, task.Slug, max); err != nil || got.Title != max {
+		t.Fatalf("Rename at the cap: %v", err)
+	}
+}
+
+// TestRenameTaskDirGone checks that a rename racing done/cancel (which
+// removes the task dir before it sets the status, without the task lock)
+// never recreates the dir or its CLAUDE.md: it warns and the rename stands.
+func TestRenameTaskDirGone(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Fix login", Repos: []RepoArg{{"api", model.ModeRW}}, NoFetch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := e.app.Paths.TaskDir(task.Slug)
+	if err := os.RemoveAll(dir); err != nil { // as finishTask does, status still open
+		t.Fatal(err)
+	}
+	out := e.app.Out.(*bytes.Buffer)
+	out.Reset()
+	got, err := e.app.Rename(ctx, task.Slug, "Fix the login")
+	if err != nil || got.Title != "Fix the login" {
+		t.Fatalf("Rename = %+v, %v", got, err)
+	}
+	if exists(dir) {
+		t.Fatal("rename recreated the removed task dir")
+	}
+	if w := out.String(); !strings.Contains(w, "warning: task fix-login renamed but CLAUDE.md not updated") || !strings.Contains(w, "is gone") {
+		t.Fatalf("warning = %q", w)
+	}
+
+	// the gen helper itself never creates the dir
+	if err := gen.RewriteClaudeMD(dir, *got, nil); err == nil || exists(dir) {
+		t.Fatalf("RewriteClaudeMD on a missing dir: %v (exists %v)", err, exists(dir))
+	}
+
+	// the dir vanishes after the checks, right before the write
+	task2, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Other", Repos: []RepoArg{{"api", model.ModeRW}}, NoFetch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir2 := e.app.Paths.TaskDir(task2.Slug)
+	beforeClaudeMDRewrite = func(d string) {
+		if err := os.RemoveAll(d); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { beforeClaudeMDRewrite = nil })
+	out.Reset()
+	if _, err := e.app.Rename(ctx, task2.Slug, "Other renamed"); err != nil {
+		t.Fatal(err)
+	}
+	if exists(dir2) {
+		t.Fatal("rename recreated the task dir removed during the rewrite")
+	}
+	if w := out.String(); !strings.Contains(w, "warning: task other renamed but CLAUDE.md not updated") {
+		t.Fatalf("warning = %q", w)
 	}
 }
 
