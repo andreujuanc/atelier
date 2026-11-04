@@ -2643,3 +2643,44 @@ func TestRenameKey(t *testing.T) {
 		t.Fatalf("rename input width after resize = %d, want %d", m.renameInput.Width, want)
 	}
 }
+
+// TestRenameLongLegacyTitle: a title longer than the input's CharLimit
+// (from before the cap) is cut when prefilled; submitting it unchanged
+// saves nothing, an edit saves at most MaxTitleLen.
+func TestRenameLongLegacyTitle(t *testing.T) {
+	fb := &fakeBackend{tasks: titledTasks()}
+	legacy := strings.Repeat("legacy ", 73) // 511 chars
+	legacy = legacy[:len(legacy)-1]
+	fb.tasks[0].Task.Title = legacy
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "fix-login")
+	if m.renameInput.CharLimit != model.MaxTitleLen {
+		t.Fatalf("CharLimit = %d", m.renameInput.CharLimit)
+	}
+	key(m, "t")
+	if got := m.renameInput.Value(); len([]rune(got)) != model.MaxTitleLen || !strings.HasPrefix(legacy, got) {
+		t.Fatalf("prefilled %d runes: %q", len([]rune(got)), got)
+	}
+	key(m, "enter")
+	if m.mode != modeNormal || fb.count("Rename") != 0 || !strings.Contains(m.status, "unchanged") {
+		t.Fatalf("unchanged submit: mode %v calls %d status %q", m.mode, fb.count("Rename"), m.status)
+	}
+	if fb.tasks[0].Task.Title != legacy {
+		t.Fatal("legacy title changed")
+	}
+	// an edit (here: deleting the last character) saves the edited text
+	key(m, "t")
+	key(m, "backspace")
+	key(m, "enter")
+	c := fb.last("Rename")
+	if c == nil {
+		t.Fatal("edited title not saved")
+	}
+	if got, _ := c.args[1].(string); len([]rune(got)) != model.MaxTitleLen-1 || !strings.HasPrefix(legacy, got) {
+		t.Fatalf("edited rename: %+v", c)
+	}
+	// the new-task form's title input has the same cap
+	if f := newTaskForm(nil); f.inputs[fieldTitle].CharLimit != model.MaxTitleLen {
+		t.Fatalf("form title CharLimit = %d", f.inputs[fieldTitle].CharLimit)
+	}
+}

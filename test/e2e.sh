@@ -395,7 +395,18 @@ expect_eq "notes" "$out" "Goal: fix login
   - shipped
 - $(date +%F) [assistant] post-mortem done"
 expect_eq "show --notes" "$(atl show fix-login --notes)" "$out"
-atl notes fix-login --set </dev/null >/dev/null || fail "atl notes --set (clear) failed"
+# an empty stdin with --set is refused (no hint on stderr: /dev/null is no terminal)
+if err="$(atl notes fix-login --set </dev/null 2>&1 >/dev/null)"; then fail "atl notes --set with empty stdin succeeded"; fi
+case "$err" in *"use --clear"*) ;; *) fail "atl notes --set empty stdin: unexpected error: $err" ;; esac
+case "$err" in *"end with ctrl-d"*) fail "stdin hint printed for /dev/null: $err" ;; esac
+expect_eq "notes after refused --set" "$(atl notes fix-login)" "$out"
+# a bad ref fails before stdin is read (a fifo with no writer would block)
+mkfifo "$E2E_OUT/nowriter"
+rc=0
+timeout 10 atl notes nope --set <>"$E2E_OUT/nowriter" >/dev/null 2>&1 || rc=$?
+[ "$rc" -ne 124 ] || fail "atl notes --set read stdin before resolving the task"
+[ "$rc" -ne 0 ] || fail "atl notes nope --set succeeded"
+atl notes fix-login --clear </dev/null >/dev/null || fail "atl notes --clear failed"
 expect_eq "notes after clear" "$(atl notes fix-login)" ""
 
 # ---- cancel ----------------------------------------------------------------

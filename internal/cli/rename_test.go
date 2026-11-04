@@ -43,6 +43,8 @@ func TestRename(t *testing.T) {
 		{[]string{"rename", "fix-login", "a\nb"}, 2, "control characters"},
 		{[]string{"rename", "fix-login", "esc\x1b[31m"}, 2, "control characters"},
 		{[]string{"rename", "nope", "x"}, 1, ""},
+		{[]string{"rename", "fix-login", strings.Repeat("x", 201)}, 2, "title is too long (the limit is 200 characters)"},
+		{[]string{"new", strings.Repeat("y", 150), strings.Repeat("y", 60), "--repo", "api", "--no-fetch"}, 2, "title is too long (the limit is 200 characters)"},
 	} {
 		code, out, errs := atl(t, c.args...)
 		if code != c.code || out != "" || !strings.Contains(errs, c.msg) {
@@ -51,6 +53,17 @@ func TestRename(t *testing.T) {
 	}
 	if _, out, _ := atl(t, "show", "fix-login"); !strings.Contains(out, "Fix the login page") {
 		t.Fatalf("rejected rename changed the title:\n%s", out)
+	}
+	if _, out, _ := atl(t, "ls", "--json"); strings.Count(out, `"slug"`) != 1 {
+		t.Fatalf("a too long title created a task:\n%s", out)
+	}
+	// exactly the cap is fine for both
+	max := strings.Repeat("z", 200)
+	if code, out, errs := atl(t, "rename", "fix-login", max); code != 0 || out != max+"\n" {
+		t.Fatalf("rename to 200 chars: %d %s", code, errs)
+	}
+	if code, _, errs := atl(t, "rename", "fix-login", "Fix the login page"); code != 0 {
+		t.Fatalf("rename back: %d %s", code, errs)
 	}
 
 	// any status: closed tasks can be renamed too

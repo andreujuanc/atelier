@@ -18,8 +18,9 @@ const AssistantGuardEvent = "AssistantGuard"
 // cannot let the assistant change repos.
 //
 // Every allow rule names a command that is read-only whatever its
-// arguments. `atl notes` is not (`--set` replaces the notes), and a
-// pattern cannot reliably tell `atl notes X` from `atl notes X --set`
+// arguments. `atl notes` is not (`--set` replaces the notes, `--clear`
+// clears them), and a pattern cannot reliably tell `atl notes X` from
+// `atl notes X --set`
 // (quoting, `--set=true`, extra spaces, flag order all change the
 // string), so all of `atl notes` asks and the notes are read with
 // `atl show <task> --notes` (or --json) under the `atl show` allow rule.
@@ -204,7 +205,8 @@ func AssistantClaudeMD() string {
 		"",
 		"- Reading is free: run the read-only commands below whenever useful.",
 		"- ALWAYS ask for explicit confirmation before any command that changes state (`atl new`, `add`,",
-		"  `status`, `rename`, `session`, `resume`, `open`, `pr`, `done`, `cancel`, `note`, `notes --set`).",
+		"  `status`, `rename`, `session`, `resume`, `open`, `pr`, `done`, `cancel`, `note`, `notes --set`,",
+		"  `notes --clear`).",
 		"  First state the exact command you want to run, wait for the user's yes, then run it.",
 		"- Never edit files in repos, worktrees or task dirs, by any means (no Edit/Write tools, no shell",
 		"  redirects, `sed -i`, `git commit`, `git checkout`, ...). Edits outside this directory are blocked by",
@@ -228,8 +230,8 @@ func AssistantClaudeMD() string {
 		"  in the atl TUI; `atl note` appends dated lines at its end. Read notes this way (runs without asking).",
 		"- `atl transcript <task> [--session ID] [--tail N]` — last N turns (default 20) of a session's",
 		"  conversation; default is the most recent session with a transcript.",
-		"- `atl notes <task>` — prints the same notes text, but asks for permission here (its `--set` form",
-		"  writes), so prefer `atl show <task> --notes`.",
+		"- `atl notes <task>` — prints the same notes text, but asks for permission here (its `--set` and",
+		"  `--clear` forms write), so prefer `atl show <task> --notes`.",
 		"- `atl repos` — git repos available in $ATL_REPOS.",
 		"- `atl diff <task>` — git diff of each rw repo against its base commit (read-only, may ask permission).",
 		"- `atl --help`, `atl <command> --help` — usage.",
@@ -238,9 +240,10 @@ func AssistantClaudeMD() string {
 		"",
 		"- `atl note <task> <text> --author assistant` — append a line `- YYYY-MM-DD [assistant] <text>` to the",
 		"  task's notes (the user's text above it is kept). This is how you add to the notes.",
-		"- `atl notes <task> --set` — REPLACE the whole notes text with stdin (empty stdin clears it), e.g.",
+		"- `atl notes <task> --set` — REPLACE the whole notes text with stdin (an empty stdin is an error), e.g.",
 		"  `atl notes X --set <<'EOF'` … `EOF`. It overwrites what the user wrote: only when the user asks,",
 		"  show them the full new text and get their yes first. To add something, use `atl note` instead.",
+		"- `atl notes <task> --clear` — DELETE the whole notes text; only when the user explicitly asks.",
 		"- `atl new <title...> [--project P] [--repo name:rw|ro ...] [--base auto|default|production|<branch>] [--backlog] [-m description]`",
 		"  — create a task with worktrees. `--base`: auto (default; origin/dev, else develop, else the default",
 		"  branch) for feature work, `default` (or `production`) for a production patch from origin's default branch, or a branch name.",

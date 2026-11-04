@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -250,9 +251,37 @@ func TestNotesSet(t *testing.T) {
 	if code, _, errs := set(strings.Repeat("x", 4*model.MaxNotesLen+10), "fix", "--set"); code != 1 || !strings.Contains(errs, "notes too large") {
 		t.Fatalf("huge stdin: %d %s", code, errs)
 	}
-	// empty stdin with --set clears
-	if code, out, errs := set("", "fix", "--set"); code != 0 || out != "notes cleared\n" || notes() != "" {
-		t.Fatalf("clear: %d %q %s", code, out, errs)
+	// empty stdin with --set is an error (an empty pipe by mistake must
+	// not wipe the notes), also when it is only blanks
+	for _, in := range []string{"", " \n\t\r\n"} {
+		if code, out, errs := set(in, "fix", "--set"); code != 1 || out != "" ||
+			!strings.Contains(errs, "stdin is empty: nothing to set (use --clear to clear the notes)") || notes() != before {
+			t.Fatalf("empty --set %q: %d %q %s", in, code, out, errs)
+		}
+	}
+	// a bad ref fails before stdin is read
+	if code, _, errs := set("", "nope", "--set"); code != 1 || !strings.Contains(errs, "nope") {
+		t.Fatalf("bad ref: %d %s", code, errs)
+	}
+	var out, errb bytes.Buffer
+	if code := runIn(context.Background(), []string{"notes", "nope", "--set"}, failReader{t}, &out, &errb); code != 1 {
+		t.Fatalf("bad ref with stdin: %d %s", code, errb.String())
+	}
+	if code := runIn(context.Background(), []string{"notes", "nope", "--clear"}, failReader{t}, &out, &errb); code != 1 {
+		t.Fatalf("bad ref --clear: %d %s", code, errb.String())
+	}
+	// --clear clears without reading stdin
+	var clearOut bytes.Buffer
+	if code := runIn(context.Background(), []string{"notes", "fix", "--clear"}, failReader{t}, &clearOut, &errb); code != 0 ||
+		clearOut.String() != "notes cleared\n" || notes() != "" {
+		t.Fatalf("--clear: %d %q %s", code, clearOut.String(), errb.String())
+	}
+	// --set --clear: stdin may be empty (clears) or not (replaces)
+	if code, out, errs := set("kept\n", "fix", "--set", "--clear"); code != 0 || out != "notes replaced (4 bytes)\n" || notes() != "kept\n" {
+		t.Fatalf("--set --clear with text: %d %q %s", code, out, errs)
+	}
+	if code, out, errs := set("", "fix", "--set", "--clear"); code != 0 || out != "notes cleared\n" || notes() != "" {
+		t.Fatalf("--set --clear empty: %d %q %s", code, out, errs)
 	}
 	// closed tasks too
 	if code, _, errs := atl(t, "done", "fix", "--force"); code != 0 {
@@ -264,7 +293,7 @@ func TestNotesSet(t *testing.T) {
 	if code, out, _ := atl(t, "show", "fix", "--json"); code != 0 || !strings.Contains(out, `"notes": "after done"`) {
 		t.Fatalf("show --json: %d %s", code, out)
 	}
-	if code, _, _ := set("", "fix", "--set"); code != 0 {
+	if code, _, _ := set("", "fix", "--clear"); code != 0 {
 		t.Fatal("clear")
 	}
 	// empty notes are "" in JSON, never null
@@ -273,6 +302,67 @@ func TestNotesSet(t *testing.T) {
 	}
 	if code, out, _ := atl(t, "show", "fix"); code != 0 || !strings.HasSuffix(out, "\nNotes\n  (none)\n") {
 		t.Fatalf("show: %d %s", code, out)
+	}
+}
+
+// failReader fails the test when read: the command must not read stdin.
+type failReader struct{ t *testing.T }
+
+func (r failReader) Read([]byte) (int, error) {
+	r.t.Helper()
+	r.t.Error("stdin was read")
+	return 0, io.EOF
+}
+
+// TestNotesSetDevNull checks that /dev/null as stdin gets no "reading from
+// stdin" hint (it is a character device, but no terminal).
+func TestNotesSetDevNull(t *testing.T) {
+	setup(t)
+	if code, _, errs := atl(t, "new", "Fix", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	if isTerminal(null) {
+		t.Fatal("isTerminal(/dev/null)")
+	}
+	var out, errb bytes.Buffer
+	code := runIn(context.Background(), []string{"notes", "fix", "--set"}, null, &out, &errb)
+	if code != 1 || strings.Contains(errb.String(), "ctrl-d") || !strings.Contains(errb.String(), "use --clear") {
+		t.Fatalf("--set < /dev/null: %d %q", code, errb.String())
+	}
+}
+
+func TestIsTerminal(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, v := range []any{f, &bytes.Buffer{}, strings.NewReader(""), nil} {
+		if isTerminal(v) {
+			t.Errorf("isTerminal(%T) = true", v)
+		}
+	}
+	for _, p := range notTTYDevices {
+		d, err := os.Open(p)
+		if err != nil {
+			continue
+		}
+		if isTerminal(d) {
+			t.Errorf("isTerminal(%s) = true", p)
+		}
+		d.Close()
+	}
+	// a real terminal, when the test has one
+	if tty, err := os.Open("/dev/tty"); err == nil {
+		defer tty.Close()
+		if !isTerminal(tty) {
+			t.Error("isTerminal(/dev/tty) = false")
+		}
 	}
 }
 

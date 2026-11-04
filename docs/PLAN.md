@@ -84,7 +84,9 @@ type Session struct {
 }
 
 func Slugify(title string) string // lowercase, non-alnum runs → "-", trim "-", cut to 40, "" → "task"
-func NormalizeTitle(s string) (string, error) // rename: invalid UTF-8 / any control char (\t, \n incl.) → error; trim + collapse space runs; "" → ErrTitleEmpty
+func NormalizeTitle(s string) (string, error) // rename: invalid UTF-8 / any control char (\t, \n incl.) → error; trim + collapse space runs; "" → ErrTitleEmpty; > MaxTitleLen runes → ErrTitleTooLong
+const MaxTitleLen = 200                        // runes, after trim/collapse; atl new, atl rename and the TUI title inputs (CharLimit)
+func CheckTitleLen(title string) error         // ErrTitleTooLong (wrapped, with the length) if over MaxTitleLen
 ```
 
 ### SQLite schema (`internal/store`, migration v1; versioning via `PRAGMA user_version`)
@@ -386,7 +388,7 @@ func (a *App) NewTask(ctx, o NewTaskOpts) (*model.Task, error)
 func (a *App) List(ctx, statuses ...model.Status) ([]TaskView, error) // RepoStatus filled (dirty check) only by Get
 func (a *App) Get(ctx, ref string) (*TaskView, error)
 func (a *App) SetStatus(ctx, ref string, st model.Status) error  // plain status change, no side effects
-func (a *App) Rename(ctx, ref, title string) (*model.Task, error) // any status; NormalizeTitle + UpdateTaskTitle; slug/branch/tmux/dirs never change; open task: rewrites CLAUDE.md if present (under lockTask; failure = warning)
+func (a *App) Rename(ctx, ref, title string) (*model.Task, error) // any status; NormalizeTitle + UpdateTaskTitle; slug/branch/tmux/dirs never change; open task: rewrites CLAUDE.md if present (under lockTask; failure = warning) with gen.RewriteClaudeMD, which never creates the task dir (finishTask removes it without the lock): task dir gone → error → warning
 func (a *App) Done(ctx, ref string, force bool) (*model.Task, error)
 func (a *App) Cancel(ctx, ref string, force bool) (*model.Task, error)
 func (a *App) RepoPathFor(t *model.Task, repo model.TaskRepo) string // worktree (rw) or canonical (ro)
@@ -405,7 +407,7 @@ dir = task dir, tag = sessions.id, env = project env + `ATL_TASK=<slug>`, `ATL_S
 `ATL_PORT_OFFSET=<n>`, `ATL_TASK_DIR=<dir>`; argv = `ClaudeArgv(ro canonical paths, resumeID)`. Before launching,
 `gen.WriteSettings` is re-run (keeps the atl path current); `CLAUDE.md` is written only if missing.
 
-NewTask flow: validate title; load project (if given) and merge repos (`--repo` overrides mode of a project repo or adds
+NewTask flow: validate title (collapse whitespace; non-empty; ≤ model.MaxTitleLen runes, same cap as rename); load project (if given) and merge repos (`--repo` overrides mode of a project repo or adds
 one); ≥1 repo required; every repo must be `gitx.IsRepo(Paths.RepoPath(name))`; slug = `UniqueSlug(Slugify(title))`
 (also must not exist on disk); port = `NextPortOffset`; mkdir task dir; for each rw repo: `gitx.Fetch` (skipped with
 `--no-fetch`), `base_branch` from the task's base ("" auto = gitx.IntegrationBranch: origin/dev → develop → default; ":default" = DefaultBranch; else explicit branch), `base_commit = RevParse("refs/remotes/origin/"+base_branch)`,
@@ -445,9 +447,9 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 | `atl session <task>` | new Claude session (does not attach; prints window) |
 | `atl resume <task>` | `App.Resume`; prints count |
 | `atl status <task> <status>` | `App.SetStatus` |
-| `atl rename <task> <new title...>` | `App.Rename` (words joined with spaces, like `atl note`); prints the new title. Empty/whitespace-only or control characters → usage error (exit 2) |
+| `atl rename <task> <new title...>` | `App.Rename` (words joined with spaces, like `atl note`); prints the new title. Empty/whitespace-only, control characters or over 200 runes → usage error (exit 2; `atl new` rejects an over-long title the same way) |
 | `atl note <task> <text...> [--author user\|assistant]` | `App.AppendNote`: appends `- YYYY-MM-DD [author] text` to the notes; prints `note added` |
-| `atl notes <task> [--set]` | prints the notes text (nothing when empty); `--set` → `App.ReplaceNotes` from stdin (empty stdin clears; only `--set` reads stdin); prints `notes replaced (N bytes)` / `notes cleared` |
+| `atl notes <task> [--set] [--clear]` | prints the notes text (nothing when empty); `--set` → `App.ReplaceNotes` from stdin, `--clear` alone → `App.ReplaceNotes(“”)` without reading stdin. The task is resolved before stdin is read. `--set` with stdin empty after `SanitizeNotes` → error (exit 1) unless `--clear` is also given (then it clears). The "reading from stdin; end with ctrl-d" hint goes to stderr only when stdin is a terminal (`isTerminal`: a char device other than /dev/null, /dev/zero, /dev/full, /dev/random, /dev/urandom; ioctl-free). Prints `notes replaced (N bytes)` / `notes cleared` |
 | `atl show <task> [--json \| --notes]` | task detail; `--notes` prints only the notes text (read-only spelling of `atl notes <task>`); `--json` + `--notes` → usage error |
 | `atl diff <task>` | `App.Diff` through pager |
 | `atl pr <task>` | prints one line per repo (URL or skipped reason) |
@@ -475,11 +477,20 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
   notes area filling the remaining height (≥3 lines; details are cut first on short terminals): `TaskView.Notes` from
   `App.Get`, sanitised, wrapped, from the top, "… N more line(s)" when cut, "(no notes — press m to write)" when empty.
 - Notes editor (`m`, refused while the task is busy): `GetNotes` then a bubbles/textarea in the notes area, prefilled,
-  cursor at the top; all keys go to it. ctrl+s → `SetNotes(text, base)` (CAS against the text it started from; task busy
+  cursor at the top; all keys go to it. Until the text arrives the TUI is in `modeNotesLoading`: every key is swallowed
+  (a multi-rune burst like "mjs" must not run j/s), esc cancels (the late result is dropped; the task stays busy until it
+  returns), ctrl-c cancels and quits; a load error returns to normal mode with the error. ctrl+s → `SetNotes(text, base)` (CAS against the text it started from; task busy
   while saving); success leaves edit mode (stays if the user typed during the save). Conflict
   (`*model.NotesConflictError`) keeps the editor and the user's text, shows the keys on the status/help line; base becomes
   the reported current text, so a second ctrl+s overwrites; ctrl+r reloads (drops the edits). esc leaves (asks "discard?
-  y/n" if unsaved); ctrl+c with unsaved changes asks before quitting. The editor is bound to its task id (the details pane
+  y/n" if unsaved); ctrl+c with unsaved changes asks before quitting (help: "y quit atl"). Unsaved = the value differs from
+  the text the save in flight sends (while saving) or from the loaded/last saved text: esc/ctrl+c during a save with no
+  newer edits leave at once (the save goes on; a later failure says the text was not saved); with newer edits the question
+  is about those only. A pending question takes every key and is only cleared by its answer or by closing the editor: a
+  save result or ctrl+r reload arriving meanwhile never closes the editor under it (no key leaks into normal mode).
+  The textarea's sanitiser turns tabs into 4 spaces and drops U+FFFD (and other control chars), and it can't be replaced:
+  saving from the TUI rewrites every tab in the text as 4 spaces and drops U+FFFD (documented; opening notes that
+  contain either shows a hint in the status line; leaving unchanged saves nothing). `atl notes --set` keeps them. The editor is bound to its task id (the details pane
   shows that task while editing, whatever the selection/list does); resize refits it; narrow terminals show the details
   pane full width while editing.
 - Repo picker (new-task form and `a`): list of `App.AvailableRepos`, type to filter, space cycles none→rw→ro, enter confirms, esc clears filter then cancels; project repos preselected.
@@ -487,7 +498,9 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
   attach cmd → tea.ExecProcess; choices → session picker), `s` new session, `r` resume, `d` done / `c` cancel (y/N confirm; if refused because dirty, offer `F`
   force), `p` pr, `D` diff (ExecProcess `$PAGER`), `1-5` set status (`AllStatuses` order, plain SetStatus), `a` add repos to the selected task (picker),
   `m` notes editor (below), `t` rename (single-line input prefilled with the title: enter → `App.Rename` (async, task busy),
-  esc cancels; empty → error shown, input stays open; unchanged → nothing saved),
+  esc cancels; empty/too long → error shown, input stays open; CharLimit = model.MaxTitleLen; submitted as prefilled (the
+  input's value right after SetValue, i.e. a legacy over-long title as cut by CharLimit) or normalising to the current
+  title → nothing saved),
   `/` filter (substring on slug/title), `j/k`/arrows move, `q`/ctrl-c quit.
 - Session picker (`enter` on a task with openable sessions: live, or resumable as `App.OpenChoices` defines; closed tasks offer
   no past sessions): row 0 "New session" (`App.OpenNew`), then `App.OpenChoices` order; row =
@@ -536,7 +549,7 @@ Part A — data the assistant reads:
   trailing whitespace trimmed); writes over `model.MaxNotesLen` (64 KiB) → `model.ErrNotesTooLarge`. App: `Notes`, `SetNotes`,
   `ReplaceNotes`, `AppendNote`; `TaskView.Notes` (Get), `TaskDetail.Notes`.
 - `atl note <task> <text...> [--author user|assistant]` appends; `atl notes <task>` prints; `atl notes <task> --set` replaces
-  from stdin. TUI: notes area under the details, `m` edits in place (§5).
+  from stdin (empty → error unless `--clear`); `atl notes <task> --clear` clears. TUI: notes area under the details, `m` edits in place (§5).
 
 Part B — the assistant:
 - Dir `$XDG_DATA_HOME/atelier/assistant/` (persists in the box data mount) with generated `CLAUDE.md` (role, atl command
@@ -544,7 +557,7 @@ Part B — the assistant:
   confirm before mutating; suggest saving a note after status discussions) and `.claude/settings.json`:
   `permissions.defaultMode = "default"`, allow read-only `atl ls/show/transcript/repos`, ask for
   mutating atl commands (rules in `Bash(atl x *)` form; incl. `note`, `notes`, `status`, `rename` — never in allow). Every allow
-  rule names a command that is read-only whatever its arguments; `atl notes` is not (`--set`), and a pattern can't reliably
+  rule names a command that is read-only whatever its arguments; `atl notes` is not (`--set`, `--clear`), and a pattern can't reliably
   separate `atl notes X` from `atl notes X --set` (quotes, `--set=true`, spacing, flag order), so all of `atl notes` is in
   ask and the assistant reads notes with `atl show <task> --notes` (allowed via `atl show`). Ask beats allow, also a
   user's global allow. PreToolUse hook `atl hook AssistantGuard` blocks Edit/Write/MultiEdit/NotebookEdit outside the
