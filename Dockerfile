@@ -1,4 +1,4 @@
-# atelier box: atl + claude + tmux + git + gh in one image.
+# atelier box: atl + claude + tmux + git + gh + docker CLI/compose + mise in one image.
 #
 # Build with your host user so paths inside the container match the host
 # (git worktrees store absolute paths):
@@ -16,7 +16,15 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/atl ./cmd/atl
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git tmux gh less openssh-client ncurses-term \
+        ca-certificates curl git tmux gh less openssh-client ncurses-term gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker CLI + compose plugin (talks to the host daemon through a mounted socket; no daemon here).
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep tmux out of the way: no status bar, mouse scrolling, Ctrl-q returns to atl.
@@ -42,8 +50,12 @@ COPY --from=build /out/atl /usr/local/bin/atl
 
 USER $USERNAME
 RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && mkdir -p "$HOME/.local/share/atelier" "$HOME/.local/state/atelier"
-ENV PATH=/home/$USERNAME/.local/bin:$PATH \
-    CLAUDE_CONFIG_DIR=/home/$USERNAME/.claude
+    && curl -fsSL https://mise.run | sh \
+    && mkdir -p "$HOME/.local/share/atelier" "$HOME/.local/state/atelier" "$HOME/.local/share/mise"
+# mise installs per-repo runtimes (go, node, bun, ...) on demand; its shims make them visible
+# to non-interactive shells too (Claude's Bash tool). Mount ~/.local/share/mise to keep installs.
+ENV PATH=/home/$USERNAME/.local/share/mise/shims:/home/$USERNAME/.local/bin:$PATH \
+    CLAUDE_CONFIG_DIR=/home/$USERNAME/.claude \
+    MISE_YES=1
 WORKDIR /home/$USERNAME
 CMD ["tmux", "new", "-A", "-s", "main"]
