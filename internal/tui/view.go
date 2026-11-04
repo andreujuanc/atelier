@@ -120,16 +120,14 @@ func (m *Model) View() string {
 		body = m.sessPick.lines(w, bodyH, m.now())
 	} else if m.mode == modeForm && m.form != nil {
 		body = m.formLines(w, bodyH)
+	} else if m.mode == modeNotes && w < minSplitWidth {
+		// Too narrow for the split: the details pane (with the editor)
+		// takes the whole body while editing.
+		body = m.detailLines(w, bodyH)
 	} else {
 		lw := w
 		if w >= minSplitWidth {
-			lw = w * 2 / 5
-			if lw < 24 {
-				lw = 24
-			}
-			if lw > 48 {
-				lw = 48
-			}
+			lw = listWidth(w)
 		}
 		left := m.listLines(lw, bodyH)
 		if w >= minSplitWidth {
@@ -159,6 +157,18 @@ func (m *Model) View() string {
 		lines = lines[len(lines)-h:]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// listWidth is the task list's width in a split view of width w.
+func listWidth(w int) int {
+	lw := w * 2 / 5
+	if lw < 24 {
+		lw = 24
+	}
+	if lw > 48 {
+		lw = 48
+	}
+	return lw
 }
 
 func (m *Model) listLines(w, h int) []string {
@@ -245,9 +255,26 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 	return dotStyle.Render(glyph) + sep + line
 }
 
+// detailLines renders the details pane (width w, height h) of the task
+// being edited, else the selected one: its details, then the notes area
+// filling the remaining height.
 func (m *Model) detailLines(w, h int) []string {
-	t := m.selected()
-	if t == nil || w <= 0 {
+	t := m.notesTask()
+	if t == nil || w <= 0 || h <= 0 {
+		return nil
+	}
+	info := m.infoLines(t, w)
+	keep, notesH := notesLayout(len(info), h)
+	out := append(info[:keep:keep], m.notesLines(t, w, notesH)...)
+	if len(out) > h {
+		out = out[:h]
+	}
+	return out
+}
+
+// infoLines renders task t's details (title … sessions) at width w.
+func (m *Model) infoLines(t *app.TaskView, w int) []string {
+	if t == nil {
 		return nil
 	}
 	task := t.Task
@@ -264,9 +291,6 @@ func (m *Model) detailLines(w, h int) []string {
 	kv("dir", clean(m.be.TaskDir(task.Slug)))
 	if d := clean(firstLine(task.Description)); d != "" {
 		kv("desc", d)
-	}
-	if m.detail != nil && m.detail.Task.ID == task.ID && m.detail.LatestNote != nil {
-		add(m.noteLine(m.detail.LatestNote, w))
 	}
 
 	add("")
@@ -325,27 +349,7 @@ func (m *Model) detailLines(w, h int) []string {
 		}
 		add(line)
 	}
-	if len(out) > h {
-		out = out[:h]
-	}
 	return out
-}
-
-// noteLine renders a task's latest note on one line of width w: a dim
-// "note:" label (styled like the other detail keys), the sanitized body
-// (truncated) and its dim age.
-func (m *Model) noteLine(n *model.Note, w int) string {
-	label := labelStyle.Render(fmt.Sprintf("%-9s", "note:")) + " "
-	age := "  " + humanAge(m.now().Sub(n.CreatedAt)) + " ago"
-	if n.Author == model.AuthorAssistant {
-		age += " (assistant)"
-	}
-	body := clean(n.Body)
-	bw := w - 10 - ansi.StringWidth(age)
-	if bw < 8 {
-		return label + trunc(body, w-10)
-	}
-	return label + trunc(body, bw) + dimStyle.Render(age)
 }
 
 func orDash(s string) string {
@@ -368,8 +372,12 @@ func (m *Model) statusLine(w int) string {
 		return trunc(s, w)
 	case m.mode == modeFilter:
 		return trunc(m.filterInput.View(), w)
-	case m.mode == modeNote:
-		return trunc(m.noteInput.View(), w)
+	case m.mode == modeNotes && m.notes != nil && m.notes.ask != askNone:
+		q := "discard your changes to the notes of " + clean(m.notes.slug) + "? y/n"
+		if m.notes.ask == askQuit {
+			q = "quit and discard your changes to the notes of " + clean(m.notes.slug) + "? y/n"
+		}
+		return trunc(markStyle.Render(q), w)
 	case m.mode == modeRename:
 		return trunc(m.renameInput.View(), w)
 	}
@@ -412,8 +420,17 @@ func (m *Model) helpLine(w int) string {
 		s = "↑/↓ move  enter open (live: attach, past: resume)  esc cancel"
 	case modeFilter:
 		s = "type to filter  enter apply  esc clear  ↑/↓ move"
-	case modeNote:
-		s = "type a note for " + clean(m.noteSlug) + "  enter save  esc cancel"
+	case modeNotes:
+		e := m.notes
+		switch {
+		case e == nil:
+		case e.ask != askNone:
+			s = "y discard and leave  any other key: back to editing"
+		case e.conflict:
+			return errStyle.Render(trunc("notes changed meanwhile: ctrl+s overwrite with your text  ctrl+r reload theirs (drops your edits)  esc leave", w))
+		default:
+			s = "editing notes of " + clean(e.slug) + ": ctrl+s save  esc leave (asks if unsaved)  ctrl+r reload (drops edits)  enter new line  ↑/↓ move  ctrl+c quit"
+		}
 	case modeRename:
 		if m.statusErr && m.status != "" {
 			// a refused title: the error replaces the help until the next edit
@@ -423,7 +440,7 @@ func (m *Model) helpLine(w int) string {
 	case modeConfirm:
 		s = ""
 	default:
-		s = "n new  enter open  s session  r resume  a add repo  m note  t rename  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  q quit"
+		s = "n new  enter open  s session  r resume  a add repo  m edit notes  t rename  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  q quit"
 		for _, l := range legends {
 			if ansi.StringWidth(s)+2+ansi.StringWidth(l) <= w {
 				return dimStyle.Render(s+"  ") + l

@@ -86,6 +86,17 @@ CREATE INDEX task_notes_task ON task_notes(task_id);`,
 	// tasks get their base from the app ('' = auto).
 	`ALTER TABLE tasks ADD COLUMN base TEXT NOT NULL DEFAULT '';
 UPDATE tasks SET base=':default';`,
+	// v5: one free-form notes text per task. The dated task_notes rows are
+	// folded into it, oldest first, one "- YYYY-MM-DD [author] body" line
+	// each (local date; newlines inside a body are kept). task_notes is
+	// kept but no longer used. The UPDATE only fills empty notes, so
+	// running it again changes nothing.
+	`ALTER TABLE tasks ADD COLUMN notes TEXT NOT NULL DEFAULT '';
+UPDATE tasks SET notes = (
+  SELECT group_concat('- ' || strftime('%Y-%m-%d', n.created_at / 1000, 'unixepoch', 'localtime') ||
+    ' [' || n.author || '] ' || n.body, char(10) ORDER BY n.created_at, n.id)
+  FROM task_notes n WHERE n.task_id = tasks.id)
+WHERE notes = '' AND EXISTS (SELECT 1 FROM task_notes n WHERE n.task_id = tasks.id);`,
 }
 
 // DefaultBusyTimeout is how long Open waits on a locked database.

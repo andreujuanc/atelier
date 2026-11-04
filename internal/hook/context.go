@@ -17,10 +17,11 @@ import (
 
 // Session context limits.
 const (
-	contextMaxLen  = 2500 // bytes (so also at most this many characters)
-	contextNotes   = 5    // newest notes included
-	contextNoteLen = 300  // characters per note body
-	contextEnvLen  = 1000 // bytes of ATL_CONTEXT text
+	contextMaxLen = 2500 // bytes (so also at most this many characters)
+	contextEnvLen = 1000 // bytes of ATL_CONTEXT text
+	// contextMinNotes is the least room worth a notes section: with less,
+	// the notes are left out (`atl notes <slug>` still has them).
+	contextMinNotes = 40
 )
 
 // envContextVar names the environment variable whose text is appended to
@@ -54,14 +55,14 @@ func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p co
 	return err
 }
 
-// sessionContext loads task id and its newest notes (one task query, one
-// repos query, one notes query) and renders them.
+// sessionContext loads task id and its notes (one task query, one repos
+// query, one notes query) and renders them.
 func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID int64, envText string, now time.Time) (string, error) {
 	t, err := st.GetTask(ctx, taskID)
 	if err != nil {
 		return "", err
 	}
-	notes, err := st.ListNotes(ctx, taskID, contextNotes)
+	notes, err := st.GetNotes(ctx, taskID)
 	if err != nil {
 		return "", err
 	}
@@ -71,9 +72,11 @@ func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID
 // renderContext renders the SessionStart task context: plain markdown of
 // at most contextMaxLen bytes. envText (the raw ATL_CONTEXT value) is
 // sanitised and, if not blank, rendered as its own section after
-// ATL_PORT_OFFSET. Notes are dropped (oldest first, then the last one kept
-// is shortened) before anything else is cut.
-func renderContext(t model.Task, notes []model.Note, p config.Paths, envText string, now time.Time) string {
+// ATL_PORT_OFFSET. The notes text comes last (before the footer) and is the
+// first thing cut: when it does not fit, its END is kept (appended notes
+// are the newest), cut at a line start (or a rune boundary when one line
+// is too long) after a truncation marker.
+func renderContext(t model.Task, notes string, p config.Paths, envText string, now time.Time) string {
 	slug := oneLine(t.Slug)
 	branch := t.Branch
 	if branch == "" {
@@ -111,34 +114,62 @@ func renderContext(t model.Task, notes []model.Note, p config.Paths, envText str
 		// Pathological (huge title or many repos): no room for notes.
 		return truncateBytes(fixed, contextMaxLen-len(footer)-len("…\n")) + "…\n" + footer
 	}
-
-	var body strings.Builder
-	if len(notes) > 0 {
-		const title = "\nNotes (newest first):\n"
-		room := contextMaxLen - len(fixed) - len(footer) - len(title)
-		var lines []string
-		for _, n := range notes {
-			line := fmt.Sprintf("- %s [%s] %s\n", n.CreatedAt.UTC().Format("2006-01-02"), oneLine(n.Author),
-				truncateRunes(oneLine(n.Body), contextNoteLen))
-			if len(line) > room {
-				// Shorten this note to fit if a useful part remains.
-				const minNote = 40
-				if room >= minNote {
-					lines = append(lines, truncateBytes(line[:len(line)-1], room-len("…\n"))+"…\n")
-				}
-				break
-			}
-			room -= len(line)
-			lines = append(lines, line)
-		}
-		if len(lines) > 0 {
-			body.WriteString(title)
-			for _, l := range lines {
-				body.WriteString(l)
-			}
-		}
+	const title = "\nNotes:\n"
+	room := contextMaxLen - len(fixed) - len(footer) - len(title)
+	if body := notesTail(notesBlock(notes), room, slug); body != "" {
+		return fixed + title + body + "\n" + footer
 	}
-	return fixed + body.String() + footer
+	return fixed + footer
+}
+
+// notesTail returns text if it fits in room bytes counting a final
+// newline, else its end after a truncation marker line, both together
+// within room: the kept part starts at a line start when there is one in
+// it, else at a rune boundary. "" when room is too small for a useful part.
+func notesTail(text string, room int, slug string) string {
+	if text == "" {
+		return ""
+	}
+	room-- // the newline after the section
+	if len(text) <= room {
+		return text
+	}
+	marker := "… (earlier notes truncated; `atl notes " + slug + "` for all)\n"
+	keep := room - len(marker)
+	if keep < contextMinNotes {
+		return ""
+	}
+	start := len(text) - keep
+	for start < len(text) && !utf8.RuneStart(text[start]) {
+		start++
+	}
+	tail := text[start:]
+	// Prefer a line boundary unless the line start is in the last bytes
+	// (one huge line): then keep its end from a rune boundary.
+	if i := strings.IndexByte(tail, '\n'); i >= 0 && len(tail)-i-1 >= contextMinNotes {
+		tail = tail[i+1:]
+	}
+	return marker + tail
+}
+
+// notesBlock sanitises the notes text for the context: line breaks are
+// kept, tabs become spaces, other control and format characters are
+// dropped or become spaces (as in envBlock), and surrounding blank lines
+// and trailing spaces are trimmed.
+func notesBlock(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' {
+			return r
+		}
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return ' '
+		}
+		return r
+	}, s)
+	s = strings.TrimRight(s, " \n")
+	return strings.TrimLeft(s, "\n")
 }
 
 // oneLine sanitises s for a single line: control and format characters
@@ -175,15 +206,6 @@ func envBlock(s string) string {
 		s = strings.TrimRight(truncateBytes(s, contextEnvLen-len("…")), " \n") + "…"
 	}
 	return s
-}
-
-// truncateRunes shortens s to at most n characters, ending with "…" when cut.
-func truncateRunes(s string, n int) string {
-	if utf8.RuneCountInString(s) <= n {
-		return s
-	}
-	r := []rune(s)
-	return strings.TrimRight(string(r[:n-1]), " ") + "…"
 }
 
 // truncateBytes cuts s to at most n bytes on a rune boundary.

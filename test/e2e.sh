@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end test for atelier: builds atl, creates fake repos and a project in
 # a temp dir, and exercises new → session → hooks → crash recovery → resume →
-# diff → pr → done/cancel against an isolated tmux server. `claude` and `gh`
+# diff → pr → done → notes → cancel against an isolated tmux server. `claude` and `gh`
 # are stub scripts (test/stubs). Requires bash, go, git, tmux and jq or
 # python3. Run from anywhere: test/e2e.sh. Prints "E2E OK" on success.
 set -euo pipefail
@@ -384,6 +384,19 @@ fi
 [[ "$out" == *"deleted branch atl/fix-login in api"* ]] || fail "atl done branch message: $out"
 if tm has-session -t "=atl-fix-login" 2>/dev/null; then fail "tmux session atl-fix-login still exists"; fi
 expect_eq "status after done" "$(task_field fix-login status)" "done"
+
+# ---- notes -----------------------------------------------------------------
+
+step "notes (closed task)"
+printf 'Goal: fix login\n  - shipped\n' | atl notes fix-login --set >/dev/null || fail "atl notes --set failed"
+atl note fix-login --author assistant "post-mortem done" >/dev/null || fail "atl note failed"
+out="$(atl notes fix-login)" || fail "atl notes failed"
+expect_eq "notes" "$out" "Goal: fix login
+  - shipped
+- $(date +%F) [assistant] post-mortem done"
+expect_eq "show --notes" "$(atl show fix-login --notes)" "$out"
+atl notes fix-login --set </dev/null >/dev/null || fail "atl notes --set (clear) failed"
+expect_eq "notes after clear" "$(atl notes fix-login)" ""
 
 # ---- cancel ----------------------------------------------------------------
 

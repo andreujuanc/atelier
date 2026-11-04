@@ -39,7 +39,12 @@ type Backend interface {
 	ProjectRepos(name string) ([]app.RepoArg, error)
 	AvailableRepos(ctx context.Context) ([]string, error)
 	AddRepo(ctx context.Context, ref string, r app.RepoArg, noFetch bool) (*model.Task, error)
-	AddNote(ctx context.Context, ref, body, author string) (*model.Note, error)
+	// GetNotes returns the task's notes text.
+	GetNotes(ctx context.Context, ref string) (string, error)
+	// SetNotes replaces the task's notes with text if they are still base
+	// (compare-and-set), returning the text as stored; else the error is a
+	// *model.NotesConflictError holding the current text.
+	SetNotes(ctx context.Context, ref, text, base string) (string, error)
 	// Rename changes the task's title only (slug, branch and dirs stay).
 	Rename(ctx context.Context, ref, title string) (*model.Task, error)
 	TaskDir(slug string) string
@@ -63,6 +68,11 @@ func (b appBackend) List(ctx context.Context) ([]app.TaskView, error) { return b
 func (b appBackend) ProjectNames() ([]string, error) { return project.List(b.Paths) }
 
 func (b appBackend) TaskDir(slug string) string { return b.Paths.TaskDir(slug) }
+
+func (b appBackend) GetNotes(ctx context.Context, ref string) (string, error) {
+	_, text, err := b.App.Notes(ctx, ref)
+	return text, err
+}
 
 func (b appBackend) ProjectRepos(name string) ([]app.RepoArg, error) {
 	pr, err := project.Load(b.Paths, name)

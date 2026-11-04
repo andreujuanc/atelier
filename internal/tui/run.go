@@ -333,12 +333,20 @@ func (b *trackedBackend) Assistant(ctx context.Context, slug string) (*exec.Cmd,
 	return b.Backend.Assistant(ctx, slug)
 }
 
-func (b *trackedBackend) AddNote(ctx context.Context, ref, body, author string) (*model.Note, error) {
+func (b *trackedBackend) GetNotes(ctx context.Context, ref string) (string, error) {
 	if !b.tr.begin() {
-		return nil, errStopped
+		return "", errStopped
 	}
 	defer b.tr.end()
-	return b.Backend.AddNote(ctx, ref, body, author)
+	return b.Backend.GetNotes(ctx, ref)
+}
+
+func (b *trackedBackend) SetNotes(ctx context.Context, ref, text, base string) (string, error) {
+	if !b.tr.begin() {
+		return "", errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.SetNotes(ctx, ref, text, base)
 }
 
 // lineWriter calls send for each complete non-empty line written, in

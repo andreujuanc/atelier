@@ -43,12 +43,12 @@ type NewTaskOpts struct {
 }
 
 // TaskView is a task with its sessions and (from Get only) repo status
-// and latest note.
+// and notes text.
 type TaskView struct {
 	Task       model.Task
 	Sessions   []model.Session
 	RepoStatus []RepoStatus
-	LatestNote *model.Note // Get only; nil if the task has no notes
+	Notes      string // Get only: the task's notes text ("" if none)
 }
 
 // RepoStatus describes one repo of a task on disk.
@@ -493,7 +493,7 @@ func (a *App) List(ctx context.Context, statuses ...model.Status) ([]TaskView, e
 	return out, nil
 }
 
-// Get returns one task with sessions, latest note and repo status (dirty
+// Get returns one task with sessions, notes and repo status (dirty
 // check for rw worktrees).
 func (a *App) Get(ctx context.Context, ref string) (*TaskView, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
@@ -504,14 +504,11 @@ func (a *App) Get(ctx context.Context, ref string) (*TaskView, error) {
 	if err != nil {
 		return nil, err
 	}
-	notes, err := a.Store.ListNotes(ctx, t.ID, 1)
+	notes, err := a.Store.GetNotes(ctx, t.ID)
 	if err != nil {
 		return nil, err
 	}
-	v := &TaskView{Task: *t, Sessions: sessions, RepoStatus: make([]RepoStatus, 0, len(t.Repos))}
-	if len(notes) > 0 {
-		v.LatestNote = &notes[0]
-	}
+	v := &TaskView{Task: *t, Sessions: sessions, Notes: notes, RepoStatus: make([]RepoStatus, 0, len(t.Repos))}
 	for _, r := range t.Repos {
 		rs := RepoStatus{Name: r.Name, Mode: r.Mode, Path: a.RepoPathFor(t, r), BaseBranch: r.BaseBranch}
 		if r.Mode == model.ModeRW {

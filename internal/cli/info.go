@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -28,7 +29,7 @@ const wrapWidth = 100
 //	 "sessions":[{"id":3,"name":"claude-3","claude_session_id":"…","state":"waiting","tmux_target":"@4",
 //	              "created_at":"…","last_event_at":"…","transcript_path":"/home/u/.claude/projects/…/….jsonl",
 //	              "title":"Fix the login redirect"}],
-//	 "notes":[{"id":7,"author":"user","body":"…","created_at":"…"}]}
+//	 "notes":"- 2026-11-04 [user] waiting on design review\n…"}
 //
 // base is the task's base choice: "" (auto: origin/dev, else develop, else
 // the default branch), ":default" (origin's default branch) or a branch
@@ -38,8 +39,9 @@ const wrapWidth = 100
 // number of commits not in origin/<branch> when pushed, else equal to
 // ahead (0 when the repo directory is gone). ahead, pushed and unpushed are
 // always 0/false for ro repos. A session's title comes from its transcript
-// (Claude Code's title, else the first user prompt; "" if none). notes are newest first; repos, sessions and
-// notes are never null.
+// (Claude Code's title, else the first user prompt; "" if none). notes is the task's notes text, a string
+// ("" when empty, never null; before migration v5 it was an array of dated notes). repos and sessions are
+// never null.
 type jsonShow struct {
 	ID          int64             `json:"id"`
 	Slug        string            `json:"slug"`
@@ -55,7 +57,7 @@ type jsonShow struct {
 	UpdatedAt   string            `json:"updated_at"`
 	Repos       []jsonRepoDetail  `json:"repos"`
 	Sessions    []jsonShowSession `json:"sessions"`
-	Notes       []jsonNote        `json:"notes"`
+	Notes       string            `json:"notes"`
 }
 
 type jsonRepoDetail struct {
@@ -89,20 +91,13 @@ type jsonShowSession struct {
 	Title           string `json:"title"`
 }
 
-type jsonNote struct {
-	ID        int64  `json:"id"`
-	Author    string `json:"author"`
-	Body      string `json:"body"`
-	CreatedAt string `json:"created_at"`
-}
-
 func showJSON(d *app.TaskDetail) jsonShow {
 	t := d.Task
 	out := jsonShow{
 		ID: t.ID, Slug: t.Slug, Title: t.Title, Description: t.Description, Status: string(t.Status),
 		Project: t.Project, Branch: t.Branch, PortOffset: t.PortOffset, Base: t.Base, TaskDir: d.TaskDir,
 		CreatedAt: rfc3339(t.CreatedAt), UpdatedAt: rfc3339(t.UpdatedAt),
-		Repos: []jsonRepoDetail{}, Sessions: []jsonShowSession{}, Notes: []jsonNote{},
+		Repos: []jsonRepoDetail{}, Sessions: []jsonShowSession{}, Notes: d.Notes,
 	}
 	for _, r := range d.Repos {
 		jr := jsonRepoDetail{Name: r.Name, Mode: string(r.Mode), Path: r.Path, BaseBranch: r.BaseBranch, Dirty: r.Dirty, Ahead: r.Ahead,
@@ -117,14 +112,7 @@ func showJSON(d *app.TaskDetail) jsonShow {
 			State: string(s.State), TmuxTarget: s.TmuxTarget, CreatedAt: rfc3339(s.CreatedAt),
 			LastEventAt: rfc3339(s.LastEventAt), TranscriptPath: s.TranscriptPath, Title: d.SessionTitles[s.ID]})
 	}
-	for _, n := range d.Notes {
-		out.Notes = append(out.Notes, noteJSON(n))
-	}
 	return out
-}
-
-func noteJSON(n model.Note) jsonNote {
-	return jsonNote{ID: n.ID, Author: n.Author, Body: n.Body, CreatedAt: rfc3339(n.CreatedAt)}
 }
 
 // localTime formats t for humans (local time, minutes).
@@ -136,15 +124,24 @@ func localTime(t time.Time) string {
 }
 
 func (c *cli) showCmd() *cobra.Command {
-	var asJSON bool
+	var asJSON, notesOnly bool
 	cmd := &cobra.Command{
-		Use:   "show <task> [--json]",
+		Use:   "show <task> [--json | --notes]",
 		Short: "Show everything about a task: repos (git state), sessions, notes",
 		Args:  args(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
+			if asJSON && notesOnly {
+				return usagef("--json and --notes are mutually exclusive")
+			}
 			ap, err := c.App()
 			if err != nil {
 				return err
+			}
+			if notesOnly {
+				// Read-only spelling of `atl notes <task>` (the assistant
+				// may run `atl show` without asking; `atl notes` asks
+				// because of its --set form).
+				return c.printNotes(cmd, ap, a[0])
 			}
 			d, err := ap.Show(cmd.Context(), a[0])
 			if err != nil {
@@ -160,7 +157,20 @@ func (c *cli) showCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().BoolVar(&notesOnly, "notes", false, "print only the task's notes text (like atl notes <task>)")
 	return cmd
+}
+
+// printNotes prints task ref's notes text (nothing when empty).
+func (c *cli) printNotes(cmd *cobra.Command, ap *app.App, ref string) error {
+	_, text, err := ap.Notes(cmd.Context(), ref)
+	if err != nil {
+		return err
+	}
+	if text = model.SanitizeNotes(text); text != "" {
+		fmt.Fprintln(c.stdout, text)
+	}
+	return nil
 }
 
 func writeShow(w io.Writer, d *app.TaskDetail) {
@@ -237,11 +247,27 @@ func writeShow(w io.Writer, d *app.TaskDetail) {
 	}
 
 	fmt.Fprintln(w, "\nNotes")
-	if len(d.Notes) == 0 {
+	if strings.TrimSpace(d.Notes) == "" {
 		fmt.Fprintln(w, "  (none)")
+		return
 	}
-	for _, n := range d.Notes {
-		writeBlock(w, "  ", "["+localTime(n.CreatedAt)+" "+n.Author+"]", n.Body)
+	writeNotes(w, "  ", d.Notes)
+}
+
+// writeNotes prints a notes text wrapped at wrapWidth, each line prefixed
+// by indent; a wrapped line's continuation keeps the line's own leading
+// indentation plus two spaces (so list items stay readable).
+func writeNotes(w io.Writer, indent, text string) {
+	for _, l := range strings.Split(sanitize(text), "\n") {
+		lead := l[:len(l)-len(strings.TrimLeft(l, " "))]
+		first := indent + lead
+		for i, wl := range wrapLine(l, wrapWidth-len([]rune(first))-2) {
+			pre := first
+			if i > 0 {
+				pre += "  "
+			}
+			fmt.Fprintln(w, strings.TrimRight(pre+wl, " "))
+		}
 	}
 }
 
@@ -306,7 +332,7 @@ func (c *cli) noteCmd() *cobra.Command {
 	var author string
 	cmd := &cobra.Command{
 		Use:   "note <task> <text...> [--author user|assistant]",
-		Short: "Add a note to a task",
+		Short: "Append a dated line (- YYYY-MM-DD [author] text) to a task's notes",
 		Args:  args(cobra.MinimumNArgs(2)),
 		RunE: func(cmd *cobra.Command, a []string) error {
 			if !model.ValidAuthor(author) {
@@ -320,11 +346,10 @@ func (c *cli) noteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			n, err := ap.AddNote(cmd.Context(), a[0], body, author)
-			if err != nil {
+			if _, err := ap.AppendNote(cmd.Context(), a[0], body, author); err != nil {
 				return err
 			}
-			fmt.Fprintf(c.stdout, "note %d added\n", n.ID)
+			fmt.Fprintln(c.stdout, "note added")
 			return nil
 		},
 	}
@@ -333,28 +358,49 @@ func (c *cli) noteCmd() *cobra.Command {
 }
 
 func (c *cli) notesCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "notes <task>",
-		Short: "List a task's notes, newest first",
+	var set bool
+	cmd := &cobra.Command{
+		Use:   "notes <task> [--set]",
+		Short: "Print a task's notes; --set replaces them with stdin (empty stdin clears them)",
 		Args:  args(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
 			ap, err := c.App()
 			if err != nil {
 				return err
 			}
-			_, notes, err := ap.Notes(cmd.Context(), a[0])
-			if err != nil {
-				return err
-			}
-			for i, n := range notes {
-				if i > 0 {
-					fmt.Fprintln(c.stdout)
+			if set {
+				// The store checks the sanitised size (\r\n, control
+				// characters and trailing blanks don't count); reading stops
+				// well past the limit so a huge stdin is never fully read.
+				const readMax = 4 * model.MaxNotesLen
+				in := cmd.InOrStdin()
+				if f, ok := in.(*os.File); ok && isTerminal(f) {
+					fmt.Fprintln(c.stderr, "atl: reading the new notes from stdin; end with ctrl-d (empty clears them)")
 				}
-				writeBlock(c.stdout, "", "["+localTime(n.CreatedAt)+" "+n.Author+"]", n.Body)
+				data, err := io.ReadAll(io.LimitReader(in, readMax+1))
+				if err != nil {
+					return fmt.Errorf("read stdin: %w", err)
+				}
+				if len(data) > readMax {
+					return fmt.Errorf("%w: stdin is over %d bytes, the limit is %d (64 KiB)",
+						model.ErrNotesTooLarge, readMax, model.MaxNotesLen)
+				}
+				text, err := ap.ReplaceNotes(cmd.Context(), a[0], string(data))
+				if err != nil {
+					return err
+				}
+				if text == "" {
+					fmt.Fprintln(c.stdout, "notes cleared")
+				} else {
+					fmt.Fprintf(c.stdout, "notes replaced (%d bytes)\n", len(text))
+				}
+				return nil
 			}
-			return nil
+			return c.printNotes(cmd, ap, a[0])
 		},
 	}
+	cmd.Flags().BoolVar(&set, "set", false, "replace the notes with the text read from stdin (empty stdin clears them)")
+	return cmd
 }
 
 // writeBlock prints "<head> <text>" wrapped at wrapWidth, each line

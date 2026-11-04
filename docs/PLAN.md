@@ -123,6 +123,7 @@ CREATE TABLE sessions (
 );
 CREATE INDEX sessions_task ON sessions(task_id);
 -- migration v2: ALTER TABLE sessions ADD COLUMN launch_seq INTEGER NOT NULL DEFAULT 0 (bumped by ClaimStopped / SetSessionLaunch)
+-- migration v5: ALTER TABLE tasks ADD COLUMN notes TEXT NOT NULL DEFAULT '' (one notes text per task; see §7)
 CREATE INDEX sessions_claude ON sessions(claude_session_id);
 ```
 
@@ -306,9 +307,12 @@ exit 0 (fail open) and log.
 
 SessionStart output: for sessions inside a task, after the DB update, print one JSON line
 `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":...}}` (task, repos + base, ro warning, port offset,
-≤5 latest notes, ≤2500 chars). If the hook's environment has a non-blank `ATL_CONTEXT`, its sanitised text (newlines
+"Notes:" section with the task's notes text, ≤2500 bytes). If the hook's environment has a non-blank `ATL_CONTEXT`, its sanitised text (newlines
 kept, other control/format chars → spaces, ≤1000 bytes) is added as an "Environment notes (ATL_CONTEXT)" section after the
-port offset; notes are dropped before it is cut. This is the ONLY stdout output of `atl hook`.
+port offset. Priority: fixed info and ATL_CONTEXT first, then notes; the footer ("Use `atl note <slug> \"...\"` …") always
+survives. Notes that don't fit keep their END (appended lines are the newest): cut at a line start (else a rune boundary when
+one line is too long), prefixed with "… (earlier notes truncated; `atl notes <slug>` for all)"; with less than 40 bytes of room
+the section is left out. This is the ONLY stdout output of `atl hook`.
 
 Performance/robustness: no cobra on this path; one DB open; total budget <50ms. All errors appended to
 `Paths.HookLog()` with timestamp + event; exit 0 except the ro block. Never prints to stdout.
@@ -442,6 +446,9 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 | `atl resume <task>` | `App.Resume`; prints count |
 | `atl status <task> <status>` | `App.SetStatus` |
 | `atl rename <task> <new title...>` | `App.Rename` (words joined with spaces, like `atl note`); prints the new title. Empty/whitespace-only or control characters → usage error (exit 2) |
+| `atl note <task> <text...> [--author user\|assistant]` | `App.AppendNote`: appends `- YYYY-MM-DD [author] text` to the notes; prints `note added` |
+| `atl notes <task> [--set]` | prints the notes text (nothing when empty); `--set` → `App.ReplaceNotes` from stdin (empty stdin clears; only `--set` reads stdin); prints `notes replaced (N bytes)` / `notes cleared` |
+| `atl show <task> [--json \| --notes]` | task detail; `--notes` prints only the notes text (read-only spelling of `atl notes <task>`); `--json` + `--notes` → usage error |
 | `atl diff <task>` | `App.Diff` through pager |
 | `atl pr <task>` | prints one line per repo (URL or skipped reason) |
 | `atl done <task> [--force]` / `atl cancel <task> [--force]` | |
@@ -464,12 +471,22 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
   the right pane; blank title → slug), truncated to the pane width, then `*` if an open task has uncommitted changes
   (kept when the title is truncated).
 - Right pane: title, slug, project, branch, port offset, task dir; repos (`rw`/`ro`, dirty `*`); sessions
-  (`claude-<id>  <state>  <age since last_event_at>`), waiting rendered highlighted (bold + accent colour).
+  (`claude-<id>  <state>  <age since last_event_at>`), waiting rendered highlighted (bold + accent colour); then the
+  notes area filling the remaining height (≥3 lines; details are cut first on short terminals): `TaskView.Notes` from
+  `App.Get`, sanitised, wrapped, from the top, "… N more line(s)" when cut, "(no notes — press m to write)" when empty.
+- Notes editor (`m`, refused while the task is busy): `GetNotes` then a bubbles/textarea in the notes area, prefilled,
+  cursor at the top; all keys go to it. ctrl+s → `SetNotes(text, base)` (CAS against the text it started from; task busy
+  while saving); success leaves edit mode (stays if the user typed during the save). Conflict
+  (`*model.NotesConflictError`) keeps the editor and the user's text, shows the keys on the status/help line; base becomes
+  the reported current text, so a second ctrl+s overwrites; ctrl+r reloads (drops the edits). esc leaves (asks "discard?
+  y/n" if unsaved); ctrl+c with unsaved changes asks before quitting. The editor is bound to its task id (the details pane
+  shows that task while editing, whatever the selection/list does); resize refits it; narrow terminals show the details
+  pane full width while editing.
 - Repo picker (new-task form and `a`): list of `App.AvailableRepos`, type to filter, space cycles none→rw→ro, enter confirms, esc clears filter then cancels; project repos preselected.
 - Keys: `n` new (form: title, project, repos via picker, description, backlog toggle), `enter` open (`App.OpenOrChoose`;
   attach cmd → tea.ExecProcess; choices → session picker), `s` new session, `r` resume, `d` done / `c` cancel (y/N confirm; if refused because dirty, offer `F`
   force), `p` pr, `D` diff (ExecProcess `$PAGER`), `1-5` set status (`AllStatuses` order, plain SetStatus), `a` add repos to the selected task (picker),
-  `m` note, `t` rename (single-line input prefilled with the title, like `m`: enter → `App.Rename` (async, task busy),
+  `m` notes editor (below), `t` rename (single-line input prefilled with the title: enter → `App.Rename` (async, task busy),
   esc cancels; empty → error shown, input stays open; unchanged → nothing saved),
   `/` filter (substring on slug/title), `j/k`/arrows move, `q`/ctrl-c quit.
 - Session picker (`enter` on a task with openable sessions: live, or resumable as `App.OpenChoices` defines; closed tasks offer
@@ -503,19 +520,34 @@ Part A — data the assistant reads:
 - Migration v3: `sessions.transcript_path TEXT NOT NULL DEFAULT ''`. Hook input gains `transcript_path`; SessionStart
   (all sources) stores it; any other event fills it if the row's value is empty. Targeted updates only.
 - Migration v3 also: `task_notes(id INTEGER PK, task_id FK ON DELETE CASCADE, body TEXT, author TEXT CHECK IN ('user','assistant'), created_at INTEGER)`.
+  Superseded by migration v5 (below); the table is kept but no longer used.
 - `atl show <task> [--json]`: task fields, task dir, repos (mode, path, dirty, commits ahead of base, last commit sha/subject/date,
   pushed = local ref refs/remotes/origin/atl/<slug> exists — no network), sessions (state, last_event_at, claude id,
-  transcript_path, title from the transcript or ""), notes (newest first).
+  transcript_path, title from the transcript or ""), notes (the notes text; JSON `"notes": "<text>"`, never null).
 - `atl transcript <task> [--session ID] [--tail N=20]`: condensed last N user/assistant text turns from the transcript JSONL
   (tool calls/results summarised as one line or skipped); default = most recent session with a transcript.
-- `atl note <task> <text...> [--author user|assistant]`, `atl notes <task>`. TUI: details pane shows latest note; key `m` adds a note.
+- Notes (migration v5, replacing the dated list): ONE free-form text per task, `tasks.notes TEXT NOT NULL DEFAULT ''`.
+  v5 folds task_notes rows into it, oldest first (created_at, id), one `- YYYY-MM-DD [author] body` line each (local date,
+  newlines in a body kept); its UPDATE only fills empty notes (idempotent); task_notes is kept.
+  Store: `GetNotes(id)`, `SetNotes(id, text, base) (stored, error)` (CAS in a BEGIN IMMEDIATE tx; mismatch →
+  `*model.NotesConflictError{Current}`, `errors.Is(err, model.ErrNotesConflict)`), `ReplaceNotes(id, text)` (no compare),
+  `AppendNote(id, author, body) (line, error)` (atomic; adds "\n" first unless empty or already newline-terminated).
+  Text is stored as `model.SanitizeNotes` (invalid UTF-8 → U+FFFD, \r\n/\r → \n, control chars except \n \t dropped,
+  trailing whitespace trimmed); writes over `model.MaxNotesLen` (64 KiB) → `model.ErrNotesTooLarge`. App: `Notes`, `SetNotes`,
+  `ReplaceNotes`, `AppendNote`; `TaskView.Notes` (Get), `TaskDetail.Notes`.
+- `atl note <task> <text...> [--author user|assistant]` appends; `atl notes <task>` prints; `atl notes <task> --set` replaces
+  from stdin. TUI: notes area under the details, `m` edits in place (§5).
 
 Part B — the assistant:
 - Dir `$XDG_DATA_HOME/atelier/assistant/` (persists in the box data mount) with generated `CLAUDE.md` (role, atl command
   reference, how to answer status questions: `atl show --json`, `atl transcript`, notes, read-only git in worktrees; always
   confirm before mutating; suggest saving a note after status discussions) and `.claude/settings.json`:
-  `permissions.defaultMode = "default"`, allow read-only `atl ls/show/transcript/notes/repos`, ask for
-  mutating atl commands (rules in `Bash(atl x *)` form; incl. `note`, `status`, `rename` — never in allow); PreToolUse hook `atl hook AssistantGuard` blocks Edit/Write/MultiEdit/NotebookEdit outside the
+  `permissions.defaultMode = "default"`, allow read-only `atl ls/show/transcript/repos`, ask for
+  mutating atl commands (rules in `Bash(atl x *)` form; incl. `note`, `notes`, `status`, `rename` — never in allow). Every allow
+  rule names a command that is read-only whatever its arguments; `atl notes` is not (`--set`), and a pattern can't reliably
+  separate `atl notes X` from `atl notes X --set` (quotes, `--set=true`, spacing, flag order), so all of `atl notes` is in
+  ask and the assistant reads notes with `atl show <task> --notes` (allowed via `atl show`). Ask beats allow, also a
+  user's global allow. PreToolUse hook `atl hook AssistantGuard` blocks Edit/Write/MultiEdit/NotebookEdit outside the
   assistant dir. No state-tracking hooks (the assistant is not a task session; untagged window → ignored by Recover).
 - tmux session `atl_assistant` (underscore cannot collide with task slugs), window `assistant`, untagged (Recover ignores it).
   Launch `claude --continue [prompt]` only if a previous conversation exists for the assistant dir
