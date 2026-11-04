@@ -49,7 +49,7 @@ mkdir -p "$W/bin"
 (cd "$ROOT" && go build -o "$W/bin/atl" ./cmd/atl) || fail "go build"
 
 # Isolated environment.
-unset TMUX TMUX_PANE ATL_BIN ATL_SESSION ATL_TASK ATL_TASK_DIR ATL_PORT_OFFSET
+unset TMUX TMUX_PANE ATL_BIN ATL_SESSION ATL_TASK ATL_TASK_DIR ATL_PORT_OFFSET CLAUDE_CONFIG_DIR
 export PATH="$W/bin:$STUBS:$PATH"
 export HOME="$W/home"
 export ATL_REPOS="$W/repos"

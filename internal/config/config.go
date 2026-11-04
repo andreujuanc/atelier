@@ -91,3 +91,27 @@ func (p Paths) ProjectFile(name string) string {
 // AssistantDir returns the atelier assistant's working directory: the
 // "assistant" directory next to the database ($XDG_DATA_HOME/atelier/assistant).
 func (p Paths) AssistantDir() string { return filepath.Join(filepath.Dir(p.DB), "assistant") }
+
+// ClaudeConfigDir returns Claude Code's config dir: $CLAUDE_CONFIG_DIR,
+// else ~/.claude ("" if neither is known).
+func ClaudeConfigDir() string {
+	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".claude")
+}
+
+// ClaudeUserSettings returns the path of Claude Code's user (global)
+// settings file, <ClaudeConfigDir>/settings.json ("" if the config dir is
+// unknown).
+func ClaudeUserSettings() string {
+	d := ClaudeConfigDir()
+	if d == "" {
+		return ""
+	}
+	return filepath.Join(d, "settings.json")
+}

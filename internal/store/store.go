@@ -146,6 +146,64 @@ func OpenWithTimeout(path string, busy time.Duration) (*Store, error) {
 	return s, nil
 }
 
+// ErrSchemaVersion is returned (wrapped) by OpenReadOnly when the
+// database's user_version is not exactly the schema version of this binary
+// (older, newer, or 0 for an empty or schema-less file).
+var ErrSchemaVersion = errors.New("database schema version mismatch")
+
+// OpenReadOnly opens the existing database at path for reading only, for
+// callers that must never change it (`atl statusline`). Unlike Open it
+// never creates the file or its directory, never migrates and never sets
+// the journal mode: the connection is opened with SQLite's mode=ro and
+// PRAGMA query_only=ON, and waits at most busy on a lock. A database whose
+// user_version is not exactly len(migrations) is closed and reported as
+// ErrSchemaVersion.
+//
+// The database file itself is never written. A read-only connection to a
+// WAL database does create empty -wal and -shm files next to it when they
+// are missing (SQLite needs the shared-memory index to read a WAL
+// database), and cannot remove them on close; the next read-write
+// connection cleans them up as usual. That is unavoidable without
+// immutable=1 (unsafe while hooks write) or readonly_shm=1 (fails when no
+// -shm exists).
+func OpenReadOnly(path string, busy time.Duration) (*Store, error) {
+	if busy < 0 {
+		busy = 0
+	}
+	if path == "" {
+		return nil, errors.New("store: empty database path")
+	}
+	if strings.ContainsRune(path, '?') {
+		return nil, fmt.Errorf("store: database path %q must not contain '?'", path)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+	// A "file:" URI so SQLite honours mode=ro; the driver passes the whole
+	// URI to sqlite3_open_v2 (SQLite ignores the driver's _pragma keys) and
+	// applies the _pragma values on every pooled connection.
+	q := url.Values{}
+	q.Set("mode", "ro")
+	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busy.Milliseconds()))
+	q.Add("_pragma", "query_only(ON)")
+	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}).String() + "?" + q.Encode()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	}
+	var v int
+	if err := db.QueryRowContext(context.Background(), "PRAGMA user_version").Scan(&v); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: open %s read-only: %w", path, err)
+	}
+	if v != len(migrations) {
+		db.Close()
+		return nil, fmt.Errorf("store: %s: %w: %d, want %d", path, ErrSchemaVersion, v, len(migrations))
+	}
+	return &Store{db: db}, nil
+}
+
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 

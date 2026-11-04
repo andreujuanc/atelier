@@ -402,3 +402,126 @@ func TestWriteSettingsStatusLine(t *testing.T) {
 		}
 	})
 }
+
+// TestMain points CLAUDE_CONFIG_DIR at an empty directory, so the user's
+// own global Claude Code settings never affect WriteSettings in tests.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "gen-test-claude")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("CLAUDE_CONFIG_DIR", dir)
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// TestWriteSettingsGlobalStatusLine: project settings override the user's
+// global ~/.claude/settings.json, so atelier's statusLine is only written
+// when the user has no global one; then an existing atelier entry is
+// removed, while a user's own task-level entry is still kept.
+func TestWriteSettingsGlobalStatusLine(t *testing.T) {
+	const bin = "/opt/atl/bin/atl"
+	global := func(t *testing.T, content *string) string {
+		t.Helper()
+		cfg := t.TempDir()
+		t.Setenv("CLAUDE_CONFIG_DIR", cfg)
+		if content != nil {
+			if err := os.WriteFile(filepath.Join(cfg, "settings.json"), []byte(*content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return cfg
+	}
+	write := func(t *testing.T, existing string) (settingsFile, map[string]any, string) {
+		t.Helper()
+		dir := t.TempDir()
+		if existing != "" {
+			os.MkdirAll(filepath.Join(dir, ".claude"), 0o755)
+			if err := os.WriteFile(filepath.Join(dir, ".claude", "settings.json"), []byte(existing), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := WriteSettings(dir, bin); err != nil {
+			t.Fatal(err)
+		}
+		return readSettings(t, dir)
+	}
+	str := func(s string) *string { return &s }
+	withGlobal := `{"model": "opus", "statusLine": {"type": "command", "command": "~/.claude/statusline.sh"}}`
+
+	t.Run("global statusLine: not added", func(t *testing.T) {
+		global(t, str(withGlobal))
+		sf, raw, text := write(t, "")
+		if _, ok := raw["statusLine"]; ok {
+			t.Errorf("statusLine added despite a global one:\n%s", text)
+		}
+		checkAtelierHooks(t, sf, bin)
+	})
+	t.Run("global statusLine: atelier's existing entry removed", func(t *testing.T) {
+		global(t, str(withGlobal))
+		for _, old := range []string{
+			`{"type": "command", "command": "'` + bin + `' statusline"}`,
+			`{"type": "command", "command": "'/old/path/atl' statusline", "padding": 2}`,
+		} {
+			sf, raw, text := write(t, `{"model": "sonnet", "statusLine": `+old+`}`)
+			if _, ok := raw["statusLine"]; ok {
+				t.Errorf("atelier's statusLine %s kept despite a global one:\n%s", old, text)
+			}
+			if raw["model"] != "sonnet" {
+				t.Errorf("other keys lost:\n%s", text)
+			}
+			checkAtelierHooks(t, sf, bin)
+		}
+	})
+	t.Run("global statusLine: user's task-level entry kept", func(t *testing.T) {
+		global(t, str(withGlobal))
+		_, raw, text := write(t, `{"statusLine": {"type": "command", "command": "~/bin/task-status"}}`)
+		if sl, _ := raw["statusLine"].(map[string]any); sl["command"] != "~/bin/task-status" {
+			t.Errorf("user's task statusLine changed:\n%s", text)
+		}
+	})
+	for _, c := range []struct {
+		name    string
+		content *string
+	}{
+		{"no global file", nil},
+		{"global without statusLine", str(`{"model": "opus", "hooks": {}}`)},
+		{"global statusLine null", str(`{"statusLine": null}`)},
+		{"broken global file", str(`{"statusLine": {"type": "command",`)},
+		{"global not an object", str(`["statusLine"]`)},
+		{"empty global file", str(``)},
+	} {
+		t.Run(c.name+": added", func(t *testing.T) {
+			global(t, c.content)
+			sf, raw, _ := write(t, "")
+			checkStatusLine(t, raw, bin)
+			checkAtelierHooks(t, sf, bin)
+		})
+	}
+	t.Run("unreadable global (a directory): added", func(t *testing.T) {
+		cfg := global(t, nil)
+		if err := os.Mkdir(filepath.Join(cfg, "settings.json"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_, raw, _ := write(t, "")
+		checkStatusLine(t, raw, bin)
+	})
+	t.Run("CLAUDE_CONFIG_DIR respected over ~/.claude", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+		if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(withGlobal), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		global(t, str(`{}`)) // CLAUDE_CONFIG_DIR without a statusLine wins
+		_, raw, _ := write(t, "")
+		checkStatusLine(t, raw, bin)
+
+		t.Setenv("CLAUDE_CONFIG_DIR", "") // unset: ~/.claude is read
+		_, raw, text := write(t, "")
+		if _, ok := raw["statusLine"]; ok {
+			t.Errorf("~/.claude/settings.json statusLine ignored without CLAUDE_CONFIG_DIR:\n%s", text)
+		}
+	})
+}
