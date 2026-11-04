@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/atl ./cmd/atl
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git tmux gh less openssh-client \
+        ca-certificates curl git tmux gh less openssh-client ncurses-term \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep tmux out of the way: no status bar, mouse scrolling, Ctrl-q returns to atl.
@@ -25,7 +25,12 @@ RUN printf '%s\n' \
         'set -g mouse on' \
         'set -g escape-time 10' \
         'bind -n C-q detach-client' \
+        'set -g default-terminal "tmux-256color"' \
+        'set -as terminal-features ",*:RGB"' \
         > /etc/tmux.conf
+
+# UTF-8 everywhere, otherwise tmux replaces Claude's logo and box characters.
+ENV LANG=C.UTF-8
 
 ARG USERNAME=atelier
 ARG UID=1000
