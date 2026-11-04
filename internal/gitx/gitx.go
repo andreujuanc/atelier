@@ -260,6 +260,26 @@ func DefaultBranch(ctx context.Context, repo string) (string, error) {
 	return "", fmt.Errorf("repo %s: cannot determine origin's default branch (no origin/HEAD, origin/main or origin/master; try fetching)", repo)
 }
 
+// IntegrationBranch returns the branch feature work starts from on
+// origin: "dev" if refs/remotes/origin/dev exists, else "develop" if
+// refs/remotes/origin/develop exists, else DefaultBranch. Only local refs
+// are consulted (fetch first for an up-to-date answer).
+func IntegrationBranch(ctx context.Context, repo string) (string, error) {
+	ok, err := hasOrigin(ctx, repo)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("repo %s has no origin remote", repo)
+	}
+	for _, b := range []string{"dev", "develop"} {
+		if refExists(ctx, repo, "refs/remotes/origin/"+b) {
+			return b, nil
+		}
+	}
+	return DefaultBranch(ctx, repo)
+}
+
 // RevParse resolves rev to a full commit sha.
 func RevParse(ctx context.Context, repo, rev string) (string, error) {
 	return run(ctx, repo, "rev-parse", "--verify", rev+"^{commit}")

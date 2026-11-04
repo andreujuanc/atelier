@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/andreujuanc/atelier/internal/app"
+	"github.com/andreujuanc/atelier/internal/model"
 )
 
 // Form fields, in order. The backlog checkbox is last: enter on it submits.
@@ -16,19 +17,26 @@ const (
 	fieldTitle = iota
 	fieldProject
 	fieldRepos
+	fieldBase
 	fieldDesc
 	fieldBacklog
 	numFields
 )
 
-var fieldLabels = [numFields]string{"Title", "Project", "Repos", "Description", "Backlog"}
+var fieldLabels = [numFields]string{"Title", "Project", "Repos", "Base", "Description", "Backlog"}
+
+// baseHint explains the Base field's auto choice.
+const baseHint = "auto = origin/dev → develop → default branch; production patch = origin's default branch"
 
 // newForm is the modal "new task" form. Repos are chosen in the repo
 // picker (enter or space on the Repos field), so inputs[fieldRepos] is
-// unused.
+// unused; Base is a two-state toggle, so inputs[fieldBase] is unused too.
 type newForm struct {
-	inputs   [fieldBacklog]textinput.Model
-	backlog  bool
+	inputs  [fieldBacklog]textinput.Model
+	backlog bool
+	// prodBase: branch from origin's default branch (production patch)
+	// instead of auto (origin/dev → develop → default branch).
+	prodBase bool
 	focus    int
 	err      string
 	projects []string
@@ -47,7 +55,7 @@ type newForm struct {
 
 func newTaskForm(projects []string) *newForm {
 	f := &newForm{projects: projects}
-	placeholders := [fieldBacklog]string{"required", "optional (tab cycles)", "", "optional"}
+	placeholders := [fieldBacklog]string{"required", "optional (tab cycles)", "", "", "optional"}
 	for i := range f.inputs {
 		ti := textinput.New()
 		ti.Prompt = ""
@@ -164,6 +172,10 @@ func (f *newForm) opts() (app.NewTaskOpts, error) {
 		Project:     f.project(),
 		Description: strings.TrimSpace(f.inputs[fieldDesc].Value()),
 		Backlog:     f.backlog,
+		Base:        model.BaseAuto,
+	}
+	if f.prodBase {
+		o.Base = model.BaseDefault
 	}
 	if o.Title == "" {
 		return o, errors.New("title is required")
@@ -239,6 +251,13 @@ func (f *newForm) update(msg tea.KeyMsg) (formResult, tea.Cmd) {
 	if f.focus == fieldRepos {
 		if key == " " {
 			return formPick, nil
+		}
+		return formContinue, nil
+	}
+	if f.focus == fieldBase {
+		switch key {
+		case " ", "left", "right":
+			f.prodBase = !f.prodBase
 		}
 		return formContinue, nil
 	}

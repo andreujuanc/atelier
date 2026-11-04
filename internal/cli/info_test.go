@@ -122,7 +122,8 @@ func TestShowNotesTranscript(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("show: %d %s", code, errs)
 	}
-	for _, s := range []string{"Task\n", "  slug         fix\n", "the description", "\nRepos\n  api (rw)  " + wt + "\n",
+	for _, s := range []string{"Task\n", "  slug         fix\n", "  base         auto\n", "the description",
+		"\nRepos\n  api (rw)  " + wt + "\n    base origin/main\n",
 		"clean, 1 commit(s) ahead of base, not pushed", "work in progress", "\nSessions\n  1 claude-1  idle",
 		"transcript  " + transcript, "\nNotes\n", "assistant] from the assistant"} {
 		if !strings.Contains(out, s) {
@@ -139,14 +140,17 @@ func TestShowNotesTranscript(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &raw); err != nil {
 		t.Fatal(err)
 	}
-	wantTop := []string{"branch", "created_at", "description", "id", "notes", "port_offset", "project", "repos",
+	wantTop := []string{"base", "branch", "created_at", "description", "id", "notes", "port_offset", "project", "repos",
 		"sessions", "slug", "status", "task_dir", "title", "updated_at"}
 	if got := keys(raw); !reflect.DeepEqual(got, wantTop) {
 		t.Fatalf("top keys %v", got)
 	}
 	repo := raw["repos"].([]any)[0].(map[string]any)
-	if got := keys(repo); !reflect.DeepEqual(got, []string{"ahead", "dirty", "error", "last_commit", "mode", "name", "path", "pushed", "unpushed"}) {
+	if got := keys(repo); !reflect.DeepEqual(got, []string{"ahead", "base_branch", "dirty", "error", "last_commit", "mode", "name", "path", "pushed", "unpushed"}) {
 		t.Fatalf("repo keys %v", got)
+	}
+	if raw["base"] != "" || repo["base_branch"] != "main" {
+		t.Fatalf("base %v base_branch %v", raw["base"], repo["base_branch"])
 	}
 	if repo["ahead"].(float64) != 1 || repo["pushed"] != false || repo["unpushed"].(float64) != 1 || repo["dirty"] != false || repo["path"] != wt {
 		t.Fatalf("repo %v", repo)

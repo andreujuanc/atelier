@@ -16,6 +16,9 @@ type RepoInfo struct {
 	Name string
 	Mode model.Mode
 	Path string // absolute: the git worktree (rw) or the canonical repo (ro)
+	// BaseBranch is the origin branch the rw worktree's branch was created
+	// from (e.g. "dev"); "" if unknown or ro.
+	BaseBranch string
 }
 
 // WriteClaudeMD writes <taskDir>/CLAUDE.md describing the task, its repos
@@ -56,7 +59,11 @@ func ClaudeMD(t model.Task, repos []RepoInfo) string {
 			ro = append(ro, r)
 			w("- **%s** — `%s` — **ro**: canonical repo, READ-ONLY (do not modify)\n", r.Name, r.Path)
 		default:
-			w("- **%s** — `%s` — **rw**: git worktree on branch `%s`; make your changes here\n", r.Name, r.Path, branch)
+			from := ""
+			if r.BaseBranch != "" {
+				from = fmt.Sprintf(" (branched from `origin/%s`; PRs target `%s`)", r.BaseBranch, r.BaseBranch)
+			}
+			w("- **%s** — `%s` — **rw**: git worktree on branch `%s`%s; make your changes here\n", r.Name, r.Path, branch, from)
 		}
 	}
 	w("\n")

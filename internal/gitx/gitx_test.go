@@ -1009,3 +1009,51 @@ func TestUniqueCommitsLocalRefsOnly(t *testing.T) {
 		t.Fatalf("after fetch: %d, %v", n, err)
 	}
 }
+
+func TestIntegrationBranch(t *testing.T) {
+	ctx := context.Background()
+	// pushBranches pushes origin's main to each named branch, then fetches.
+	pushBranches := func(t *testing.T, f fixture, branches ...string) {
+		t.Helper()
+		for _, b := range branches {
+			git(t, f.repo, "push", "-q", "origin", "refs/remotes/origin/main:refs/heads/"+b)
+		}
+		git(t, f.repo, "fetch", "-q", "origin")
+	}
+	cases := []struct {
+		name     string
+		branches []string
+		want     string
+	}{
+		{"neither", nil, "main"},
+		{"dev", []string{"dev"}, "dev"},
+		{"develop", []string{"develop"}, "develop"},
+		{"both", []string{"develop", "dev"}, "dev"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t)
+			pushBranches(t, f, c.branches...)
+			got, err := IntegrationBranch(ctx, f.repo)
+			if err != nil || got != c.want {
+				t.Fatalf("got %q, %v; want %q", got, err, c.want)
+			}
+		})
+	}
+
+	t.Run("local dev branch does not count", func(t *testing.T) {
+		f := newFixture(t)
+		git(t, f.repo, "branch", "dev")
+		if got, err := IntegrationBranch(ctx, f.repo); err != nil || got != "main" {
+			t.Fatalf("got %q, %v", got, err)
+		}
+	})
+
+	t.Run("no origin", func(t *testing.T) {
+		dir := t.TempDir()
+		git(t, dir, "init", "-q", "-b", "main")
+		if _, err := IntegrationBranch(ctx, dir); err == nil || !strings.Contains(err.Error(), "no origin remote") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}

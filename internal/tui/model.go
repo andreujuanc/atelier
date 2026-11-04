@@ -982,7 +982,7 @@ func (m *Model) pickerKey(msg tea.KeyMsg) tea.Cmd {
 				m.form.repos = p.selection()
 				m.form.err = ""
 				// Enter on Repos would reopen the picker: move on.
-				m.form.setFocus(fieldDesc)
+				m.form.setFocus(fieldBase)
 			}
 		} else {
 			m.mode = modeNormal

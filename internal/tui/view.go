@@ -217,7 +217,7 @@ func (m *Model) detailLines(w, h int) []string {
 	}
 	if len(status) == 0 {
 		for _, r := range task.Repos {
-			add(fmt.Sprintf("  %s  %s", clean(string(r.Mode)), clean(r.Name)))
+			add(fmt.Sprintf("  %s  %s", clean(string(r.Mode)), clean(r.Name)) + baseSuffix(r.BaseBranch))
 		}
 	}
 	for _, r := range status {
@@ -233,7 +233,7 @@ func (m *Model) detailLines(w, h int) []string {
 		case r.Dirty:
 			line += markStyle.Render(" *")
 		}
-		add(line)
+		add(line + baseSuffix(r.BaseBranch))
 	}
 	if len(task.Repos) == 0 && len(status) == 0 {
 		add(dimStyle.Render("  none"))
@@ -330,11 +330,20 @@ func (m *Model) statusLine(w int) string {
 	return trunc(s, w)
 }
 
+// baseSuffix shows the origin branch a rw repo's task branch started from
+// ("" when unknown, e.g. ro repos).
+func baseSuffix(branch string) string {
+	if branch == "" {
+		return ""
+	}
+	return dimStyle.Render("  ← " + clean(branch))
+}
+
 func (m *Model) helpLine(w int) string {
 	var s string
 	switch m.mode {
 	case modeForm:
-		s = "enter/↓ next  ↑ prev  tab next/complete project  enter/space on Repos picks  ctrl+b backlog  enter on Backlog creates  esc cancel"
+		s = "enter/↓ next  ↑ prev  tab next/complete project  enter/space on Repos picks  space/←/→ on Base toggles  ctrl+b backlog  enter on Backlog creates  esc cancel"
 	case modePicker:
 		s = "type to filter  ↑/↓ move  space none/rw/ro  enter confirm  esc clear filter/cancel"
 	case modeFilter:
@@ -382,6 +391,12 @@ func (m *Model) formLines(w, h int) []string {
 				val = "[x]"
 			}
 			val += dimStyle.Render(" space / ctrl+b toggles")
+		case fieldBase:
+			auto, prod := "(•) auto (dev → develop → default)", "( ) production patch (default branch)"
+			if f.prodBase {
+				auto, prod = "( ) auto (dev → develop → default)", "(•) production patch (default branch)"
+			}
+			val = auto + "   " + prod
 		case fieldRepos:
 			switch {
 			case len(f.repos) > 0:
@@ -407,6 +422,9 @@ func (m *Model) formLines(w, h int) []string {
 		}
 		if i == fieldRepos && i == f.focus {
 			add(dimStyle.Render("                enter or space opens the repo picker"))
+		}
+		if i == fieldBase {
+			add(dimStyle.Render("                " + baseHint))
 		}
 	}
 	add("")

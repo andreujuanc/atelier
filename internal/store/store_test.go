@@ -94,7 +94,7 @@ func TestTaskCRUD(t *testing.T) {
 		{Name: "mid", Mode: model.ModeRW, BaseBranch: "develop", BaseCommit: "def456"},
 	}
 	task := &model.Task{Slug: "fix-bug", Title: "Fix bug", Description: "desc", Status: model.StatusBacklog,
-		Project: "acme", Branch: "atl/fix-bug", PortOffset: 200, Repos: repos}
+		Project: "acme", Branch: "atl/fix-bug", PortOffset: 200, Base: "release/1.2", Repos: repos}
 	before := time.Now().Add(-time.Second)
 	if err := s.CreateTask(ctx, task); err != nil {
 		t.Fatal(err)

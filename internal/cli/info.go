@@ -21,15 +21,18 @@ const wrapWidth = 100
 // `atl show --json` prints one object (stable; times are RFC3339 UTC):
 //
 //	{"id":1,"slug":"fix-login","title":"Fix login","description":"","status":"active","project":"shop",
-//	 "branch":"atl/fix-login","port_offset":100,"task_dir":"/home/u/tasks/fix-login",
+//	 "branch":"atl/fix-login","port_offset":100,"base":"","task_dir":"/home/u/tasks/fix-login",
 //	 "created_at":"…","updated_at":"…",
-//	 "repos":[{"name":"api","mode":"rw","path":"/home/u/tasks/fix-login/api","dirty":true,"ahead":2,
+//	 "repos":[{"name":"api","mode":"rw","path":"/home/u/tasks/fix-login/api","base_branch":"dev","dirty":true,"ahead":2,
 //	           "pushed":false,"unpushed":2,"last_commit":{"sha":"…","subject":"…","date":"…"},"error":""}],
 //	 "sessions":[{"id":3,"name":"claude-3","claude_session_id":"…","state":"waiting","tmux_target":"@4",
 //	              "created_at":"…","last_event_at":"…","transcript_path":"/home/u/.claude/projects/…/….jsonl"}],
 //	 "notes":[{"id":7,"author":"user","body":"…","created_at":"…"}]}
 //
-// last_commit is null when HEAD could not be read; error is "missing" when
+// base is the task's base choice: "" (auto: origin/dev, else develop, else
+// the default branch), ":default" (origin's default branch) or a branch
+// name. base_branch is the origin branch a rw repo's task branch started
+// from ("" for ro). last_commit is null when HEAD could not be read; error is "missing" when
 // the repo directory is gone, else a git error or "". unpushed is the
 // number of commits not in origin/<branch> when pushed, else equal to
 // ahead (0 when the repo directory is gone). ahead, pushed and unpushed are
@@ -44,6 +47,7 @@ type jsonShow struct {
 	Project     string            `json:"project"`
 	Branch      string            `json:"branch"`
 	PortOffset  int               `json:"port_offset"`
+	Base        string            `json:"base"`
 	TaskDir     string            `json:"task_dir"`
 	CreatedAt   string            `json:"created_at"`
 	UpdatedAt   string            `json:"updated_at"`
@@ -56,6 +60,7 @@ type jsonRepoDetail struct {
 	Name       string      `json:"name"`
 	Mode       string      `json:"mode"`
 	Path       string      `json:"path"`
+	BaseBranch string      `json:"base_branch"`
 	Dirty      bool        `json:"dirty"`
 	Ahead      int         `json:"ahead"`
 	Pushed     bool        `json:"pushed"`
@@ -92,12 +97,12 @@ func showJSON(d *app.TaskDetail) jsonShow {
 	t := d.Task
 	out := jsonShow{
 		ID: t.ID, Slug: t.Slug, Title: t.Title, Description: t.Description, Status: string(t.Status),
-		Project: t.Project, Branch: t.Branch, PortOffset: t.PortOffset, TaskDir: d.TaskDir,
+		Project: t.Project, Branch: t.Branch, PortOffset: t.PortOffset, Base: t.Base, TaskDir: d.TaskDir,
 		CreatedAt: rfc3339(t.CreatedAt), UpdatedAt: rfc3339(t.UpdatedAt),
 		Repos: []jsonRepoDetail{}, Sessions: []jsonShowSession{}, Notes: []jsonNote{},
 	}
 	for _, r := range d.Repos {
-		jr := jsonRepoDetail{Name: r.Name, Mode: string(r.Mode), Path: r.Path, Dirty: r.Dirty, Ahead: r.Ahead,
+		jr := jsonRepoDetail{Name: r.Name, Mode: string(r.Mode), Path: r.Path, BaseBranch: r.BaseBranch, Dirty: r.Dirty, Ahead: r.Ahead,
 			Pushed: r.Pushed, Unpushed: r.Unpushed, Error: r.Err}
 		if c := r.LastCommit; c != nil {
 			jr.LastCommit = &jsonCommit{SHA: c.SHA, Subject: c.Subject, Date: rfc3339(c.Date)}
@@ -165,6 +170,7 @@ func writeShow(w io.Writer, d *app.TaskDetail) {
 	kv("status", string(t.Status))
 	kv("project", orDash(t.Project))
 	kv("branch", t.Branch)
+	kv("base", sanitize(app.BaseLabel(t.Base)))
 	kv("port offset", strconv.Itoa(t.PortOffset))
 	kv("dir", d.TaskDir)
 	kv("created", localTime(t.CreatedAt))
@@ -180,6 +186,9 @@ func writeShow(w io.Writer, d *app.TaskDetail) {
 	}
 	for _, r := range d.Repos {
 		fmt.Fprintf(w, "  %s (%s)  %s\n", r.Name, r.Mode, r.Path)
+		if r.BaseBranch != "" {
+			fmt.Fprintf(w, "    base origin/%s\n", sanitize(r.BaseBranch))
+		}
 		if r.Err == "missing" {
 			fmt.Fprintln(w, "    missing (worktree removed)")
 			if r.Mode == model.ModeRW {
