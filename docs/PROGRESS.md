@@ -60,6 +60,8 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | Dockerfile (atl + claude + tmux + git + gh + ssh; build args USERNAME/UID/GID; tmux conf: no status, Ctrl-q detach) | done |
 | Repo picker in TUI + add repo to existing task (`a`, `atl add`, `atl repos`) | done (reviewed, 1 fix round) |
 | SessionEnd on container shutdown marks sessions `ended` (should be `stopped`, resumable) | todo |
-| atelier assistant (Claude session for atelier ops: status of stalled tasks, run atl commands) | design discussed, awaiting user decisions |
+| atelier assistant — Part A (transcript_path, notes, show, transcript) | in progress |
+| atelier assistant — Part B (assistant session, `atl assistant`, TUI `A`) | todo |
 
 - (follow-up) NewTaskOpts.ExactRepos for the picker; runSetup takes a repo filter; validRepoArg shared; store.ErrDuplicate; Backend gained ProjectRepos/AvailableRepos/AddRepo.
+- (user, 2026-11-04) Assistant: one for all tasks; asks before mutating actions; never edits repos. Design in PLAN §7.

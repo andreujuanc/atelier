@@ -466,3 +466,31 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 | M6 | `internal/tui` | |
 | M7 | `internal/project/scripts.go`, `internal/app/diff.go`, `internal/app/pr.go`, edits to `task.go`/`session.go` for scripts + env | |
 | M8 | recovery startup wiring in cli/tui, `test/e2e.sh`, `test/stubs/*` | |
+
+## 7. atelier assistant (follow-up feature)
+
+One Claude Code session for atelier operations (not repo work): "what's the status of X?", "add repo Y to X".
+User decisions: ONE assistant for all tasks; reads freely, ASKS before any mutating action; never edits repos.
+
+Part A — data the assistant reads:
+- Migration v3: `sessions.transcript_path TEXT NOT NULL DEFAULT ''`. Hook input gains `transcript_path`; SessionStart
+  (all sources) stores it; any other event fills it if the row's value is empty. Targeted updates only.
+- Migration v3 also: `task_notes(id INTEGER PK, task_id FK ON DELETE CASCADE, body TEXT, author TEXT CHECK IN ('user','assistant'), created_at INTEGER)`.
+- `atl show <task> [--json]`: task fields, task dir, repos (mode, path, dirty, commits ahead of base, last commit sha/subject/date,
+  pushed = local ref refs/remotes/origin/atl/<slug> exists — no network), sessions (state, last_event_at, claude id,
+  transcript_path), notes (newest first).
+- `atl transcript <task> [--session ID] [--tail N=20]`: condensed last N user/assistant text turns from the transcript JSONL
+  (tool calls/results summarised as one line or skipped); default = most recent session with a transcript.
+- `atl note <task> <text...> [--author user|assistant]`, `atl notes <task>`. TUI: details pane shows latest note; key `m` adds a note.
+
+Part B — the assistant:
+- Dir `$XDG_DATA_HOME/atelier/assistant/` (persists in the box data mount) with generated `CLAUDE.md` (role, atl command
+  reference, how to answer status questions: `atl show --json`, `atl transcript`, notes, read-only git in worktrees; always
+  confirm before mutating; suggest saving a note after status discussions) and `.claude/settings.json`:
+  `permissions.defaultMode = "default"`, allow read-only `atl ls/show/transcript/notes/repos` + read-only git, ask for
+  mutating atl commands; PreToolUse hook `atl hook AssistantGuard` blocks Edit/Write/MultiEdit/NotebookEdit outside the
+  assistant dir. No state-tracking hooks (the assistant is not a task session; untagged window → ignored by Recover).
+- tmux session `atl_assistant` (underscore cannot collide with task slugs). Launch `sh -c 'claude --continue || claude'`
+  in the assistant dir so the conversation persists across restarts.
+- `atl assistant [task]` / TUI key `A` (on the selected task): ensure session, if a task is given type
+  "Let's talk about task <slug>." into it (tmux send-keys) or pass it as the initial prompt on fresh launch; then attach.
