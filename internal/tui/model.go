@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -22,7 +23,8 @@ const (
 	listEvery    = time.Second
 	detailEvery  = 3 * time.Second
 	recoverEvery = 5 * time.Second
-	dirtyEvery   = 5 * time.Second
+	dirtyEvery   = 5 * time.Second // after the previous check finished
+	dirtyTimeout = 30 * time.Second
 	selDebounce  = 150 * time.Millisecond
 )
 
@@ -138,6 +140,9 @@ type Model struct {
 	now func() time.Time
 	// after schedules msg after d (tea.Tick); tests replace it.
 	after func(d time.Duration, msg tea.Msg) tea.Cmd
+	// dirtyTimeout bounds one DirtyTasks call (a hung git must not leave
+	// dirtying set forever); tests shorten it.
+	dirtyTimeout time.Duration
 	// diffCmd returns the command that shows a task's diff (paged).
 	diffCmd func(slug string) *exec.Cmd
 	// flushOut, if set, returns once every App.Out line written so far has
@@ -238,21 +243,22 @@ func New(ctx context.Context, be Backend) *Model {
 		after: func(d time.Duration, msg tea.Msg) tea.Cmd {
 			return tea.Tick(d, func(time.Time) tea.Msg { return msg })
 		},
-		diffCmd:     func(slug string) *exec.Cmd { return exec.Command("atl", "diff", slug) },
-		filterInput: fi,
-		noteInput:   ni,
-		busy:        map[int64]string{},
-		width:       80,
-		height:      24,
+		diffCmd:      func(slug string) *exec.Cmd { return exec.Command("atl", "diff", slug) },
+		filterInput:  fi,
+		noteInput:    ni,
+		busy:         map[int64]string{},
+		dirtyTimeout: dirtyTimeout,
+		width:        80,
+		height:       24,
 	}
 }
 
 // Init loads tasks, projects and runs Recover, and starts the tickers.
+// The dirty check is a single chain: each result arms the next tick.
 func (m *Model) Init() tea.Cmd {
 	m.listing, m.recovering, m.dirtying = true, true, true
 	return tea.Batch(m.listCmd(), m.recoverCmd(), m.projectsCmd(), m.dirtyCmd(),
-		m.after(listEvery, listTickMsg{}), m.after(recoverEvery, recoverTickMsg{}),
-		m.after(dirtyEvery, dirtyTickMsg{}))
+		m.after(listEvery, listTickMsg{}), m.after(recoverEvery, recoverTickMsg{}))
 }
 
 // --- commands ---
@@ -274,9 +280,14 @@ func (m *Model) recoverCmd() tea.Cmd {
 }
 
 func (m *Model) dirtyCmd() tea.Cmd {
-	be, ctx := m.be, m.ctx
+	be, ctx, timeout := m.be, m.ctx, m.dirtyTimeout
 	return func() tea.Msg {
-		d, err := be.DirtyTasks(ctx)
+		tctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		d, err := be.DirtyTasks(tctx)
+		if err != nil && errors.Is(tctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			err = fmt.Errorf("timed out after %s", timeout)
+		}
 		return dirtyMsg{d, err}
 	}
 }
@@ -665,12 +676,12 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		}
 		return tea.Batch(cmds...)
 	case dirtyTickMsg:
-		cmds := []tea.Cmd{m.after(dirtyEvery, dirtyTickMsg{})}
-		if !m.dirtying {
-			m.dirtying = true
-			cmds = append(cmds, m.dirtyCmd())
+		// Not rescheduled here: the check's dirtyMsg arms the next tick.
+		if m.dirtying {
+			return nil
 		}
-		return tea.Batch(cmds...)
+		m.dirtying = true
+		return m.dirtyCmd()
 	case selTickMsg:
 		if msg.seq != m.selSeq {
 			return nil
@@ -725,17 +736,18 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return nil
 	case dirtyMsg:
 		m.dirtying = false
+		next := m.after(dirtyEvery, dirtyTickMsg{})
 		if msg.err != nil {
 			// Keep the last result; show each distinct error once.
 			if e := msg.err.Error(); e != m.dirtyErr {
 				m.dirtyErr = e
 				m.setErr(fmt.Errorf("dirty check: %w", msg.err))
 			}
-			return nil
+			return next
 		}
 		m.dirtyErr = ""
 		m.dirty = msg.dirty
-		return nil
+		return next
 	case projectsMsg:
 		if msg.err == nil {
 			m.projects = msg.names
