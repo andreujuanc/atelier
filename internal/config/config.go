@@ -87,3 +87,7 @@ func (p Paths) HookLog() string { return filepath.Join(p.StateDir, "hook.log") }
 func (p Paths) ProjectFile(name string) string {
 	return filepath.Join(p.ConfigDir, "projects", name+".toml")
 }
+
+// AssistantDir returns the atelier assistant's working directory: the
+// "assistant" directory next to the database ($XDG_DATA_HOME/atelier/assistant).
+func (p Paths) AssistantDir() string { return filepath.Join(filepath.Dir(p.DB), "assistant") }

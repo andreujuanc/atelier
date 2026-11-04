@@ -43,44 +43,65 @@ func HookCommand(atlBin, event string) string {
 // path stays current). A file that is not a valid settings object is
 // backed up to settings.json.bak and replaced. The write is atomic.
 func WriteSettings(taskDir, atlBin string) error {
-	dir := filepath.Join(taskDir, ".claude")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("gen: create %s: %w", dir, err)
+	path, root, err := loadSettings(taskDir)
+	if err != nil {
+		return err
 	}
-	path := filepath.Join(dir, "settings.json")
-
-	root := map[string]any{}
-	data, err := os.ReadFile(path)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
-		return fmt.Errorf("gen: read %s: %w", path, err)
-	case len(bytes.TrimSpace(data)) == 0:
-	default:
-		if root, err = parseSettings(data); err != nil {
-			if err := os.WriteFile(path+".bak", data, 0o644); err != nil {
-				return fmt.Errorf("gen: back up invalid %s: %w", path, err)
-			}
-			root = map[string]any{}
-		}
-	}
-
 	hooks, _ := root["hooks"].(map[string]any)
 	if hooks == nil {
 		hooks = map[string]any{}
 	}
 	for _, ev := range hookEvents {
-		groups, _ := hooks[ev.Name].([]any)
-		groups = removeAtelierHooks(groups, ev.Name, atlBin)
-		group := map[string]any{}
-		if ev.Matcher != "" {
-			group["matcher"] = ev.Matcher
-		}
-		group["hooks"] = []any{map[string]any{"type": "command", "command": HookCommand(atlBin, ev.Name)}}
-		hooks[ev.Name] = append(groups, group)
+		setAtelierHook(hooks, ev.Name, ev.Matcher, ev.Name, atlBin)
 	}
 	root["hooks"] = hooks
+	return saveSettings(path, root)
+}
 
+// setAtelierHook replaces atelier's `hook <cmdEvent>` entries under the
+// Claude Code hook event `event` with one fresh group (with matcher, if
+// non-empty), keeping every other entry.
+func setAtelierHook(hooks map[string]any, event, matcher, cmdEvent, atlBin string) {
+	groups, _ := hooks[event].([]any)
+	groups = removeAtelierHooks(groups, cmdEvent, atlBin)
+	group := map[string]any{}
+	if matcher != "" {
+		group["matcher"] = matcher
+	}
+	group["hooks"] = []any{map[string]any{"type": "command", "command": HookCommand(atlBin, cmdEvent)}}
+	hooks[event] = append(groups, group)
+}
+
+// loadSettings creates <dir>/.claude and returns the path of its
+// settings.json and the parsed contents ({} if the file is missing or
+// empty). A file that is not a valid settings object is backed up to
+// settings.json.bak and treated as empty.
+func loadSettings(dir string) (string, map[string]any, error) {
+	cdir := filepath.Join(dir, ".claude")
+	if err := os.MkdirAll(cdir, 0o755); err != nil {
+		return "", nil, fmt.Errorf("gen: create %s: %w", cdir, err)
+	}
+	path := filepath.Join(cdir, "settings.json")
+	root := map[string]any{}
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return "", nil, fmt.Errorf("gen: read %s: %w", path, err)
+	case len(bytes.TrimSpace(data)) == 0:
+	default:
+		if root, err = parseSettings(data); err != nil {
+			if err := os.WriteFile(path+".bak", data, 0o644); err != nil {
+				return "", nil, fmt.Errorf("gen: back up invalid %s: %w", path, err)
+			}
+			root = map[string]any{}
+		}
+	}
+	return path, root, nil
+}
+
+// saveSettings writes root as indented JSON to path atomically.
+func saveSettings(path string, root map[string]any) error {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)

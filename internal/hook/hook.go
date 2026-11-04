@@ -45,6 +45,9 @@ const (
 	EventSessionEnd       = "SessionEnd"
 	EventPreToolUse       = "PreToolUse"
 	EventPostToolUse      = "PostToolUse"
+	// EventAssistantGuard is the atelier assistant's PreToolUse guard (see
+	// assistant.go); it never opens the database.
+	EventAssistantGuard = "AssistantGuard"
 )
 
 func knownEvent(e string) bool {
@@ -87,13 +90,22 @@ func run(args []string, stdin io.Reader, stderr io.Writer, env func(string) stri
 		if r := recover(); r != nil {
 			logError(p, stderr, event, sid, fmt.Errorf("panic: %v\n%s", r, debug.Stack()))
 			code = 0
+			if event == EventAssistantGuard {
+				code = assistantRefuse(stderr, "", "internal error")
+			}
 		}
 	}()
 
 	p, err := config.Resolve()
 	if err != nil {
 		logError(p, stderr, event, sid, err)
+		if event == EventAssistantGuard {
+			return assistantRefuse(stderr, "", "cannot resolve atelier paths")
+		}
 		return 0
+	}
+	if event == EventAssistantGuard {
+		return assistantGuardMain(p, stdin, stderr)
 	}
 	if event == "" {
 		logError(p, stderr, event, sid, errors.New("missing event name (usage: atl hook <event>)"))

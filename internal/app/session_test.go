@@ -44,6 +44,7 @@ func newEnv(t *testing.T) *env {
 	t.Setenv("HOME", root) // keep the user's tmux.conf out of the test server
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, ".config"))
 	t.Setenv("SHELL", "/bin/sh")
+	t.Setenv("CLAUDE_CONFIG_DIR", "") // Claude's config dir is $HOME/.claude
 
 	bin := filepath.Join(root, "bin")
 	out := filepath.Join(root, "out")

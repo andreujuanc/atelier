@@ -309,6 +309,14 @@ func (b *trackedBackend) AddRepo(ctx context.Context, ref string, r app.RepoArg,
 	return b.Backend.AddRepo(ctx, ref, r, noFetch)
 }
 
+func (b *trackedBackend) Assistant(ctx context.Context, slug string) (*exec.Cmd, string, error) {
+	if !b.tr.begin() {
+		return nil, "", errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.Assistant(ctx, slug)
+}
+
 func (b *trackedBackend) AddNote(ctx context.Context, ref, body, author string) (*model.Note, error) {
 	if !b.tr.begin() {
 		return nil, errStopped
