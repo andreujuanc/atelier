@@ -804,3 +804,29 @@ func TestErrorFormat(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func TestUntracked(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "untracked")
+	got, err := Untracked(ctx, wt)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("clean: %v, %v", got, err)
+	}
+	writeFile(t, filepath.Join(wt, "new.txt"), "x")
+	writeFile(t, filepath.Join(wt, "dir", "sub", "deep file.txt"), "x")
+	writeFile(t, filepath.Join(wt, ".gitignore"), "*.log\n")
+	writeFile(t, filepath.Join(wt, "ignored.log"), "x")
+	writeFile(t, filepath.Join(wt, "README.md"), "modified\n") // tracked: not listed
+	got, err = Untracked(ctx, wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{".gitignore", "dir/sub/deep file.txt", "new.txt"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if _, err := Untracked(ctx, filepath.Join(f.root, "nope")); err == nil {
+		t.Fatal("want error for missing worktree")
+	}
+}

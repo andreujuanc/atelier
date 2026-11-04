@@ -236,3 +236,33 @@ func TestSessionsSummary(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestPRExitCode(t *testing.T) {
+	root := setup(t)
+	bin := t.TempDir()
+	stub := "#!/bin/sh\necho 'boom' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if code, _, errs := atl(t, "new", "ship", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	wt := filepath.Join(root, "tasks", "ship", "api")
+
+	// Skips are not failures.
+	if code, out, errs := atl(t, "pr", "ship"); code != 0 || out != "api\tskipped: no commits\n" {
+		t.Fatalf("pr (no commits): %d %q %s", code, out, errs)
+	}
+	git(t, wt, "commit", "-q", "--allow-empty", "-m", "work")
+	if code, out, errs := atl(t, "pr", "ship"); code != 0 || out != "api\tskipped: push atl/ship first\n" {
+		t.Fatalf("pr (unpushed): %d %q %s", code, out, errs)
+	}
+
+	// gh failing is.
+	git(t, wt, "push", "-q", "origin", "atl/ship")
+	if code, out, errs := atl(t, "pr", "ship"); code != 1 || out != "api\tskipped: gh: boom\n" || errs != "" {
+		t.Fatalf("pr (gh fails): %d %q %q", code, out, errs)
+	}
+}

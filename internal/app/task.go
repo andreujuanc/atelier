@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -140,8 +142,10 @@ func checkRepo(ctx context.Context, name, path string) error {
 // records origin's default branch and its commit, inserts the task row
 // (allocating slug and port offset atomically), creates the task dir with a
 // worktree per rw repo on branch atl/<slug> starting at that commit, and
-// writes CLAUDE.md and .claude/settings.json. Any failure after the insert
-// rolls everything back.
+// writes CLAUDE.md and .claude/settings.json. Any failure up to this point
+// after the insert rolls everything back. Then, once the task exists, the
+// project's setup script (if any) runs in each rw worktree; a setup failure
+// is only reported as a warning and leaves the task in place.
 func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 	// The title is one line: collapse whitespace runs (newlines included).
 	title := strings.Join(strings.Fields(o.Title), " ")
@@ -274,13 +278,117 @@ func (a *App) populateTaskDir(ctx context.Context, t *model.Task) (err error) {
 	return gen.WriteSettings(dir, a.AtlBin)
 }
 
-// runSetup runs the project's setup script in each rw worktree.
-// TODO(M7): implement via project.RunScript.
-func (a *App) runSetup(ctx context.Context, t *model.Task) error { return nil }
+// taskProject loads the task's project, or returns nil if it has none.
+func (a *App) taskProject(t *model.Task) (*project.Project, error) {
+	if t.Project == "" {
+		return nil, nil
+	}
+	return project.Load(a.Paths, t.Project)
+}
 
-// runTeardown runs the project's teardown script in each rw worktree.
-// TODO(M7): implement via project.RunScript.
-func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error { return nil }
+// scriptEnv is the script context for rw repo r of task t.
+func (a *App) scriptEnv(t *model.Task, r model.TaskRepo) project.ScriptEnv {
+	return project.ScriptEnv{Task: *t, TaskDir: a.Paths.TaskDir(t.Slug), Repo: r.Name,
+		Worktree: a.Paths.WorktreePath(t.Slug, r.Name)}
+}
+
+// runScript runs one setup/teardown script for rw repo r, streaming its
+// output to Out as "<kind> <repo>: <line>".
+func (a *App) runScript(ctx context.Context, pr *project.Project, kind, script string, t *model.Task, r model.TaskRepo) error {
+	se := a.scriptEnv(t, r)
+	fmt.Fprintf(a.out(), "%s %s: $ %s\n", kind, r.Name, strings.TrimSpace(script))
+	pw := &prefixWriter{w: a.out(), prefix: kind + " " + r.Name + ": "}
+	err := project.RunScript(ctx, script, se.Worktree, pr.EnvFor(se), pw)
+	pw.Flush()
+	return err
+}
+
+// runSetup runs the project's setup script in each rw worktree. A failure
+// in one repo is a warning; the remaining repos still run. The returned
+// error is only for a project that cannot be loaded.
+func (a *App) runSetup(ctx context.Context, t *model.Task) error {
+	pr, err := a.taskProject(t)
+	if err != nil || pr == nil || strings.TrimSpace(pr.Setup) == "" {
+		return err
+	}
+	for _, r := range t.Repos {
+		if r.Mode != model.ModeRW {
+			continue
+		}
+		if err := a.runScript(ctx, pr, "setup", pr.Setup, t, r); err != nil {
+			a.warnf("setup failed in %s: %v", r.Name, err)
+		}
+	}
+	return nil
+}
+
+// runTeardown runs the project's teardown script in each rw worktree that
+// still exists. Without force the first failure is returned (and the
+// remaining repos are not torn down); with force failures are warnings. A
+// project that can no longer be loaded is a warning, never an error, so it
+// cannot block closing the task.
+func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error {
+	pr, err := a.taskProject(t)
+	if err != nil {
+		a.warnf("skipping teardown: %v", err)
+		return nil
+	}
+	if pr == nil || strings.TrimSpace(pr.Teardown) == "" {
+		return nil
+	}
+	for _, r := range t.Repos {
+		if r.Mode != model.ModeRW {
+			continue
+		}
+		if _, err := os.Stat(a.Paths.WorktreePath(t.Slug, r.Name)); errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err := a.runScript(ctx, pr, "teardown", pr.Teardown, t, r); err != nil {
+			if !force {
+				return fmt.Errorf("repo %s: %w", r.Name, err)
+			}
+			a.warnf("teardown failed in %s: %v", r.Name, err)
+		}
+	}
+	return nil
+}
+
+// prefixWriter writes each line to w with prefix; Flush emits a trailing
+// partial line. '\r' ends a line too, so progress output (docker, npm)
+// streams; empty segments (e.g. from "\r\n") are skipped.
+type prefixWriter struct {
+	w      io.Writer
+	prefix string
+	buf    []byte
+}
+
+func (p *prefixWriter) Write(b []byte) (int, error) {
+	p.buf = append(p.buf, b...)
+	for {
+		i := bytes.IndexAny(p.buf, "\r\n")
+		if i < 0 {
+			break
+		}
+		line := p.buf[:i]
+		p.buf = p.buf[i+1:]
+		if len(line) == 0 {
+			continue
+		}
+		if _, err := fmt.Fprintf(p.w, "%s%s\n", p.prefix, line); err != nil {
+			p.buf = nil // progress output is best effort; keep the script running
+			return len(b), nil
+		}
+	}
+	return len(b), nil
+}
+
+// Flush writes any buffered partial line.
+func (p *prefixWriter) Flush() {
+	if len(p.buf) > 0 {
+		fmt.Fprintf(p.w, "%s%s\n", p.prefix, p.buf)
+		p.buf = nil
+	}
+}
 
 // List returns tasks with the given statuses (all if none) with their
 // sessions; RepoStatus is not filled.
@@ -432,6 +540,11 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 	for _, w := range wts {
 		if err := gitx.RemoveWorktree(ctx, w.repo, w.path, force); err != nil {
 			if !force {
+				// It was clean before teardown, so teardown left changes.
+				if d, derr := gitx.IsDirty(ctx, w.path); derr == nil && d {
+					return fmt.Errorf("task %s: repo %s: worktree has changes after teardown (%w); re-run with --force to discard them",
+						t.Slug, w.name, err)
+				}
 				return fmt.Errorf("task %s: repo %s: %w", t.Slug, w.name, err)
 			}
 			a.warnf("remove worktree %s: %v", w.path, err)

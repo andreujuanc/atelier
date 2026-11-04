@@ -90,15 +90,27 @@ func (a *App) prepareTaskDir(ctx context.Context, t *model.Task) error {
 	return nil
 }
 
-// launchEnv is the environment passed to a Claude window.
-// TODO(M7): merge the project's env underneath these.
+// launchEnv is the environment passed to a Claude window: the project's env
+// (if the task has a project that still loads; otherwise a warning goes to
+// a.Out) overridden by ATL_TASK, ATL_SESSION, ATL_PORT_OFFSET and
+// ATL_TASK_DIR.
 func (a *App) launchEnv(t *model.Task, s *model.Session) map[string]string {
-	return map[string]string{
-		"ATL_TASK":        t.Slug,
-		"ATL_SESSION":     strconv.FormatInt(s.ID, 10),
-		"ATL_PORT_OFFSET": strconv.Itoa(t.PortOffset),
-		"ATL_TASK_DIR":    a.Paths.TaskDir(t.Slug),
+	env := map[string]string{}
+	pr, err := a.taskProject(t)
+	if err != nil {
+		// err already names the project: `project "x": ...`.
+		a.warnf("%v; launching without project env", err)
 	}
+	if pr != nil {
+		for k, v := range pr.Env {
+			env[k] = v
+		}
+	}
+	env["ATL_TASK"] = t.Slug
+	env["ATL_SESSION"] = strconv.FormatInt(s.ID, 10)
+	env["ATL_PORT_OFFSET"] = strconv.Itoa(t.PortOffset)
+	env["ATL_TASK_DIR"] = a.Paths.TaskDir(t.Slug)
+	return env
 }
 
 // roPaths returns the canonical paths of the task's ro repos, in repo order.

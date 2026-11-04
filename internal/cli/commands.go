@@ -388,12 +388,16 @@ func (c *cli) prCmd() *cobra.Command {
 				return err
 			}
 			res, err := ap.PR(cmd.Context(), a[0])
+			ghFailed := false
 			for _, r := range res {
-				if r.Skipped {
-					fmt.Fprintf(c.stdout, "%s\tskipped: %s\n", r.Repo, r.Reason)
-				} else {
-					fmt.Fprintf(c.stdout, "%s\t%s\n", r.Repo, r.URL)
+				fmt.Fprintf(c.stdout, "%s\t%s\n", r.Repo, r)
+				if strings.HasPrefix(r.Reason, "gh:") {
+					ghFailed = true
 				}
+			}
+			if err == nil && ghFailed {
+				// The lines above say why; skips (no commits, not pushed) are not failures.
+				err = exitCodeError{exitErr}
 			}
 			return err
 		},

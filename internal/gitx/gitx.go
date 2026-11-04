@@ -394,3 +394,24 @@ func RemoteBranchExists(ctx context.Context, worktree, branch string) (bool, err
 	}
 	return false, err
 }
+
+// Untracked returns the untracked, non-ignored files of the worktree
+// (each file individually, like `git status --untracked-files=all`), as
+// paths relative to the worktree root, in git's order.
+func Untracked(ctx context.Context, worktree string) ([]string, error) {
+	var stdout, stderr bytes.Buffer
+	args := []string{"ls-files", "-z", "--others", "--exclude-standard"}
+	cmd := command(ctx, worktree, args...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, wrap(ctx, args, stderr.String(), err)
+	}
+	var out []string
+	for _, p := range strings.Split(stdout.String(), "\x00") {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
