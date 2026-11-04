@@ -98,6 +98,17 @@ for t in json.load(sys.stdin):
 	fi
 }
 
+# repo_base SLUG REPO → the repo's base_branch from `atl show --json`.
+repo_base() {
+	if [[ $JSON == jq ]]; then
+		atl show "$1" --json | jq -r --arg r "$2" '.repos[] | select(.name == $r) | .base_branch'
+	else
+		atl show "$1" --json | python3 -c 'import json,sys
+for r in json.load(sys.stdin)["repos"]:
+    if r["name"] == sys.argv[1]: print(r["base_branch"])' "$2"
+	fi
+}
+
 # sess_field SLUG FIELD → the field of the task's last session ("" if none).
 sess_field() {
 	if [[ $JSON == jq ]]; then
@@ -163,12 +174,20 @@ done
 
 # Make the canonical api clone stale and off its default branch: origin's main
 # gains a commit the clone has not fetched, and the clone sits on a local-only
-# branch with a local-only commit. Tasks must still branch from origin's main.
+# branch with a local-only commit. Tasks must still branch from origin's main
+# (production patches) or, by default, from origin's integration branch dev,
+# which is one commit ahead of main and also not fetched yet. docs has only
+# main: auto falls back to it.
 git clone -q "$W/origin/api.git" "$W/seed/api-upstream"
 echo "upstream change" >"$W/seed/api-upstream/upstream.txt"
 git -C "$W/seed/api-upstream" add upstream.txt
 git -C "$W/seed/api-upstream" commit -q -m "upstream change"
 git -C "$W/seed/api-upstream" push -q origin HEAD:main
+echo "dev work" >"$W/seed/api-upstream/dev.txt"
+git -C "$W/seed/api-upstream" add dev.txt
+git -C "$W/seed/api-upstream" commit -q -m "dev work"
+git -C "$W/seed/api-upstream" push -q origin HEAD:dev
+ORIGIN_DEV="$(git -C "$W/origin/api.git" rev-parse dev)"
 git -C "$ATL_REPOS/api" checkout -q -b local-work
 echo "local only" >"$ATL_REPOS/api/local.txt"
 git -C "$ATL_REPOS/api" add local.txt
@@ -210,7 +229,10 @@ T="$ATL_TASKS/fix-login"
 out="$(atl new "Fix login" --project shop)" || fail "atl new failed: $out"
 expect_eq "atl new output" "$out" "fix-login	$T"
 [[ "$(git -C "$T/api" rev-parse --abbrev-ref HEAD)" == "atl/fix-login" ]] || fail "api worktree not on atl/fix-login"
-expect_eq "api worktree base (origin main)" "$(git -C "$T/api" rev-parse HEAD)" "$ORIGIN_MAIN"
+expect_eq "api worktree base (origin dev)" "$(git -C "$T/api" rev-parse HEAD)" "$ORIGIN_DEV"
+expect_eq "api base_branch" "$(repo_base fix-login api)" "dev"
+grep -qF 'branched from `origin/dev`' "$T/CLAUDE.md" || fail "CLAUDE.md does not name the base branch:
+$(cat "$T/CLAUDE.md")"
 expect_eq "canonical api branch after new" "$(git -C "$ATL_REPOS/api" rev-parse --abbrev-ref HEAD)" "local-work"
 expect_eq "canonical api HEAD after new" "$(git -C "$ATL_REPOS/api" rev-parse HEAD)" "$CANON_HEAD"
 git -C "$ATL_REPOS/api" worktree list --porcelain | grep -qx "worktree $T/api" || fail "api is not a registered worktree"
@@ -224,9 +246,21 @@ grep -q "hook PreToolUse" "$T/.claude/settings.json" || fail "settings.json lack
 expect_eq "setup port offset" "$(cat "$E2E_OUT/setup-fix-login")" "0"
 expect_eq "task status" "$(task_field fix-login status)" "active"
 
-out="$(atl new "Second task" --project shop)" || fail "atl new (second) failed: $out"
+# docs is rw here (overriding the project's ro): it has no dev/develop on
+# origin, so auto falls back to its default branch.
+out="$(atl new "Second task" --project shop --repo docs:rw)" || fail "atl new (second) failed: $out"
 expect_eq "second port offset" "$(task_field second-task port_offset)" "100"
 expect_eq "second setup port offset" "$(cat "$E2E_OUT/setup-second-task")" "100"
+expect_eq "second api base_branch" "$(repo_base second-task api)" "dev"
+expect_eq "docs base_branch (fallback)" "$(repo_base second-task docs)" "main"
+expect_eq "docs worktree base (origin main)" "$(git -C "$ATL_TASKS/second-task/docs" rev-parse HEAD)" \
+	"$(git -C "$W/origin/docs.git" rev-parse main)"
+
+# A production patch branches from origin's default branch.
+out="$(atl new "Hotfix" --repo api --base production)" || fail "atl new --base production failed: $out"
+expect_eq "hotfix api base_branch" "$(repo_base hotfix api)" "main"
+expect_eq "hotfix worktree base (origin main)" "$(git -C "$ATL_TASKS/hotfix/api" rev-parse HEAD)" "$ORIGIN_MAIN"
+out="$(atl cancel hotfix 2>&1)" || fail "atl cancel hotfix failed: $out"
 
 # ---- session + hooks -------------------------------------------------------
 
@@ -308,7 +342,7 @@ expect_eq "remote atl/fix-login before manual push (atelier never pushes)" "$hea
 git -C "$T/api" push -q origin atl/fix-login
 out="$(atl pr fix-login)" || fail "atl pr failed: $out"
 [[ "$out" == *"https://github.com/example/api/pull/1"* ]] || fail "atl pr output: $out"
-grep -qF "[pr][create][--head][atl/fix-login][--base][main]" "$E2E_GH_LOG" || fail "gh not called as expected: $(cat "$E2E_GH_LOG")"
+grep -qF "[pr][create][--head][atl/fix-login][--base][dev]" "$E2E_GH_LOG" || fail "gh not called as expected: $(cat "$E2E_GH_LOG")"
 grep -qF "cwd=$T/api " "$E2E_GH_LOG" || fail "gh not run in the api worktree: $(cat "$E2E_GH_LOG")"
 expect_eq "status after pr" "$(task_field fix-login status)" "review"
 

@@ -118,7 +118,7 @@ func lockFile(ctx context.Context, path string, wait time.Duration, busy string)
 
 // AddRepo adds repo r (mode rw if empty) to the open task ref. For rw it
 // fetches origin (unless noFetch) and creates a worktree on the task's
-// branch at origin's default branch; ro needs nothing on disk. The repo is
+// branch at the base branch chosen by the task's Base (see resolveBase); ro needs nothing on disk. The repo is
 // then recorded (a failed insert, e.g. because the task was closed
 // meanwhile, undoes the worktree and, if this call created it, the
 // branch), CLAUDE.md is regenerated and the project's setup script runs in
@@ -165,11 +165,8 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 				return nil, fmt.Errorf("repo %s: %w", name, err)
 			}
 		}
-		if tr.BaseBranch, err = gitx.DefaultBranch(ctx, repo); err != nil {
-			return nil, fmt.Errorf("repo %s: %w", name, err)
-		}
-		if tr.BaseCommit, err = gitx.RevParse(ctx, repo, "refs/remotes/origin/"+tr.BaseBranch); err != nil {
-			return nil, fmt.Errorf("repo %s: %w", name, err)
+		if tr.BaseBranch, tr.BaseCommit, err = resolveBase(ctx, name, repo, t.Base); err != nil {
+			return nil, err
 		}
 		if _, err := os.Lstat(wt); err == nil {
 			return nil, fmt.Errorf("repo %s: %s already exists; remove it first", name, wt)

@@ -63,6 +63,7 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | atelier assistant — Part A (transcript_path, notes, show, transcript) | done (reviewed, 1 fix round) |
 | atelier assistant — Part B (assistant session, `atl assistant`, TUI `A`) | done (reviewed, 1 fix round) |
 | done/cancel delete the local atl/<slug> branch when nothing would be lost (no own commits, or all pushed); keep + report otherwise | done (reviewed + safety nits fixed) |
+| Base branch per task: auto (origin/dev → develop → default), production (:default), or explicit; migration v4 (old tasks = :default); TUI Base toggle (space/←/→) | done (reviewed, 1 fix round) |
 | optional: skip-fetch toggle in TUI new-task form / SSH ControlMaster in box (YubiKey touch per fetch) | idea |
 
 - (follow-up) NewTaskOpts.ExactRepos for the picker; runSetup takes a repo filter; validRepoArg shared; store.ErrDuplicate; Backend gained ProjectRepos/AvailableRepos/AddRepo.
@@ -70,3 +71,4 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 - (follow-up) Part A: migration v3 (sessions.transcript_path, task_notes); `atl show/transcript/note/notes`; TUI `m`. Transcript parser collapses injected entries, caps turns at 3000 runes.
 - (follow-up) Branch cleanup: gitx.UniqueCommits (commits not reachable from any other local branch or remote-tracking ref; local refs only). Done/Cancel force-delete when 0, else keep + report.
 - (follow-up) Assistant: never types into a live session (paste buffer + hint instead); `--continue` only if a conversation exists; flock-serialised launch; deny rules for common repo mutators. Known: TUI hint barely visible because attach starts immediately (could chain `display-message` into the attach cmd).
+- (user) Team branches features from dev/develop, production patches from main → task base selection (PLAN §3 NewTask). PRs target each repo's base_branch.

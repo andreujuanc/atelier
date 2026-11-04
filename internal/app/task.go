@@ -30,6 +30,12 @@ type NewTaskOpts struct {
 	Title, Description, Project string
 	Repos                       []RepoArg // override the mode of a project repo, or add one
 	Backlog, NoFetch            bool
+	// Base selects the branch every rw repo starts from: model.BaseAuto
+	// (""; origin/dev, else origin/develop, else origin's default branch),
+	// model.BaseDefault (origin's default branch) or an exact branch name
+	// that must exist on origin in every rw repo. It is stored on the task
+	// and used again for repos added later.
+	Base string
 	// ExactRepos: Repos is the complete repo list; the project's repos are
 	// not merged in (the project is still loaded, for setup and env). Used
 	// by the TUI, where the project only preselects repos in the picker.
@@ -47,11 +53,12 @@ type TaskView struct {
 
 // RepoStatus describes one repo of a task on disk.
 type RepoStatus struct {
-	Name  string
-	Mode  model.Mode
-	Path  string // worktree (rw) or canonical repo (ro)
-	Dirty bool   // rw only
-	Err   string // "missing" if the worktree is gone, or the git error
+	Name       string
+	Mode       model.Mode
+	Path       string // worktree (rw) or canonical repo (ro)
+	BaseBranch string // origin branch the task branch started from (rw)
+	Dirty      bool   // rw only
+	Err        string // "missing" if the worktree is gone, or the git error
 }
 
 // RepoPathFor returns where repo r of task t lives: its worktree (rw) or
@@ -66,7 +73,7 @@ func (a *App) RepoPathFor(t *model.Task, r model.TaskRepo) string {
 func (a *App) repoInfos(t *model.Task) []gen.RepoInfo {
 	out := make([]gen.RepoInfo, 0, len(t.Repos))
 	for _, r := range t.Repos {
-		out = append(out, gen.RepoInfo{Name: r.Name, Mode: r.Mode, Path: a.RepoPathFor(t, r)})
+		out = append(out, gen.RepoInfo{Name: r.Name, Mode: r.Mode, Path: a.RepoPathFor(t, r), BaseBranch: r.BaseBranch})
 	}
 	return out
 }
@@ -158,7 +165,8 @@ func checkRepo(ctx context.Context, name, path string) error {
 }
 
 // NewTask creates a task: validates the inputs, fetches every rw repo and
-// records origin's default branch and its commit, inserts the task row
+// records its base branch (see NewTaskOpts.Base and resolveBase) and that
+// branch's commit on origin, inserts the task row
 // (allocating slug and port offset atomically), creates the task dir with a
 // worktree per rw repo on branch atl/<slug> starting at that commit, and
 // writes CLAUDE.md and .claude/settings.json. Any failure up to this point
@@ -181,6 +189,10 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 			return nil, err
 		}
 	}
+	base, err := NormalizeBase(o.Base)
+	if err != nil {
+		return nil, err
+	}
 	for i := range repos {
 		r := &repos[i]
 		if r.Mode != model.ModeRW {
@@ -193,11 +205,8 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 				return nil, fmt.Errorf("repo %s: %w", r.Name, err)
 			}
 		}
-		if r.BaseBranch, err = gitx.DefaultBranch(ctx, path); err != nil {
-			return nil, fmt.Errorf("repo %s: %w", r.Name, err)
-		}
-		if r.BaseCommit, err = gitx.RevParse(ctx, path, "refs/remotes/origin/"+r.BaseBranch); err != nil {
-			return nil, fmt.Errorf("repo %s: %w", r.Name, err)
+		if r.BaseBranch, r.BaseCommit, err = resolveBase(ctx, r.Name, path, base); err != nil {
+			return nil, err
 		}
 	}
 
@@ -211,6 +220,7 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 		Description: strings.TrimSpace(o.Description),
 		Status:      status,
 		Project:     o.Project,
+		Base:        base,
 		Repos:       repos,
 	}
 	if err := a.Store.CreateTaskAutoPort(ctx, t); err != nil {
@@ -223,6 +233,61 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 		a.warnf("setup for task %s failed (task kept): %v", t.Slug, err)
 	}
 	return t, nil
+}
+
+// NormalizeBase validates a task base choice and returns it trimmed:
+// model.BaseAuto (""), model.BaseDefault (":default") or a branch name.
+func NormalizeBase(base string) (string, error) {
+	base = strings.TrimSpace(base)
+	switch {
+	case base == model.BaseAuto || base == model.BaseDefault:
+		return base, nil
+	case strings.HasPrefix(base, ":"):
+		return "", fmt.Errorf("invalid base %q (want %q, a branch name, or empty for auto)", base, model.BaseDefault)
+	case strings.HasPrefix(base, "-") || strings.ContainsAny(base, " \t\n~^:?*[\\") ||
+		strings.Contains(base, "..") || strings.HasPrefix(base, "refs/") || strings.HasPrefix(base, "origin/"):
+		return "", fmt.Errorf("invalid base branch %q (give the branch name as on origin, e.g. dev)", base)
+	}
+	return base, nil
+}
+
+// BaseLabel describes a task base choice for humans: "auto", "default" or
+// the branch name.
+func BaseLabel(base string) string {
+	switch base {
+	case model.BaseAuto:
+		return "auto"
+	case model.BaseDefault:
+		return "default"
+	}
+	return base
+}
+
+// resolveBase returns the branch rw repo name (canonical clone at path)
+// starts from under the task base choice base, and that branch's commit on
+// origin (refs/remotes/origin/<branch>, as of the last fetch): BaseAuto →
+// gitx.IntegrationBranch, BaseDefault → gitx.DefaultBranch, else the named
+// branch, which must exist on origin.
+func resolveBase(ctx context.Context, name, path, base string) (branch, commit string, err error) {
+	switch base {
+	case model.BaseAuto:
+		branch, err = gitx.IntegrationBranch(ctx, path)
+	case model.BaseDefault:
+		branch, err = gitx.DefaultBranch(ctx, path)
+	default:
+		var ok bool
+		if ok, err = gitx.RefExists(ctx, path, "refs/remotes/origin/"+base); err == nil && !ok {
+			return "", "", fmt.Errorf("repo %s: base branch %q not found on origin (no refs/remotes/origin/%s)", name, base, base)
+		}
+		branch = base
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("repo %s: %w", name, err)
+	}
+	if commit, err = gitx.RevParse(ctx, path, "refs/remotes/origin/"+branch); err != nil {
+		return "", "", fmt.Errorf("repo %s: %w", name, err)
+	}
+	return branch, commit, nil
 }
 
 // populateTaskDir creates the task dir, worktrees and generated files for a
@@ -448,7 +513,7 @@ func (a *App) Get(ctx context.Context, ref string) (*TaskView, error) {
 		v.LatestNote = &notes[0]
 	}
 	for _, r := range t.Repos {
-		rs := RepoStatus{Name: r.Name, Mode: r.Mode, Path: a.RepoPathFor(t, r)}
+		rs := RepoStatus{Name: r.Name, Mode: r.Mode, Path: a.RepoPathFor(t, r), BaseBranch: r.BaseBranch}
 		if r.Mode == model.ModeRW {
 			if _, err := os.Stat(rs.Path); errors.Is(err, os.ErrNotExist) {
 				rs.Err = "missing"

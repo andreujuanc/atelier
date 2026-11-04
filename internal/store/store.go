@@ -80,6 +80,12 @@ CREATE TABLE task_notes (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX task_notes_task ON task_notes(task_id);`,
+	// v4: the task's base branch choice ('' = auto, ':default' = origin's
+	// default branch, else a branch name), used when repos are added later.
+	// Existing tasks keep their old behaviour (origin's default branch); new
+	// tasks get their base from the app ('' = auto).
+	`ALTER TABLE tasks ADD COLUMN base TEXT NOT NULL DEFAULT '';
+UPDATE tasks SET base=':default';`,
 }
 
 // DefaultBusyTimeout is how long Open waits on a locked database.

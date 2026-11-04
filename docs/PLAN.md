@@ -387,7 +387,7 @@ dir = task dir, tag = sessions.id, env = project env + `ATL_TASK=<slug>`, `ATL_S
 NewTask flow: validate title; load project (if given) and merge repos (`--repo` overrides mode of a project repo or adds
 one); ≥1 repo required; every repo must be `gitx.IsRepo(Paths.RepoPath(name))`; slug = `UniqueSlug(Slugify(title))`
 (also must not exist on disk); port = `NextPortOffset`; mkdir task dir; for each rw repo: `gitx.Fetch` (skipped with
-`--no-fetch`), `base_branch = DefaultBranch`, `base_commit = RevParse("refs/remotes/origin/"+base_branch)`,
+`--no-fetch`), `base_branch` from the task's base ("" auto = gitx.IntegrationBranch: origin/dev → develop → default; ":default" = DefaultBranch; else explicit branch), `base_commit = RevParse("refs/remotes/origin/"+base_branch)`,
 `AddWorktree(repo, wt, "atl/<slug>", base_commit)` → on any failure roll back created worktrees + dir; write CLAUDE.md + settings.json; `CreateTask`
 (status active, or backlog with `--backlog`); then (M7) run project setup in each rw worktree — failure is a warning,
 task stays. Worktrees are created even for backlog tasks.

@@ -120,16 +120,29 @@ type Task struct {
 	Project     string // "" allowed
 	Branch      string // "atl/" + Slug
 	PortOffset  int    // 0,100,200...
+	Base        string // base branch choice for rw repos: BaseAuto, BaseDefault or a branch name
 	Repos       []TaskRepo
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
 
+// Task base choices (Task.Base). Any other value is the exact name of a
+// branch that must exist on origin (refs/remotes/origin/<name>) in every rw
+// repo of the task.
+const (
+	// BaseAuto: each rw repo branches from its integration branch
+	// (origin/dev, else origin/develop, else origin's default branch).
+	BaseAuto = ""
+	// BaseDefault: each rw repo branches from origin's default branch
+	// (production patches).
+	BaseDefault = ":default"
+)
+
 // TaskRepo is a repo attached to a task.
 type TaskRepo struct {
 	Name       string // dir name under $ATL_REPOS
 	Mode       Mode
-	BaseBranch string // origin's default branch at task creation, e.g. "main" ("" for ro)
+	BaseBranch string // origin branch the task branch was created from, e.g. "dev" or "main" ("" for ro)
 	BaseCommit string // sha of origin/<BaseBranch> the task branch was created from ("" for ro)
 }
 

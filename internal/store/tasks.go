@@ -11,7 +11,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
-const taskCols = `id, slug, title, description, status, project, branch, port_offset, created_at, updated_at`
+const taskCols = `id, slug, title, description, status, project, branch, port_offset, base, created_at, updated_at`
 
 // statusOrder sorts tasks in model.AllStatuses order.
 var statusOrder = func() string {
@@ -29,7 +29,7 @@ func scanTask(sc scanner) (*model.Task, error) {
 	var status string
 	var created, updated int64
 	if err := sc.Scan(&t.ID, &t.Slug, &t.Title, &t.Description, &status, &t.Project,
-		&t.Branch, &t.PortOffset, &created, &updated); err != nil {
+		&t.Branch, &t.PortOffset, &t.Base, &created, &updated); err != nil {
 		return nil, err
 	}
 	t.Status = model.Status(status)
@@ -121,9 +121,9 @@ func validateTask(t *model.Task) error {
 func insertTask(ctx context.Context, tx *sql.Tx, t *model.Task) error {
 	created, updated := normTime(t.CreatedAt), normTime(t.UpdatedAt)
 	res, err := tx.ExecContext(ctx, `INSERT INTO tasks
-		(slug, title, description, status, project, branch, port_offset, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.Slug, t.Title, t.Description, string(t.Status), t.Project, t.Branch, t.PortOffset,
+		(slug, title, description, status, project, branch, port_offset, base, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.Slug, t.Title, t.Description, string(t.Status), t.Project, t.Branch, t.PortOffset, t.Base,
 		toMS(created), toMS(updated))
 	if err != nil {
 		return fmt.Errorf("store: insert task %q: %w", t.Slug, err)

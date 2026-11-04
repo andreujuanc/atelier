@@ -22,8 +22,9 @@ import (
 func (c *cli) newCmd() *cobra.Command {
 	var o app.NewTaskOpts
 	var repos []string
+	var base string
 	cmd := &cobra.Command{
-		Use:   "new <title...> [--project P] [--repo name:rw|ro ...] [--backlog] [--no-fetch] [-m description]",
+		Use:   "new <title...> [--project P] [--repo name:rw|ro ...] [--base auto|default|production|<branch>] [--backlog] [--no-fetch] [-m description]",
 		Short: "Create a task with worktrees on branch atl/<slug>; prints slug and task dir",
 		Args:  args(cobra.MinimumNArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
@@ -38,6 +39,11 @@ func (c *cli) newCmd() *cobra.Command {
 				}
 				o.Repos = append(o.Repos, ra)
 			}
+			b, err := parseBaseFlag(base)
+			if err != nil {
+				return err
+			}
+			o.Base = b
 			ap, err := c.App()
 			if err != nil {
 				return err
@@ -53,10 +59,33 @@ func (c *cli) newCmd() *cobra.Command {
 	f := cmd.Flags()
 	f.StringVarP(&o.Project, "project", "p", "", "project whose repos to use")
 	f.StringArrayVar(&repos, "repo", nil, "repo as name[:rw|ro] (repeatable; overrides the project's mode)")
+	f.StringVar(&base, "base", "auto", "branch rw repos start from: auto (origin/dev, else develop, else default branch), default|production (origin's default branch), or a branch name on origin (auto, default and production are reserved words, so a branch with one of those names cannot be chosen)")
 	f.BoolVar(&o.Backlog, "backlog", false, "create in backlog instead of active")
 	f.BoolVar(&o.NoFetch, "no-fetch", false, "do not fetch origin before branching")
 	f.StringVarP(&o.Description, "description", "m", "", "task description")
 	return cmd
+}
+
+// parseBaseFlag maps `atl new --base` to a task base choice: "auto" (or
+// empty) → model.BaseAuto, "default"/"production" → model.BaseDefault, any
+// other value is a branch name (e.g. "main"). The words are reserved: a
+// branch literally named auto, default or production cannot be chosen.
+func parseBaseFlag(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	var b string
+	switch s {
+	case "", "auto":
+		b = model.BaseAuto
+	case "default", "production":
+		b = model.BaseDefault
+	default:
+		b = s
+	}
+	b, err := app.NormalizeBase(b)
+	if err != nil {
+		return "", usagef("--base: %v", err)
+	}
+	return b, nil
 }
 
 // parseRepoArg parses name[:rw|ro] (mode defaults to rw); label names the

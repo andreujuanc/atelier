@@ -46,8 +46,8 @@ func TestMigrationV3FromV2(t *testing.T) {
 	}
 	defer s.Close()
 	var v int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 3 {
-		t.Fatalf("user_version = %d (%v), want 3", v, err)
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != len(migrations) {
+		t.Fatalf("user_version = %d (%v), want %d", v, err, len(migrations))
 	}
 	ss, err := s.GetSession(ctx, 5)
 	if err != nil {
@@ -186,5 +186,70 @@ func TestNotes(t *testing.T) {
 	}
 	if left, err := s.ListNotes(ctx, a.ID, 0); err != nil || len(left) != 0 {
 		t.Fatalf("notes after delete = %+v, %v", left, err)
+	}
+}
+
+// TestMigrationV4FromV3 builds a v3 database by hand, with a task in it,
+// and checks that opening it applies v4: the old task gets base "" (auto)
+// and new tasks round-trip their base.
+func TestMigrationV4FromV3(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "atelier.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range migrations[:3] {
+		if _, err := db.Exec(m); err != nil {
+			t.Fatalf("migration %d: %v", i+1, err)
+		}
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO tasks (id, slug, title, status, branch, port_offset, created_at, updated_at)
+		VALUES (1, 'old', 'Old', 'active', 'atl/old', 0, 1000, 1000)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO task_repos (task_id, name, mode, base_branch, base_commit, position)
+		VALUES (1, 'api', 'rw', 'main', 'abc', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var v int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 4 {
+		t.Fatalf("user_version = %d (%v), want 4", v, err)
+	}
+	old, err := s.GetTask(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Base != model.BaseDefault || len(old.Repos) != 1 || old.Repos[0].BaseBranch != "main" {
+		t.Fatalf("migrated task = %+v", old)
+	}
+	nt := &model.Task{Slug: "prod", Title: "Prod", Status: model.StatusActive, Base: model.BaseDefault}
+	if err := s.CreateTaskAutoPort(ctx, nt); err != nil {
+		t.Fatal(err)
+	}
+	nt = &model.Task{Slug: "auto", Title: "Auto", Status: model.StatusActive, Base: model.BaseAuto}
+	if err := s.CreateTaskAutoPort(ctx, nt); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bases := map[string]string{}
+	for _, x := range list {
+		bases[x.Slug] = x.Base
+	}
+	if bases["old"] != ":default" || bases["prod"] != ":default" || bases["auto"] != "" {
+		t.Fatalf("bases = %v", bases)
 	}
 }

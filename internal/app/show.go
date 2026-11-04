@@ -26,10 +26,13 @@ type TaskDetail struct {
 // describes the task worktree; for ro repos the canonical clone (Ahead,
 // Unpushed and Pushed are then always zero).
 type RepoDetail struct {
-	Name  string
-	Mode  model.Mode
-	Path  string // worktree (rw) or canonical repo (ro)
-	Dirty bool
+	Name string
+	Mode model.Mode
+	Path string // worktree (rw) or canonical repo (ro)
+	// BaseBranch is the origin branch the task branch started from (rw;
+	// "" for ro).
+	BaseBranch string
+	Dirty      bool
 	// Ahead is the number of commits on HEAD not in the task's base commit (rw).
 	Ahead int
 	// LastCommit is HEAD's commit; nil if it could not be read.
@@ -78,7 +81,7 @@ func (a *App) Show(ctx context.Context, ref string) (*TaskDetail, error) {
 }
 
 func (a *App) repoDetail(ctx context.Context, t *model.Task, r model.TaskRepo) RepoDetail {
-	rd := RepoDetail{Name: r.Name, Mode: r.Mode, Path: a.RepoPathFor(t, r)}
+	rd := RepoDetail{Name: r.Name, Mode: r.Mode, Path: a.RepoPathFor(t, r), BaseBranch: r.BaseBranch}
 	var errs []string
 	note := func(err error) {
 		if err != nil {

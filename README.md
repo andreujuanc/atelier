@@ -27,6 +27,7 @@ Claude full screen, and press **Ctrl-q** to go back to the TUI (Claude keeps run
 ```sh
 atl new "Fix login" --project shop        # task + worktrees, prints "<slug>\t<dir>"
 atl new "Spike" --repo api:rw --repo docs:ro -m "why" [--backlog] [--no-fetch]
+atl new "Hotfix" --project shop --base default   # branch from origin's default branch (production)
 atl add fix-login web [--no-fetch]  # add a repo to an open task (rw: worktree on atl/<slug>)
 atl add fix-login docs:ro           # ro: listed in CLAUDE.md; running sessions need a new one (s)
 atl repos                 # git repos in $ATL_REPOS, one per line
@@ -36,7 +37,7 @@ atl session fix-login     # start another Claude session (window) in the task
 atl resume fix-login      # after a crash/reboot: relaunch stopped sessions with claude --resume
 atl status fix-login review
 atl diff fix-login        # git diff of each rw repo vs its base commit (paged on a TTY)
-atl pr fix-login          # gh pr create per rw repo with pushed commits; status → review
+atl pr fix-login          # gh pr create (--base = the repo's base branch) per rw repo with pushed commits; status → review
 atl show fix-login [--json]     # task, repos (dirty, commits ahead, last commit, pushed), sessions, notes
 atl transcript fix-login [--session ID] [--tail N]  # last N (20; 0 = all) turns of a Claude session
 atl note fix-login waiting on design review [--author user|assistant]
@@ -54,7 +55,9 @@ selected task, `m` add a note to the selected task (`enter` saves, `esc` cancels
 `/` filter, `q` quit. The details pane shows the task's latest note.
 Repos (in the new-task form and for `a`) are picked from a list of `$ATL_REPOS`: type to
 filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter` confirms, `esc` cancels.
-Choosing a project in the form preselects its repos.
+Choosing a project in the form preselects its repos. The form's Base field toggles
+(`space`, `←`/`→`; `enter` moves on) between "auto (dev → develop → default)" and
+"production patch (default branch)".
 
 `<task>` is a slug, numeric id, or unique slug prefix. atelier never pushes:
 push `atl/<slug>` yourself before `atl pr`.
@@ -97,6 +100,26 @@ by atelier: crash recovery, `done` and `cancel` never touch it.
 
 Every `atl` invocation (except `hook` and `doctor`) first marks sessions whose tmux
 window is gone as `stopped`; the TUI also does so every few seconds.
+
+## Base branch
+
+Each rw repo's `atl/<slug>` branch starts from a base branch on origin (after `git fetch
+origin`, unless `--no-fetch`), chosen per task with `atl new --base`:
+
+- `auto` (default): `origin/dev` if it exists, else `origin/develop`, else origin's default
+  branch (`origin/HEAD`, `main` or `master`). Feature work starts from the integration branch.
+- `default` (or `production`): origin's default branch, for production patches.
+- any other value: that exact branch (e.g. `main`, `release/1.2`), which must exist as
+  `origin/<name>` in every rw repo, else `atl new` fails naming the repo and nothing is created.
+  `auto`, `default` and `production` are reserved words: a branch with one of those names
+  cannot be chosen.
+
+The choice is stored on the task, so `atl add` (and TUI `a`) resolves the same way for repos
+added later (tasks created before this choice existed keep origin's default branch). Each repo records the branch it started from: `atl pr` targets it (`gh pr create
+--base <branch>`), `atl diff` compares against the commit it started from, the task's
+`CLAUDE.md` says "branched from `origin/<branch>`", `atl show` prints `base origin/<branch>`
+per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; repo
+`base_branch`), and the TUI details pane shows `← <branch>` per rw repo.
 
 ## Environment
 

@@ -465,8 +465,8 @@ func TestGetListSetStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []RepoStatus{
-		{Name: "api", Mode: model.ModeRW, Path: e.app.Paths.WorktreePath("view", "api"), Dirty: true},
-		{Name: "web", Mode: model.ModeRW, Path: e.app.Paths.WorktreePath("view", "web"), Err: "missing"},
+		{Name: "api", Mode: model.ModeRW, Path: e.app.Paths.WorktreePath("view", "api"), BaseBranch: "main", Dirty: true},
+		{Name: "web", Mode: model.ModeRW, Path: e.app.Paths.WorktreePath("view", "web"), BaseBranch: "main", Err: "missing"},
 		{Name: "docs", Mode: model.ModeRO, Path: e.canonical("docs")},
 	}
 	if fmt.Sprint(v.RepoStatus) != fmt.Sprint(want) || len(v.Sessions) != 1 {

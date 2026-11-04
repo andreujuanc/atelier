@@ -79,7 +79,7 @@ func (f *fakeBackend) Get(ctx context.Context, ref string) (*app.TaskView, error
 		if t.Task.Slug == ref {
 			v := t
 			for _, r := range t.Task.Repos {
-				rs := app.RepoStatus{Name: r.Name, Mode: r.Mode, Dirty: r.Name == "dirtyrepo"}
+				rs := app.RepoStatus{Name: r.Name, Mode: r.Mode, BaseBranch: r.BaseBranch, Dirty: r.Name == "dirtyrepo"}
 				if r.Name == "gonerepo" {
 					rs.Err = "missing"
 				}
@@ -214,7 +214,7 @@ func tv(id int64, slug string, st model.Status, sessions ...model.Session) app.T
 	return app.TaskView{
 		Task: model.Task{
 			ID: id, Slug: slug, Title: "Title of " + slug, Status: st, Branch: "atl/" + slug,
-			PortOffset: int(id) * 100, Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW}, {Name: "docs", Mode: model.ModeRO}},
+			PortOffset: int(id) * 100, Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "dev"}, {Name: "docs", Mode: model.ModeRO}},
 			UpdatedAt: t0.Add(time.Duration(id) * time.Minute),
 		},
 		Sessions: sessions,
@@ -508,7 +508,7 @@ func TestWaitingMarkerAndHighlight(t *testing.T) {
 		t.Fatalf("waiting session not highlighted: %q", ansi.Strip(line))
 	}
 	// details pane
-	for _, s := range []string{"slug", "atl/gamma", "+300", "/tasks/gamma", "rw  api", "ro  docs"} {
+	for _, s := range []string{"slug", "atl/gamma", "+300", "/tasks/gamma", "rw  api  ← dev", "ro  docs"} {
 		if !strings.Contains(v, s) {
 			t.Errorf("details missing %q:\n%s", s, v)
 		}
@@ -650,8 +650,8 @@ func TestNewTaskForm(t *testing.T) {
 	if m.mode != modeForm || summary(m.form.repos) != "web(ro) api(rw)" {
 		t.Fatalf("after picker: mode %d repos %q", m.mode, summary(m.form.repos))
 	}
-	// confirming moves on to Description: enter does not reopen the picker
-	if m.form.focus != fieldDesc {
+	// confirming moves on to Base: enter does not reopen the picker
+	if m.form.focus != fieldBase {
 		t.Fatalf("focus after confirm: %d", m.form.focus)
 	}
 	key(m, "up")
@@ -662,7 +662,26 @@ func TestNewTaskForm(t *testing.T) {
 	if m.mode != modeForm || summary(m.form.repos) != "web(ro) api(rw)" || m.form.focus != fieldRepos {
 		t.Fatalf("after esc: mode %d repos %q focus %d", m.mode, summary(m.form.repos), m.form.focus)
 	}
-	key(m, "down")
+	key(m, "down") // Base: auto by default, toggled by right/space/left
+	if v := plainView(m); !strings.Contains(v, "(•) auto (dev → develop → default)") || !strings.Contains(v, baseHint) {
+		t.Fatalf("base field:\n%s", v)
+	}
+	key(m, "right")
+	if !m.form.prodBase || !strings.Contains(plainView(m), "(•) production patch (default branch)") {
+		t.Fatalf("right did not toggle:\n%s", plainView(m))
+	}
+	key(m, " ")
+	if m.form.prodBase {
+		t.Fatal("space did not toggle back")
+	}
+	key(m, "left")
+	if !m.form.prodBase || m.form.focus != fieldBase {
+		t.Fatalf("left: prod %v focus %d", m.form.prodBase, m.form.focus)
+	}
+	key(m, "enter") // enter advances to Description without toggling
+	if !m.form.prodBase || m.form.focus != fieldDesc {
+		t.Fatalf("enter: prod %v focus %d", m.form.prodBase, m.form.focus)
+	}
 	typeText(m, "the description")
 	key(m, "ctrl+b")
 	key(m, "enter") // focus backlog
@@ -673,6 +692,7 @@ func TestNewTaskForm(t *testing.T) {
 	}
 	want := app.NewTaskOpts{
 		Title: "Add login", Project: "site", Description: "the description", Backlog: true, ExactRepos: true,
+		Base:  model.BaseDefault,
 		Repos: []app.RepoArg{{Name: "web", Mode: model.ModeRO}, {Name: "api", Mode: model.ModeRW}},
 	}
 	if got := c.args[0].(app.NewTaskOpts); !reflect.DeepEqual(got, want) {
@@ -720,6 +740,7 @@ func TestNewTaskFormProjectSwitch(t *testing.T) {
 	key(m, "down")
 	key(m, "down")
 	key(m, "down")
+	key(m, "down")
 	key(m, "enter")
 	c := fb.last("NewTask")
 	want := app.NewTaskOpts{Title: "T", Repos: []app.RepoArg{{Name: "docs", Mode: model.ModeRW}}}
@@ -741,6 +762,7 @@ func TestNewTaskFormProjectSwitch(t *testing.T) {
 	key(m, "down")
 	key(m, "down")
 	key(m, "down")
+	key(m, "down")
 	key(m, "enter")
 	if c := fb.last("NewTask"); c == nil || c.args[0].(app.NewTaskOpts).Title != "U" {
 		t.Fatalf("NewTask not called: %q", m.form.err)
@@ -752,20 +774,18 @@ func TestNewTaskFormValidation(t *testing.T) {
 		projRepos: map[string][]app.RepoArg{"shop": {{Name: "api", Mode: model.ModeRW}}}}
 	m, _ := newTest(t, fb)
 	key(m, "n")
-	key(m, "down")
-	key(m, "down")
-	key(m, "down")
-	key(m, "down")
+	for i := 0; i < numFields-1; i++ {
+		key(m, "down")
+	}
 	key(m, "enter") // submit with empty title
 	if fb.count("NewTask") != 0 || !strings.Contains(m.form.err, "title") {
 		t.Fatalf("empty title: err %q", m.form.err)
 	}
-	key(m, "up")
-	key(m, "up")
-	key(m, "up")
-	key(m, "up")
+	for i := 0; i < numFields-1; i++ {
+		key(m, "up")
+	}
 	typeText(m, "T")
-	for i := 0; i < 4; i++ {
+	for i := 0; i < numFields-1; i++ {
 		key(m, "down")
 	}
 	key(m, "enter") // no repos, no project
@@ -773,9 +793,9 @@ func TestNewTaskFormValidation(t *testing.T) {
 		t.Fatalf("no repos: calls %v err %q", fb.calls, m.form.err)
 	}
 	// a preselected project whose repos were all deselected
-	key(m, "up")
-	key(m, "up")
-	key(m, "up")
+	for i := fieldBacklog; i > fieldProject; i-- {
+		key(m, "up")
+	}
 	typeText(m, "shop")
 	key(m, "down")
 	key(m, "enter") // picker
