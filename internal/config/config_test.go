@@ -102,3 +102,10 @@ func TestResolveIgnoresRelativeXDG(t *testing.T) {
 		t.Errorf("ConfigDir = %q, want %q", p.ConfigDir, want)
 	}
 }
+
+func TestAssistantDir(t *testing.T) {
+	p := Paths{DB: "/data/atelier/atelier.db"}
+	if got := p.AssistantDir(); got != "/data/atelier/assistant" {
+		t.Fatalf("AssistantDir = %q", got)
+	}
+}

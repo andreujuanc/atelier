@@ -312,6 +312,38 @@ func (c *cli) openCmd() *cobra.Command {
 	}
 }
 
+func (c *cli) assistantCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "assistant [task]",
+		Short: "Open the atelier assistant (one Claude session for managing all tasks); with a task, ask it about that task",
+		Args:  args(cobra.MaximumNArgs(1)),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			ref := ""
+			if len(a) == 1 {
+				if ref = strings.TrimSpace(a[0]); ref == "" {
+					return usagef("empty task")
+				}
+			}
+			ap, err := c.App()
+			if err != nil {
+				return err
+			}
+			attach, hint, err := ap.Assistant(cmd.Context(), ref)
+			if err != nil {
+				return err
+			}
+			if hint != "" {
+				fmt.Fprintln(c.stderr, hint)
+			}
+			attach.Stdin, attach.Stdout, attach.Stderr = os.Stdin, c.stdout, c.stderr
+			if err := attach.Run(); err != nil {
+				return fmt.Errorf("attach: %w", err)
+			}
+			return nil
+		},
+	}
+}
+
 func (c *cli) sessionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "session <task>",

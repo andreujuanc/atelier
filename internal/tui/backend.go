@@ -31,6 +31,11 @@ type Backend interface {
 	AddRepo(ctx context.Context, ref string, r app.RepoArg, noFetch bool) (*model.Task, error)
 	AddNote(ctx context.Context, ref, body, author string) (*model.Note, error)
 	TaskDir(slug string) string
+	// Assistant ensures the atelier assistant runs (told about task slug,
+	// if non-empty) and returns the command that attaches to it and a hint
+	// for the user ("" if none), e.g. how to paste the task sentence into
+	// an assistant that was already running.
+	Assistant(ctx context.Context, slug string) (*exec.Cmd, string, error)
 }
 
 // appBackend adapts *app.App to Backend.

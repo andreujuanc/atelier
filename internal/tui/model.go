@@ -92,6 +92,11 @@ type (
 		cmd  *exec.Cmd
 		err  error
 	}
+	assistantMsg struct {
+		cmd  *exec.Cmd
+		hint string
+		err  error
+	}
 	execDoneMsg struct {
 		op, slug string
 		stderr   *bytes.Buffer
@@ -182,7 +187,9 @@ type Model struct {
 
 	busy     map[int64]string // task id → op in progress
 	creating bool
-	projects []string
+	// assisting: an Assistant call is in flight (A pressed, not yet attached).
+	assisting bool
+	projects  []string
 
 	status    string
 	statusErr bool
@@ -798,12 +805,23 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			return m.reload()
 		}
 		return m.exec("open", msg.slug, msg.cmd)
+	case assistantMsg:
+		m.assisting = false
+		if msg.err != nil {
+			m.setErr(fmt.Errorf("assistant: %w", msg.err))
+			return nil
+		}
+		if msg.hint != "" {
+			m.setStatus(msg.hint)
+		}
+		return m.exec("assistant", "", msg.cmd)
 	case execDoneMsg:
 		if msg.err != nil {
-			text := msg.op + " " + msg.slug + ": " + msg.err.Error()
+			prefix := strings.TrimSpace(msg.op + " " + msg.slug)
+			text := prefix + ": " + msg.err.Error()
 			if msg.stderr != nil {
 				if s := lastLine(msg.stderr.String()); s != "" {
-					text = msg.op + " " + msg.slug + ": " + s
+					text = prefix + ": " + s
 				}
 			}
 			m.setStatusErr(text, true)
@@ -1086,6 +1104,8 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		m.form.setWidth(m.formInputWidth())
 		m.mode = modeForm
 		return tea.Batch(m.projectsCmd(), m.syncProject())
+	case "A":
+		return m.assistant()
 	}
 
 	t := m.selected()
@@ -1181,6 +1201,25 @@ func (m *Model) normalKey(key string) tea.Cmd {
 	return nil
 }
 
+// assistant opens the atelier assistant, pointed at the selected task if
+// there is one.
+func (m *Model) assistant() tea.Cmd {
+	if m.assisting {
+		m.setStatus("busy: opening the assistant…")
+		return nil
+	}
+	slug := ""
+	if t := m.selected(); t != nil {
+		slug = t.Task.Slug
+	}
+	m.assisting = true
+	be, ctx := m.be, m.ctx
+	return func() tea.Msg {
+		c, hint, err := be.Assistant(ctx, slug)
+		return assistantMsg{cmd: c, hint: hint, err: err}
+	}
+}
+
 // prSummary formats PR results for the status line.
 func prSummary(slug string, res []app.PRResult) string {
 	if len(res) == 0 {
@@ -1205,6 +1244,9 @@ func (m *Model) busyOps() []string {
 	}
 	if m.creating {
 		ops = append(ops, "new task")
+	}
+	if m.assisting {
+		ops = append(ops, "assistant")
 	}
 	sort.Strings(ops)
 	return ops

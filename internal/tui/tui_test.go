@@ -35,12 +35,14 @@ type fakeBackend struct {
 	projects []string
 	newTask  *model.Task
 	// repos is AvailableRepos' result; projRepos ProjectRepos' per project.
-	repos     []string
-	projRepos map[string][]app.RepoArg
-	addErr    map[string]error       // AddRepo error per repo name
-	addOut    func(r app.RepoArg)    // called by AddRepo (to write App.Out)
-	notes     map[string]*model.Note // latest note per slug (Get's LatestNote)
-	noteErr   error
+	repos      []string
+	projRepos  map[string][]app.RepoArg
+	addErr     map[string]error       // AddRepo error per repo name
+	addOut     func(r app.RepoArg)    // called by AddRepo (to write App.Out)
+	notes      map[string]*model.Note // latest note per slug (Get's LatestNote)
+	noteErr    error
+	assistErr  error
+	assistHint string
 }
 
 func (f *fakeBackend) rec(name string, args ...any) { f.calls = append(f.calls, call{name, args}) }
@@ -101,6 +103,14 @@ func (f *fakeBackend) NewTask(ctx context.Context, o app.NewTaskOpts) (*model.Ta
 func (f *fakeBackend) Open(ctx context.Context, ref string) (*exec.Cmd, error) {
 	f.rec("Open", ref)
 	return exec.Command("true"), nil
+}
+
+func (f *fakeBackend) Assistant(ctx context.Context, slug string) (*exec.Cmd, string, error) {
+	f.rec("Assistant", slug)
+	if f.assistErr != nil {
+		return nil, "", f.assistErr
+	}
+	return exec.Command("true"), f.assistHint, nil
 }
 
 func (f *fakeBackend) NewSession(ctx context.Context, ref string) (*model.Session, error) {
@@ -1923,4 +1933,61 @@ func selectTask(t *testing.T, m *Model, slug string) {
 		t.Fatalf("cannot select %s (rows %v)", slug, rowSlugs(m))
 	}
 	drain(m, m.detailCmd(sel.Task.ID, slug))
+}
+
+func TestAssistantKey(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+	if !strings.Contains(plainView(m), "A assistant") {
+		t.Fatal("help lacks A")
+	}
+	cmd := press(m, "A")
+	if cmd == nil || !m.assisting {
+		t.Fatalf("A: cmd=%v assisting=%v", cmd, m.assisting)
+	}
+	// a second A while the first is in flight is refused
+	if press(m, "A") != nil || !strings.Contains(m.status, "busy") {
+		t.Fatalf("second A not refused: %q", m.status)
+	}
+	msg := cmd()
+	if c := fb.last("Assistant"); c == nil || c.args[0] != "gamma" || fb.count("Assistant") != 1 {
+		t.Fatalf("Assistant calls: %+v", fb.calls)
+	}
+	_, next := m.Update(msg)
+	if m.assisting || next == nil {
+		t.Fatalf("after assistantMsg: assisting=%v next=%v", m.assisting, next)
+	}
+	if got := fmt.Sprintf("%T", next()); !strings.Contains(got, "execMsg") {
+		t.Fatalf("A did not exec the attach command: %s", got)
+	}
+
+	if strings.Contains(m.status, "paste") {
+		t.Fatalf("hint without one: %q", m.status)
+	}
+
+	// a running assistant's paste hint lands in the status line
+	fbh := &fakeBackend{tasks: sampleTasks(), assistHint: "assistant already running: press Ctrl-b ] to paste"}
+	mh, _ := newTest(t, fbh)
+	selectTask(t, mh, "gamma")
+	hc := press(mh, "A")
+	if _, next := mh.Update(hc()); next == nil || !strings.Contains(mh.status, "Ctrl-b ] to paste") || mh.statusErr {
+		t.Fatalf("hint status %q err=%v next=%v", mh.status, mh.statusErr, next)
+	}
+
+	// no task selected: the assistant opens without a task
+	fb2 := &fakeBackend{}
+	m2, _ := newTest(t, fb2)
+	key(m2, "A")
+	if c := fb2.last("Assistant"); c == nil || c.args[0] != "" {
+		t.Fatalf("Assistant without selection: %+v", fb2.calls)
+	}
+
+	// errors land in the status line
+	fb3 := &fakeBackend{tasks: sampleTasks(), assistErr: errors.New("tmux exploded")}
+	m3, _ := newTest(t, fb3)
+	key(m3, "A")
+	if !strings.Contains(m3.status, "assistant: tmux exploded") || m3.assisting {
+		t.Fatalf("status %q assisting=%v", m3.status, m3.assisting)
+	}
 }

@@ -82,11 +82,18 @@ func (a *App) lockTask(ctx context.Context, id int64) (func(), error) {
 		return nil, fmt.Errorf("create lock dir: %w", err)
 	}
 	path := filepath.Join(dir, fmt.Sprintf("task-%d.lock", id))
+	return lockFile(ctx, path, addRepoLockWait, "another operation is adding a repo to this task")
+}
+
+// lockFile takes an exclusive flock on path (created if missing), waiting
+// up to wait (or until ctx ends); busy describes the holder in the timeout
+// error. The returned func releases it.
+func lockFile(ctx context.Context, path string, wait time.Duration, busy string) (func(), error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, addRepoLockWait)
+	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	for {
 		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
@@ -103,7 +110,7 @@ func (a *App) lockTask(ctx context.Context, id int64) (func(), error) {
 		select {
 		case <-ctx.Done():
 			f.Close()
-			return nil, fmt.Errorf("another operation is adding a repo to this task (lock %s): %w", path, ctx.Err())
+			return nil, fmt.Errorf("%s (lock %s): %w", busy, path, ctx.Err())
 		case <-time.After(25 * time.Millisecond):
 		}
 	}

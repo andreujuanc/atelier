@@ -344,7 +344,7 @@ func (m *Model) helpLine(w int) string {
 	case modeConfirm:
 		s = ""
 	default:
-		s = "n new  enter open  s session  r resume  a add repo  m note  d done  c cancel  p pr  D diff  1-5 status  / filter  q quit"
+		s = "n new  enter open  s session  r resume  a add repo  m note  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  q quit"
 	}
 	return dimStyle.Render(trunc(s, w))
 }

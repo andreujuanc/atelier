@@ -55,7 +55,7 @@ type WindowSpec struct {
 	Dir     string            // start dir
 	Env     map[string]string // passed with -e
 	Argv    []string          // command
-	Tag     string            // stored as window user option @atl_session
+	Tag     string            // stored as window user option @atl_session; "" → untagged
 }
 
 // Error is returned when a tmux invocation fails.
@@ -164,7 +164,8 @@ func (c *Client) HasSession(ctx context.Context, name string) bool {
 
 // NewWindow launches spec.Argv in a new window (creating the session detached
 // if it is missing), tags it with @atl_session=spec.Tag and returns its window
-// id ("@N").
+// id ("@N"). With an empty Tag the window is left untagged (TaggedWindows,
+// KillTaggedWindows and so Recover ignore it).
 //
 // The tag is set by a second tmux command. If the window's command exits
 // immediately the window can be gone by then; the id is returned together
@@ -225,6 +226,9 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	id := strings.TrimSpace(out)
 	if !strings.HasPrefix(id, "@") || strings.ContainsAny(id, " \n") {
 		return "", fmt.Errorf("tmux: launch window in session %s: unexpected output %q", spec.Session, out)
+	}
+	if spec.Tag == "" {
+		return id, nil
 	}
 	if _, err := c.run(ctx, "set-option", "-w", "-t", id, TagOption, spec.Tag); err != nil {
 		if gone(err) {
@@ -308,6 +312,43 @@ func (c *Client) KillTaggedWindows(ctx context.Context, tag, except string) (int
 		n++
 	}
 	return n, errors.Join(errs...)
+}
+
+// WindowAlive reports whether window (matched by exact name) of the named
+// session (exact name) exists and its first pane is alive (not dead). A
+// missing server, session or window is (false, nil).
+func (c *Client) WindowAlive(ctx context.Context, session, window string) (bool, error) {
+	out, err := c.run(ctx, "list-panes", "-t", "="+session+":="+window, "-F", "#{pane_dead}")
+	if err != nil {
+		if noSession(err) || gone(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	first, _, _ := strings.Cut(out, "\n")
+	return strings.TrimSpace(first) == "0", nil
+}
+
+// SetBuffer puts text in a new automatic paste buffer, the one tmux's
+// paste-buffer (prefix ]) pastes by default.
+func (c *Client) SetBuffer(ctx context.Context, text string) error {
+	if _, err := c.run(ctx, "set-buffer", "--", text); err != nil {
+		return fmt.Errorf("tmux: set paste buffer: %w", err)
+	}
+	return nil
+}
+
+// PrefixKey returns the server's prefix key for display, e.g. "Ctrl-b";
+// "Ctrl-b" if it cannot be read.
+func (c *Client) PrefixKey(ctx context.Context) string {
+	k, err := c.run(ctx, "show-options", "-gv", "prefix")
+	if err != nil || k == "" || k == "None" {
+		return "Ctrl-b"
+	}
+	if rest, ok := strings.CutPrefix(k, "C-"); ok {
+		return "Ctrl-" + rest
+	}
+	return k
 }
 
 // KillSession kills the named session. A missing session or server is not an
