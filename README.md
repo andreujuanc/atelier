@@ -8,6 +8,20 @@ tracks session state in SQLite via Claude Code hooks.
 Requires git, tmux ≥ 3.2, `claude`, and `gh` (for `atl pr`). Build with
 `go build -o ~/bin/atl ./cmd/atl`, then run `atl doctor`.
 
+## Docker image
+
+The `Dockerfile` builds an image with `atl`, `claude`, `tmux`, `git` and `gh`, so nothing
+needs to be installed on the host. Build it with your host user, so paths inside the
+container match the host (git worktrees store absolute paths):
+
+```bash
+docker build -t atelier \
+  --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+```
+
+Inside the image tmux stays out of the way: run `atl`, press Enter on a task to open
+Claude full screen, and press **Ctrl-q** to go back to the TUI (Claude keeps running).
+
 ## Usage
 
 ```sh
