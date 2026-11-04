@@ -64,7 +64,7 @@ func TestAssistantClaudeMD(t *testing.T) {
 		"state the exact command",
 		"atl ls [--status", "atl show <task> [--json]", "atl transcript <task> [--session ID] [--tail N]",
 		"atl notes <task>", "atl note <task> <text> --author assistant", "atl repos", "atl new ", "atl add ",
-		"atl status ", "atl session ", "atl resume ", "atl diff ", "atl pr ", "atl done ", "atl cancel ",
+		"atl status ", "atl rename <task> <new title...>", "atl session ", "atl resume ", "atl diff ", "atl pr ", "atl done ", "atl cancel ",
 		"atl show X --json", "atl notes X", "atl transcript X --tail 30",
 		"git log", "goal, what was done, what is pending, blockers, suggested next step",
 		"run `atl ls` and ask",
@@ -77,6 +77,19 @@ func TestAssistantClaudeMD(t *testing.T) {
 		if !strings.Contains(md, want) {
 			t.Errorf("CLAUDE.md lacks %q", want)
 		}
+	}
+	// rename is a state-changing command: in the confirm rule and listed
+	// under "Changes state", not under the read-only commands.
+	if !strings.Contains(md, "`status`, `rename`, `session`") {
+		t.Error("confirm rule lacks rename")
+	}
+	ro, changes, ok := strings.Cut(md, "Changes state (ALWAYS confirm first):")
+	if !ok || strings.Contains(ro[strings.Index(ro, "Read-only (run freely):"):], "atl rename") ||
+		!strings.Contains(changes, "- `atl rename <task> <new title...>` — change the task's title only") {
+		t.Error("atl rename not listed (only) under the state-changing commands")
+	}
+	if !strings.Contains(md, "slug, branch `atl/<slug>`, tmux") {
+		t.Error("rename entry does not say the slug and branch stay")
 	}
 	// always regenerated
 	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("tampered"), 0o644); err != nil {
@@ -119,9 +132,17 @@ func TestAssistantSettings(t *testing.T) {
 			t.Errorf("allow lacks %s", want)
 		}
 	}
-	for _, want := range []string{"Bash(atl done *)", "Bash(atl note *)", "Bash(atl new *)", "Bash(atl open *)"} {
+	for _, want := range []string{"Bash(atl done *)", "Bash(atl note *)", "Bash(atl new *)", "Bash(atl open *)", "Bash(atl rename *)", "Bash(atl status *)"} {
 		if !contains(strList(t, perms["ask"]), want) {
 			t.Errorf("ask lacks %s", want)
+		}
+	}
+	// state-changing commands are never auto-allowed
+	for _, r := range strList(t, perms["allow"]) {
+		for _, cmd := range []string{"rename", "note ", "status"} {
+			if strings.Contains(r, "atl "+cmd) {
+				t.Errorf("allow has state-changing rule %s", r)
+			}
 		}
 	}
 	hooks := m["hooks"].(map[string]any)
@@ -152,7 +173,7 @@ func TestAssistantSettingsMerge(t *testing.T) {
   "model": "opus",
   "permissions": {
     "defaultMode": "bypassPermissions",
-    "allow": ["Bash(git log:*)", "Read", "Bash(atl note:*)", "Bash(atl ls:*)", "Bash(rm *)"],
+    "allow": ["Bash(git log:*)", "Read", "Bash(atl note:*)", "Bash(atl ls:*)", "Bash(rm *)", "Bash(atl rename *)", "Bash(atl rename:*)"],
     "ask": ["Bash(rm:*)", "Bash(atl pr:*)", "Bash(atl pr *)"],
     "deny": ["Bash(atl done:*)", "Bash(atl done *)", "Bash(git push *)", "Bash(curl *)"]
   },

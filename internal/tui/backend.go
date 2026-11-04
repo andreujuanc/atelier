@@ -40,6 +40,8 @@ type Backend interface {
 	AvailableRepos(ctx context.Context) ([]string, error)
 	AddRepo(ctx context.Context, ref string, r app.RepoArg, noFetch bool) (*model.Task, error)
 	AddNote(ctx context.Context, ref, body, author string) (*model.Note, error)
+	// Rename changes the task's title only (slug, branch and dirs stay).
+	Rename(ctx context.Context, ref, title string) (*model.Task, error)
 	TaskDir(slug string) string
 	// Assistant ensures the atelier assistant runs (told about task slug,
 	// if non-empty) and returns the command that attaches to it and a hint

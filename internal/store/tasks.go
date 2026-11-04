@@ -321,6 +321,24 @@ func (s *Store) SetTaskStatus(ctx context.Context, id int64, st model.Status) er
 	return checkAffected(res, "task", id)
 }
 
+// UpdateTaskTitle sets a task's title and bumps updated_at; nothing else
+// changes (slug, branch and dirs keep the original name). The title must
+// already be in its stored form: model.NormalizeTitle must return it
+// unchanged.
+func (s *Store) UpdateTaskTitle(ctx context.Context, id int64, title string) error {
+	if t, err := model.NormalizeTitle(title); err != nil {
+		return fmt.Errorf("store: %w", err)
+	} else if t != title {
+		return fmt.Errorf("store: title %q is not normalized", title)
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?`,
+		title, toMS(now()), id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res, "task", id)
+}
+
 // TouchTask sets a task's updated_at to now.
 func (s *Store) TouchTask(ctx context.Context, id int64) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET updated_at = ? WHERE id = ?`, toMS(now()), id)

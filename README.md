@@ -38,6 +38,7 @@ atl open fix-login --new  # start a new Claude session and attach to it
 atl session fix-login     # start another Claude session (window) in the task
 atl resume fix-login      # after a crash/reboot: relaunch stopped sessions with claude --resume
 atl status fix-login review
+atl rename fix-login Fix the login page   # title only: slug, branch atl/<slug>, tmux session and dirs keep the old name
 atl diff fix-login        # git diff of each rw repo vs its base commit (paged on a TTY)
 atl pr fix-login          # gh pr create (--base = the repo's base branch) per rw repo with pushed commits; status → review
 atl show fix-login [--json]     # task, repos (dirty, commits ahead, last commit, pushed), sessions, notes
@@ -52,9 +53,12 @@ atl                       # TUI (on a terminal)
 ```
 
 TUI keys: `n` new task, `enter` open (see below), `s` new session, `r` resume, `a` add repos to the
-selected task, `m` add a note to the selected task (`enter` saves, `esc` cancels), `d` done,
+selected task, `m` add a note to the selected task (`enter` saves, `esc` cancels), `t` rename
+the selected task (an input prefilled with its title; `enter` saves, `esc` cancels), `d` done,
 `c` cancel, `p` pr, `D` diff, `A` assistant (about the selected task), `1`-`5` status,
-`/` filter, `q` quit. The details pane shows the task's latest note.
+`/` filter (matches the slug or the title), `q` quit. The task list shows each task's title
+(with its session-state dot and `*` for uncommitted changes), truncated to the pane; the slug
+is in the details pane, which also shows the task's latest note.
 Repos (in the new-task form and for `a`) are picked from a list of `$ATL_REPOS`: type to
 filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter` confirms, `esc` cancels.
 Choosing a project in the form preselects its repos. The form's Base field toggles
@@ -83,6 +87,11 @@ new one. `atl open --session` and `--new` are mutually exclusive; `--session` at
 a session with a live window like the picker, and refuses another task's session, past
 sessions it would not offer (no Claude id, transcript gone or recorded for another
 directory, or no transcript and not launched by atl), and resuming in a closed task.
+
+`atl rename` (TUI `t`) changes only the title, on a task of any status: the title is trimmed,
+space runs are collapsed, and an empty title or one with control characters is rejected. The
+slug never changes, so keep using it (or the id) to refer to the task. An open task's
+generated `CLAUDE.md` is rewritten with the new title.
 
 `<task>` is a slug, numeric id, or unique slug prefix. atelier never pushes:
 push `atl/<slug>` yourself before `atl pr`.

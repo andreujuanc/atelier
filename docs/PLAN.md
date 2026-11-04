@@ -84,6 +84,7 @@ type Session struct {
 }
 
 func Slugify(title string) string // lowercase, non-alnum runs → "-", trim "-", cut to 40, "" → "task"
+func NormalizeTitle(s string) (string, error) // rename: invalid UTF-8 / any control char (\t, \n incl.) → error; trim + collapse space runs; "" → ErrTitleEmpty
 ```
 
 ### SQLite schema (`internal/store`, migration v1; versioning via `PRAGMA user_version`)
@@ -167,6 +168,7 @@ func (s *Store) CreateTaskAutoPort(ctx, t *model.Task) error   // one tx: unique
 func (s *Store) DeleteTask(ctx, id int64) error
 func (s *Store) AddTaskRepo(ctx, taskID int64, r model.TaskRepo) error // position = max+1; ErrDuplicate; ErrTaskClosed if task closed
 func (s *Store) SetTaskStatus(ctx, id int64, st model.Status) error // bumps updated_at
+func (s *Store) UpdateTaskTitle(ctx, id int64, title string) error  // title only (must be NormalizeTitle's output); bumps updated_at
 func (s *Store) UniqueSlug(ctx, base string) (string, error)   // base, base-2, base-3 ...
 func (s *Store) NextPortOffset(ctx) (int, error)               // lowest multiple of 100 not used by an Open() task
 // sessions
@@ -380,6 +382,7 @@ func (a *App) NewTask(ctx, o NewTaskOpts) (*model.Task, error)
 func (a *App) List(ctx, statuses ...model.Status) ([]TaskView, error) // RepoStatus filled (dirty check) only by Get
 func (a *App) Get(ctx, ref string) (*TaskView, error)
 func (a *App) SetStatus(ctx, ref string, st model.Status) error  // plain status change, no side effects
+func (a *App) Rename(ctx, ref, title string) (*model.Task, error) // any status; NormalizeTitle + UpdateTaskTitle; slug/branch/tmux/dirs never change; open task: rewrites CLAUDE.md if present (under lockTask; failure = warning)
 func (a *App) Done(ctx, ref string, force bool) (*model.Task, error)
 func (a *App) Cancel(ctx, ref string, force bool) (*model.Task, error)
 func (a *App) RepoPathFor(t *model.Task, repo model.TaskRepo) string // worktree (rw) or canonical (ro)
@@ -438,6 +441,7 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 | `atl session <task>` | new Claude session (does not attach; prints window) |
 | `atl resume <task>` | `App.Resume`; prints count |
 | `atl status <task> <status>` | `App.SetStatus` |
+| `atl rename <task> <new title...>` | `App.Rename` (words joined with spaces, like `atl note`); prints the new title. Empty/whitespace-only or control characters → usage error (exit 2) |
 | `atl diff <task>` | `App.Diff` through pager |
 | `atl pr <task>` | prints one line per repo (URL or skipped reason) |
 | `atl done <task> [--force]` / `atl cancel <task> [--force]` | |
@@ -456,13 +460,17 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 ## 5. TUI (`internal/tui`)
 
 - Left pane: tasks grouped under status headers (backlog, active, review, done, cancelled; done/cancelled collapsed
-  to last 10). Task row shows a `●` marker if any session is waiting.
+  to last 10). Task row = session-state dot (waiting > running > idle > stopped), the task TITLE only (the slug is in
+  the right pane; blank title → slug), truncated to the pane width, then `*` if an open task has uncommitted changes
+  (kept when the title is truncated).
 - Right pane: title, slug, project, branch, port offset, task dir; repos (`rw`/`ro`, dirty `*`); sessions
   (`claude-<id>  <state>  <age since last_event_at>`), waiting rendered highlighted (bold + accent colour).
 - Repo picker (new-task form and `a`): list of `App.AvailableRepos`, type to filter, space cycles none→rw→ro, enter confirms, esc clears filter then cancels; project repos preselected.
 - Keys: `n` new (form: title, project, repos via picker, description, backlog toggle), `enter` open (`App.OpenOrChoose`;
   attach cmd → tea.ExecProcess; choices → session picker), `s` new session, `r` resume, `d` done / `c` cancel (y/N confirm; if refused because dirty, offer `F`
   force), `p` pr, `D` diff (ExecProcess `$PAGER`), `1-5` set status (`AllStatuses` order, plain SetStatus), `a` add repos to the selected task (picker),
+  `m` note, `t` rename (single-line input prefilled with the title, like `m`: enter → `App.Rename` (async, task busy),
+  esc cancels; empty → error shown, input stays open; unchanged → nothing saved),
   `/` filter (substring on slug/title), `j/k`/arrows move, `q`/ctrl-c quit.
 - Session picker (`enter` on a task with openable sessions: live, or resumable as `App.OpenChoices` defines; closed tasks offer
   no past sessions): row 0 "New session" (`App.OpenNew`), then `App.OpenChoices` order; row =
@@ -507,7 +515,7 @@ Part B — the assistant:
   reference, how to answer status questions: `atl show --json`, `atl transcript`, notes, read-only git in worktrees; always
   confirm before mutating; suggest saving a note after status discussions) and `.claude/settings.json`:
   `permissions.defaultMode = "default"`, allow read-only `atl ls/show/transcript/notes/repos`, ask for
-  mutating atl commands (rules in `Bash(atl x *)` form); PreToolUse hook `atl hook AssistantGuard` blocks Edit/Write/MultiEdit/NotebookEdit outside the
+  mutating atl commands (rules in `Bash(atl x *)` form; incl. `note`, `status`, `rename` — never in allow); PreToolUse hook `atl hook AssistantGuard` blocks Edit/Write/MultiEdit/NotebookEdit outside the
   assistant dir. No state-tracking hooks (the assistant is not a task session; untagged window → ignored by Recover).
 - tmux session `atl_assistant` (underscore cannot collide with task slugs), window `assistant`, untagged (Recover ignores it).
   Launch `claude --continue [prompt]` only if a previous conversation exists for the assistant dir
