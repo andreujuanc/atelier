@@ -1,4 +1,4 @@
-# atelier box: atl + claude + tmux + git + gh + docker CLI/compose + mise in one image.
+# atelier box: atl + claude + tmux + git + gh + docker CLI/compose in one image.
 #
 # Build with your host user so paths inside the container match the host
 # (git worktrees store absolute paths):
@@ -50,12 +50,8 @@ COPY --from=build /out/atl /usr/local/bin/atl
 
 USER $USERNAME
 RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && curl -fsSL https://mise.run | sh \
-    && mkdir -p "$HOME/.local/share/atelier" "$HOME/.local/state/atelier" "$HOME/.local/share/mise"
-# mise installs per-repo runtimes (go, node, bun, ...) on demand; its shims make them visible
-# to non-interactive shells too (Claude's Bash tool). Mount ~/.local/share/mise to keep installs.
-ENV PATH=/home/$USERNAME/.local/share/mise/shims:/home/$USERNAME/.local/bin:$PATH \
-    CLAUDE_CONFIG_DIR=/home/$USERNAME/.claude \
-    MISE_YES=1
+    && mkdir -p "$HOME/.local/share/atelier" "$HOME/.local/state/atelier"
+ENV PATH=/home/$USERNAME/.local/bin:$PATH \
+    CLAUDE_CONFIG_DIR=/home/$USERNAME/.claude
 WORKDIR /home/$USERNAME
 CMD ["tmux", "new", "-A", "-s", "main"]
