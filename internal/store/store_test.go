@@ -574,3 +574,100 @@ func TestConcurrentStores(t *testing.T) {
 		t.Errorf("got %d tasks, want %d", len(all), writers*perWriter)
 	}
 }
+
+func TestSessionTransitions(t *testing.T) {
+	s, _ := openTest(t)
+	ctx := context.Background()
+	task := mkTask(t, s, "t", model.StatusActive, 0)
+	mk := func(st model.SessionState) *model.Session {
+		ss := &model.Session{TaskID: task.ID, ClaudeSessionID: "cid", TmuxTarget: "@7", Name: "n", State: st}
+		if err := s.CreateSession(ctx, ss); err != nil {
+			t.Fatal(err)
+		}
+		return ss
+	}
+	at := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+	get := func(id int64) *model.Session {
+		g, err := s.GetSession(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+
+	// MarkStoppedIfLive: only live states change.
+	for _, st := range model.AllSessionStates {
+		ss := mk(st)
+		ok, err := s.MarkStoppedIfLive(ctx, ss.ID, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok != st.Live() {
+			t.Errorf("MarkStoppedIfLive(%s) = %v", st, ok)
+		}
+		g := get(ss.ID)
+		if st.Live() {
+			if g.State != model.StateStopped || !g.LastEventAt.Equal(at) || g.TmuxTarget != "@7" || g.ClaudeSessionID != "cid" {
+				t.Errorf("after MarkStoppedIfLive(%s): %+v", st, g)
+			}
+		} else if g.State != st || g.LastEventAt.Equal(at) {
+			t.Errorf("MarkStoppedIfLive touched %s session: %+v", st, g)
+		}
+	}
+	if ok, err := s.MarkStoppedIfLive(ctx, 9999, at); ok || err != nil {
+		t.Errorf("MarkStoppedIfLive(9999) = %v, %v", ok, err)
+	}
+	// A live row without a tmux target (hook-created, or mid-launch) is left alone.
+	untargeted := &model.Session{TaskID: task.ID, State: model.StateRunning}
+	if err := s.CreateSession(ctx, untargeted); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.MarkStoppedIfLive(ctx, untargeted.ID, at); ok || err != nil {
+		t.Errorf("MarkStoppedIfLive(no target) = %v, %v", ok, err)
+	}
+	if g := get(untargeted.ID); g.State != model.StateRunning {
+		t.Errorf("MarkStoppedIfLive(no target) changed state to %s", g.State)
+	}
+
+	// ClaimStopped: only stopped sessions, and only once.
+	for _, st := range model.AllSessionStates {
+		ss := mk(st)
+		ok, err := s.ClaimStopped(ctx, ss.ID, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := st == model.StateStopped; ok != want {
+			t.Errorf("ClaimStopped(%s) = %v", st, ok)
+		}
+		g := get(ss.ID)
+		if st == model.StateStopped {
+			if g.State != model.StateIdle || g.TmuxTarget != "" || !g.LastEventAt.Equal(at) || g.ClaudeSessionID != "cid" || g.Name != "n" {
+				t.Errorf("after ClaimStopped: %+v", g)
+			}
+			if ok, err := s.ClaimStopped(ctx, ss.ID, at); ok || err != nil {
+				t.Errorf("second ClaimStopped = %v, %v", ok, err)
+			}
+		} else if g.State != st || g.TmuxTarget != "@7" {
+			t.Errorf("ClaimStopped touched %s session: %+v", st, g)
+		}
+	}
+	if ok, err := s.ClaimStopped(ctx, 9999, at); ok || err != nil {
+		t.Errorf("ClaimStopped(9999) = %v, %v", ok, err)
+	}
+
+	// SetSessionLaunch: only target and name.
+	ss := mk(model.StateRunning)
+	before := get(ss.ID)
+	if err := s.SetSessionLaunch(ctx, ss.ID, "@42", "claude-x"); err != nil {
+		t.Fatal(err)
+	}
+	g := get(ss.ID)
+	want := *before
+	want.TmuxTarget, want.Name = "@42", "claude-x"
+	if *g != want {
+		t.Errorf("after SetSessionLaunch: %+v, want %+v", g, want)
+	}
+	if err := s.SetSessionLaunch(ctx, 9999, "@1", "x"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("SetSessionLaunch(9999) err = %v", err)
+	}
+}

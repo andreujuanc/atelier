@@ -173,6 +173,9 @@ func (s *Store) ListSessions(ctx, taskID int64) ([]model.Session, error)      //
 func (s *Store) ListSessionsByState(ctx, states ...model.SessionState) ([]model.Session, error)
 func (s *Store) UpdateSession(ctx, sess *model.Session) error  // writes all mutable fields
 func (s *Store) SetSessionState(ctx, id int64, st model.SessionState, at time.Time) error
+func (s *Store) MarkStoppedIfLive(ctx, id int64, at time.Time) (bool, error) // only if live AND tmux_target != '' (Recover)
+func (s *Store) ClaimStopped(ctx, id int64, at time.Time) (bool, error)      // stopped → idle, clears tmux_target (Resume claim)
+func (s *Store) SetSessionLaunch(ctx, id int64, tmuxTarget, name string) error // only those two columns
 func (s *Store) TouchTask(ctx, id int64) error                 // updated_at = now
 ```
 
@@ -385,6 +388,8 @@ PR: atelier never pushes. For each rw repo: no commits (`CommitsAhead(base_commi
 `!RemoteBranchExists("atl/<slug>")` → Skipped with reason `push atl/<slug> first` (printed); otherwise in the worktree
 `gh pr create --head atl/<slug> --base <base_branch> --title <title> --body <description + "Created by atelier">`;
 capture URL from stdout. If ≥1 PR created → status review.
+
+Recover only considers rows with a non-empty tmux_target (rows created by hooks for claude processes atl didn't launch are never stopped). Writes from Recover/launch/hooks use targeted or conditional updates, never read-modify-write of a whole row. atelier assumes one tmux server (`ATL_TMUX_SOCKET` for non-default sockets).
 
 Recover runs at the start of every `atl` invocation except `hook`, and every 5s inside the TUI.
 

@@ -145,3 +145,47 @@ func (s *Store) SetSessionState(ctx context.Context, id int64, st model.SessionS
 	}
 	return checkAffected(res, "session", id)
 }
+
+// MarkStoppedIfLive sets the session to stopped (last_event_at = at, now if
+// zero) only if it is currently live (running, waiting or idle), so it never
+// overwrites a concurrent transition to ended. Rows with an empty tmux_target
+// (hook-created rows for Claude processes atl did not launch, and sessions
+// whose window is being launched — see ClaimStopped) are never changed, so a
+// Recover working from a stale snapshot cannot stop a session mid-launch. It
+// reports whether the row changed; an unknown id is not an error.
+func (s *Store) MarkStoppedIfLive(ctx context.Context, id int64, at time.Time) (bool, error) {
+	return s.changed(ctx, `UPDATE sessions SET state = 'stopped', last_event_at = ?
+		WHERE id = ? AND state IN ('running', 'waiting', 'idle') AND tmux_target != ''`, toMS(normTime(at)), id)
+}
+
+// ClaimStopped atomically moves a stopped session to idle (last_event_at =
+// at, now if zero) and clears its tmux_target, reporting whether this caller
+// won the claim. Only the winner may launch a window for the session. The
+// target is cleared because the old window is gone and a live row with an
+// empty target is one Recover leaves alone while its window is launched; the
+// launcher records the new window with SetSessionLaunch.
+func (s *Store) ClaimStopped(ctx context.Context, id int64, at time.Time) (bool, error) {
+	return s.changed(ctx, `UPDATE sessions SET state = 'idle', tmux_target = '', last_event_at = ?
+		WHERE id = ? AND state = 'stopped'`, toMS(normTime(at)), id)
+}
+
+// SetSessionLaunch records the tmux window and name of a launched session,
+// leaving every other column (state, claude_session_id, ...) untouched.
+func (s *Store) SetSessionLaunch(ctx context.Context, id int64, tmuxTarget, name string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET tmux_target = ?, name = ? WHERE id = ?`,
+		tmuxTarget, name, id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res, "session", id)
+}
+
+// changed runs a conditional UPDATE and reports whether it changed a row.
+func (s *Store) changed(ctx context.Context, query string, args ...any) (bool, error) {
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}

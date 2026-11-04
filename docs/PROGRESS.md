@@ -9,8 +9,8 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | Phase 0 — PLAN.md | done, approved 2026-11-04 with 5 changes (applied) |
 | M1 models + store + migrations | done (reviewed, 1 fix round) |
 | M2 git worktree management | done (reviewed, 1 fix round) |
-| M3 tmux + session launch/resume/attach | in progress |
-| M4 hook, state machine, ro guard, CLAUDE.md/settings.json | todo |
+| M3 tmux + session launch/resume/attach | done (reviewed, 1 fix round) |
+| M4 hook, state machine, ro guard, CLAUDE.md/settings.json | in progress |
 | M5 CLI | todo |
 | M6 TUI | todo |
 | M7 projects, scripts, ports, diff, pr | todo |
@@ -35,3 +35,5 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 - (M2) gitx: exported *gitx.Error (Args, Stderr, ExitCode, Err; Unwrap → ctx errors). GIT_OPTIONAL_LOCKS=0 everywhere; repo-local GIT_* env stripped. Diff returns nil on SIGPIPE/EPIPE.
 - (M2→M5) NewTask must RevParse("refs/remotes/origin/"+base_branch) (PLAN updated). IsRepo false on git "dubious ownership" — app should surface rev-parse stderr in its error.
 - (M3) Recover implemented in M3 (Resume needs it); M8 keeps startup wiring + e2e.
+- (M3) needs tmux ≥ 3.2. Liveness = tagged window with ≥1 non-dead pane. Store gained MarkStoppedIfLive / ClaimStopped / SetSessionLaunch.
+- (M3, known) tiny residual race Recover-vs-Resume; remain-on-exit dead windows are not killed on resume (M8 could kill dead tagged windows).
