@@ -368,7 +368,7 @@ dir = task dir, tag = sessions.id, env = project env + `ATL_TASK=<slug>`, `ATL_S
 NewTask flow: validate title; load project (if given) and merge repos (`--repo` overrides mode of a project repo or adds
 one); ≥1 repo required; every repo must be `gitx.IsRepo(Paths.RepoPath(name))`; slug = `UniqueSlug(Slugify(title))`
 (also must not exist on disk); port = `NextPortOffset`; mkdir task dir; for each rw repo: `gitx.Fetch` (skipped with
-`--no-fetch`), `base_branch = DefaultBranch`, `base_commit = RevParse("origin/"+base_branch)`,
+`--no-fetch`), `base_branch = DefaultBranch`, `base_commit = RevParse("refs/remotes/origin/"+base_branch)`,
 `AddWorktree(repo, wt, "atl/<slug>", base_commit)` → on any failure roll back created worktrees + dir; write CLAUDE.md + settings.json; `CreateTask`
 (status active, or backlog with `--backlog`); then (M7) run project setup in each rw worktree — failure is a warning,
 task stays. Worktrees are created even for backlog tasks.
@@ -436,9 +436,9 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 |---|---|---|
 | M1 | `go.mod`, `cmd/atl/main.go` (stub), `internal/model`, `internal/config`, `internal/store`, `.gitignore` | |
 | M2 | `internal/gitx` | tests build temp repos |
-| M3 | `internal/tmux`, `internal/app/app.go`, `internal/app/session.go` | Resume calls `a.Recover` → add a minimal stub in `recover.go` M8 replaces |
+| M3 | `internal/tmux`, `internal/app/app.go`, `internal/app/session.go`, `internal/app/recover.go` | Recover implemented here (Resume needs it) |
 | M4 | `internal/hook`, `internal/gen` | |
 | M5 | `internal/cli`, `internal/project/project.go` (Load/List), `internal/app/task.go`, `internal/app/doctor.go`, `cmd/atl/main.go` | |
 | M6 | `internal/tui` | |
 | M7 | `internal/project/scripts.go`, `internal/app/diff.go`, `internal/app/pr.go`, edits to `task.go`/`session.go` for scripts + env | |
-| M8 | `internal/app/recover.go`, startup wiring in cli, `test/e2e.sh`, `test/stubs/*` | |
+| M8 | recovery startup wiring in cli/tui, `test/e2e.sh`, `test/stubs/*` | |

@@ -8,8 +8,8 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 |---|---|
 | Phase 0 — PLAN.md | done, approved 2026-11-04 with 5 changes (applied) |
 | M1 models + store + migrations | done (reviewed, 1 fix round) |
-| M2 git worktree management | in progress |
-| M3 tmux + session launch/resume/attach | todo |
+| M2 git worktree management | done (reviewed, 1 fix round) |
+| M3 tmux + session launch/resume/attach | in progress |
 | M4 hook, state machine, ro guard, CLAUDE.md/settings.json | todo |
 | M5 CLI | todo |
 | M6 TUI | todo |
@@ -32,3 +32,6 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 - (M1) modernc.org/sqlite pinned v1.46.1 (last version supporting go 1.24). DSN `_pragma=` + `_txlock=immediate`.
 - (M1) Extra API: AllSessionStates, ParseSessionState, Valid() on enums. UniqueSlug keeps ≤40 chars. Relative XDG_* ignored.
 - (M1, open) NextPortOffset is not race-safe across concurrent `atl new`; M5 should allocate offset + insert in one store tx (e.g. retry, or CreateTask assigning offset).
+- (M2) gitx: exported *gitx.Error (Args, Stderr, ExitCode, Err; Unwrap → ctx errors). GIT_OPTIONAL_LOCKS=0 everywhere; repo-local GIT_* env stripped. Diff returns nil on SIGPIPE/EPIPE.
+- (M2→M5) NewTask must RevParse("refs/remotes/origin/"+base_branch) (PLAN updated). IsRepo false on git "dubious ownership" — app should surface rev-parse stderr in its error.
+- (M3) Recover implemented in M3 (Resume needs it); M8 keeps startup wiring + e2e.
