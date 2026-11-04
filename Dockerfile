@@ -38,6 +38,7 @@ COPY --from=build /out/atl /usr/local/bin/atl
 USER $USERNAME
 RUN curl -fsSL https://claude.ai/install.sh | bash \
     && mkdir -p "$HOME/.local/share/atelier" "$HOME/.local/state/atelier"
-ENV PATH=/home/$USERNAME/.local/bin:$PATH
+ENV PATH=/home/$USERNAME/.local/bin:$PATH \
+    CLAUDE_CONFIG_DIR=/home/$USERNAME/.claude
 WORKDIR /home/$USERNAME
 CMD ["tmux", "new", "-A", "-s", "main"]
