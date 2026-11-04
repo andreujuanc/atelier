@@ -167,12 +167,3 @@ const (
 
 // ValidAuthor reports whether a is a known note author.
 func ValidAuthor(a string) bool { return a == AuthorUser || a == AuthorAssistant }
-
-// Note is a free-form note on a task (status summaries, decisions, ...).
-type Note struct {
-	ID        int64
-	TaskID    int64
-	Body      string
-	Author    string // AuthorUser or AuthorAssistant
-	CreatedAt time.Time
-}

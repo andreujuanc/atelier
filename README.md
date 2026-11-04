@@ -42,9 +42,11 @@ atl rename fix-login Fix the login page   # title only: slug, branch atl/<slug>,
 atl diff fix-login        # git diff of each rw repo vs its base commit (paged on a TTY)
 atl pr fix-login          # gh pr create (--base = the repo's base branch) per rw repo with pushed commits; status → review
 atl show fix-login [--json]     # task, repos (dirty, commits ahead, last commit, pushed), sessions, notes
+atl show fix-login --notes      # only the notes text (same as atl notes; read-only spelling)
 atl transcript fix-login [--session ID] [--tail N]  # last N (20; 0 = all) turns of a Claude session
-atl note fix-login waiting on design review [--author user|assistant]
-atl notes fix-login       # notes, newest first
+atl note fix-login waiting on design review [--author user|assistant]  # appends "- YYYY-MM-DD [user] waiting on…"
+atl notes fix-login       # print the task's notes text
+atl notes fix-login --set < notes.md   # replace the notes with stdin (empty stdin clears them)
 atl assistant [fix-login] # the atelier assistant (one Claude session for all tasks); attach
 atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
 atl cancel fix-login [--force]
@@ -53,12 +55,12 @@ atl                       # TUI (on a terminal)
 ```
 
 TUI keys: `n` new task, `enter` open (see below), `s` new session, `r` resume, `a` add repos to the
-selected task, `m` add a note to the selected task (`enter` saves, `esc` cancels), `t` rename
+selected task, `m` edit the selected task's notes in place (see [Notes](#notes)), `t` rename
 the selected task (an input prefilled with its title; `enter` saves, `esc` cancels), `d` done,
 `c` cancel, `p` pr, `D` diff, `A` assistant (about the selected task), `1`-`5` status,
 `/` filter (matches the slug or the title), `q` quit. The task list shows each task's title
 (with its session-state dot and `*` for uncommitted changes), truncated to the pane; the slug
-is in the details pane, which also shows the task's latest note.
+is in the details pane, with the task's notes below the details.
 Repos (in the new-task form and for `a`) are picked from a list of `$ATL_REPOS`: type to
 filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter` confirms, `esc` cancels.
 Choosing a project in the form preselects its repos. The form's Base field toggles
@@ -88,6 +90,33 @@ a session with a live window like the picker, and refuses another task's session
 sessions it would not offer (no Claude id, transcript gone or recorded for another
 directory, or no transcript and not launched by atl), and resuming in a closed task.
 
+## Notes
+
+Each task has one free-form notes text (goal, decisions, where you left off, ...). The TUI
+shows it under the task's details, filling the rest of the details pane (wrapped, from the
+top; "(no notes — press m to write)" when empty). `m` turns that area into an editor
+prefilled with the text; while it is focused every key goes to the editor (`enter` is a new
+line, arrows move, the text scrolls):
+
+- `ctrl+s` saves and leaves the editor. The save only succeeds if the notes are still what
+  the editor started from; if something changed them meanwhile (e.g. an agent ran
+  `atl note`), the editor stays open with your text and the status line says so: `ctrl+s`
+  again overwrites with your text, `ctrl+r` reloads theirs (dropping your edits).
+- `esc` leaves the editor; with unsaved changes it asks first ("discard …? y/n").
+- `ctrl+r` reloads the stored text (dropping your edits); `ctrl+c` with unsaved changes asks
+  before quitting.
+
+The editor stays on the task it was opened for, even if the selection or the list changes
+meanwhile; like other operations it is refused while the task is busy.
+
+`atl note <task> <text...> [--author user|assistant]` appends a line
+`- YYYY-MM-DD [author] text` (today's local date) at the end, so agents and the assistant can
+add to the notes without touching what you wrote. `atl notes <task>` prints the whole text,
+and `atl notes <task> --set` replaces it with stdin (an empty stdin clears it; only `--set`
+ever reads stdin). Notes are capped at 64 KiB; control characters other than newline and tab
+are dropped. Notes work on closed tasks too. Before this, notes were a list of dated entries:
+upgrading folds them into the text, oldest first, as `- YYYY-MM-DD [author] body` lines.
+
 `atl rename` (TUI `t`) changes only the title, on a task of any status: the title is trimmed,
 space runs are collapsed, and an empty title or one with control characters is rejected. The
 slug never changes, so keep using it (or the id) to refer to the task. An open task's
@@ -106,7 +135,8 @@ uncommitted changes, never unpushed commits.
 `atl show` also prints each session's title (from its transcript; `--json`: `title`,
 `""` when none). It never touches the network: "pushed" means the local remote-tracking ref
 `origin/atl/<slug>` exists (as of your last push or fetch). `--json` prints a stable
-snake_case object (see `internal/cli/info.go`). `atl transcript` reads the Claude Code
+snake_case object (see `internal/cli/info.go`); its `notes` is the notes text as a string
+(it used to be an array of dated notes). `atl transcript` reads the Claude Code
 transcript JSONL recorded by the hooks and condenses it to user/assistant text; tool
 calls become one-line `[tool: Name] …` summaries and tool results are skipped. Notes
 work on closed tasks too.
@@ -116,8 +146,12 @@ in tmux session `atl_assistant`, for managing tasks rather than writing code ("w
 status of X?", "where did I leave off?", "add repo Y to X"). It runs in
 `$XDG_DATA_HOME/atelier/assistant/` with a generated `CLAUDE.md` (role and `atl` command
 reference, always rewritten) and `.claude/settings.json` (merged): read-only `atl`
-commands (`ls`, `show`, `transcript`, `notes`, `repos`) and Read/Grep/Glob are allowed,
-every state-changing `atl` command asks first, common repo mutators (`git commit`, `push`,
+commands (`ls`, `show`, `transcript`, `repos`) and Read/Grep/Glob are allowed,
+every state-changing `atl` command asks first (`atl note` appends; `atl notes --set` replaces
+the notes, and the assistant is told to show you the new text first). All of `atl notes`
+asks, even plain reads: a permission pattern can't reliably tell `atl notes X` from
+`atl notes X --set` (quoting, `--set=true`, flag order), so the assistant reads notes with
+`atl show <task> --notes` (or `--json`), which is allowed; common repo mutators (`git commit`, `push`,
 `checkout`, `reset`, `rebase`, `merge`, `stash`, `rm`, `mv`, `cp`, `sed -i`, `tee`, ...) are
 denied, and the `atl hook AssistantGuard` PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
 outside that dir (and on its own `CLAUDE.md` and `.claude/`, in any letter case). Bash and MCP
@@ -207,8 +241,10 @@ read-only guard) and are logged to `hook.log`. The assistant's `AssistantGuard` 
 On SessionStart (startup, resume, `/clear`, compaction) inside a task, `atl hook
 SessionStart` also prints Claude Code's `hookSpecificOutput.additionalContext` JSON with
 fresh task context (title, status, branch, repos with their base branch or read-only
-warning, `ATL_PORT_OFFSET`, the 5 newest notes; at most 2500 characters), so a session
-sees current notes without any file being rewritten. If `ATL_CONTEXT` is set in the hook's
+warning, `ATL_PORT_OFFSET`, the notes text; at most 2500 bytes), so a session
+sees current notes without any file being rewritten. If the notes don't fit, their end is kept
+(appended notes are the newest), cut at a line start, after "… (earlier notes truncated;
+`atl notes <slug>` for all)". If `ATL_CONTEXT` is set in the hook's
 environment (e.g. a devcontainer's `containerEnv`: "no language runtimes here; run tests
 inside each repo's container via docker"), its text (newlines kept, up to 1000 bytes) is added
 as an "Environment notes" section before the notes. This is the only hook output on

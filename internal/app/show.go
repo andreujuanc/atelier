@@ -19,7 +19,7 @@ type TaskDetail struct {
 	TaskDir  string
 	Repos    []RepoDetail
 	Sessions []model.Session // created_at asc
-	Notes    []model.Note    // newest first
+	Notes    string          // the task's notes text ("" if none)
 	// SessionTitles maps a session id to its conversation title, read from
 	// its transcript: Claude Code's title, else the first user prompt.
 	// Sessions without one (no or unreadable transcript) are absent.
@@ -72,7 +72,7 @@ func (a *App) Show(ctx context.Context, ref string) (*TaskDetail, error) {
 	if err != nil {
 		return nil, err
 	}
-	notes, err := a.Store.ListNotes(ctx, t.ID, 0)
+	notes, err := a.Store.GetNotes(ctx, t.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -149,40 +149,59 @@ func firstLineOf(s string) string {
 	return s
 }
 
-// AddNote adds a note to a task (open or closed). The body is trimmed and
-// must not be empty; author is model.AuthorUser ("" means user) or
+// AppendNote appends the line "- YYYY-MM-DD [author] body" to a task's
+// notes (open or closed) and returns it. The body is sanitised and trimmed
+// and must not be empty; author is model.AuthorUser ("" means user) or
 // model.AuthorAssistant.
-func (a *App) AddNote(ctx context.Context, ref, body, author string) (*model.Note, error) {
-	body = strings.TrimSpace(body)
+func (a *App) AppendNote(ctx context.Context, ref, body, author string) (string, error) {
+	body = strings.TrimSpace(model.SanitizeNotes(body))
 	if body == "" {
-		return nil, errors.New("note is empty")
+		return "", errors.New("note is empty")
 	}
 	if author == "" {
 		author = model.AuthorUser
 	}
 	if !model.ValidAuthor(author) {
-		return nil, fmt.Errorf("invalid note author %q (want user or assistant)", author)
+		return "", fmt.Errorf("invalid note author %q (want user or assistant)", author)
 	}
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	n := &model.Note{TaskID: t.ID, Body: body, Author: author, CreatedAt: a.now()}
-	if err := a.Store.AddNote(ctx, n); err != nil {
-		return nil, err
-	}
-	return n, nil
+	return a.Store.AppendNote(ctx, t.ID, author, body)
 }
 
-// Notes returns a task's notes, newest first.
-func (a *App) Notes(ctx context.Context, ref string) (*model.Task, []model.Note, error) {
+// Notes returns a task's notes text ("" if none).
+func (a *App) Notes(ctx context.Context, ref string) (*model.Task, string, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", err
 	}
-	notes, err := a.Store.ListNotes(ctx, t.ID, 0)
+	text, err := a.Store.GetNotes(ctx, t.ID)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", err
 	}
-	return t, notes, nil
+	return t, text, nil
+}
+
+// SetNotes replaces a task's notes with text if they are still base, the
+// text the edit started from (compare-and-set); else it fails with a
+// *model.NotesConflictError holding the current text. It returns the text
+// as stored (model.SanitizeNotes).
+func (a *App) SetNotes(ctx context.Context, ref, text, base string) (string, error) {
+	t, err := a.Store.ResolveTask(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	return a.Store.SetNotes(ctx, t.ID, text, base)
+}
+
+// ReplaceNotes replaces a task's notes with text unconditionally ("" clears
+// them) and returns the text as stored.
+func (a *App) ReplaceNotes(ctx context.Context, ref, text string) (string, error) {
+	t, err := a.Store.ResolveTask(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	return a.Store.ReplaceNotes(ctx, t.ID, text)
 }

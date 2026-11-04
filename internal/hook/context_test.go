@@ -46,9 +46,9 @@ func sessionStartContext(t *testing.T, out string) string {
 	return o.HookSpecificOutput.AdditionalContext
 }
 
-// ctxTask adds task "ctx" (api rw from dev, docs ro, offset 300) with n
-// notes, note i (1-based) created i days after 2026-04-01, alternating
-// authors; it returns the task.
+// ctxTask adds task "ctx" (api rw from dev, docs ro, offset 300) whose
+// notes text has n lines, line i (1-based) dated i days after 2026-04-01,
+// alternating authors; it returns the task.
 func ctxTask(t *testing.T, f *fixture, n int) *model.Task {
 	t.Helper()
 	ctx := context.Background()
@@ -61,17 +61,23 @@ func ctxTask(t *testing.T, f *fixture, n int) *model.Task {
 	if err := os.MkdirAll(f.p.WorktreePath("ctx", "api"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for i := 1; i <= n; i++ {
+	if _, err := f.st.SetNotes(ctx, task.ID, noteLines(1, n), ""); err != nil {
+		t.Fatal(err)
+	}
+	return task
+}
+
+// noteLines returns notes lines from..to (see ctxTask), newline-separated.
+func noteLines(from, to int) string {
+	var lines []string
+	for i := from; i <= to; i++ {
 		author := model.AuthorUser
 		if i%2 == 0 {
 			author = model.AuthorAssistant
 		}
-		if err := f.st.AddNote(ctx, &model.Note{TaskID: task.ID, Body: fmt.Sprintf("note %d", i), Author: author,
-			CreatedAt: time.Date(2026, 4, 1+i, 9, 0, 0, 0, time.UTC)}); err != nil {
-			t.Fatal(err)
-		}
+		lines = append(lines, model.NoteLine(time.Date(2026, 4, 1+i, 12, 0, 0, 0, time.Local), author, fmt.Sprintf("note %d", i)))
 	}
-	return task
+	return strings.Join(lines, "\n")
 }
 
 func runHook(t *testing.T, event string, in Input, env map[string]string) (code int, stdout, stderr string) {
@@ -110,15 +116,16 @@ func TestSessionStartContext(t *testing.T) {
 			"Repos:\n- api (rw, worktree " + f.p.WorktreePath("ctx", "api") + ", branched from origin/dev)\n" +
 				"- docs (ro, " + f.p.RepoPath("docs") + ", READ-ONLY: do not modify by any means)\n",
 			"\nATL_PORT_OFFSET=300\n",
-			"\nNotes (newest first):\n- 2026-04-08 [user] note 7\n- 2026-04-07 [assistant] note 6\n- 2026-04-06 [user] note 5\n" +
-				"- 2026-04-05 [assistant] note 4\n- 2026-04-04 [user] note 3\n\n",
+			"\nNotes:\n- 2026-04-02 [user] note 1\n- 2026-04-03 [assistant] note 2\n- 2026-04-04 [user] note 3\n" +
+				"- 2026-04-05 [assistant] note 4\n- 2026-04-06 [user] note 5\n- 2026-04-07 [assistant] note 6\n" +
+				"- 2026-04-08 [user] note 7\n\n",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("context lacks %q:\n%s", want, got)
 			}
 		}
-		if strings.Contains(got, "note 2") || strings.Contains(got, "note 1\n") {
-			t.Errorf("more than 5 notes:\n%s", got)
+		if strings.Contains(got, "truncated") {
+			t.Errorf("short notes truncated:\n%s", got)
 		}
 		if !strings.HasSuffix(got, "\nUse `atl note ctx \"...\"` to leave a status note for later sessions.\n") {
 			t.Errorf("bad final line:\n%s", got)
@@ -209,7 +216,7 @@ func TestSessionStartContext(t *testing.T) {
 			t.Fatalf("exit=%d stderr=%q", code, errOut)
 		}
 		got := sessionStartContext(t, out)
-		want := "\nATL_PORT_OFFSET=300\n\nEnvironment notes (ATL_CONTEXT):\nNo runtimes here.\nRun tests via docker.\n\nNotes (newest first):\n"
+		want := "\nATL_PORT_OFFSET=300\n\nEnvironment notes (ATL_CONTEXT):\nNo runtimes here.\nRun tests via docker.\n\nNotes:\n"
 		if !strings.Contains(got, want) {
 			t.Errorf("context lacks %q:\n%s", want, got)
 		}
@@ -273,46 +280,77 @@ func TestSessionStartContext(t *testing.T) {
 
 func TestRenderContextLimits(t *testing.T) {
 	p := config.Paths{Tasks: "/t", Repos: "/r"}
-	day := func(d int) time.Time { return time.Date(2026, 3, d, 0, 0, 0, 0, time.UTC) }
 	base := model.Task{Slug: "s", Title: "T", Status: model.StatusActive, Branch: "atl/s",
 		Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "main"}}}
 	footer := "\nUse `atl note s \"...\"` to leave a status note for later sessions.\n"
+	const marker = "… (earlier notes truncated; `atl notes s` for all)\n"
+	// notesOf returns the notes section of a context ("" if none).
+	notesOf := func(t *testing.T, got string) string {
+		t.Helper()
+		i := strings.Index(got, "\nNotes:\n")
+		if i < 0 {
+			return ""
+		}
+		rest := got[i+len("\nNotes:\n"):]
+		if !strings.HasSuffix(rest, "\n"+footer) {
+			t.Fatalf("notes section not followed by the footer:\n%q", rest)
+		}
+		return strings.TrimSuffix(rest, "\n"+footer)
+	}
+	manyRepos := func(n int) model.Task {
+		task := base
+		for i := 0; i < n; i++ {
+			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-with-a-long-name-%02d", i), Mode: model.ModeRO})
+		}
+		return task
+	}
 
-	t.Run("sanitised one-line notes capped at 300 chars", func(t *testing.T) {
+	t.Run("sanitised, newlines and indentation kept", func(t *testing.T) {
 		task := base
 		task.Title = "evil\x1b[2J\u202etitle\r\nnext"
-		notes := []model.Note{
-			{Body: "line one\nline\ttwo\x00\x07 \u200b\x1b[31mred", Author: "user", CreatedAt: day(2)},
-			{Body: strings.Repeat("é", 1000), Author: "assistant", CreatedAt: day(1)},
-		}
+		notes := "\n\nGoal: fix it\r\n  - sub\titem\x00\x07 \u200b\x1b[31mred\rlast  \n\n"
 		got := renderContext(task, notes, p, "", now)
 		if !strings.Contains(got, "- Title: evil [2J title next\n") {
 			t.Errorf("title not sanitised:\n%q", got)
 		}
-		if !strings.Contains(got, "- 2026-03-02 [user] line one line two [31mred\n") {
-			t.Errorf("note not sanitised:\n%q", got)
+		if n := notesOf(t, got); n != "Goal: fix it\n  - sub item     [31mred\nlast" {
+			t.Errorf("notes section %q", n)
 		}
 		for _, r := range got {
 			if r != '\n' && (r < 0x20 || r == 0x7f || r == '\u202e' || r == '\u200b') {
 				t.Fatalf("control/format char %U in context", r)
 			}
 		}
-		long := "- 2026-03-01 [assistant] " + strings.Repeat("é", 299) + "…\n"
-		if !strings.Contains(got, long) {
-			t.Errorf("long note not cut to 300 chars:\n%s", got)
+	})
+
+	t.Run("blank notes: no section", func(t *testing.T) {
+		for _, n := range []string{"", " \n\t\n", "\x1b"} {
+			if got := renderContext(base, n, p, "", now); strings.Contains(got, "Notes") || !strings.HasSuffix(got, footer) {
+				t.Errorf("%q:\n%s", n, got)
+			}
 		}
 	})
 
-	t.Run("notes truncated first at the cap", func(t *testing.T) {
-		task := base
-		for i := 0; i < 12; i++ {
-			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-with-a-long-name-%02d", i), Mode: model.ModeRO})
+	t.Run("fits exactly, one more byte truncates", func(t *testing.T) {
+		room := contextMaxLen - len(renderContext(base, "", p, "", now)) - len("\nNotes:\n") - 1
+		exact := strings.Repeat("a", room)
+		got := renderContext(base, exact, p, "", now)
+		if len(got) != contextMaxLen || notesOf(t, got) != exact {
+			t.Fatalf("exact fit: len %d", len(got))
 		}
-		var notes []model.Note
-		for i := 0; i < 5; i++ {
-			notes = append(notes, model.Note{Body: fmt.Sprintf("N%d ", i) + strings.Repeat("x", 400), Author: "user", CreatedAt: day(20 - i)})
+		got = renderContext(base, "b\n"+exact, p, "", now)
+		if len(got) > contextMaxLen || notesOf(t, got) != marker+exact[len(marker):] {
+			t.Errorf("one line over: len %d:\n%s", len(got), notesOf(t, got))
 		}
-		got := renderContext(task, notes, p, "", now)
+	})
+
+	t.Run("keeps the end, cut at a line start", func(t *testing.T) {
+		task := manyRepos(12)
+		var lines []string
+		for i := 0; i < 60; i++ {
+			lines = append(lines, fmt.Sprintf("- 2026-03-%02d [user] N%02d %s", i%28+1, i, strings.Repeat("x", 40)))
+		}
+		got := renderContext(task, strings.Join(lines, "\n"), p, "", now)
 		if len(got) > contextMaxLen || !utf8.ValidString(got) {
 			t.Fatalf("len %d > %d", len(got), contextMaxLen)
 		}
@@ -320,8 +358,31 @@ func TestRenderContextLimits(t *testing.T) {
 			!strings.Contains(got, "ATL_PORT_OFFSET=0") {
 			t.Errorf("fixed part or footer lost:\n%s", got)
 		}
-		if !strings.Contains(got, "Notes (newest first):\n- 2026-03-20 [user] N0 ") || strings.Contains(got, "N4 ") {
-			t.Errorf("notes not truncated oldest-first:\n%s", got)
+		n := notesOf(t, got)
+		if !strings.HasPrefix(n, marker+"- 2026-03-") || !strings.HasSuffix(n, "N59 "+strings.Repeat("x", 40)) || strings.Contains(n, "N00 ") {
+			t.Errorf("not the end of the notes from a line start:\n%s", n)
+		}
+		// every kept line is whole, and nearly all the room is used
+		for _, l := range strings.Split(strings.TrimPrefix(n, marker), "\n") {
+			if len(l) != len(lines[0]) {
+				t.Errorf("partial line %q", l)
+			}
+		}
+		if len(got) < contextMaxLen-len(lines[0])-1 {
+			t.Errorf("too much room left: len %d", len(got))
+		}
+	})
+
+	t.Run("one huge line: cut on a rune boundary", func(t *testing.T) {
+		notes := "first line\n" + strings.Repeat("é", 3000) + "Z"
+		got := renderContext(base, notes, p, "", now)
+		n := notesOf(t, got)
+		if len(got) > contextMaxLen || !utf8.ValidString(got) || !strings.HasPrefix(n, marker+"é") || !strings.HasSuffix(n, "éZ") ||
+			strings.Contains(n, "first line") {
+			t.Errorf("len %d:\n%s", len(got), n)
+		}
+		if len(got) < contextMaxLen-1 {
+			t.Errorf("rune cut too short: len %d", len(got))
 		}
 	})
 
@@ -330,7 +391,18 @@ func TestRenderContextLimits(t *testing.T) {
 		for i := 0; i < 80; i++ {
 			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-%02d", i), Mode: model.ModeRO})
 		}
-		got := renderContext(task, []model.Note{{Body: "hi", Author: "user", CreatedAt: day(1)}}, p, "", now)
+		got := renderContext(task, "- 2026-03-01 [user] hi", p, "", now)
+		if len(got) > contextMaxLen || !strings.HasSuffix(got, footer) || strings.Contains(got, "Notes") {
+			t.Errorf("len %d:\n%s", len(got), got)
+		}
+	})
+
+	t.Run("too little room for notes: section dropped", func(t *testing.T) {
+		task := manyRepos(0)
+		for len(renderContext(task, "", p, "", now)) < contextMaxLen-len("\nNotes:\n")-len(marker)-contextMinNotes+5 {
+			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("r%03d", len(task.Repos)), Mode: model.ModeRO})
+		}
+		got := renderContext(task, strings.Repeat("long notes line\n", 50), p, "", now)
 		if len(got) > contextMaxLen || !strings.HasSuffix(got, footer) || strings.Contains(got, "Notes") {
 			t.Errorf("len %d:\n%s", len(got), got)
 		}
@@ -339,10 +411,9 @@ func TestRenderContextLimits(t *testing.T) {
 
 func TestRenderContextEnv(t *testing.T) {
 	p := config.Paths{Tasks: "/t", Repos: "/r"}
-	day := func(d int) time.Time { return time.Date(2026, 3, d, 0, 0, 0, 0, time.UTC) }
 	base := model.Task{Slug: "s", Title: "T", Status: model.StatusActive, Branch: "atl/s", PortOffset: 100,
 		Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "main"}}}
-	notes := []model.Note{{Body: "hi", Author: "user", CreatedAt: day(1)}}
+	notes := "- 2026-03-01 [user] hi"
 	footer := "\nUse `atl note s \"...\"` to leave a status note for later sessions.\n"
 	const head = "\nEnvironment notes (ATL_CONTEXT):\n"
 	section := func(t *testing.T, got string) string {
@@ -361,11 +432,11 @@ func TestRenderContextEnv(t *testing.T) {
 
 	t.Run("placed after ATL_PORT_OFFSET, before notes", func(t *testing.T) {
 		got := renderContext(base, notes, p, "Use docker for tests.", now)
-		want := "\nATL_PORT_OFFSET=100\n" + head + "Use docker for tests.\n\nNotes (newest first):\n- 2026-03-01 [user] hi\n" + footer
+		want := "\nATL_PORT_OFFSET=100\n" + head + "Use docker for tests.\n\nNotes:\n- 2026-03-01 [user] hi\n" + footer
 		if !strings.HasSuffix(got, want) {
 			t.Errorf("got:\n%s", got)
 		}
-		got = renderContext(base, nil, p, "x", now)
+		got = renderContext(base, "", p, "x", now)
 		if !strings.HasSuffix(got, "\nATL_PORT_OFFSET=100\n"+head+"x\n"+footer) {
 			t.Errorf("no notes:\n%s", got)
 		}
@@ -397,10 +468,10 @@ func TestRenderContextEnv(t *testing.T) {
 
 	t.Run("capped at 1000 bytes", func(t *testing.T) {
 		exact := strings.Repeat("a", contextEnvLen)
-		if s := section(t, renderContext(base, nil, p, exact, now)); s != exact {
+		if s := section(t, renderContext(base, "", p, exact, now)); s != exact {
 			t.Errorf("%d-byte text cut to %d", len(exact), len(s))
 		}
-		got := renderContext(base, nil, p, "b"+strings.Repeat("é", 1000), now)
+		got := renderContext(base, "", p, "b"+strings.Repeat("é", 1000), now)
 		s := section(t, got)
 		if len(s) > contextEnvLen || !utf8.ValidString(s) || !strings.HasSuffix(s, "é…") || !strings.HasPrefix(s, "bé") {
 			t.Errorf("len %d, valid %v, tail %q", len(s), utf8.ValidString(s), s[len(s)-8:])
@@ -412,13 +483,14 @@ func TestRenderContextEnv(t *testing.T) {
 
 	t.Run("overall cap: notes dropped first", func(t *testing.T) {
 		task := base
-		for i := 0; i < 12; i++ {
+		for i := 0; i < 8; i++ {
 			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-with-a-long-name-%02d", i), Mode: model.ModeRO})
 		}
-		var many []model.Note
+		var lines []string
 		for i := 0; i < 5; i++ {
-			many = append(many, model.Note{Body: fmt.Sprintf("N%d ", i) + strings.Repeat("x", 400), Author: "user", CreatedAt: day(20 - i)})
+			lines = append(lines, fmt.Sprintf("- 2026-03-%02d [user] N%d ", 16+i, i)+strings.Repeat("x", 400))
 		}
+		many := strings.Join(lines, "\n")
 		env := strings.Repeat("env text ", 200)
 		got := renderContext(task, many, p, env, now)
 		if len(got) > contextMaxLen || !utf8.ValidString(got) || !strings.HasSuffix(got, footer) {
@@ -427,12 +499,14 @@ func TestRenderContextEnv(t *testing.T) {
 		if s := section(t, got); len(s) > contextEnvLen || !strings.HasSuffix(s, "…") || !strings.HasPrefix(s, "env text env") {
 			t.Errorf("section cut wrongly (len %d): %q", len(s), s)
 		}
-		if strings.Contains(got, "N1 ") {
-			t.Errorf("older notes kept:\n%s", got)
+		// the little room left keeps the end of the newest line, after the marker
+		if strings.Contains(got, "N0 ") || !strings.Contains(got, "\nNotes:\n… (earlier notes truncated; `atl notes s` for all)\nxxx") ||
+			!strings.HasSuffix(got, "xxx\n"+footer) || len(got) < contextMaxLen-1 {
+			t.Errorf("notes not cut from the start, newest kept:\n%s", got)
 		}
 
 		// A fixed part too big for notes: notes go, the cap and footer hold.
-		for i := 12; i < 30; i++ {
+		for i := 8; i < 30; i++ {
 			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-with-a-long-name-%02d", i), Mode: model.ModeRO})
 		}
 		got = renderContext(task, many, p, env, now)

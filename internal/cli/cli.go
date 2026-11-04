@@ -49,7 +49,7 @@ func (e exitCodeError) Error() string { return fmt.Sprintf("exit status %d", e.c
 func Execute() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	return runIn(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 }
 
 // cli holds per-invocation state: the output streams and the lazily
@@ -116,7 +116,13 @@ func (c *cli) doctorApp() (*app.App, error) {
 	return &app.App{Paths: p, Tmux: tmux.New(), Out: c.stderr, Now: time.Now}, nil
 }
 
+// run is runIn with an empty stdin.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return runIn(ctx, args, strings.NewReader(""), stdout, stderr)
+}
+
+// runIn runs atl with args; stdin is what commands read (atl notes --set).
+func runIn(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	c := &cli{stdout: stdout, stderr: stderr, ctx: ctx}
 	defer func() {
 		if c.app != nil {
@@ -125,6 +131,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}()
 	root := c.rootCmd()
 	root.SetArgs(args)
+	root.SetIn(stdin)
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	cmd, err := root.ExecuteContextC(ctx)

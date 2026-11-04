@@ -16,15 +16,23 @@ const AssistantGuardEvent = "AssistantGuard"
 // asking, every command that changes state asks first, and common
 // repo-mutating commands are denied, so that a user's global allow rules
 // cannot let the assistant change repos.
+//
+// Every allow rule names a command that is read-only whatever its
+// arguments. `atl notes` is not (`--set` replaces the notes), and a
+// pattern cannot reliably tell `atl notes X` from `atl notes X --set`
+// (quoting, `--set=true`, extra spaces, flag order all change the
+// string), so all of `atl notes` asks and the notes are read with
+// `atl show <task> --notes` (or --json) under the `atl show` allow rule.
+// Ask rules win over allow rules, also over a user's global ones.
 var (
 	assistantAllow = []string{
-		"Bash(atl ls *)", "Bash(atl show *)", "Bash(atl transcript *)", "Bash(atl notes *)",
+		"Bash(atl ls *)", "Bash(atl show *)", "Bash(atl transcript *)",
 		"Bash(atl repos *)", "Bash(atl --help *)", "Read", "Grep", "Glob",
 	}
 	assistantAsk = []string{
 		"Bash(atl new *)", "Bash(atl add *)", "Bash(atl status *)", "Bash(atl session *)",
 		"Bash(atl resume *)", "Bash(atl pr *)", "Bash(atl done *)", "Bash(atl cancel *)",
-		"Bash(atl note *)", "Bash(atl open *)", "Bash(atl rename *)",
+		"Bash(atl note *)", "Bash(atl notes *)", "Bash(atl open *)", "Bash(atl rename *)",
 	}
 	assistantDeny = []string{
 		"Bash(git commit *)", "Bash(git push *)", "Bash(git checkout *)", "Bash(git switch *)",
@@ -188,7 +196,7 @@ func AssistantClaudeMD() string {
 		"## \"Let's talk about task <slug>.\"",
 		"",
 		"When greeted with \"Let's talk about task <slug>.\", immediately gather status (no need to ask):",
-		"`atl show <slug> --json`, `atl notes <slug>`, `atl transcript <slug> --tail 30`. Then reply with a short",
+		"`atl show <slug> --json` (includes the notes), `atl transcript <slug> --tail 30`. Then reply with a short",
 		"catch-up, one line each: goal, done, pending, blockers, suggested next step. Then ask what the user",
 		"wants to do with the task (e.g. resume it, add a repo, save a note, finish it).",
 		"",
@@ -196,7 +204,7 @@ func AssistantClaudeMD() string {
 		"",
 		"- Reading is free: run the read-only commands below whenever useful.",
 		"- ALWAYS ask for explicit confirmation before any command that changes state (`atl new`, `add`,",
-		"  `status`, `rename`, `session`, `resume`, `open`, `pr`, `done`, `cancel`, `note`).",
+		"  `status`, `rename`, `session`, `resume`, `open`, `pr`, `done`, `cancel`, `note`, `notes --set`).",
 		"  First state the exact command you want to run, wait for the user's yes, then run it.",
 		"- Never edit files in repos, worktrees or task dirs, by any means (no Edit/Write tools, no shell",
 		"  redirects, `sed -i`, `git commit`, `git checkout`, ...). Edits outside this directory are blocked by",
@@ -215,17 +223,24 @@ func AssistantClaudeMD() string {
 		"",
 		"- `atl ls [--status S[,S...]|all] [--json]` — list tasks (default: backlog, active, review).",
 		"- `atl show <task> [--json]` — task details: repos with worktree paths and git state (dirty, commits",
-		"  ahead, last commit, pushed), sessions (state, last event, transcript path), notes.",
+		"  ahead, last commit, pushed), sessions (state, last event, transcript path), the notes text.",
+		"- `atl show <task> --notes` — only the task's notes: one free-form text per task that the user edits",
+		"  in the atl TUI; `atl note` appends dated lines at its end. Read notes this way (runs without asking).",
 		"- `atl transcript <task> [--session ID] [--tail N]` — last N turns (default 20) of a session's",
 		"  conversation; default is the most recent session with a transcript.",
-		"- `atl notes <task>` — the task's notes, newest first.",
+		"- `atl notes <task>` — prints the same notes text, but asks for permission here (its `--set` form",
+		"  writes), so prefer `atl show <task> --notes`.",
 		"- `atl repos` — git repos available in $ATL_REPOS.",
 		"- `atl diff <task>` — git diff of each rw repo against its base commit (read-only, may ask permission).",
 		"- `atl --help`, `atl <command> --help` — usage.",
 		"",
 		"Changes state (ALWAYS confirm first):",
 		"",
-		"- `atl note <task> <text> --author assistant` — add a note to the task.",
+		"- `atl note <task> <text> --author assistant` — append a line `- YYYY-MM-DD [assistant] <text>` to the",
+		"  task's notes (the user's text above it is kept). This is how you add to the notes.",
+		"- `atl notes <task> --set` — REPLACE the whole notes text with stdin (empty stdin clears it), e.g.",
+		"  `atl notes X --set <<'EOF'` … `EOF`. It overwrites what the user wrote: only when the user asks,",
+		"  show them the full new text and get their yes first. To add something, use `atl note` instead.",
 		"- `atl new <title...> [--project P] [--repo name:rw|ro ...] [--base auto|default|production|<branch>] [--backlog] [-m description]`",
 		"  — create a task with worktrees. `--base`: auto (default; origin/dev, else develop, else the default",
 		"  branch) for feature work, `default` (or `production`) for a production patch from origin's default branch, or a branch name.",
@@ -244,13 +259,13 @@ func AssistantClaudeMD() string {
 		"## \"What's the status of X?\" / \"Where did I leave off?\"",
 		"",
 		"1. `atl show X --json`",
-		"2. `atl notes X`",
+		"2. The notes text in that output (`notes`); `atl show X --notes` prints just the notes.",
 		"3. `atl transcript X --tail 30` (if the task has several sessions, also the others:",
 		"   `atl transcript X --session ID --tail 30`).",
 		"4. Optionally a glance at `git log` in the worktree paths from `atl show` (no in-depth code reading).",
 		"5. Summarise briefly: goal, what was done, what is pending, blockers, suggested next step.",
 		"",
-		"After a status discussion, offer to save a short note, e.g.",
+		"After a status discussion, offer to append a short note, e.g.",
 		"`atl note X \"<summary>\" --author assistant` — and run it only after the user agrees.",
 	)
 	return b.String()

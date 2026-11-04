@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,12 +36,14 @@ func TestShow(t *testing.T) {
 	if err := e.app.Store.CreateSession(ctx, sess); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.app.AddNote(ctx, task.Slug, "first", ""); err != nil {
+	if _, err := e.app.AppendNote(ctx, task.Slug, "first", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.app.AddNote(ctx, task.Slug, "second", model.AuthorAssistant); err != nil {
+	if _, err := e.app.AppendNote(ctx, task.Slug, "second", model.AuthorAssistant); err != nil {
 		t.Fatal(err)
 	}
+	today := time.Now().Format("2006-01-02")
+	wantNotes := "- " + today + " [user] first\n- " + today + " [assistant] second"
 
 	d, err := e.app.Show(ctx, task.Slug)
 	if err != nil {
@@ -67,9 +70,8 @@ func TestShow(t *testing.T) {
 	if len(d.Sessions) != 1 || d.Sessions[0].TranscriptPath != "/t/x.jsonl" {
 		t.Fatalf("sessions = %+v", d.Sessions)
 	}
-	if len(d.Notes) != 2 || d.Notes[0].Body != "second" || d.Notes[0].Author != "assistant" ||
-		d.Notes[1].Body != "first" || d.Notes[1].Author != "user" {
-		t.Fatalf("notes = %+v", d.Notes)
+	if d.Notes != wantNotes {
+		t.Fatalf("notes = %q, want %q", d.Notes, wantNotes)
 	}
 
 	// Pushed: the remote-tracking ref appears after a push to the bare
@@ -92,10 +94,10 @@ func TestShow(t *testing.T) {
 		t.Fatalf("after a new commit: %+v", d.Repos[0])
 	}
 
-	// Get carries the latest note (TUI details pane).
+	// Get carries the notes text (TUI details pane).
 	v, err := e.app.Get(ctx, task.Slug)
-	if err != nil || v.LatestNote == nil || v.LatestNote.Body != "second" {
-		t.Fatalf("Get latest note = %+v, %v", v, err)
+	if err != nil || v.Notes != wantNotes {
+		t.Fatalf("Get notes = %+v, %v", v, err)
 	}
 
 	if _, err := e.app.Show(ctx, "nope"); err == nil {
@@ -103,31 +105,45 @@ func TestShow(t *testing.T) {
 	}
 }
 
-func TestAddNote(t *testing.T) {
+func TestNotesApp(t *testing.T) {
 	e := newTaskEnv(t)
 	ctx := context.Background()
 	task := &model.Task{Slug: "closed", Title: "Closed", Status: model.StatusDone, Branch: "atl/closed"}
 	if err := e.app.Store.CreateTask(ctx, task); err != nil {
 		t.Fatal(err)
 	}
-	n, err := e.app.AddNote(ctx, "clo", "  note on a closed task \n", model.AuthorUser)
-	if err != nil || n.ID == 0 || n.Body != "note on a closed task" || n.TaskID != task.ID || n.Author != "user" {
-		t.Fatalf("AddNote = %+v, %v", n, err)
+	today := time.Now().Format("2006-01-02")
+	line, err := e.app.AppendNote(ctx, "clo", "  note on a closed task \n", "")
+	if err != nil || line != "- "+today+" [user] note on a closed task" {
+		t.Fatalf("AppendNote = %q, %v", line, err)
 	}
-	for _, c := range []struct{ body, author string }{{"   ", "user"}, {"x", "bot"}} {
-		if _, err := e.app.AddNote(ctx, "closed", c.body, c.author); err == nil {
-			t.Errorf("AddNote(%q, %q) succeeded", c.body, c.author)
+	for _, c := range []struct{ body, author string }{{"   ", "user"}, {"\x1b", "user"}, {"x", "bot"}} {
+		if _, err := e.app.AppendNote(ctx, "closed", c.body, c.author); err == nil {
+			t.Errorf("AppendNote(%q, %q) succeeded", c.body, c.author)
 		}
 	}
-	if _, err := e.app.AddNote(ctx, "missing", "x", "user"); err == nil {
-		t.Error("AddNote on unknown task succeeded")
+	if _, err := e.app.AppendNote(ctx, "missing", "x", "user"); err == nil {
+		t.Error("AppendNote on unknown task succeeded")
 	}
-	_, notes, err := e.app.Notes(ctx, "closed")
-	if err != nil || len(notes) != 1 {
-		t.Fatalf("Notes = %+v, %v", notes, err)
+	tk, text, err := e.app.Notes(ctx, "closed")
+	if err != nil || tk.ID != task.ID || text != line {
+		t.Fatalf("Notes = %+v %q, %v", tk, text, err)
+	}
+	// SetNotes is a compare-and-set; ReplaceNotes is not
+	if _, err := e.app.SetNotes(ctx, "closed", "mine", "something else"); !errors.Is(err, model.ErrNotesConflict) {
+		t.Fatalf("SetNotes with a stale base = %v", err)
+	}
+	if saved, err := e.app.SetNotes(ctx, "closed", "mine\n", line); err != nil || saved != "mine" {
+		t.Fatalf("SetNotes = %q, %v", saved, err)
+	}
+	if saved, err := e.app.ReplaceNotes(ctx, "closed", "theirs"); err != nil || saved != "theirs" {
+		t.Fatalf("ReplaceNotes = %q, %v", saved, err)
+	}
+	if _, err := e.app.SetNotes(ctx, "missing", "x", ""); err == nil {
+		t.Error("SetNotes on unknown task succeeded")
 	}
 	v, err := e.app.Get(ctx, "closed")
-	if err != nil || v.LatestNote == nil || v.LatestNote.ID != n.ID {
+	if err != nil || v.Notes != "theirs" {
 		t.Fatalf("Get = %+v, %v", v, err)
 	}
 }

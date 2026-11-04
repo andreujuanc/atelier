@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/store"
@@ -32,7 +34,11 @@ func TestShowNotesTranscript(t *testing.T) {
 	git(t, wt, "commit", "-q", "--allow-empty", "-m", "work in progress")
 
 	// notes
-	if code, out, errs := atl(t, "note", "fix", "first", "note"); code != 0 || out != "note 1 added\n" {
+	today := time.Now().Format("2006-01-02")
+	if code, out, errs := atl(t, "notes", "fix"); code != 0 || out != "" {
+		t.Fatalf("notes of a new task: %d %q %s", code, out, errs)
+	}
+	if code, out, errs := atl(t, "note", "fix", "first", "note"); code != 0 || out != "note added\n" {
 		t.Fatalf("note: %d %q %s", code, out, errs)
 	}
 	if code, _, errs := atl(t, "note", "fix", "from the", "assistant", "--author", "assistant"); code != 0 {
@@ -48,6 +54,10 @@ func TestShowNotesTranscript(t *testing.T) {
 		{[]string{"note", "nope", "x"}, 1},
 		{[]string{"notes"}, 2},
 		{[]string{"notes", "nope"}, 1},
+		{[]string{"notes", "fix", "extra"}, 2},
+		{[]string{"notes", "fix", "--set", "extra"}, 2},
+		{[]string{"notes", "nope", "--set"}, 1},
+		{[]string{"show", "fix", "--json", "--notes"}, 2},
 		{[]string{"show"}, 2},
 		{[]string{"show", "nope"}, 1},
 		{[]string{"transcript", "fix", "--tail", "-1"}, 2},
@@ -58,10 +68,14 @@ func TestShowNotesTranscript(t *testing.T) {
 			t.Errorf("%v: exit %d, want %d (%s)", c.args, code, c.code, errs)
 		}
 	}
+	wantNotes := "- " + today + " [user] first note\n- " + today + " [assistant] from the assistant\n"
 	code, out, _ := atl(t, "notes", "fix")
-	if code != 0 || !strings.HasPrefix(out, "[") || !strings.Contains(out, " assistant] from the assistant\n\n[") ||
-		!strings.HasSuffix(out, " user] first note\n") {
-		t.Fatalf("notes: %d %q", code, out)
+	if code != 0 || out != wantNotes {
+		t.Fatalf("notes: %d %q, want %q", code, out, wantNotes)
+	}
+	// the read-only spelling the assistant may run without asking
+	if code, out, _ := atl(t, "show", "fix", "--notes"); code != 0 || out != wantNotes {
+		t.Fatalf("show --notes: %d %q", code, out)
 	}
 
 	// a session with a transcript
@@ -125,7 +139,8 @@ func TestShowNotesTranscript(t *testing.T) {
 	for _, s := range []string{"Task\n", "  slug         fix\n", "  base         auto\n", "the description",
 		"\nRepos\n  api (rw)  " + wt + "\n    base origin/main\n",
 		"clean, 1 commit(s) ahead of base, not pushed", "work in progress", "\nSessions\n  1 claude-1  idle",
-		"transcript  " + transcript, "    title       Fix it [31m please\n", "\nNotes\n", "assistant] from the assistant"} {
+		"transcript  " + transcript, "    title       Fix it [31m please\n",
+		"\nNotes\n  - " + today + " [user] first note\n  - " + today + " [assistant] from the assistant\n"} {
 		if !strings.Contains(out, s) {
 			t.Errorf("show lacks %q:\n%s", s, out)
 		}
@@ -164,11 +179,8 @@ func TestShowNotesTranscript(t *testing.T) {
 		"state", "title", "tmux_target", "transcript_path"}) || s["transcript_path"] != transcript || s["title"] != "Fix it [31m please" {
 		t.Fatalf("session %v", s)
 	}
-	notes := raw["notes"].([]any)
-	n0 := notes[0].(map[string]any)
-	if got := keys(n0); len(notes) != 2 || !reflect.DeepEqual(got, []string{"author", "body", "created_at", "id"}) ||
-		n0["author"] != "assistant" || n0["body"] != "from the assistant" {
-		t.Fatalf("notes %v", notes)
+	if notes, ok := raw["notes"].(string); !ok || notes+"\n" != wantNotes {
+		t.Fatalf("notes %#v", raw["notes"])
 	}
 
 	// closed tasks still take notes
@@ -179,8 +191,98 @@ func TestShowNotesTranscript(t *testing.T) {
 		t.Fatalf("note on closed: %d %s", code, errs)
 	}
 	if code, out, _ := atl(t, "show", "fix"); code != 0 || !strings.Contains(out, "missing (worktree removed)") ||
-		!strings.Contains(out, "user] post-mortem") {
+		!strings.Contains(out, "  - "+today+" [user] post-mortem\n") {
 		t.Fatalf("show closed: %d\n%s", code, out)
+	}
+}
+
+func TestNotesSet(t *testing.T) {
+	setup(t)
+	if code, _, errs := atl(t, "new", "Fix", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	set := func(in string, args ...string) (int, string, string) {
+		t.Helper()
+		var out, errb bytes.Buffer
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		code := runIn(ctx, append([]string{"notes"}, args...), strings.NewReader(in), &out, &errb)
+		return code, out.String(), errb.String()
+	}
+	notes := func() string {
+		t.Helper()
+		code, out, errs := atl(t, "notes", "fix")
+		if code != 0 {
+			t.Fatalf("notes: %d %s", code, errs)
+		}
+		return out
+	}
+	// --set replaces with stdin: newlines, tabs and indentation kept, CRLF
+	// and control characters cleaned, trailing blank lines dropped
+	text := "Goal: fix login\r\n\n  - step\tone\x1b[31m\n  - step two\n\n\n"
+	if code, out, errs := set(text, "fix", "--set"); code != 0 || out != "notes replaced (46 bytes)\n" {
+		t.Fatalf("--set: %d %q %s", code, out, errs)
+	}
+	if got := notes(); got != "Goal: fix login\n\n  - step\tone[31m\n  - step two\n" {
+		t.Fatalf("after --set: %q", got)
+	}
+	// note appends a line after it
+	if code, _, errs := atl(t, "note", "fix", "--author", "assistant", "agent", "line"); code != 0 {
+		t.Fatalf("note: %d %s", code, errs)
+	}
+	if got := notes(); !strings.HasSuffix(got, "  - step two\n- "+time.Now().Format("2006-01-02")+" [assistant] agent line\n") {
+		t.Fatalf("after note: %q", got)
+	}
+	// --set round-trips what atl notes prints
+	before := notes()
+	if code, _, errs := set(before, "fix", "--set"); code != 0 || notes() != before {
+		t.Fatalf("round trip: %d %s %q", code, errs, notes())
+	}
+	// plain atl notes never reads stdin or clears
+	if code, out, _ := set("", "fix"); code != 0 || out != before {
+		t.Fatalf("notes without --set: %d %q", code, out)
+	}
+	// too large: refused, nothing changes
+	if code, _, errs := set(strings.Repeat("x", model.MaxNotesLen+1), "fix", "--set"); code != 1 ||
+		!strings.Contains(errs, "notes too large") || !strings.Contains(errs, "64 KiB") || notes() != before {
+		t.Fatalf("too large: %d %s", code, errs)
+	}
+	if code, _, errs := set(strings.Repeat("x", 4*model.MaxNotesLen+10), "fix", "--set"); code != 1 || !strings.Contains(errs, "notes too large") {
+		t.Fatalf("huge stdin: %d %s", code, errs)
+	}
+	// empty stdin with --set clears
+	if code, out, errs := set("", "fix", "--set"); code != 0 || out != "notes cleared\n" || notes() != "" {
+		t.Fatalf("clear: %d %q %s", code, out, errs)
+	}
+	// closed tasks too
+	if code, _, errs := atl(t, "done", "fix", "--force"); code != 0 {
+		t.Fatalf("done: %d %s", code, errs)
+	}
+	if code, _, errs := set("after done\n", "fix", "--set"); code != 0 || notes() != "after done\n" {
+		t.Fatalf("--set on a closed task: %d %s %q", code, errs, notes())
+	}
+	if code, out, _ := atl(t, "show", "fix", "--json"); code != 0 || !strings.Contains(out, `"notes": "after done"`) {
+		t.Fatalf("show --json: %d %s", code, out)
+	}
+	if code, _, _ := set("", "fix", "--set"); code != 0 {
+		t.Fatal("clear")
+	}
+	// empty notes are "" in JSON, never null
+	if code, out, _ := atl(t, "show", "fix", "--json"); code != 0 || !strings.Contains(out, `"notes": ""`) {
+		t.Fatalf("show --json: %d %s", code, out)
+	}
+	if code, out, _ := atl(t, "show", "fix"); code != 0 || !strings.HasSuffix(out, "\nNotes\n  (none)\n") {
+		t.Fatalf("show: %d %s", code, out)
+	}
+}
+
+func TestWriteNotes(t *testing.T) {
+	var b bytes.Buffer
+	writeNotes(&b, "  ", "Goal\n\n  - "+strings.Repeat("word ", 30)+"\n\tx\x1b")
+	want := "  Goal\n\n    - " + strings.TrimSpace(strings.Repeat("word ", 18)) + "\n      " +
+		strings.TrimSpace(strings.Repeat("word ", 12)) + "\n   x\n"
+	if b.String() != want {
+		t.Fatalf("got\n%q\nwant\n%q", b.String(), want)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -57,18 +58,19 @@ func TestAssistantClaudeMD(t *testing.T) {
 		"belongs in the task's own Claude", "select the task and press Enter", "`atl open <task>`",
 		"The task session sees the task's worktrees",
 		"When greeted with \"Let's talk about task <slug>.\", immediately gather status",
-		"`atl show <slug> --json`, `atl notes <slug>`, `atl transcript <slug> --tail 30`",
+		"`atl show <slug> --json` (includes the notes), `atl transcript <slug> --tail 30`",
 		"goal, done, pending, blockers, suggested next step",
 		"ask what the user", "resume it, add a repo, save a note, finish it",
 		"ALWAYS ask for explicit confirmation",
 		"state the exact command",
 		"atl ls [--status", "atl show <task> [--json]", "atl transcript <task> [--session ID] [--tail N]",
-		"atl notes <task>", "atl note <task> <text> --author assistant", "atl repos", "atl new ", "atl add ",
+		"atl show <task> --notes", "atl notes <task>", "atl note <task> <text> --author assistant", "atl notes <task> --set",
+		"atl repos", "atl new ", "atl add ",
 		"atl status ", "atl rename <task> <new title...>", "atl session ", "atl resume ", "atl diff ", "atl pr ", "atl done ", "atl cancel ",
-		"atl show X --json", "atl notes X", "atl transcript X --tail 30",
+		"atl show X --json", "atl show X --notes", "atl transcript X --tail 30",
 		"git log", "goal, what was done, what is pending, blockers, suggested next step",
 		"run `atl ls` and ask",
-		"offer to save a short note",
+		"offer to append a short note",
 		"Never edit files in repos",
 		"Keep answers short",
 		"one-step-at-a-time",
@@ -90,6 +92,22 @@ func TestAssistantClaudeMD(t *testing.T) {
 	}
 	if !strings.Contains(md, "slug, branch `atl/<slug>`, tmux") {
 		t.Error("rename entry does not say the slug and branch stay")
+	}
+	// notes: read with atl show --notes (allowed); atl note appends and
+	// atl notes --set replaces, both under "Changes state", --set asks first
+	readOnly := ro[strings.Index(ro, "Read-only (run freely):"):]
+	if !strings.Contains(readOnly, "- `atl show <task> --notes` — only the task's notes") ||
+		!strings.Contains(readOnly, "asks for permission here (its `--set` form") ||
+		strings.Contains(readOnly, "--set` —") || strings.Contains(readOnly, "atl note <task>") {
+		t.Error("read-only notes commands wrong")
+	}
+	if !strings.Contains(changes, "- `atl note <task> <text> --author assistant` — append a line `- YYYY-MM-DD [assistant] <text>`") ||
+		!strings.Contains(changes, "- `atl notes <task> --set` — REPLACE the whole notes text with stdin") ||
+		!strings.Contains(changes, "get their yes first") || !strings.Contains(changes, "use `atl note` instead") {
+		t.Error("notes write commands not described under the state-changing commands")
+	}
+	if !strings.Contains(md, "`cancel`, `note`, `notes --set`)") {
+		t.Error("confirm rule lacks notes --set")
 	}
 	// always regenerated
 	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("tampered"), 0o644); err != nil {
@@ -132,14 +150,14 @@ func TestAssistantSettings(t *testing.T) {
 			t.Errorf("allow lacks %s", want)
 		}
 	}
-	for _, want := range []string{"Bash(atl done *)", "Bash(atl note *)", "Bash(atl new *)", "Bash(atl open *)", "Bash(atl rename *)", "Bash(atl status *)"} {
+	for _, want := range []string{"Bash(atl done *)", "Bash(atl note *)", "Bash(atl notes *)", "Bash(atl new *)", "Bash(atl open *)", "Bash(atl rename *)", "Bash(atl status *)"} {
 		if !contains(strList(t, perms["ask"]), want) {
 			t.Errorf("ask lacks %s", want)
 		}
 	}
 	// state-changing commands are never auto-allowed
 	for _, r := range strList(t, perms["allow"]) {
-		for _, cmd := range []string{"rename", "note ", "status"} {
+		for _, cmd := range []string{"rename", "note", "status"} {
 			if strings.Contains(r, "atl "+cmd) {
 				t.Errorf("allow has state-changing rule %s", r)
 			}
@@ -163,6 +181,68 @@ func TestAssistantSettings(t *testing.T) {
 	}
 }
 
+// ruleMatches reports whether permission rule matches Bash command c the
+// way Claude Code matches rules: "Bash(pattern)" with * matching any run of
+// characters (spaces included), and the legacy "Bash(prefix:*)".
+func ruleMatches(rule, c string) bool {
+	if !strings.HasPrefix(rule, "Bash(") || !strings.HasSuffix(rule, ")") {
+		return false
+	}
+	pat := strings.TrimSuffix(strings.TrimPrefix(rule, "Bash("), ")")
+	if p, ok := strings.CutSuffix(pat, ":*"); ok {
+		return c == p || strings.HasPrefix(c, p+" ")
+	}
+	var re strings.Builder
+	re.WriteString("^")
+	for i, part := range strings.Split(pat, "*") {
+		if i > 0 {
+			re.WriteString(".*")
+		}
+		re.WriteString(regexp.QuoteMeta(part))
+	}
+	re.WriteString("$")
+	return regexp.MustCompile(re.String()).MatchString(c)
+}
+
+// TestAssistantNotesPermissions checks that no allow rule lets a notes
+// write run without asking, however --set is spelled (an ask rule that
+// matches wins over allow; a command no rule matches asks in the
+// default mode), and that notes can still be read without asking.
+func TestAssistantNotesPermissions(t *testing.T) {
+	if !ruleMatches("Bash(atl show *)", "atl show x --json") || ruleMatches("Bash(atl note *)", "atl notes x") ||
+		!ruleMatches("Bash(atl ls:*)", "atl ls") || ruleMatches("Bash(atl notes *)", "atl notes-x") {
+		t.Fatal("ruleMatches is broken")
+	}
+	matchesAny := func(rules []string, c string) bool {
+		for _, r := range rules {
+			if ruleMatches(r, c) {
+				return true
+			}
+		}
+		return false
+	}
+	asks := []string{ // writes, and atl notes itself (its --set form writes)
+		"atl notes fix --set", "atl notes --set fix", "atl notes fix --set=true", `atl notes fix "--set"`,
+		"atl notes fix '--set'", `atl notes fix --s""et`, "atl notes fix --set < /tmp/x", "atl notes  fix --set",
+		"atl notes\tfix --set", "atl note fix hello", "atl note fix --author assistant hello", "atl notes fix",
+	}
+	for _, c := range asks {
+		if matchesAny(assistantAllow, c) {
+			t.Errorf("allow rule lets %q run without asking", c)
+		}
+	}
+	for _, c := range []string{"atl notes fix --set", "atl notes --set fix", "atl notes fix --set=true", `atl notes fix "--set"`, "atl note fix hello"} {
+		if !matchesAny(assistantAsk, c) {
+			t.Errorf("no ask rule for %q", c)
+		}
+	}
+	for _, c := range []string{"atl show fix --notes", "atl show fix --json"} {
+		if !matchesAny(assistantAllow, c) || matchesAny(assistantAsk, c) {
+			t.Errorf("%q is not allowed without asking", c)
+		}
+	}
+}
+
 func TestAssistantSettingsMerge(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".claude", "settings.json")
@@ -173,7 +253,7 @@ func TestAssistantSettingsMerge(t *testing.T) {
   "model": "opus",
   "permissions": {
     "defaultMode": "bypassPermissions",
-    "allow": ["Bash(git log:*)", "Read", "Bash(atl note:*)", "Bash(atl ls:*)", "Bash(rm *)", "Bash(atl rename *)", "Bash(atl rename:*)"],
+    "allow": ["Bash(git log:*)", "Read", "Bash(atl note:*)", "Bash(atl ls:*)", "Bash(rm *)", "Bash(atl rename *)", "Bash(atl rename:*)", "Bash(atl notes *)", "Bash(atl notes:*)"],
     "ask": ["Bash(rm:*)", "Bash(atl pr:*)", "Bash(atl pr *)"],
     "deny": ["Bash(atl done:*)", "Bash(atl done *)", "Bash(git push *)", "Bash(curl *)"]
   },

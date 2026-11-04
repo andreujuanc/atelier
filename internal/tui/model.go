@@ -36,7 +36,7 @@ const (
 	modeForm
 	modeConfirm
 	modePicker
-	modeNote
+	modeNotes // the in-place notes editor (m) has the keyboard
 	modeSessions
 	modeRename
 )
@@ -126,6 +126,22 @@ type (
 		repos []app.RepoArg
 		err   error
 	}
+	// notesLoadedMsg ends a GetNotes for `m` (open the editor) or, with
+	// reload, for ctrl+r in the editor.
+	notesLoadedMsg struct {
+		id     int64
+		slug   string
+		text   string
+		reload bool
+		err    error
+	}
+	// notesSavedMsg ends a ctrl+s save of sent (saved: as stored).
+	notesSavedMsg struct {
+		id          int64
+		slug        string
+		sent, saved string
+		err         error
+	}
 	// addStepMsg ends AddRepo for repos[i] of an `a` run on a task.
 	addStepMsg struct {
 		id     int64
@@ -202,10 +218,9 @@ type Model struct {
 	repos    []string // last AvailableRepos result
 	// sessPick is the session picker Enter opened (modeSessions).
 	sessPick *sessionPicker
-	// noteInput is the `m` note being typed for task noteID/noteSlug.
-	noteInput textinput.Model
-	noteID    int64
-	noteSlug  string
+	// notes is the in-place notes editor (`m`), bound to the task it was
+	// opened on; nil when not editing.
+	notes *notesEditor
 	// renameInput is the `t` title being edited for task renameID/renameSlug.
 	renameInput textinput.Model
 	renameID    int64
@@ -243,11 +258,6 @@ func New(ctx context.Context, be Backend) *Model {
 	fi.Prompt = "/"
 	fi.Placeholder = "filter"
 	fi.Cursor.SetMode(cursor.CursorStatic)
-	ni := textinput.New()
-	ni.Prompt = "note> "
-	ni.Placeholder = "a note for this task (enter saves, esc cancels)"
-	ni.Cursor.SetMode(cursor.CursorStatic)
-	ni.CharLimit = 2000
 	ri := textinput.New()
 	ri.Prompt = "title> "
 	ri.Placeholder = "the task's new title (enter saves, esc cancels)"
@@ -262,7 +272,6 @@ func New(ctx context.Context, be Backend) *Model {
 		},
 		diffCmd:      func(slug string) *exec.Cmd { return exec.Command("atl", "diff", slug) },
 		filterInput:  fi,
-		noteInput:    ni,
 		renameInput:  ri,
 		busy:         map[int64]string{},
 		dirtyTimeout: dirtyTimeout,
@@ -625,6 +634,7 @@ func firstLine(s string) string {
 // Update implements tea.Model.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cmd := m.update(msg)
+	m.syncNotesSize()
 	if m.forceQuit {
 		return m, tea.Quit
 	}
@@ -668,7 +678,6 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		if m.form != nil {
 			m.form.setWidth(m.formInputWidth())
 		}
-		m.noteInput.Width = m.noteInputWidth()
 		m.renameInput.Width = m.renameInputWidth()
 		return nil
 	case tea.KeyMsg:
@@ -826,6 +835,10 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		m.statusFromOut = true
 		return nil
 
+	case notesLoadedMsg:
+		return m.notesLoaded(msg)
+	case notesSavedMsg:
+		return m.notesSaved(msg)
 	case opMsg:
 		delete(m.busy, msg.id)
 		if msg.err != nil {
@@ -922,10 +935,8 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		var cmd tea.Cmd
 		m.filterInput, cmd = m.filterInput.Update(msg)
 		return cmd
-	case modeNote:
-		var cmd tea.Cmd
-		m.noteInput, cmd = m.noteInput.Update(msg)
-		return cmd
+	case modeNotes:
+		return m.notesUpdate(msg)
 	case modeRename:
 		var cmd tea.Cmd
 		m.renameInput, cmd = m.renameInput.Update(msg)
@@ -961,6 +972,9 @@ func (m *Model) exec(op, slug string, c *exec.Cmd) tea.Cmd {
 func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	key := msg.String()
 	if key == "ctrl+c" {
+		if m.mode == modeNotes && m.notes != nil {
+			return m.notesQuit()
+		}
 		return m.requestQuit(key)
 	}
 	// Bubble Tea may deliver fast-typed letters as one multi-rune event
@@ -985,51 +999,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.confirmKey(key)
 	case modeFilter:
 		return m.filterKey(msg)
-	case modeNote:
-		return m.noteKey(msg)
+	case modeNotes:
+		return m.notesKey(msg)
 	case modeRename:
 		return m.renameKey(msg)
 	case modeSessions:
 		return m.sessionsKey(msg)
 	}
 	return m.normalKey(key)
-}
-
-// noteKey handles a key while a note is being typed (`m`).
-func (m *Model) noteKey(msg tea.KeyMsg) tea.Cmd {
-	switch msg.String() {
-	case "esc":
-		m.mode = modeNormal
-		m.noteInput.Blur()
-		m.setStatus("note cancelled")
-		return nil
-	case "enter":
-		body := strings.TrimSpace(m.noteInput.Value())
-		if body == "" {
-			m.mode = modeNormal
-			m.noteInput.Blur()
-			m.setStatus("note: empty, not saved")
-			return nil
-		}
-		if op, busy := m.busy[m.noteID]; busy {
-			m.setStatus("busy: " + op + "… (enter again to save, esc cancels)")
-			return nil
-		}
-		m.mode = modeNormal
-		m.noteInput.Blur()
-		id, slug, be, ctx := m.noteID, m.noteSlug, m.be, m.ctx
-		m.busy[id] = "note " + slug
-		return func() tea.Msg {
-			text := "note added to " + slug
-			if _, err := be.AddNote(ctx, slug, body, model.AuthorUser); err != nil {
-				return opMsg{id: id, op: "note", err: err}
-			}
-			return opMsg{id: id, op: "note", text: text}
-		}
-	}
-	var cmd tea.Cmd
-	m.noteInput, cmd = m.noteInput.Update(msg)
-	return cmd
 }
 
 // renameKey handles a key while a task's title is being edited (`t`).
@@ -1354,12 +1331,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		tv := *t
 		return m.openPicker(&tv, "Add repos to "+clean(slug), nil, locked)
 	case "m":
-		m.noteID, m.noteSlug = t.Task.ID, slug
-		m.noteInput.SetValue("")
-		m.noteInput.Width = m.noteInputWidth()
-		m.noteInput.Focus()
-		m.mode = modeNote
-		return nil
+		return m.openNotes(t)
 	case "t":
 		m.renameID, m.renameSlug, m.renameOrig = t.Task.ID, slug, clean(t.Task.Title)
 		m.renameInput.SetValue(m.renameOrig)
@@ -1438,14 +1410,8 @@ func (m *Model) busyOps() []string {
 	return ops
 }
 
-// noteInputWidth is the visible width of the `m` note input: the full
+// renameInputWidth is the visible width of the `t` title input: the full
 // terminal width minus its prompt (0 or less means unlimited).
-func (m *Model) noteInputWidth() int {
-	return m.width - len(m.noteInput.Prompt) - 1
-}
-
-// renameInputWidth is the visible width of the `t` title input (see
-// noteInputWidth).
 func (m *Model) renameInputWidth() int {
 	return m.width - len(m.renameInput.Prompt) - 1
 }
