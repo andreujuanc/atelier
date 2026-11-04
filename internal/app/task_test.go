@@ -37,6 +37,9 @@ func TestMain(m *testing.M) {
 		"GIT_AUTHOR_EMAIL":    "test@example.com",
 		"GIT_COMMITTER_NAME":  "Test",
 		"GIT_COMMITTER_EMAIL": "test@example.com",
+		// No global Claude Code settings (a global statusLine would keep
+		// atelier's out of task settings, see gen.WriteSettings).
+		"CLAUDE_CONFIG_DIR": filepath.Join(dir, "claude"),
 	} {
 		os.Setenv(k, v)
 	}

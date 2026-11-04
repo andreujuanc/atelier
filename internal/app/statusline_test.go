@@ -14,7 +14,8 @@ import (
 // TestRelaunchAddsStatusLine: a task whose settings.json predates the
 // status line (hooks only, written by an older atl) gets atelier's
 // statusLine on its next launch (resume or new session); the hooks stay
-// and a user's own statusLine is never replaced.
+// and a user's own statusLine is never replaced. A global statusLine of the
+// user's makes the next launch drop atelier's entry.
 func TestRelaunchAddsStatusLine(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
@@ -99,6 +100,28 @@ func TestRelaunchAddsStatusLine(t *testing.T) {
 	m = read(path)
 	if sl, _ := m["statusLine"].(map[string]any); sl["command"] != "~/bin/my-status" {
 		t.Errorf("user statusLine replaced: %#v", m["statusLine"])
+	}
+	if countCmd(m, "Stop", gen.HookCommand("/opt/atl/atl", "Stop")) != 1 {
+		t.Errorf("hooks not refreshed: %v", m["hooks"])
+	}
+
+	// With a global statusLine of the user's, the next launch removes
+	// atelier's entry (project settings would hide the user's) and keeps
+	// the hooks.
+	cfg := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
+	if err := os.WriteFile(filepath.Join(cfg, "settings.json"), []byte(`{"statusLine": {"type": "command", "command": "~/s.sh"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path = filepath.Join(e.app.Paths.TaskDir("old"), ".claude", "settings.json")
+	s, err = e.app.NewSession(ctx, "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s.ID)
+	m = read(path)
+	if _, ok := m["statusLine"]; ok {
+		t.Errorf("atelier's statusLine kept despite a global one: %#v", m["statusLine"])
 	}
 	if countCmd(m, "Stop", gen.HookCommand("/opt/atl/atl", "Stop")) != 1 {
 		t.Errorf("hooks not refreshed: %v", m["hooks"])

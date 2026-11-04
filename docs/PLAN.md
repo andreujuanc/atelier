@@ -152,6 +152,8 @@ func (p Paths) RepoPath(name string) string   // Repos/name
 func (p Paths) WorktreePath(slug, repo string) string // Tasks/slug/repo
 func (p Paths) HookLog() string               // StateDir/hook.log
 func (p Paths) ProjectFile(name string) string // ConfigDir/projects/<name>.toml
+func ClaudeConfigDir() string                 // Claude Code's config dir: $CLAUDE_CONFIG_DIR, else ~/.claude ("" if unknown)
+func ClaudeUserSettings() string              // <ClaudeConfigDir>/settings.json, the user's global Claude settings
 ```
 
 Other env vars honoured across packages: `ATL_TMUX_SOCKET` (tmux `-L` name, tests), `ATL_BIN` (path written into
@@ -162,6 +164,7 @@ hook commands; default `os.Executable()`), `PAGER` (default `less -R`).
 ```go
 var ErrNotFound, ErrAmbiguous error
 func Open(path string) (*Store, error)   // mkdir parent, pragmas, migrate
+func OpenReadOnly(path string, busy time.Duration) (*Store, error) // statusline only: existing file, mode=ro + query_only, no migrate/journal_mode; user_version != current → ErrSchemaVersion
 func (s *Store) Close() error
 // tasks
 func (s *Store) CreateTask(ctx, t *model.Task) error            // inserts task + repos in one tx; sets t.ID, timestamps
@@ -276,8 +279,13 @@ Merge: other top-level keys and non-atelier hook entries are kept; atelier's hoo
 the binary = atlBin or a basename `atl`/`atl<non-letter>…`) are replaced. `statusLine` is set only if absent or
 atelier's own (an object, `type` absent or "command", `command` exactly `<atl binary> statusline` by the same binary
 rule), which is updated in place (its other keys, e.g. `padding`, kept); any other `statusLine` (a user's) is left
-alone. Rewritten before every Claude launch (prepareTaskDir), so existing tasks get it on their next session or
-resume. The user's global `~/.claude/settings.json` and the assistant's settings are never touched.
+alone. Project settings take precedence over the user's global ones, so if `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`
+(`config.ClaudeUserSettings()`) has a non-null `statusLine`, atelier's entry is not added and an existing atelier entry
+is removed (a user's task-level one is still kept); a missing, unreadable or unparsable global file counts as "no
+statusLine" (not logged). So atelier's status line appears only for users without a global one; they can remove theirs
+or call `atl statusline` from their own script. Rewritten before every Claude launch (prepareTaskDir), so existing
+tasks get it on their next session or resume. The user's global settings (only read) and the assistant's settings are
+never touched.
 
 ### `internal/hook`
 
@@ -339,7 +347,11 @@ object; missing/mistyped fields ignored). Task: the row with `session_id` (state
 `oneLine` (control/format chars → space, collapsed; blank → slug), cut to 80 columns with "…"; the dot wrapped in
 24-bit ANSI from `palette.StateLook(state)` (TUI colours; Light variant if `$COLORFGBG` says light bg; plain with
 `NO_COLOR`). No task, no DB file (never created), bad/oversized input → prints nothing; always exit 0; errors (not
-"no match") → hook.log as `event=statusline`. One DB open, 2 queries (3 when a session id is unknown).
+"no match") → hook.log as `event=statusline`. DB via `store.OpenReadOnly` (busy timeout 500ms): never creates,
+migrates or writes the file, journal mode untouched; a `user_version` other than the current one (older, newer, 0 for
+an empty file) → prints nothing, not logged (the next hook/atl migrates). Reading a WAL DB may leave empty `-wal`/`-shm`
+files (SQLite needs the shm index; avoidable only with `immutable=1`, unsafe, or `readonly_shm=1`, which fails without
+an existing `-shm`). One DB open + the version check, 2 queries (3 when a session id is unknown).
 
 Performance/robustness: no cobra on this path; one DB open; total budget <50ms. All errors appended to
 `Paths.HookLog()` with timestamp + event; exit 0 except the ro block. Never prints to stdout.

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/gen"
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
@@ -113,19 +114,6 @@ func assistantArgv(continueLast bool, prompt []string) []string {
 	return append(argv, prompt...)
 }
 
-// claudeConfigDir returns Claude Code's config dir: $CLAUDE_CONFIG_DIR, else
-// ~/.claude ("" if neither is known).
-func claudeConfigDir() string {
-	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
-		return d
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return ""
-	}
-	return filepath.Join(home, ".claude")
-}
-
 // claudeProjectKey encodes an absolute directory the way Claude Code names
 // its per-project transcript dir under <config>/projects: every character
 // other than [A-Za-z0-9] becomes '-' (two for a character outside the BMP,
@@ -149,7 +137,7 @@ func claudeProjectKey(dir string) string {
 // <config>/projects/<key> for dir's absolute path and, if different, its
 // symlink-resolved path (nil if the config dir is unknown).
 func claudeProjectDirs(dir string) []string {
-	cfg := claudeConfigDir()
+	cfg := config.ClaudeConfigDir()
 	if cfg == "" {
 		return nil
 	}

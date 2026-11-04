@@ -3,6 +3,7 @@ package hook
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -131,6 +132,137 @@ func TestStatusLineNothing(t *testing.T) {
 		}
 		if _, err := os.Stat(data); !os.IsNotExist(err) {
 			t.Errorf("data dir created: %v", err)
+		}
+	})
+}
+
+// dbSnap is the database file's contents and modification time.
+type dbSnap struct {
+	data  []byte
+	mtime time.Time
+}
+
+func snapDB(t *testing.T, path string) dbSnap {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dbSnap{b, fi.ModTime()}
+}
+
+// rawDB opens path with plain SQLite (no store.Open, so no migration).
+func rawDB(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	return db
+}
+
+func userVersion(t *testing.T, path string) int {
+	t.Helper()
+	db := rawDB(t, path)
+	defer db.Close()
+	var v int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+// TestStatusLineReadOnly: `atl statusline` never writes the database. A
+// current one is read without changing the file; an older (v4), newer or
+// empty one prints nothing, is not migrated or created, and is not logged.
+// (Reading a WAL database may leave empty -wal/-shm files next to it, see
+// store.OpenReadOnly; the database file itself is untouched.)
+func TestStatusLineReadOnly(t *testing.T) {
+	f := setup(t)
+	f.session(t, model.StateIdle, "c-fix")
+	f.st.Close() // the last connection: the WAL is folded into the file
+	env := map[string]string{"ATL_TASK": "fix", "NO_COLOR": "1"}
+
+	t.Run("current schema", func(t *testing.T) {
+		before := snapDB(t, f.p.DB)
+		if out, errOut := statusRun(t, `{"session_id":"c-fix"}`, env); out != "● Fix\n" || errOut != "" {
+			t.Errorf("stdout %q stderr %q", out, errOut)
+		}
+		if after := snapDB(t, f.p.DB); !bytes.Equal(before.data, after.data) || !before.mtime.Equal(after.mtime) {
+			t.Error("database file changed")
+		}
+	})
+
+	t.Run("older schema (v4) stays v4", func(t *testing.T) {
+		// Turn the fixture's database into a genuine v4 one: v5 only added
+		// tasks.notes (and filled it from task_notes).
+		db := rawDB(t, f.p.DB)
+		for _, q := range []string{"ALTER TABLE tasks DROP COLUMN notes", "PRAGMA user_version = 4"} {
+			if _, err := db.Exec(q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		db.Close()
+		before := snapDB(t, f.p.DB)
+		os.Remove(f.p.HookLog())
+		if out, errOut := statusRun(t, `{"session_id":"c-fix"}`, env); out != "" || errOut != "" {
+			t.Errorf("stdout %q stderr %q, want nothing", out, errOut)
+		}
+		if after := snapDB(t, f.p.DB); !bytes.Equal(before.data, after.data) || !before.mtime.Equal(after.mtime) {
+			t.Error("database file changed")
+		}
+		if v := userVersion(t, f.p.DB); v != 4 {
+			t.Errorf("user_version = %d, want 4 (migrated by the status line)", v)
+		}
+		if log := readLog(t, f.p); log != "" {
+			t.Errorf("logged: %s", log)
+		}
+	})
+
+	t.Run("newer schema", func(t *testing.T) {
+		db := rawDB(t, f.p.DB)
+		if _, err := db.Exec("PRAGMA user_version = 99"); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		before := snapDB(t, f.p.DB)
+		if out, _ := statusRun(t, `{"session_id":"c-fix"}`, env); out != "" {
+			t.Errorf("stdout %q, want nothing", out)
+		}
+		if after := snapDB(t, f.p.DB); !bytes.Equal(before.data, after.data) || !before.mtime.Equal(after.mtime) {
+			t.Error("database file changed")
+		}
+	})
+
+	t.Run("zero-byte file stays empty", func(t *testing.T) {
+		data := filepath.Join(f.root, "emptydata")
+		t.Setenv("XDG_DATA_HOME", data)
+		dbPath := filepath.Join(data, "atelier", "atelier.db")
+		if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dbPath, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		before := snapDB(t, dbPath)
+		os.Remove(f.p.HookLog())
+		if out, errOut := statusRun(t, `{"session_id":"c-fix"}`, env); out != "" || errOut != "" {
+			t.Errorf("stdout %q stderr %q, want nothing", out, errOut)
+		}
+		if after := snapDB(t, dbPath); len(after.data) != 0 || !before.mtime.Equal(after.mtime) {
+			t.Errorf("empty database written: %d bytes", len(after.data))
+		}
+		ents, _ := os.ReadDir(filepath.Dir(dbPath))
+		if len(ents) != 1 {
+			t.Errorf("files next to the empty database: %v", ents)
+		}
+		if log := readLog(t, f.p); log != "" {
+			t.Errorf("logged: %s", log)
 		}
 	})
 }

@@ -252,7 +252,8 @@ PostToolUse, Stop, SessionEnd and PreToolUse, and a `statusLine` that runs
 `atl statusline` (see [Status line](#status-line)). The file is rewritten before every
 Claude launch (new session, resume, `open --session`), so the `atl` path stays current and
 existing tasks pick up new entries on their next launch; your own keys and hooks in it are
-kept. Your global `~/.claude/settings.json` is never touched. They keep session state current
+kept. Your global `~/.claude/settings.json` is never touched (only read, for its
+`statusLine`). They keep session state current
 (`running`, `waiting` on permission prompts, `idle`, `ended`; `stopped` comes from
 crash recovery) and record each session's transcript path, and the PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
 on paths inside read-only repos. Hook failures never block Claude (except the
@@ -284,6 +285,19 @@ removed, cut at 80 columns). It prints nothing if it can't tell (errors go to `h
 If a task's `.claude/settings.json` already has a `statusLine` of yours, atelier leaves it
 alone; its own entry (`<atl> statusline`) is updated in place. Like hooks, Claude Code runs
 it only in trusted workspaces and not with `disableAllHooks`.
+
+Atelier's status line only appears when you have no global status line of your own. A
+task's project settings take precedence over your `~/.claude/settings.json` (or
+`$CLAUDE_CONFIG_DIR/settings.json`), so if that file defines a `statusLine`, atelier does
+not add its entry to task settings, and removes it on the next launch if an earlier one
+wrote it; your global status line shows instead. To see atelier's anyway, remove your
+global `statusLine`, or call `atl statusline` from your own status line script (pass it
+the same JSON on stdin; it prints one line, or nothing). A global file that is missing or
+can't be parsed counts as having no `statusLine`.
+
+`atl statusline` only reads the database: it never creates or migrates it, and prints
+nothing while the database is at another schema version than the binary (the next `atl`
+command or hook migrates it).
 
 ## Tests
 

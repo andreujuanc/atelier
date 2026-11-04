@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/andreujuanc/atelier/internal/config"
 )
 
 // hookEvents lists the Claude Code hook events atelier installs, in order.
@@ -50,8 +53,11 @@ func StatusLineCommand(atlBin string) string {
 // atelier entries are replaced (so there are never duplicates and the atl
 // path stays current). A statusLine atelier did not write is left alone;
 // atelier's own is updated in place (other keys in it, e.g. padding, are
-// kept). A file that is not a valid settings object is backed up to
-// settings.json.bak and replaced. The write is atomic.
+// kept). If the user's global Claude Code settings define a statusLine
+// (see globalStatusLine), atelier's own is not added and an existing one is
+// removed, since project settings would override the user's. A file that
+// is not a valid settings object is backed up to settings.json.bak and
+// replaced. The write is atomic.
 func WriteSettings(taskDir, atlBin string) error {
 	path, root, err := loadSettings(taskDir)
 	if err != nil {
@@ -65,13 +71,15 @@ func WriteSettings(taskDir, atlBin string) error {
 		setAtelierHook(hooks, ev.Name, ev.Matcher, ev.Name, atlBin)
 	}
 	root["hooks"] = hooks
-	setStatusLine(root, atlBin)
+	setStatusLine(root, atlBin, globalStatusLine(config.ClaudeUserSettings()))
 	return saveSettings(path, root)
 }
 
 // setStatusLine sets root's statusLine to atelier's command unless it holds
-// one atelier did not write (see isAtelierStatusLine).
-func setStatusLine(root map[string]any, atlBin string) {
+// one atelier did not write (see isAtelierStatusLine), which is kept. If
+// deferToGlobal is set (the user has a global statusLine), atelier's own
+// entry is removed instead of added.
+func setStatusLine(root map[string]any, atlBin string, deferToGlobal bool) {
 	entry := map[string]any{}
 	if cur, ok := root["statusLine"]; ok {
 		if !isAtelierStatusLine(cur, atlBin) {
@@ -79,9 +87,42 @@ func setStatusLine(root map[string]any, atlBin string) {
 		}
 		entry = cur.(map[string]any)
 	}
+	if deferToGlobal {
+		delete(root, "statusLine")
+		return
+	}
 	entry["type"] = "command"
 	entry["command"] = StatusLineCommand(atlBin)
 	root["statusLine"] = entry
+}
+
+// maxGlobalSettings caps how much of the user's global settings file
+// globalStatusLine reads; a larger file counts as having no statusLine.
+const maxGlobalSettings = 4 << 20
+
+// globalStatusLine reports whether the Claude Code settings file at path
+// (the user's global ~/.claude/settings.json) defines a non-null
+// statusLine. A missing, unreadable, oversized or unparsable file counts
+// as not defining one; errors are deliberately not reported.
+func globalStatusLine(path string) bool {
+	if path == "" {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxGlobalSettings+1))
+	if err != nil || len(data) > maxGlobalSettings {
+		return false
+	}
+	var root map[string]json.RawMessage
+	if json.Unmarshal(data, &root) != nil {
+		return false
+	}
+	v, ok := root["statusLine"]
+	return ok && string(bytes.TrimSpace(v)) != "null"
 }
 
 // isAtelierStatusLine reports whether v is a statusLine object written by

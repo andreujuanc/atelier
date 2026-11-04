@@ -25,8 +25,10 @@ import (
 // workspace.project_dir, model, ...) and shows its first stdout line under
 // the prompt. It prints "● <task title>", the dot coloured like the TUI
 // draws the session's state, or nothing at all when the task cannot be
-// resolved. Like the hook it is fast (one DB open, two queries), never
-// prints errors to stdout and always exits 0; errors go to hook.log.
+// resolved. Like the hook it is fast (one read-only DB open, a schema
+// version check and two queries), never prints errors to stdout and always
+// exits 0; errors go to hook.log. It never writes the database (see
+// store.OpenReadOnly).
 
 // EventStatusLine names `atl statusline` in hook.log lines.
 const EventStatusLine = "statusline"
@@ -86,7 +88,13 @@ func runStatusLine(stdin io.Reader, stdout, stderr io.Writer, env func(string) s
 	if _, err := os.Stat(p.DB); err != nil {
 		return 0 // no database (yet): never create one from here
 	}
-	st, err := store.OpenWithTimeout(p.DB, dbBusyTimeout)
+	// Read-only: the status line never creates, migrates or writes the
+	// database. An older (not yet migrated), newer or empty schema prints
+	// nothing and is not logged; the next hook or atl command migrates it.
+	st, err := store.OpenReadOnly(p.DB, dbBusyTimeout)
+	if errors.Is(err, store.ErrSchemaVersion) {
+		return 0
+	}
 	if err != nil {
 		logError(p, stderr, EventStatusLine, sid, err)
 		return 0
