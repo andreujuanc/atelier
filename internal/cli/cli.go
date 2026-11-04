@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -56,10 +57,24 @@ func Execute() int {
 type cli struct {
 	stdout, stderr io.Writer
 	app            *app.App
+	recovered      bool            // startup Recover already ran
+	ctx            context.Context // the invocation's context (for Recover)
 }
 
-// App returns the App, creating it on first use.
+// App returns the App, creating it on first use and then running startup
+// recovery (see recoverOnce).
 func (c *cli) App() (*app.App, error) {
+	a, err := c.openApp()
+	if err != nil {
+		return nil, err
+	}
+	c.recoverOnce(a)
+	return a, nil
+}
+
+// openApp returns the App, creating it on first use, without recovery (the
+// TUI runs its own Recover at start and every few seconds).
+func (c *cli) openApp() (*app.App, error) {
 	if c.app == nil {
 		a, err := app.New(c.stderr)
 		if err != nil {
@@ -68,6 +83,24 @@ func (c *cli) App() (*app.App, error) {
 		c.app = a
 	}
 	return c.app, nil
+}
+
+// recoverOnce runs App.Recover the first time it is called: sessions whose
+// tmux window is gone become stopped on every atl start (spec "Crash
+// recovery"). Failures are warnings, and are not even printed when tmux is
+// not installed (doctor reports that).
+func (c *cli) recoverOnce(a *app.App) {
+	if c.recovered {
+		return
+	}
+	c.recovered = true
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := a.Recover(ctx); err != nil && !errors.Is(err, exec.ErrNotFound) {
+		fmt.Fprintf(c.stderr, "atl: warning: %v\n", err)
+	}
 }
 
 // doctorApp returns an App for doctor, which must work even when the
@@ -84,7 +117,7 @@ func (c *cli) doctorApp() (*app.App, error) {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	c := &cli{stdout: stdout, stderr: stderr}
+	c := &cli{stdout: stdout, stderr: stderr, ctx: ctx}
 	defer func() {
 		if c.app != nil {
 			c.app.Close()
@@ -147,7 +180,7 @@ func (c *cli) rootCmd() *cobra.Command {
 			if !isTerminal(os.Stdin) || !isTerminal(c.stdout) {
 				return cmd.Help()
 			}
-			ap, err := c.App()
+			ap, err := c.openApp()
 			if err != nil {
 				return err
 			}

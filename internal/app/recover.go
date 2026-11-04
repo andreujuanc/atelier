@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-
-	"github.com/andreujuanc/atelier/internal/model"
 )
 
 // Recover marks live sessions (running, waiting, idle) whose tagged tmux
@@ -17,12 +15,16 @@ import (
 // Live sessions with an empty tmux target are skipped entirely: they are
 // either Claude processes atl did not launch (rows created by hooks) or
 // sessions whose window is being launched right now (NewSession, Resume).
-// Rows are marked with Store.MarkStoppedIfLive, so a session that ended
-// concurrently stays ended.
+//
+// The session snapshot is taken before the tmux listing, and each row is
+// marked with Store.MarkStoppedIfLaunch, a compare-and-set on the launch
+// (tmux target + launch sequence) seen in that snapshot. Together these make
+// a stale snapshot harmless: a window recorded before the snapshot was
+// tagged before it too, so its absence from the later listing means it is
+// really gone; and a session relaunched (or ended) after the snapshot no
+// longer matches the launch and is left alone.
 func (a *App) Recover(ctx context.Context) (int, error) {
-	// Sessions are listed before windows: a session that became live after
-	// the listing cannot be misjudged by a stale window snapshot.
-	live, err := a.Store.ListSessionsByState(ctx, model.StateRunning, model.StateWaiting, model.StateIdle)
+	live, err := a.Store.ListLaunchedLive(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("recover: %w", err)
 	}
@@ -36,16 +38,13 @@ func (a *App) Recover(ctx context.Context) (int, error) {
 	now := a.now()
 	n := 0
 	var errs []error
-	for _, s := range live {
-		if s.TmuxTarget == "" {
+	for _, l := range live {
+		if _, ok := tags[strconv.FormatInt(l.ID, 10)]; ok {
 			continue
 		}
-		if _, ok := tags[strconv.FormatInt(s.ID, 10)]; ok {
-			continue
-		}
-		changed, err := a.Store.MarkStoppedIfLive(ctx, s.ID, now)
+		changed, err := a.Store.MarkStoppedIfLaunch(ctx, l, now)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("recover session %d: %w", s.ID, err))
+			errs = append(errs, fmt.Errorf("recover session %d: %w", l.ID, err))
 			continue
 		}
 		if changed {

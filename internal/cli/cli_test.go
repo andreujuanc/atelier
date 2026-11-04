@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/store"
 )
 
 func TestMain(m *testing.M) {
@@ -264,5 +265,47 @@ func TestPRExitCode(t *testing.T) {
 	git(t, wt, "push", "-q", "origin", "atl/ship")
 	if code, out, errs := atl(t, "pr", "ship"); code != 1 || out != "api\tskipped: gh: boom\n" || errs != "" {
 		t.Fatalf("pr (gh fails): %d %q %q", code, out, errs)
+	}
+}
+
+// TestStartupRecover checks that commands run Recover once at start: a live
+// session whose tmux window is gone (here: no server at all) is reported
+// stopped by `atl ls`, without a warning.
+func TestStartupRecover(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	setup(t)
+	if code, _, errs := atl(t, "new", "rec", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	st, err := store.Open(filepath.Join(os.Getenv("XDG_DATA_HOME"), "atelier", "atelier.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	tk, err := st.ResolveTask(ctx, "rec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &model.Session{TaskID: tk.ID, ClaudeSessionID: "cid", TmuxTarget: "@5", Name: "claude-x", State: model.StateRunning}
+	if err := st.CreateSession(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errs := atl(t, "ls", "--json")
+	if code != 0 || errs != "" {
+		t.Fatalf("ls: %d %q", code, errs)
+	}
+	var tasks []struct {
+		Sessions []struct {
+			State string `json:"state"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal([]byte(out), &tasks); err != nil || len(tasks) != 1 || len(tasks[0].Sessions) != 1 {
+		t.Fatalf("ls json: %v %s", err, out)
+	}
+	if got := tasks[0].Sessions[0].State; got != "stopped" {
+		t.Fatalf("session state after startup recover = %s, want stopped", got)
 	}
 }

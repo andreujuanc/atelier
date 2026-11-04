@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Stub `claude` for test/e2e.sh. It logs its argv and selected env, then
+# emulates Claude Code's SessionStart hook by piping hook JSON into
+# `atl hook SessionStart` (atl is on PATH), and idles like an interactive
+# session waiting for input.
+set -euo pipefail
+
+if [[ "${1:-}" == "--version" ]]; then
+	echo "0.0.0 (claude stub)"
+	exit 0
+fi
+
+log="${E2E_LOG:-${ATL_TASK_DIR:-$PWD}/.e2e-claude.log}"
+
+sid="" source="startup" prev=""
+for a in "$@"; do
+	if [[ "$prev" == "--resume" ]]; then
+		sid="$a" source="resume"
+	fi
+	prev="$a"
+done
+if [[ -z "$sid" ]]; then
+	if [[ -r /proc/sys/kernel/random/uuid ]]; then
+		sid="$(cat /proc/sys/kernel/random/uuid)"
+	else
+		sid="stub-$$-$RANDOM$RANDOM"
+	fi
+fi
+
+{
+	printf 'claude task=%s session=%s port=%s foo=%s cwd=%s sid=%s argv=' \
+		"${ATL_TASK:-}" "${ATL_SESSION:-}" "${ATL_PORT_OFFSET:-}" "${FOO:-}" "$PWD" "$sid"
+	printf '[%s]' "$@"
+	printf '\n'
+} >>"$log"
+
+printf '{"session_id":"%s","cwd":"%s","hook_event_name":"SessionStart","source":"%s"}' \
+	"$sid" "$PWD" "$source" | atl hook SessionStart
+
+exec sleep 3600

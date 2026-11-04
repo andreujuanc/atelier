@@ -65,6 +65,10 @@ CREATE TABLE sessions (
 );
 CREATE INDEX sessions_task ON sessions(task_id);
 CREATE INDEX sessions_claude ON sessions(claude_session_id);`,
+	// v2: launch_seq is bumped whenever a window is (about to be) launched
+	// for the session, so Recover can compare-and-set against the launch it
+	// observed even if tmux reuses a window id after a server restart.
+	`ALTER TABLE sessions ADD COLUMN launch_seq INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // DefaultBusyTimeout is how long Open waits on a locked database.

@@ -381,3 +381,53 @@ func TestShellQuote(t *testing.T) {
 		}
 	}
 }
+
+func TestKillTaggedWindows(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	if n, err := c.KillTaggedWindows(ctx, "7", ""); n != 0 || err != nil {
+		t.Fatalf("KillTaggedWindows on empty server = %d, %v", n, err)
+	}
+	if _, err := c.run(ctx, "set-option", "-g", "remain-on-exit", "on"); err != nil {
+		t.Fatal(err)
+	}
+	keep, err := c.NewWindow(ctx, WindowSpec{Session: "atl-x", Argv: []string{"sleep", "300"}, Tag: "70"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead, err := c.NewWindow(ctx, WindowSpec{Session: "atl-x", Argv: []string{"sh", "-c", "sleep 0.3"}, Tag: "7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := c.NewWindow(ctx, WindowSpec{Session: "atl-y", Argv: []string{"sleep", "300"}, Tag: "7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDead(t, c, dead)
+	// except spares one window carrying the tag.
+	n, err := c.KillTaggedWindows(ctx, "7", live)
+	if err != nil || n != 1 {
+		t.Fatalf("KillTaggedWindows(except %s) = %d, %v; want 1", live, n, err)
+	}
+	out, err := c.run(ctx, "list-windows", "-a", "-F", "#{window_id}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := keep + "\n" + live; out != want {
+		t.Fatalf("windows left = %q, want %q (killed %s)", out, want, dead)
+	}
+	n, err = c.KillTaggedWindows(ctx, "7", "")
+	if err != nil || n != 1 {
+		t.Fatalf("KillTaggedWindows = %d, %v; want 1", n, err)
+	}
+	out, err = c.run(ctx, "list-windows", "-a", "-F", "#{window_id}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != keep {
+		t.Fatalf("windows left = %q, want only %s (killed %s)", out, keep, live)
+	}
+	if _, err := c.KillTaggedWindows(ctx, "", ""); err == nil {
+		t.Fatal("KillTaggedWindows(\"\") succeeded")
+	}
+}

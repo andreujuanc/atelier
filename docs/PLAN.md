@@ -121,6 +121,7 @@ CREATE TABLE sessions (
   last_event_at INTEGER NOT NULL
 );
 CREATE INDEX sessions_task ON sessions(task_id);
+-- migration v2: ALTER TABLE sessions ADD COLUMN launch_seq INTEGER NOT NULL DEFAULT 0 (bumped by ClaimStopped / SetSessionLaunch)
 CREATE INDEX sessions_claude ON sessions(claude_session_id);
 ```
 
@@ -175,7 +176,8 @@ func (s *Store) ListSessions(ctx, taskID int64) ([]model.Session, error)      //
 func (s *Store) ListSessionsByState(ctx, states ...model.SessionState) ([]model.Session, error)
 func (s *Store) UpdateSession(ctx, sess *model.Session) error  // writes all mutable fields
 func (s *Store) SetSessionState(ctx, id int64, st model.SessionState, at time.Time) error
-func (s *Store) MarkStoppedIfLive(ctx, id int64, at time.Time) (bool, error) // only if live AND tmux_target != '' (Recover)
+func (s *Store) ListLaunchedLive(ctx) ([]model.Session, ...)                  // live rows with tmux_target != '' + launch_seq snapshot (Recover)
+func (s *Store) MarkStoppedIfLaunch(ctx, id, target, launchSeq, at) (bool, error) // CAS on target + launch_seq (Recover)
 func (s *Store) ClaimStopped(ctx, id int64, at time.Time) (bool, error)      // stopped → idle, clears tmux_target (Resume claim)
 func (s *Store) SetSessionLaunch(ctx, id int64, tmuxTarget, name string) error // only those two columns
 func (s *Store) SetClaudeSession(ctx, id int64, cid string, at time.Time) error   // claude id + state idle (hook SessionStart)
@@ -221,6 +223,7 @@ type WindowSpec struct {
 }
 func (c *Client) NewWindow(ctx, spec WindowSpec) (windowID string, err error) // returns "@N"
 func (c *Client) TaggedWindows(ctx) (map[string]string, error) // tag → window id, all sessions; no server → empty map, nil
+func (c *Client) KillTaggedWindows(ctx, tag, except string) error // exact @atl_session match; Resume kills stale windows after launching
 func (c *Client) KillSession(ctx, name string) error           // missing session is not an error
 func (c *Client) AttachCmd(name string) *exec.Cmd               // $TMUX set → switch-client -t, else attach-session -t
 ```

@@ -14,7 +14,7 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | M5 CLI | done (reviewed, 1 fix round) |
 | M6 TUI | done (reviewed, 1 fix round) |
 | M7 projects, scripts, ports, diff, pr | done (approved + 1 fix round) |
-| M8 crash recovery + e2e | in progress |
+| M8 crash recovery + e2e | done (reviewed, 1 fix round) |
 
 ## Decisions
 
@@ -47,4 +47,9 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 - (M6) q with ops in flight waits for them (second ctrl+c forces). D runs `atl diff <slug>` via ExecProcess. Titles are whitespace-collapsed at creation.
 - (M7) Scripts: `sh -c` in worktree, own process group (SIGTERM then SIGKILL after 5s on cancel), stdin /dev/null, output streamed to App.Out prefixed. Env: inherited < project env < ATL_*; ATL_SESSION dropped.
 - (M7) setup failure = warning; teardown failure aborts done/cancel unless --force. `atl pr` never pushes; exit 1 only if gh failed. gitx.Untracked added.
-- (M7, open) flaky TestResumeConcurrent ("resumed 4, want 3") under -race → duplicate window; M3 Resume/Recover race. Assigned to M8.
+- (M7, fixed in M8) flaky TestResumeConcurrent ("resumed 4, want 3") under -race → duplicate window; M3 Resume/Recover race. Assigned to M8.
+- (M8) Race fix: Recover's stale snapshot could stop a session relaunched by a concurrent Resume (window ids reused after server restart) → migration v2 `launch_seq` + MarkStoppedIfLaunch CAS.
+- (M8) Startup Recover on every App command except hook/doctor (TUI recovers in Init + every 5s). Open attaches only if a live tagged window exists, else resume → new. Resume launches first, then kills stale same-tag windows.
+- (M8) `test/e2e.sh` (+ stubs, Go wrapper test/e2e_test.go) covers new → session → hook states → ro guard → crash/resume → diff → pr (no push) → done/cancel. README.md added.
+
+## All milestones complete. Branch `impl` (not merged to main).

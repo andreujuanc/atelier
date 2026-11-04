@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Stub `gh` for test/e2e.sh: logs argv and cwd to $E2E_GH_LOG (default
+# ./.e2e-gh.log) and prints a PR URL.
+set -euo pipefail
+
+if [[ "${1:-}" == "--version" ]]; then
+	echo "gh version 0.0.0 (stub)"
+	exit 0
+fi
+
+log="${E2E_GH_LOG:-$PWD/.e2e-gh.log}"
+{
+	printf 'gh cwd=%s argv=' "$PWD"
+	printf '[%s]' "$@"
+	printf '\n'
+} >>"$log"
+echo "https://github.com/example/$(basename "$PWD")/pull/1"

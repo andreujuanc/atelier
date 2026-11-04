@@ -277,6 +277,39 @@ func (c *Client) TaggedWindows(ctx context.Context) (map[string]string, error) {
 	return m, nil
 }
 
+// KillTaggedWindows kills every window, in every session, tagged with exactly
+// @atl_session=tag — live or dead (remain-on-exit) — except the window whose
+// id is except (if non-empty), and returns how many it killed. No server, no
+// sessions, or a window that disappears meanwhile is not an error.
+func (c *Client) KillTaggedWindows(ctx context.Context, tag, except string) (int, error) {
+	if tag == "" {
+		return 0, errors.New("tmux: kill tagged windows: empty tag")
+	}
+	out, err := c.run(ctx, "list-windows", "-a", "-F", "#{window_id} #{"+TagOption+"}")
+	if err != nil {
+		if noSessions(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	n := 0
+	var errs []error
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.SplitN(strings.TrimSpace(line), " ", 2)
+		if len(f) != 2 || f[1] != tag || !strings.HasPrefix(f[0], "@") || f[0] == except {
+			continue
+		}
+		if _, err := c.run(ctx, "kill-window", "-t", f[0]); err != nil {
+			if !gone(err) {
+				errs = append(errs, err)
+			}
+			continue
+		}
+		n++
+	}
+	return n, errors.Join(errs...)
+}
+
 // KillSession kills the named session. A missing session or server is not an
 // error.
 func (c *Client) KillSession(ctx context.Context, name string) error {

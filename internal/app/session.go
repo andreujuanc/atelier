@@ -165,8 +165,9 @@ func (a *App) Resume(ctx context.Context, ref string) (int, error) {
 }
 
 // resumeClaimed launches `claude --resume` for a session this caller has
-// claimed and records the window; on a failed launch it puts the session
-// back to stopped (see Resume).
+// claimed, then kills any other window still tagged with the session (e.g. a
+// dead remain-on-exit window) and records the new window; on a failed launch
+// it puts the session back to stopped (see Resume).
 func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir string) (err error) {
 	bg := context.WithoutCancel(ctx)
 	s, err := a.Store.GetSession(bg, id)
@@ -186,26 +187,43 @@ func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir st
 		}
 		return err
 	}
+	// A crashed claude under remain-on-exit leaves a dead window carrying the
+	// session's tag; drop it (and anything else still tagged with this
+	// session, which this caller now owns), sparing the new window. This runs
+	// after the launch so that, when the dead window was the tmux session's
+	// only one, the tmux session survives.
+	if _, kerr := a.Tmux.KillTaggedWindows(bg, strconv.FormatInt(id, 10), win); kerr != nil {
+		a.warnf("session %d: kill old windows: %v", id, kerr)
+	}
 	if err := a.Store.SetSessionLaunch(bg, id, win, s.Name); err != nil {
 		return fmt.Errorf("record window %s: %w", win, err)
 	}
 	return nil
 }
 
-// Open makes sure the task's tmux session exists — resuming stopped sessions,
-// else starting a new Claude session — and returns the command that attaches
-// the terminal to it.
+// Open makes sure the task has a live Claude window — resuming stopped
+// sessions, else starting a new Claude session — and returns the command that
+// attaches the terminal to the task's tmux session.
+//
+// It runs Recover first and attaches straight away only if one of the task's
+// sessions has a live tagged window: a tmux session holding nothing but dead
+// (remain-on-exit) windows does not count, so a crashed claude is relaunched
+// rather than attached to.
 func (a *App) Open(ctx context.Context, ref string) (*exec.Cmd, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
 	name := tmux.SessionName(t.Slug)
-	if a.Tmux.HasSession(ctx, name) {
-		return a.Tmux.AttachCmd(name), nil
-	}
 	if _, err := a.Recover(ctx); err != nil {
 		return nil, err
+	}
+	live, err := a.hasLiveWindow(ctx, t, name)
+	if err != nil {
+		return nil, err
+	}
+	if live {
+		return a.Tmux.AttachCmd(name), nil
 	}
 	sessions, err := a.Store.ListSessions(ctx, t.ID)
 	if err != nil {
@@ -219,10 +237,38 @@ func (a *App) Open(ctx context.Context, ref string) (*exec.Cmd, error) {
 			break
 		}
 	}
-	if !a.Tmux.HasSession(ctx, name) {
+	if live, err = a.hasLiveWindow(ctx, t, name); err != nil {
+		return nil, err
+	}
+	if !live {
 		if _, err := a.NewSession(ctx, t.Slug); err != nil {
 			return nil, err
 		}
 	}
 	return a.Tmux.AttachCmd(name), nil
+}
+
+// hasLiveWindow reports whether the task's tmux session exists and tmux has a
+// live (not dead) window tagged with one of the task's sessions.
+func (a *App) hasLiveWindow(ctx context.Context, t *model.Task, name string) (bool, error) {
+	if !a.Tmux.HasSession(ctx, name) {
+		return false, nil
+	}
+	tags, err := a.Tmux.TaggedWindows(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(tags) == 0 {
+		return false, nil
+	}
+	sessions, err := a.Store.ListSessions(ctx, t.ID)
+	if err != nil {
+		return false, err
+	}
+	for _, s := range sessions {
+		if _, ok := tags[strconv.FormatInt(s.ID, 10)]; ok {
+			return true, nil
+		}
+	}
+	return false, nil
 }

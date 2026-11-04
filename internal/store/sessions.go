@@ -146,34 +146,66 @@ func (s *Store) SetSessionState(ctx context.Context, id int64, st model.SessionS
 	return checkAffected(res, "session", id)
 }
 
-// MarkStoppedIfLive sets the session to stopped (last_event_at = at, now if
-// zero) only if it is currently live (running, waiting or idle), so it never
-// overwrites a concurrent transition to ended. Rows with an empty tmux_target
-// (hook-created rows for Claude processes atl did not launch, and sessions
-// whose window is being launched — see ClaimStopped) are never changed, so a
-// Recover working from a stale snapshot cannot stop a session mid-launch. It
-// reports whether the row changed; an unknown id is not an error.
-func (s *Store) MarkStoppedIfLive(ctx context.Context, id int64, at time.Time) (bool, error) {
+// Launch identifies one launch of a live session's window, as observed by
+// ListLaunchedLive: the recorded tmux target plus the session's launch
+// sequence number (bumped by ClaimStopped and SetSessionLaunch). Window ids
+// are reused after a tmux server restart, so the target alone does not
+// identify a launch.
+type Launch struct {
+	ID     int64
+	Target string
+	Seq    int64
+}
+
+// ListLaunchedLive returns every live session (running, waiting, idle) that
+// has a recorded tmux target, with the launch it was observed at.
+func (s *Store) ListLaunchedLive(ctx context.Context) ([]Launch, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, tmux_target, launch_seq FROM sessions
+		WHERE state IN ('running', 'waiting', 'idle') AND tmux_target != '' ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Launch
+	for rows.Next() {
+		var l Launch
+		if err := rows.Scan(&l.ID, &l.Target, &l.Seq); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// MarkStoppedIfLaunch sets the session to stopped (last_event_at = at, now if
+// zero) only if it is still live and still at the launch l (same non-empty
+// tmux target and launch sequence number). A session relaunched since l was
+// observed — even into a window that reuses the old window id — or ended
+// meanwhile is left alone. It reports whether the row changed.
+func (s *Store) MarkStoppedIfLaunch(ctx context.Context, l Launch, at time.Time) (bool, error) {
 	return s.changed(ctx, `UPDATE sessions SET state = 'stopped', last_event_at = ?
-		WHERE id = ? AND state IN ('running', 'waiting', 'idle') AND tmux_target != ''`, toMS(normTime(at)), id)
+		WHERE id = ? AND state IN ('running', 'waiting', 'idle') AND tmux_target != ''
+		AND tmux_target = ? AND launch_seq = ?`, toMS(normTime(at)), l.ID, l.Target, l.Seq)
 }
 
 // ClaimStopped atomically moves a stopped session to idle (last_event_at =
-// at, now if zero) and clears its tmux_target, reporting whether this caller
-// won the claim. Only the winner may launch a window for the session. The
-// target is cleared because the old window is gone and a live row with an
-// empty target is one Recover leaves alone while its window is launched; the
-// launcher records the new window with SetSessionLaunch.
+// at, now if zero), clears its tmux_target and bumps its launch sequence,
+// reporting whether this caller won the claim. Only the winner may launch a
+// window for the session. The target is cleared because the old window is
+// gone and a live row with an empty target is one Recover leaves alone while
+// its window is launched; the launcher records the new window with
+// SetSessionLaunch.
 func (s *Store) ClaimStopped(ctx context.Context, id int64, at time.Time) (bool, error) {
-	return s.changed(ctx, `UPDATE sessions SET state = 'idle', tmux_target = '', last_event_at = ?
-		WHERE id = ? AND state = 'stopped'`, toMS(normTime(at)), id)
+	return s.changed(ctx, `UPDATE sessions SET state = 'idle', tmux_target = '', launch_seq = launch_seq + 1,
+		last_event_at = ? WHERE id = ? AND state = 'stopped'`, toMS(normTime(at)), id)
 }
 
-// SetSessionLaunch records the tmux window and name of a launched session,
-// leaving every other column (state, claude_session_id, ...) untouched.
+// SetSessionLaunch records the tmux window and name of a launched session and
+// bumps its launch sequence, leaving every other column (state,
+// claude_session_id, ...) untouched.
 func (s *Store) SetSessionLaunch(ctx context.Context, id int64, tmuxTarget, name string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET tmux_target = ?, name = ? WHERE id = ?`,
-		tmuxTarget, name, id)
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET tmux_target = ?, name = ?,
+		launch_seq = launch_seq + 1 WHERE id = ?`, tmuxTarget, name, id)
 	if err != nil {
 		return err
 	}

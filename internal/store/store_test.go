@@ -595,40 +595,6 @@ func TestSessionTransitions(t *testing.T) {
 		return g
 	}
 
-	// MarkStoppedIfLive: only live states change.
-	for _, st := range model.AllSessionStates {
-		ss := mk(st)
-		ok, err := s.MarkStoppedIfLive(ctx, ss.ID, at)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if ok != st.Live() {
-			t.Errorf("MarkStoppedIfLive(%s) = %v", st, ok)
-		}
-		g := get(ss.ID)
-		if st.Live() {
-			if g.State != model.StateStopped || !g.LastEventAt.Equal(at) || g.TmuxTarget != "@7" || g.ClaudeSessionID != "cid" {
-				t.Errorf("after MarkStoppedIfLive(%s): %+v", st, g)
-			}
-		} else if g.State != st || g.LastEventAt.Equal(at) {
-			t.Errorf("MarkStoppedIfLive touched %s session: %+v", st, g)
-		}
-	}
-	if ok, err := s.MarkStoppedIfLive(ctx, 9999, at); ok || err != nil {
-		t.Errorf("MarkStoppedIfLive(9999) = %v, %v", ok, err)
-	}
-	// A live row without a tmux target (hook-created, or mid-launch) is left alone.
-	untargeted := &model.Session{TaskID: task.ID, State: model.StateRunning}
-	if err := s.CreateSession(ctx, untargeted); err != nil {
-		t.Fatal(err)
-	}
-	if ok, err := s.MarkStoppedIfLive(ctx, untargeted.ID, at); ok || err != nil {
-		t.Errorf("MarkStoppedIfLive(no target) = %v, %v", ok, err)
-	}
-	if g := get(untargeted.ID); g.State != model.StateRunning {
-		t.Errorf("MarkStoppedIfLive(no target) changed state to %s", g.State)
-	}
-
 	// ClaimStopped: only stopped sessions, and only once.
 	for _, st := range model.AllSessionStates {
 		ss := mk(st)

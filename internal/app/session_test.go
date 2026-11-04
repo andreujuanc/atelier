@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -154,6 +155,26 @@ func (e *env) argv(t *testing.T, id int64) []string {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("claude stub never ran for session %d", id)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// crashClaude kills the claude process in window target and waits for its
+// pane to be dead (the server must have remain-on-exit on).
+func (e *env) crashClaude(t *testing.T, target string) {
+	t.Helper()
+	pid, err := strconv.Atoi(e.tmux(t, "display-message", "-p", "-t", target, "#{pane_pid}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for e.tmux(t, "display-message", "-p", "-t", target, "#{pane_dead}") != "1" {
+		if time.Now().After(deadline) {
+			t.Fatal("pane never died")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -587,20 +608,7 @@ func TestUserTmuxOptions(t *testing.T) {
 	}
 
 	// Claude exits; remain-on-exit keeps its window with a dead pane.
-	pid, err := strconv.Atoi(e.tmux(t, "display-message", "-p", "-t", s1.TmuxTarget, "#{pane_pid}"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for e.tmux(t, "display-message", "-p", "-t", s1.TmuxTarget, "#{pane_dead}") != "1" {
-		if time.Now().After(deadline) {
-			t.Fatal("pane never died")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	e.crashClaude(t, s1.TmuxTarget)
 	if n, err := e.app.Recover(ctx); err != nil || n != 1 {
 		t.Fatalf("Recover = %d, %v; want 1", n, err)
 	}
@@ -630,8 +638,163 @@ func TestUserTmuxOptions(t *testing.T) {
 	if !reflect.DeepEqual(tags, want) {
 		t.Errorf("tags = %v, want %v", tags, want)
 	}
+	// The dead remain-on-exit window was killed before the relaunch.
+	wins := strings.Fields(e.tmux(t, "list-windows", "-a", "-F", "#{window_id}"))
+	sort.Strings(wins)
+	wantWins := []string{got.TmuxTarget, s2.TmuxTarget}
+	sort.Strings(wantWins)
+	if !reflect.DeepEqual(wins, wantWins) {
+		t.Errorf("windows = %v, want %v (dead window %s killed)", wins, wantWins, s1.TmuxTarget)
+	}
 	if n, err := e.app.Recover(ctx); err != nil || n != 0 {
 		t.Errorf("Recover after resume = %d, %v", n, err)
+	}
+}
+
+// TestResumeOnlyWindowDead resumes a session whose dead remain-on-exit
+// window is the only window of the task's tmux session: the new window is
+// launched before the dead one is killed, so the tmux session survives.
+func TestResumeOnlyWindowDead(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.tmux(t, "set-option", "-g", "remain-on-exit", "on")
+	e.task(t, "t", model.StatusActive, true)
+	s, err := e.app.NewSession(ctx, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s.ID)
+	s.ClaudeSessionID = "cid-1"
+	if err := e.app.Store.UpdateSession(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	e.crashClaude(t, s.TmuxTarget)
+	tsess := e.tmux(t, "display-message", "-p", "-t", "=atl-t:", "#{session_id}")
+
+	os.Remove(filepath.Join(e.out, fmt.Sprintf("argv-%d", s.ID)))
+	if n, err := e.app.Resume(ctx, "t"); err != nil || n != 1 {
+		t.Fatalf("Resume = %d, %v; want 1", n, err)
+	}
+	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume", "cid-1"}) {
+		t.Errorf("resumed argv = %q", argv)
+	}
+	got := e.session(t, s.ID)
+	if got.State != model.StateIdle || got.TmuxTarget == "" || got.TmuxTarget == s.TmuxTarget {
+		t.Fatalf("resumed session = %+v (old target %s)", got, s.TmuxTarget)
+	}
+	if now := e.tmux(t, "display-message", "-p", "-t", "=atl-t:", "#{session_id}"); now != tsess {
+		t.Errorf("tmux session replaced: %s → %s", tsess, now)
+	}
+	if wins := e.tmux(t, "list-windows", "-a", "-F", "#{window_id} #{pane_dead}"); wins != got.TmuxTarget+" 0" {
+		t.Errorf("windows = %q, want only the live %s", wins, got.TmuxTarget)
+	}
+}
+
+// TestOpenDeadWindow opens a task whose tmux session survives with only a
+// dead (remain-on-exit) claude window: Open relaunches rather than attaching.
+func TestOpenDeadWindow(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.tmux(t, "set-option", "-g", "remain-on-exit", "on")
+	e.task(t, "t", model.StatusActive, true)
+	if _, err := e.app.Open(ctx, "t"); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := e.app.Store.ListSessionsByState(ctx)
+	if len(all) != 1 {
+		t.Fatalf("sessions after first Open = %+v", all)
+	}
+	s := all[0]
+	e.argv(t, s.ID)
+	s.ClaudeSessionID = "cid-1"
+	if err := e.app.Store.UpdateSession(ctx, &s); err != nil {
+		t.Fatal(err)
+	}
+
+	// Crashed with a claude id: resumed.
+	e.crashClaude(t, s.TmuxTarget)
+	os.Remove(filepath.Join(e.out, fmt.Sprintf("argv-%d", s.ID)))
+	if _, err := e.app.Open(ctx, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume", "cid-1"}) {
+		t.Errorf("argv after Open = %q, want a resume", argv)
+	}
+	got := e.session(t, s.ID)
+	if got.State != model.StateIdle || got.TmuxTarget == s.TmuxTarget {
+		t.Fatalf("session after Open = %+v (old target %s)", got, s.TmuxTarget)
+	}
+	if wins := e.tmux(t, "list-windows", "-a", "-F", "#{window_id} #{pane_dead}"); wins != got.TmuxTarget+" 0" {
+		t.Errorf("windows = %q, want only the live %s", wins, got.TmuxTarget)
+	}
+
+	// Crashed without a claude id: a new session is started.
+	got.ClaudeSessionID = ""
+	if err := e.app.Store.UpdateSession(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	e.crashClaude(t, got.TmuxTarget)
+	if _, err := e.app.Open(ctx, "t"); err != nil {
+		t.Fatal(err)
+	}
+	live, _ := e.app.Store.ListSessionsByState(ctx, model.StateIdle)
+	if len(live) != 1 || live[0].ID == s.ID {
+		t.Fatalf("live sessions after Open = %+v", live)
+	}
+	e.argv(t, live[0].ID)
+	tags, err := e.app.Tmux.TaggedWindows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{strconv.FormatInt(live[0].ID, 10): live[0].TmuxTarget}; !reflect.DeepEqual(tags, want) {
+		t.Errorf("live tags = %v, want %v", tags, want)
+	}
+}
+
+// TestRecoverStaleSnapshot replays the Recover-vs-Resume interleaving that
+// used to launch a session twice: a Recover whose session snapshot predates
+// a relaunch (here into a window that reuses the old window id, as happens
+// after a tmux server restart) must not mark the relaunched session stopped.
+func TestRecoverStaleSnapshot(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.task(t, "t", model.StatusActive, true)
+	s, err := e.app.NewSession(ctx, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s.ID)
+	st := e.app.Store
+	snap, err := st.ListLaunchedLive(ctx) // the slow Recover's snapshot
+	if err != nil || len(snap) != 1 {
+		t.Fatalf("ListLaunchedLive = %v, %v", snap, err)
+	}
+	e.crash(t)
+	// A concurrent Resume: its own Recover marks the session stopped, it
+	// claims it and records a relaunch in a window with the same id.
+	if n, err := e.app.Recover(ctx); err != nil || n != 1 {
+		t.Fatalf("Recover = %d, %v", n, err)
+	}
+	if ok, err := st.ClaimStopped(ctx, s.ID, time.Now()); !ok || err != nil {
+		t.Fatalf("ClaimStopped = %v, %v", ok, err)
+	}
+	if err := st.SetSessionLaunch(ctx, s.ID, snap[0].Target, s.Name); err != nil {
+		t.Fatal(err)
+	}
+	// The slow Recover, whose tmux listing missed the new window's tag.
+	if ok, err := st.MarkStoppedIfLaunch(ctx, snap[0], time.Now()); ok || err != nil {
+		t.Fatalf("MarkStoppedIfLaunch(stale) = %v, %v; want false", ok, err)
+	}
+	if got := e.session(t, s.ID); got.State != model.StateIdle {
+		t.Fatalf("relaunched session = %+v, want idle", got)
+	}
+	// A fresh snapshot of the same launch still marks it.
+	fresh, err := st.ListLaunchedLive(ctx)
+	if err != nil || len(fresh) != 1 {
+		t.Fatalf("ListLaunchedLive = %v, %v", fresh, err)
+	}
+	if ok, err := st.MarkStoppedIfLaunch(ctx, fresh[0], time.Now()); !ok || err != nil {
+		t.Fatalf("MarkStoppedIfLaunch(fresh) = %v, %v; want true", ok, err)
 	}
 }
 
