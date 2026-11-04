@@ -14,6 +14,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/app"
@@ -43,6 +44,8 @@ type fakeBackend struct {
 	noteErr    error
 	assistErr  error
 	assistHint string
+	dirty      map[int64]bool // DirtyTasks' result
+	dirtyErr   error
 }
 
 func (f *fakeBackend) rec(name string, args ...any) { f.calls = append(f.calls, call{name, args}) }
@@ -157,6 +160,18 @@ func (f *fakeBackend) PR(ctx context.Context, ref string) ([]app.PRResult, error
 func (f *fakeBackend) Recover(ctx context.Context) (int, error) {
 	f.rec("Recover")
 	return 0, nil
+}
+
+func (f *fakeBackend) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
+	f.rec("DirtyTasks")
+	if f.dirtyErr != nil {
+		return nil, f.dirtyErr
+	}
+	out := map[int64]bool{}
+	for id, d := range f.dirty {
+		out[id] = d
+	}
+	return out, nil
 }
 
 func (f *fakeBackend) ProjectNames() ([]string, error) { return f.projects, nil }
@@ -2009,5 +2024,239 @@ func TestAssistantKey(t *testing.T) {
 	key(m3, "A")
 	if !strings.Contains(m3.status, "assistant: tmux exploded") || m3.assisting {
 		t.Fatalf("status %q assisting=%v", m3.status, m3.assisting)
+	}
+}
+
+func sess(id int64, st model.SessionState) model.Session {
+	return model.Session{ID: id, State: st, LastEventAt: t0}
+}
+
+func TestAggregateDot(t *testing.T) {
+	cases := []struct {
+		name  string
+		ss    []model.Session
+		want  dotKind
+		glyph string
+		style lipgloss.Style
+	}{
+		{"none", nil, dotNone, " ", lipgloss.NewStyle()},
+		{"ended only", []model.Session{sess(1, model.StateEnded), sess(2, model.StateEnded)}, dotNone, " ", lipgloss.NewStyle()},
+		{"stopped", []model.Session{sess(1, model.StateEnded), sess(2, model.StateStopped)}, dotStopped, "○", stopStyle},
+		{"idle beats stopped", []model.Session{sess(1, model.StateStopped), sess(2, model.StateIdle)}, dotIdle, "●", idleStyle},
+		{"running beats idle", []model.Session{sess(1, model.StateIdle), sess(2, model.StateRunning), sess(3, model.StateStopped)}, dotRunning, "●", runStyle},
+		{"waiting beats all", []model.Session{sess(1, model.StateRunning), sess(2, model.StateWaiting), sess(3, model.StateIdle)}, dotWaiting, "●", waitStyle},
+	}
+	for _, c := range cases {
+		k := aggregate(c.ss)
+		if k != c.want {
+			t.Errorf("%s: aggregate %d, want %d", c.name, k, c.want)
+		}
+		g, st := dotFor(k)
+		if g != c.glyph || st.GetForeground() != c.style.GetForeground() || st.GetBold() != c.style.GetBold() {
+			t.Errorf("%s: dot %q fg %v bold %v", c.name, g, st.GetForeground(), st.GetBold())
+		}
+		if ansi.StringWidth(g) != 1 {
+			t.Errorf("%s: glyph width %d", c.name, ansi.StringWidth(g))
+		}
+	}
+	if waitStyle.GetForeground() != lipgloss.TerminalColor(accent) || !waitStyle.GetBold() {
+		t.Error("waiting dot is not accent + bold")
+	}
+	if runStyle.GetForeground() != lipgloss.TerminalColor(okColor) {
+		t.Error("running dot is not green")
+	}
+}
+
+// listLine returns the plain list line of task slug (left pane).
+func listLine(t *testing.T, m *Model, slug string) string {
+	t.Helper()
+	for _, l := range strings.Split(plainView(m), "\n") {
+		left := strings.SplitN(l, "│", 2)[0]
+		if strings.Contains(left, slug) && !strings.Contains(left, "slug") {
+			return left
+		}
+	}
+	t.Fatalf("no list line for %s:\n%s", slug, plainView(m))
+	return ""
+}
+
+// selectSlug selects task slug directly (no debounce).
+func selectSlug(t *testing.T, m *Model, slug string) {
+	t.Helper()
+	for i, r := range m.rows {
+		if r.isTask() && r.task.Task.Slug == slug {
+			m.selIdx, m.selID = i, r.task.Task.ID
+			return
+		}
+	}
+	t.Fatalf("no row for %s", slug)
+}
+
+func TestRowDots(t *testing.T) {
+	fb := &fakeBackend{tasks: []app.TaskView{
+		tv(1, "ended", model.StatusActive, sess(1, model.StateEnded)),
+		tv(2, "empty", model.StatusActive),
+		tv(3, "waits", model.StatusActive, sess(2, model.StateRunning), sess(3, model.StateWaiting)),
+		tv(4, "runs", model.StatusActive, sess(4, model.StateIdle), sess(5, model.StateRunning)),
+		tv(5, "idles", model.StatusActive, sess(6, model.StateIdle), sess(7, model.StateStopped)),
+		tv(6, "stops", model.StatusActive, sess(8, model.StateStopped), sess(9, model.StateEnded)),
+	}}
+	m, _ := newTest(t, fb)
+	want := map[string]string{"ended": "  ended", "empty": "  empty", "waits": "● waits", "runs": "● runs", "idles": "● idles", "stops": "○ stops"}
+	for slug, prefix := range want {
+		for _, sel := range []bool{false, true} {
+			if sel {
+				selectSlug(t, m, slug)
+			}
+			if l := listLine(t, m, slug); !strings.HasPrefix(l, prefix+"  Title of "+slug) {
+				t.Errorf("%s (sel %v): %q, want prefix %q", slug, sel, l, prefix)
+			}
+		}
+	}
+}
+
+func TestDirtyStar(t *testing.T) {
+	fb := &fakeBackend{tasks: append(sampleTasks(),
+		tv(5, "shut", model.StatusDone), tv(6, "busy", model.StatusActive, sess(1, model.StateRunning))),
+		dirty: map[int64]bool{1: true, 3: true, 5: true, 6: true}}
+	m, _ := newTest(t, fb)
+	if fb.count("DirtyTasks") != 1 {
+		t.Fatalf("DirtyTasks at start: %d", fb.count("DirtyTasks"))
+	}
+	for slug, want := range map[string]string{
+		"alpha": "  alpha*  Title of alpha",
+		"beta":  "  beta  Title of beta",
+		"gamma": "● gamma*  Title of gamma",
+		"delta": "  delta  Title of delta",
+		"shut":  "  shut  Title of shut", // closed: never starred
+		"busy":  "● busy*  Title of busy",
+	} {
+		for _, sel := range []bool{false, true} {
+			if sel {
+				selectSlug(t, m, slug)
+			}
+			if l := listLine(t, m, slug); !strings.HasPrefix(l, want) {
+				t.Errorf("%s (sel %v): %q, want prefix %q", slug, sel, l, want)
+			}
+		}
+	}
+	// the star survives truncation of a long slug
+	m.Update(tea.WindowSizeMsg{Width: 12, Height: 20})
+	found := false
+	for _, l := range strings.Split(plainView(m), "\n") {
+		if strings.HasPrefix(l, "  alph") || strings.HasPrefix(l, "  al") {
+			found = true
+			if !strings.Contains(l, "*") || ansi.StringWidth(l) > 12 {
+				t.Errorf("narrow alpha row %q", l)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no alpha row:\n%s", plainView(m))
+	}
+}
+
+func TestDirtyTicks(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), dirty: map[int64]bool{1: true}}
+	m, sched := newTest(t, fb)
+	countTicks := func() int {
+		n := 0
+		for _, msg := range *sched {
+			if _, ok := msg.(dirtyTickMsg); ok {
+				n++
+			}
+		}
+		return n
+	}
+	if countTicks() != 1 || fb.count("DirtyTasks") != 1 || !m.dirty[1] || m.dirtying {
+		t.Fatalf("start: ticks %d calls %d dirty %v", countTicks(), fb.count("DirtyTasks"), m.dirty)
+	}
+	// a tick reschedules itself once and starts one check
+	*sched = nil
+	fb.dirty = map[int64]bool{2: true}
+	_, cmd := m.Update(dirtyTickMsg{})
+	if countTicks() != 1 || len(*sched) != 1 || !m.dirtying {
+		t.Fatalf("tick: sched %v dirtying %v", *sched, m.dirtying)
+	}
+	if fb.count("DirtyTasks") != 1 {
+		t.Fatal("tick blocked on DirtyTasks")
+	}
+	if !m.dirty[1] {
+		t.Fatal("last result dropped before the new one arrived")
+	}
+	// a second tick while the check is in flight starts nothing new
+	*sched = nil
+	_, cmd2 := m.Update(dirtyTickMsg{})
+	drain(m, cmd2)
+	if countTicks() != 1 || fb.count("DirtyTasks") != 1 {
+		t.Fatalf("in-flight tick: ticks %d calls %d", countTicks(), fb.count("DirtyTasks"))
+	}
+	drain(m, cmd)
+	if fb.count("DirtyTasks") != 2 || m.dirtying || m.dirty[1] || !m.dirty[2] {
+		t.Fatalf("result not applied: %v", m.dirty)
+	}
+	if !strings.Contains(listLine(t, m, "beta"), "beta*") || strings.Contains(listLine(t, m, "alpha"), "alpha*") {
+		t.Fatalf("view:\n%s", plainView(m))
+	}
+	// an error keeps the last result and is reported once
+	fb.dirtyErr = errors.New("boom")
+	_, cmd = m.Update(dirtyTickMsg{})
+	drain(m, cmd)
+	if !m.dirty[2] || !m.statusErr || !strings.Contains(m.status, "boom") {
+		t.Fatalf("error: dirty %v status %q", m.dirty, m.status)
+	}
+	m.status, m.statusErr = "", false
+	_, cmd = m.Update(dirtyTickMsg{})
+	drain(m, cmd)
+	if m.status != "" {
+		t.Fatalf("same error shown again: %q", m.status)
+	}
+	// list ticks do not start dirty checks
+	n := fb.count("DirtyTasks")
+	_, cmd = m.Update(listTickMsg{})
+	drain(m, cmd)
+	if fb.count("DirtyTasks") != n {
+		t.Fatal("list tick ran DirtyTasks")
+	}
+}
+
+func TestLegend(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	m.Update(tea.WindowSizeMsg{Width: 200, Height: 30})
+	lines := strings.Split(plainView(m), "\n")
+	if help := lines[len(lines)-1]; !strings.Contains(help, "● waiting/running/idle  * uncommitted") || ansi.StringWidth(help) > 200 {
+		t.Fatalf("wide help %q", help)
+	}
+	for _, w := range []int{120, 80, 30} {
+		m.Update(tea.WindowSizeMsg{Width: w, Height: 30})
+		lines = strings.Split(plainView(m), "\n")
+		if help := lines[len(lines)-1]; strings.Contains(help, "uncommitted") {
+			t.Fatalf("legend at width %d: %q", w, help)
+		}
+	}
+}
+
+func TestDotsSmallSizes(t *testing.T) {
+	fb := &fakeBackend{tasks: []app.TaskView{
+		tv(1, "a-very-long-slug-that-will-not-fit", model.StatusActive, sess(1, model.StateWaiting)),
+		tv(2, "b", model.StatusActive, sess(2, model.StateStopped)),
+		tv(3, "c", model.StatusReview),
+		tv(4, "d", model.StatusDone, sess(3, model.StateRunning)),
+	}, dirty: map[int64]bool{1: true, 2: true, 3: true, 4: true}}
+	m, _ := newTest(t, fb)
+	m.busy[1] = "pr"
+	for w := 0; w <= 50; w++ {
+		for _, h := range []int{0, 1, 2, 3, 6} {
+			m.Update(tea.WindowSizeMsg{Width: w, Height: h})
+			for _, slug := range []string{"a-very-long-slug-that-will-not-fit", "b", "d"} {
+				selectSlug(t, m, slug)
+				for _, l := range strings.Split(m.View(), "\n") {
+					if ansi.StringWidth(l) > w {
+						t.Fatalf("%dx%d: line too wide: %q", w, h, ansi.Strip(l))
+					}
+				}
+			}
+		}
 	}
 }

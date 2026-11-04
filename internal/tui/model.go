@@ -22,6 +22,7 @@ const (
 	listEvery    = time.Second
 	detailEvery  = 3 * time.Second
 	recoverEvery = 5 * time.Second
+	dirtyEvery   = 5 * time.Second
 	selDebounce  = 150 * time.Millisecond
 )
 
@@ -48,6 +49,7 @@ type confirmState struct {
 type (
 	listTickMsg    struct{}
 	recoverTickMsg struct{}
+	dirtyTickMsg   struct{}
 	selTickMsg     struct{ seq int }
 
 	listMsg struct {
@@ -63,6 +65,10 @@ type (
 	recoverMsg struct {
 		n   int
 		err error
+	}
+	dirtyMsg struct {
+		dirty map[int64]bool
+		err   error
 	}
 	projectsMsg struct {
 		names []string
@@ -166,6 +172,13 @@ type Model struct {
 	recovering bool
 	recoverErr string
 
+	// dirty is the last DirtyTasks result (open task id → uncommitted
+	// changes in a rw worktree), kept between refreshes; dirtying: a
+	// DirtyTasks call is in flight.
+	dirty    map[int64]bool
+	dirtying bool
+	dirtyErr string
+
 	mode        mode
 	filter      string
 	filterInput textinput.Model
@@ -236,9 +249,10 @@ func New(ctx context.Context, be Backend) *Model {
 
 // Init loads tasks, projects and runs Recover, and starts the tickers.
 func (m *Model) Init() tea.Cmd {
-	m.listing, m.recovering = true, true
-	return tea.Batch(m.listCmd(), m.recoverCmd(), m.projectsCmd(),
-		m.after(listEvery, listTickMsg{}), m.after(recoverEvery, recoverTickMsg{}))
+	m.listing, m.recovering, m.dirtying = true, true, true
+	return tea.Batch(m.listCmd(), m.recoverCmd(), m.projectsCmd(), m.dirtyCmd(),
+		m.after(listEvery, listTickMsg{}), m.after(recoverEvery, recoverTickMsg{}),
+		m.after(dirtyEvery, dirtyTickMsg{}))
 }
 
 // --- commands ---
@@ -256,6 +270,14 @@ func (m *Model) recoverCmd() tea.Cmd {
 	return func() tea.Msg {
 		n, err := be.Recover(ctx)
 		return recoverMsg{n, err}
+	}
+}
+
+func (m *Model) dirtyCmd() tea.Cmd {
+	be, ctx := m.be, m.ctx
+	return func() tea.Msg {
+		d, err := be.DirtyTasks(ctx)
+		return dirtyMsg{d, err}
 	}
 }
 
@@ -642,6 +664,13 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			cmds = append(cmds, m.recoverCmd())
 		}
 		return tea.Batch(cmds...)
+	case dirtyTickMsg:
+		cmds := []tea.Cmd{m.after(dirtyEvery, dirtyTickMsg{})}
+		if !m.dirtying {
+			m.dirtying = true
+			cmds = append(cmds, m.dirtyCmd())
+		}
+		return tea.Batch(cmds...)
 	case selTickMsg:
 		if msg.seq != m.selSeq {
 			return nil
@@ -693,6 +722,19 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.setStatus(fmt.Sprintf("%d session(s) marked stopped (tmux window gone); r resumes", msg.n))
 			return m.reload()
 		}
+		return nil
+	case dirtyMsg:
+		m.dirtying = false
+		if msg.err != nil {
+			// Keep the last result; show each distinct error once.
+			if e := msg.err.Error(); e != m.dirtyErr {
+				m.dirtyErr = e
+				m.setErr(fmt.Errorf("dirty check: %w", msg.err))
+			}
+			return nil
+		}
+		m.dirtyErr = ""
+		m.dirty = msg.dirty
 		return nil
 	case projectsMsg:
 		if msg.err == nil {

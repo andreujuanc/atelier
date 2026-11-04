@@ -1,6 +1,11 @@
 // Package hook implements `atl hook <event>`: the Claude Code hook handler
 // that tracks session state in the database and enforces read-only repos.
 //
+// The hook never writes to stdout, with exactly one exception: a
+// SessionStart inside a task prints one JSON object
+// {"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":...}}
+// carrying fresh task context (see context.go). Errors go to hook.log.
+//
 // This path must stay fast (<50ms): no cobra, one DB open, no tmux calls.
 package hook
 
@@ -73,13 +78,14 @@ const (
 
 // Main runs `atl hook <args...>`: args[0] is the event name. It reads the
 // hook JSON from stdin and returns the process exit code: 2 only when the
-// ro guard blocks a tool call, 0 otherwise. It never writes to stdout;
-// errors are appended to Paths.HookLog().
+// ro guard blocks a tool call, 0 otherwise. Errors are appended to
+// Paths.HookLog(). The only stdout output is the SessionStart task context
+// JSON (one object, only for a session resolved to a task).
 func Main(args []string) int {
-	return run(args, os.Stdin, os.Stderr, os.Getenv)
+	return run(args, os.Stdin, os.Stdout, os.Stderr, os.Getenv)
 }
 
-func run(args []string, stdin io.Reader, stderr io.Writer, env func(string) string) (code int) {
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer, env func(string) string) (code int) {
 	event := ""
 	if len(args) > 0 {
 		event = args[0]
@@ -138,12 +144,14 @@ func run(args []string, stdin io.Reader, stderr io.Writer, env func(string) stri
 	if !knownEvent(event) {
 		return 0
 	}
-	return handleMain(p, stderr, env, event, in)
+	return handleMain(p, stdout, stderr, env, event, in)
 }
 
 // handleMain opens the store and runs Handle, mapping its result to the
-// process exit code.
-func handleMain(p config.Paths, stderr io.Writer, env func(string) string, event string, in Input) int {
+// process exit code. For a SessionStart resolved to a task it then writes
+// the task context JSON to stdout (stdout is nil for callers that must
+// never print it).
+func handleMain(p config.Paths, stdout, stderr io.Writer, env func(string) string, event string, in Input) int {
 	st, err := store.OpenWithTimeout(p.DB, dbBusyTimeout)
 	if err != nil {
 		logError(p, stderr, event, in.SessionID, err)
@@ -153,9 +161,15 @@ func handleMain(p config.Paths, stderr io.Writer, env func(string) string, event
 	ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 	defer cancel()
 
-	exit, msg, err := Handle(ctx, event, in, env, st, p, time.Now())
+	now := time.Now()
+	exit, msg, taskID, err := handle(ctx, event, in, env, st, p, now)
 	if err != nil {
 		logError(p, stderr, event, in.SessionID, err)
+	}
+	if event == EventSessionStart && taskID != 0 && stdout != nil {
+		if err := writeSessionContext(ctx, stdout, st, p, taskID, now); err != nil {
+			logError(p, stderr, event, in.SessionID, fmt.Errorf("session context: %w", err))
+		}
 	}
 	if exit == 2 {
 		fmt.Fprintln(stderr, msg)
@@ -173,7 +187,7 @@ func handleMain(p config.Paths, stderr io.Writer, env func(string) string, event
 func guardPartial(p config.Paths, stderr io.Writer, env func(string) string, event string, data []byte, oversized bool) int {
 	in, ok := partialInput(data)
 	if ok {
-		code := handleMain(p, stderr, env, event, in)
+		code := handleMain(p, nil, stderr, env, event, in)
 		if code == 2 || !oversized {
 			return code
 		}
@@ -311,38 +325,51 @@ func orDash(s string) string {
 // to log (which never changes the exit code from 0).
 func Handle(ctx context.Context, event string, in Input, env func(string) string, st *store.Store,
 	p config.Paths, now time.Time) (exit int, msg string, err error) {
+	exit, msg, _, err = handle(ctx, event, in, env, st, p, now)
+	return exit, msg, err
+}
+
+// handle is Handle that also returns the id of the task the event's
+// session was resolved to (0 if none, or for events that do not resolve a
+// session).
+func handle(ctx context.Context, event string, in Input, env func(string) string, st *store.Store,
+	p config.Paths, now time.Time) (exit int, msg string, taskID int64, err error) {
 	switch event {
 	case EventPreToolUse:
-		return guard(ctx, in, env, st, p)
+		exit, msg, err = guard(ctx, in, env, st, p)
+		return exit, msg, 0, err
 	case EventSessionStart, EventUserPromptSubmit, EventNotification, EventStop,
 		EventSessionEnd, EventPostToolUse:
-		return 0, "", transition(ctx, event, in, env, st, p, now)
+		taskID, err = transition(ctx, event, in, env, st, p, now)
+		return 0, "", taskID, err
 	default:
-		return 0, "", nil
+		return 0, "", 0, nil
 	}
 }
 
+// transition applies event to its session's row and returns the session's
+// task id (0 if the event matched no session or task).
 func transition(ctx context.Context, event string, in Input, env func(string) string, st *store.Store,
-	p config.Paths, now time.Time) error {
+	p config.Paths, now time.Time) (int64, error) {
 	sess, err := findSession(ctx, event, in, env, st)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if sess == nil {
 		if event != EventSessionStart {
-			return nil // not a session atelier knows about
+			return 0, nil // not a session atelier knows about
 		}
 		task, err := findTask(ctx, in, env, st, p)
 		if err != nil || task == nil {
-			return err
+			return 0, err
 		}
-		return st.CreateSession(ctx, &model.Session{TaskID: task.ID, ClaudeSessionID: in.SessionID,
+		return task.ID, st.CreateSession(ctx, &model.Session{TaskID: task.ID, ClaudeSessionID: in.SessionID,
 			State: model.StateIdle, CreatedAt: now, LastEventAt: now, TranscriptPath: in.TranscriptPath})
 	}
 	if err := transitionState(ctx, event, in, sess.ID, st, now); err != nil {
-		return err
+		return sess.TaskID, err
 	}
-	return recordTranscript(ctx, event, in, sess, st)
+	return sess.TaskID, recordTranscript(ctx, event, in, sess, st)
 }
 
 // recordTranscript stores the event's transcript path: SessionStart (any

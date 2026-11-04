@@ -64,7 +64,10 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | atelier assistant — Part B (assistant session, `atl assistant`, TUI `A`) | done (reviewed, 1 fix round) |
 | done/cancel delete the local atl/<slug> branch when nothing would be lost (no own commits, or all pushed); keep + report otherwise | done (reviewed + safety nits fixed) |
 | Base branch per task: auto (origin/dev → develop → default), production (:default), or explicit; migration v4 (old tasks = :default); TUI Base toggle (space/←/→) | done (reviewed, 1 fix round) |
-| idea: include task notes in the task's generated CLAUDE.md so new task sessions get context | idea (offered to user) |
+| Task context injected at SessionStart (hookSpecificOutput.additionalContext: task, repos+base, ro warning, port, 5 latest notes) instead of CLAUDE.md | done (reviewed) |
+| TUI list: status dot per task (waiting>running>idle>stopped) + `*` for dirty open tasks (App.DirtyTasks, 5s async) | done (reviewed; nits pending) |
+| Dockerfile: UTF-8 + tmux 256/RGB (rendering artifacts) | done |
+| idea: Claude on the right pane of the TUI (tmux join-pane) instead of full-screen attach | idea (user wants it later) |
 | optional: skip-fetch toggle in TUI new-task form / SSH ControlMaster in box (YubiKey touch per fetch) | idea |
 
 - (follow-up) NewTaskOpts.ExactRepos for the picker; runSetup takes a repo filter; validRepoArg shared; store.ErrDuplicate; Backend gained ProjectRepos/AvailableRepos/AddRepo.

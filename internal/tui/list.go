@@ -66,14 +66,38 @@ func buildRows(tasks []app.TaskView, filter string) []row {
 	return rows
 }
 
-// hasWaiting reports whether any session is waiting for input.
-func hasWaiting(ss []model.Session) bool {
+// dotKind is a task's aggregate session state, shown as the list row's dot.
+// Higher values win: waiting > running > idle > stopped > none.
+type dotKind int
+
+const (
+	dotNone    dotKind = iota // no sessions, or all ended
+	dotStopped                // only stopped (and ended) sessions
+	dotIdle
+	dotRunning
+	dotWaiting
+)
+
+// aggregate returns the highest-priority state of ss.
+func aggregate(ss []model.Session) dotKind {
+	k := dotNone
 	for _, s := range ss {
-		if s.State == model.StateWaiting {
-			return true
+		var sk dotKind
+		switch s.State {
+		case model.StateWaiting:
+			sk = dotWaiting
+		case model.StateRunning:
+			sk = dotRunning
+		case model.StateIdle:
+			sk = dotIdle
+		case model.StateStopped:
+			sk = dotStopped
+		}
+		if sk > k {
+			k = sk
 		}
 	}
-	return false
+	return k
 }
 
 // humanAge formats d as 5s, 3m, 2h or 4d.
