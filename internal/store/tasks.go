@@ -409,3 +409,63 @@ func nextPortOffset(ctx context.Context, q querier) (int, error) {
 	}
 	return off, nil
 }
+
+// ErrDuplicate is returned (wrapped) by AddTaskRepo when the task already
+// has a repo with that name.
+var ErrDuplicate = errors.New("already exists")
+
+// ErrTaskClosed is returned (wrapped) by AddTaskRepo when the task is no
+// longer open (done or cancelled).
+var ErrTaskClosed = errors.New("task is closed")
+
+// AddTaskRepo appends repo r to task taskID (position = current max + 1)
+// and bumps the task's updated_at, in one transaction. It returns
+// ErrNotFound for an unknown task, ErrTaskClosed if the task is not open
+// (backlog, active or review) and ErrDuplicate if the task already has a
+// repo named r.Name.
+func (s *Store) AddTaskRepo(ctx context.Context, taskID int64, r model.TaskRepo) error {
+	if r.Name == "" {
+		return errors.New("store: task repo name is empty")
+	}
+	if !r.Mode.Valid() {
+		return fmt.Errorf("store: invalid mode %q for repo %q", r.Mode, r.Name)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var one int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM task_repos WHERE task_id = ? AND name = ?`, taskID, r.Name).Scan(&one)
+	if err == nil {
+		return fmt.Errorf("store: repo %q of task %d: %w", r.Name, taskID, ErrDuplicate)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE tasks SET updated_at = ?
+		WHERE id = ? AND status IN ('backlog', 'active', 'review')`, toMS(now()), taskID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		var st string
+		err := tx.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id = ?`, taskID).Scan(&st)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("task %d: %w", taskID, ErrNotFound)
+		case err != nil:
+			return err
+		}
+		return fmt.Errorf("store: task %d is %s: %w", taskID, st, ErrTaskClosed)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_repos
+		(task_id, name, mode, base_branch, base_commit, position)
+		VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(position), -1) + 1 FROM task_repos WHERE task_id = ?))`,
+		taskID, r.Name, string(r.Mode), r.BaseBranch, r.BaseCommit, taskID); err != nil {
+		return fmt.Errorf("store: insert repo %q for task %d: %w", r.Name, taskID, err)
+	}
+	return tx.Commit()
+}

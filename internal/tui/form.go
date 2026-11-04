@@ -23,7 +23,9 @@ const (
 
 var fieldLabels = [numFields]string{"Title", "Project", "Repos", "Description", "Backlog"}
 
-// newForm is the modal "new task" form.
+// newForm is the modal "new task" form. Repos are chosen in the repo
+// picker (enter or space on the Repos field), so inputs[fieldRepos] is
+// unused.
 type newForm struct {
 	inputs   [fieldBacklog]textinput.Model
 	backlog  bool
@@ -32,11 +34,20 @@ type newForm struct {
 	projects []string
 	stem     string // what the user typed in project before tab cycling
 	cycling  bool
+
+	repos []app.RepoArg // the picker's selection
+	// preProject is the project whose repos were preselected (and are
+	// recorded in fromProject); loadingProject is one being loaded.
+	preProject     string
+	loadingProject string
+	fromProject    map[string]bool
+	// projErr is why project projErrFor's repos could not be loaded.
+	projErr, projErrFor string
 }
 
 func newTaskForm(projects []string) *newForm {
 	f := &newForm{projects: projects}
-	placeholders := [fieldBacklog]string{"required", "optional (tab cycles)", "name:rw name2:ro (optional)", "optional"}
+	placeholders := [fieldBacklog]string{"required", "optional (tab cycles)", "", "optional"}
 	for i := range f.inputs {
 		ti := textinput.New()
 		ti.Prompt = ""
@@ -112,22 +123,63 @@ func (f *newForm) cycleProject(dir int) {
 	f.cycling = true
 }
 
-// opts validates the form and builds the NewTask options.
+func (f *newForm) project() string { return strings.TrimSpace(f.inputs[fieldProject].Value()) }
+
+// applyProject preselects project name's repos: repos preselected from the
+// previous project are dropped, then name's repos come first (in project
+// order, with the project's modes) followed by the rest of the selection.
+func (f *newForm) applyProject(name string, repos []app.RepoArg) {
+	from := map[string]bool{}
+	for _, r := range repos {
+		from[r.Name] = true
+	}
+	f.repos = mergeProject(f.repos, f.fromProject, repos)
+	f.fromProject, f.preProject = from, name
+	f.projErr, f.projErrFor = "", ""
+}
+
+// mergeProject returns repos followed by the repos of sel that are neither
+// in repos nor in oldFrom (the previous project's preselection).
+func mergeProject(sel []app.RepoArg, oldFrom map[string]bool, repos []app.RepoArg) []app.RepoArg {
+	from := map[string]bool{}
+	var out []app.RepoArg
+	for _, r := range repos {
+		from[r.Name] = true
+		out = append(out, r)
+	}
+	for _, r := range sel {
+		if !from[r.Name] && !oldFrom[r.Name] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// opts validates the form and builds the NewTask options. The picker's
+// selection is the exact repo list once the project's repos have been
+// preselected into it; with no selection a project's own repos are used.
 func (f *newForm) opts() (app.NewTaskOpts, error) {
 	o := app.NewTaskOpts{
 		Title:       strings.TrimSpace(f.inputs[fieldTitle].Value()),
-		Project:     strings.TrimSpace(f.inputs[fieldProject].Value()),
+		Project:     f.project(),
 		Description: strings.TrimSpace(f.inputs[fieldDesc].Value()),
 		Backlog:     f.backlog,
 	}
 	if o.Title == "" {
 		return o, errors.New("title is required")
 	}
-	repos, err := parseRepos(f.inputs[fieldRepos].Value())
-	if err != nil {
-		return o, err
+	preselected := o.Project != "" && o.Project == f.preProject
+	if len(f.repos) == 0 {
+		if o.Project == "" {
+			return o, errors.New("pick at least one repo (enter on Repos) or choose a project")
+		}
+		if preselected {
+			return o, errors.New("no repos selected (enter on Repos to pick some)")
+		}
+		return o, nil
 	}
-	o.Repos = repos
+	o.Repos = append([]app.RepoArg(nil), f.repos...)
+	o.ExactRepos = preselected
 	return o, nil
 }
 
@@ -138,6 +190,7 @@ const (
 	formContinue formResult = iota
 	formCancel
 	formSubmit
+	formPick // open the repo picker
 )
 
 // update handles a key in the form. On formSubmit the caller reads opts().
@@ -177,7 +230,16 @@ func (f *newForm) update(msg tea.KeyMsg) (formResult, tea.Cmd) {
 			}
 			return formSubmit, nil
 		}
+		if f.focus == fieldRepos {
+			return formPick, nil
+		}
 		f.setFocus(f.focus + 1)
+		return formContinue, nil
+	}
+	if f.focus == fieldRepos {
+		if key == " " {
+			return formPick, nil
+		}
 		return formContinue, nil
 	}
 	if f.focus == fieldBacklog {

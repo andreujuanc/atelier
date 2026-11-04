@@ -91,29 +91,3 @@ func humanAge(d time.Duration) string {
 	}
 	return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
 }
-
-// parseRepos parses the form's repos field: `name[:rw|ro]` items separated
-// by spaces or commas (mode defaults to rw).
-func parseRepos(s string) ([]app.RepoArg, error) {
-	var out []app.RepoArg
-	for _, f := range strings.FieldsFunc(s, func(r rune) bool { return r == ' ' || r == ',' || r == '\t' }) {
-		name, mode, hasMode := strings.Cut(f, ":")
-		name = strings.TrimSpace(name)
-		if name == "" {
-			return nil, fmt.Errorf("repo %q: empty name", f)
-		}
-		if strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
-			return nil, fmt.Errorf("repo %q: invalid name", f)
-		}
-		ra := app.RepoArg{Name: name, Mode: model.ModeRW}
-		if hasMode {
-			m, err := model.ParseMode(mode)
-			if err != nil {
-				return nil, fmt.Errorf("repo %q: %v", f, err)
-			}
-			ra.Mode = m
-		}
-		out = append(out, ra)
-	}
-	return out, nil
-}

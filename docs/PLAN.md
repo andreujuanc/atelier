@@ -165,6 +165,7 @@ func (s *Store) ResolveTask(ctx, ref string) (*model.Task, error) // exact slug,
 func (s *Store) ListTasks(ctx, statuses ...model.Status) ([]model.Task, error) // none = all; order: status order, updated_at desc
 func (s *Store) CreateTaskAutoPort(ctx, t *model.Task) error   // one tx: unique slug + free port + insert (used by NewTask)
 func (s *Store) DeleteTask(ctx, id int64) error
+func (s *Store) AddTaskRepo(ctx, taskID int64, r model.TaskRepo) error // position = max+1; ErrDuplicate; ErrTaskClosed if task closed
 func (s *Store) SetTaskStatus(ctx, id int64, st model.Status) error // bumps updated_at
 func (s *Store) UniqueSlug(ctx, base string) (string, error)   // base, base-2, base-3 ...
 func (s *Store) NextPortOffset(ctx) (int, error)               // lowest multiple of 100 not used by an Open() task
@@ -350,7 +351,8 @@ func New(out io.Writer) (*App, error)  // Resolve paths, open store, tmux.New(),
 func (a *App) Close() error
 
 type RepoArg struct { Name string; Mode model.Mode }
-type NewTaskOpts struct { Title, Description, Project string; Repos []RepoArg; Backlog, NoFetch bool }
+type NewTaskOpts struct { Title, Description, Project string; Repos []RepoArg; Backlog, NoFetch bool
+    ExactRepos bool } // ExactRepos: Repos is the full list (TUI picker); project still used for setup/env
 type TaskView struct { Task model.Task; Sessions []model.Session; RepoStatus []RepoStatus }
 type RepoStatus struct { Name string; Mode model.Mode; Path string; Dirty bool; Err string }
 
@@ -367,6 +369,8 @@ func (a *App) SetStatus(ctx, ref string, st model.Status) error  // plain status
 func (a *App) Done(ctx, ref string, force bool) (*model.Task, error)
 func (a *App) Cancel(ctx, ref string, force bool) (*model.Task, error)
 func (a *App) RepoPathFor(t *model.Task, repo model.TaskRepo) string // worktree (rw) or canonical (ro)
+func (a *App) AvailableRepos(ctx) ([]string, error) // git repos directly under Paths.Repos (symlinks followed)
+func (a *App) AddRepo(ctx, ref string, r RepoArg, noFetch bool) (*model.Task, error) // open tasks; per-task flock; rw = fetch + worktree on task branch from origin default; regenerates CLAUDE.md; setup for that repo only
 func (a *App) Doctor(ctx) []Check  // type Check struct{ Name string; OK, Warn bool; Detail string }
 // M7
 func (a *App) Diff(ctx, ref string, w io.Writer, color bool) error
@@ -414,6 +418,8 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 | `atl` | TUI |
 | `atl new <title...> [--project P] [--repo name:rw\|ro ...] [--backlog] [--no-fetch] [-m/--description D]` | create task; prints slug + task dir |
 | `atl ls [--status S[,S...]\|all] [--json]` | default: open statuses. Text columns: `ID SLUG STATUS PROJECT SESSIONS TITLE` (sessions like `2 (1 waiting)`) |
+| `atl add <task> <name>[:rw\|ro] [--no-fetch]` | add a repo to an open task; prints `slug\trepo\tmode\tpath` |
+| `atl repos` | list repos available under `$ATL_REPOS` |
 | `atl open <task>` | `App.Open` then run attach cmd with stdio attached |
 | `atl session <task>` | new Claude session (does not attach; prints window) |
 | `atl resume <task>` | `App.Resume`; prints count |
@@ -439,9 +445,10 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
   to last 10). Task row shows a `●` marker if any session is waiting.
 - Right pane: title, slug, project, branch, port offset, task dir; repos (`rw`/`ro`, dirty `*`); sessions
   (`claude-<id>  <state>  <age since last_event_at>`), waiting rendered highlighted (bold + accent colour).
-- Keys: `n` new (form: title, project, repos `name:mode ...`, backlog toggle), `enter` open (tea.ExecProcess on the
+- Repo picker (new-task form and `a`): list of `App.AvailableRepos`, type to filter, space cycles none→rw→ro, enter confirms, esc clears filter then cancels; project repos preselected.
+- Keys: `n` new (form: title, project, repos via picker, description, backlog toggle), `enter` open (tea.ExecProcess on the
   attach cmd), `s` new session, `r` resume, `d` done / `c` cancel (y/N confirm; if refused because dirty, offer `F`
-  force), `p` pr, `D` diff (ExecProcess `$PAGER`), `1-5` set status (`AllStatuses` order, plain SetStatus),
+  force), `p` pr, `D` diff (ExecProcess `$PAGER`), `1-5` set status (`AllStatuses` order, plain SetStatus), `a` add repos to the selected task (picker),
   `/` filter (substring on slug/title), `j/k`/arrows move, `q`/ctrl-c quit.
 - Ticks: reload from DB every 1s (`App.List`; dirty status via `App.Get` for selected task only, at most every 3s);
   `App.Recover` every 5s. Errors shown in a status line, never crash.

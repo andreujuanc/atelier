@@ -27,6 +27,9 @@ Claude full screen, and press **Ctrl-q** to go back to the TUI (Claude keeps run
 ```sh
 atl new "Fix login" --project shop        # task + worktrees, prints "<slug>\t<dir>"
 atl new "Spike" --repo api:rw --repo docs:ro -m "why" [--backlog] [--no-fetch]
+atl add fix-login web [--no-fetch]  # add a repo to an open task (rw: worktree on atl/<slug>)
+atl add fix-login docs:ro           # ro: listed in CLAUDE.md; running sessions need a new one (s)
+atl repos                 # git repos in $ATL_REPOS, one per line
 atl ls [--status active,review|all] [--json]
 atl open fix-login        # ensure the tmux session (resume or start Claude), attach
 atl session fix-login     # start another Claude session (window) in the task
@@ -39,6 +42,12 @@ atl cancel fix-login [--force]
 atl doctor
 atl                       # TUI (on a terminal)
 ```
+
+TUI keys: `n` new task, `enter` open, `s` new session, `r` resume, `a` add repos to the
+selected task, `d` done, `c` cancel, `p` pr, `D` diff, `1`-`5` status, `/` filter, `q` quit.
+Repos (in the new-task form and for `a`) are picked from a list of `$ATL_REPOS`: type to
+filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter` confirms, `esc` cancels.
+Choosing a project in the form preselects its repos.
 
 `<task>` is a slug, numeric id, or unique slug prefix. atelier never pushes:
 push `atl/<slug>` yourself before `atl pr`.

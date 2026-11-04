@@ -32,7 +32,7 @@ func (c *cli) newCmd() *cobra.Command {
 				return usagef("title is required")
 			}
 			for _, r := range repos {
-				ra, err := parseRepoArg(r)
+				ra, err := parseRepoArg("--repo", r)
 				if err != nil {
 					return err
 				}
@@ -59,20 +59,75 @@ func (c *cli) newCmd() *cobra.Command {
 	return cmd
 }
 
-func parseRepoArg(s string) (app.RepoArg, error) {
+// parseRepoArg parses name[:rw|ro] (mode defaults to rw); label names the
+// argument in usage errors.
+func parseRepoArg(label, s string) (app.RepoArg, error) {
 	name, mode, hasMode := strings.Cut(s, ":")
 	ra := app.RepoArg{Name: strings.TrimSpace(name), Mode: model.ModeRW}
 	if ra.Name == "" {
-		return ra, usagef("--repo %q: empty repo name", s)
+		return ra, usagef("%s %q: empty repo name", label, s)
 	}
 	if hasMode {
 		m, err := model.ParseMode(mode)
 		if err != nil {
-			return ra, usagef("--repo %q: %v", s, err)
+			return ra, usagef("%s %q: %v", label, s, err)
 		}
 		ra.Mode = m
 	}
 	return ra, nil
+}
+
+func (c *cli) addCmd() *cobra.Command {
+	var noFetch bool
+	cmd := &cobra.Command{
+		Use:   "add <task> <repo>[:rw|ro] [--no-fetch]",
+		Short: "Add a repo to an open task (rw: worktree on atl/<slug>); prints slug, repo, mode and path",
+		Args:  args(cobra.ExactArgs(2)),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			ra, err := parseRepoArg("repo", a[1])
+			if err != nil {
+				return err
+			}
+			ap, err := c.App()
+			if err != nil {
+				return err
+			}
+			t, err := ap.AddRepo(cmd.Context(), a[0], ra, noFetch)
+			if err != nil {
+				return err
+			}
+			for _, r := range t.Repos {
+				if r.Name == strings.TrimSpace(ra.Name) {
+					fmt.Fprintf(c.stdout, "%s\t%s\t%s\t%s\n", t.Slug, r.Name, r.Mode, ap.RepoPathFor(t, r))
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&noFetch, "no-fetch", false, "do not fetch origin before branching (rw)")
+	return cmd
+}
+
+func (c *cli) reposCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "repos",
+		Short: "List the git repos in $ATL_REPOS, one per line",
+		Args:  args(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ap, err := c.App()
+			if err != nil {
+				return err
+			}
+			names, err := ap.AvailableRepos(cmd.Context())
+			if err != nil {
+				return err
+			}
+			for _, n := range names {
+				fmt.Fprintln(c.stdout, n)
+			}
+			return nil
+		},
+	}
 }
 
 // parseStatuses parses --status: "" → open statuses, "all" → nil (every

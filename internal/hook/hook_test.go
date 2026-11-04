@@ -739,3 +739,24 @@ func TestMainProcess(t *testing.T) {
 		}
 	})
 }
+
+// TestROGuardRepoAddedLater: the guard reads the task's repos from the DB
+// on every call, so an ro repo added to a running task (atl add) is
+// protected immediately, with no session restart.
+func TestROGuardRepoAddedLater(t *testing.T) {
+	ctx := context.Background()
+	f := setup(t)
+	target := filepath.Join(f.p.RepoPath("docs2"), "a.md")
+	in := Input{SessionID: "s", Cwd: f.p.TaskDir("fix"), ToolName: "Edit", ToolInput: toolInput("file_path", target)}
+	env := envOf(map[string]string{"ATL_TASK": "fix"})
+	if exit, msg, err := Handle(ctx, EventPreToolUse, in, env, f.st, f.p, now); exit != 0 || err != nil {
+		t.Fatalf("before add: %d %q %v", exit, msg, err)
+	}
+	if err := f.st.AddTaskRepo(ctx, f.task.ID, model.TaskRepo{Name: "docs2", Mode: model.ModeRO}); err != nil {
+		t.Fatal(err)
+	}
+	exit, msg, err := Handle(ctx, EventPreToolUse, in, env, f.st, f.p, now)
+	if exit != 2 || err != nil || !strings.Contains(msg, "inside read-only repo docs2") {
+		t.Fatalf("after add: %d %q %v", exit, msg, err)
+	}
+}

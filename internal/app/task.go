@@ -30,6 +30,10 @@ type NewTaskOpts struct {
 	Title, Description, Project string
 	Repos                       []RepoArg // override the mode of a project repo, or add one
 	Backlog, NoFetch            bool
+	// ExactRepos: Repos is the complete repo list; the project's repos are
+	// not merged in (the project is still loaded, for setup and env). Used
+	// by the TUI, where the project only preselects repos in the picker.
+	ExactRepos bool
 }
 
 // TaskView is a task with its sessions and (from Get only) repo status.
@@ -75,19 +79,9 @@ func (a *App) mergeRepos(o NewTaskOpts) ([]model.TaskRepo, error) {
 	var repos []model.TaskRepo
 	idx := map[string]int{}
 	add := func(name string, mode model.Mode) error {
-		name = strings.TrimSpace(name)
-		if name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
-			return fmt.Errorf("invalid repo name %q", name)
-		}
-		// The task dir also holds the generated CLAUDE.md and .claude/.
-		if strings.EqualFold(name, ".claude") || strings.EqualFold(name, "CLAUDE.md") {
-			return fmt.Errorf("invalid repo name %q (reserved in the task dir)", name)
-		}
-		if mode == "" {
-			mode = model.ModeRW
-		}
-		if !mode.Valid() {
-			return fmt.Errorf("repo %s: invalid mode %q (want rw or ro)", name, mode)
+		name, mode, err := validRepoArg(name, mode)
+		if err != nil {
+			return err
 		}
 		if i, ok := idx[name]; ok {
 			repos[i].Mode = mode
@@ -103,6 +97,9 @@ func (a *App) mergeRepos(o NewTaskOpts) ([]model.TaskRepo, error) {
 			return nil, err
 		}
 		for _, r := range pr.Repos {
+			if o.ExactRepos {
+				break
+			}
 			if err := add(r.Name, r.Mode); err != nil {
 				return nil, err
 			}
@@ -120,6 +117,26 @@ func (a *App) mergeRepos(o NewTaskOpts) ([]model.TaskRepo, error) {
 		return nil, errors.New("no repos: pass --project or --repo name:rw|ro")
 	}
 	return repos, nil
+}
+
+// validRepoArg trims and validates a requested repo name (a single path
+// component, not reserved in the task dir) and mode (empty → rw).
+func validRepoArg(name string, mode model.Mode) (string, model.Mode, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
+		return "", "", fmt.Errorf("invalid repo name %q", name)
+	}
+	// The task dir also holds the generated CLAUDE.md and .claude/.
+	if strings.EqualFold(name, ".claude") || strings.EqualFold(name, "CLAUDE.md") {
+		return "", "", fmt.Errorf("invalid repo name %q (reserved in the task dir)", name)
+	}
+	if mode == "" {
+		mode = model.ModeRW
+	}
+	if !mode.Valid() {
+		return "", "", fmt.Errorf("repo %s: invalid mode %q (want rw or ro)", name, mode)
+	}
+	return name, mode, nil
 }
 
 // checkRepo explains why path is not a usable canonical clone, or returns nil.
@@ -200,7 +217,7 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 	if err := a.populateTaskDir(ctx, t); err != nil {
 		return nil, err
 	}
-	if err := a.runSetup(ctx, t); err != nil {
+	if err := a.runSetup(ctx, t, nil); err != nil {
 		a.warnf("setup for task %s failed (task kept): %v", t.Slug, err)
 	}
 	return t, nil
@@ -303,16 +320,17 @@ func (a *App) runScript(ctx context.Context, pr *project.Project, kind, script s
 	return err
 }
 
-// runSetup runs the project's setup script in each rw worktree. A failure
-// in one repo is a warning; the remaining repos still run. The returned
-// error is only for a project that cannot be loaded.
-func (a *App) runSetup(ctx context.Context, t *model.Task) error {
+// runSetup runs the project's setup script in each rw worktree (only those
+// for which only returns true, if only is not nil). A failure in one repo
+// is a warning; the remaining repos still run. The returned error is only
+// for a project that cannot be loaded.
+func (a *App) runSetup(ctx context.Context, t *model.Task, only func(model.TaskRepo) bool) error {
 	pr, err := a.taskProject(t)
 	if err != nil || pr == nil || strings.TrimSpace(pr.Setup) == "" {
 		return err
 	}
 	for _, r := range t.Repos {
-		if r.Mode != model.ModeRW {
+		if r.Mode != model.ModeRW || (only != nil && !only(r)) {
 			continue
 		}
 		if err := a.runScript(ctx, pr, "setup", pr.Setup, t, r); err != nil {

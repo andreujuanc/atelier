@@ -25,6 +25,10 @@ type Backend interface {
 	PR(ctx context.Context, ref string) ([]app.PRResult, error)
 	Recover(ctx context.Context) (int, error)
 	ProjectNames() ([]string, error)
+	// ProjectRepos returns project name's repos with their default modes.
+	ProjectRepos(name string) ([]app.RepoArg, error)
+	AvailableRepos(ctx context.Context) ([]string, error)
+	AddRepo(ctx context.Context, ref string, r app.RepoArg, noFetch bool) (*model.Task, error)
 	TaskDir(slug string) string
 }
 
@@ -41,3 +45,15 @@ func (b appBackend) List(ctx context.Context) ([]app.TaskView, error) { return b
 func (b appBackend) ProjectNames() ([]string, error) { return project.List(b.Paths) }
 
 func (b appBackend) TaskDir(slug string) string { return b.Paths.TaskDir(slug) }
+
+func (b appBackend) ProjectRepos(name string) ([]app.RepoArg, error) {
+	pr, err := project.Load(b.Paths, name)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]app.RepoArg, 0, len(pr.Repos))
+	for _, r := range pr.Repos {
+		out = append(out, app.RepoArg{Name: r.Name, Mode: r.Mode})
+	}
+	return out, nil
+}

@@ -56,8 +56,9 @@ func RunContext(ctx context.Context, a *app.App) error {
 	if fallback == nil {
 		fallback = io.Discard
 	}
-	send, stop := orderedSend(func(s string) { p.Send(warnMsg(s)) }, fallback)
+	send, flush, stop := orderedSend(func(s string) { p.Send(warnMsg(s)) }, fallback)
 	a.Out = &lineWriter{send: send}
+	m.flushOut = flush
 
 	_, err = p.Run()
 	stop()
@@ -72,17 +73,27 @@ func RunContext(ctx context.Context, a *app.App) error {
 }
 
 // orderedSend returns send, which hands lines to deliver one at a time and
-// in order from a single goroutine, and stop. After stop, send writes lines
-// to fallback instead and never blocks; deliver must return once the
-// consumer is gone (tea.Program.Send does after the program stops).
-func orderedSend(deliver func(string), fallback io.Writer) (send func(string), stop func()) {
-	lines := make(chan string, 64)
+// in order from a single goroutine, flush, which returns once every line
+// sent before it has been delivered (or stop was called), and stop. After
+// stop, send writes lines to fallback instead and never blocks; deliver
+// must return once the consumer is gone (tea.Program.Send does after the
+// program stops).
+func orderedSend(deliver func(string), fallback io.Writer) (send func(string), flush func(), stop func()) {
+	type item struct {
+		line    string
+		barrier chan struct{} // non-nil: a flush marker, closed when reached
+	}
+	items := make(chan item, 64)
 	stopped := make(chan struct{})
 	go func() {
 		for {
 			select {
-			case s := <-lines:
-				deliver(s)
+			case it := <-items:
+				if it.barrier != nil {
+					close(it.barrier)
+				} else {
+					deliver(it.line)
+				}
 			case <-stopped:
 				return
 			}
@@ -96,13 +107,25 @@ func orderedSend(deliver func(string), fallback io.Writer) (send func(string), s
 		default:
 		}
 		select {
-		case lines <- s:
+		case items <- item{line: s}:
 		case <-stopped:
 			fmt.Fprintln(fallback, s)
 		}
 	}
+	flush = func() {
+		b := make(chan struct{})
+		select {
+		case items <- item{barrier: b}:
+		case <-stopped:
+			return
+		}
+		select {
+		case <-b:
+		case <-stopped:
+		}
+	}
 	var once sync.Once
-	return send, func() { once.Do(func() { close(stopped) }) }
+	return send, flush, func() { once.Do(func() { close(stopped) }) }
 }
 
 // shutdown closes tr and waits for the tracked backend calls. Unless force,
@@ -260,6 +283,30 @@ func (b *trackedBackend) ProjectNames() ([]string, error) {
 	}
 	defer b.tr.end()
 	return b.Backend.ProjectNames()
+}
+
+func (b *trackedBackend) ProjectRepos(name string) ([]app.RepoArg, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.ProjectRepos(name)
+}
+
+func (b *trackedBackend) AvailableRepos(ctx context.Context) ([]string, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.AvailableRepos(ctx)
+}
+
+func (b *trackedBackend) AddRepo(ctx context.Context, ref string, r app.RepoArg, noFetch bool) (*model.Task, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.AddRepo(ctx, ref, r, noFetch)
 }
 
 // lineWriter calls send for each complete non-empty line written, in

@@ -32,6 +32,7 @@ const (
 	modeFilter
 	modeForm
 	modeConfirm
+	modePicker
 )
 
 // confirmState is a pending done/cancel confirmation.
@@ -96,6 +97,26 @@ type (
 		err      error
 	}
 	warnMsg string
+
+	reposMsg struct {
+		names []string
+		err   error
+	}
+	projectReposMsg struct {
+		name  string
+		repos []app.RepoArg
+		err   error
+	}
+	// addStepMsg ends AddRepo for repos[i] of an `a` run on a task.
+	addStepMsg struct {
+		id     int64
+		slug   string
+		repos  []app.RepoArg
+		i      int
+		err    error
+		added  []app.RepoArg // before this step
+		failed []string      // before this step
+	}
 )
 
 // Model is the TUI state. All backend calls run as tea.Cmds.
@@ -107,6 +128,10 @@ type Model struct {
 	after func(d time.Duration, msg tea.Msg) tea.Cmd
 	// diffCmd returns the command that shows a task's diff (paged).
 	diffCmd func(slug string) *exec.Cmd
+	// flushOut, if set, returns once every App.Out line written so far has
+	// been delivered to the program (as warnMsg): an op's result message
+	// sent after it is then handled after the op's output lines.
+	flushOut func()
 
 	width, height int
 
@@ -141,6 +166,11 @@ type Model struct {
 	form        *newForm
 	lastForm    *newForm // kept after a failed create, to retry
 	confirm     *confirmState
+	picker      *picker
+	// pickTask is the task the open picker adds repos to (`a`); nil: the
+	// picker belongs to the new-task form.
+	pickTask *app.TaskView
+	repos    []string // last AvailableRepos result
 	// pending holds dirty refusals that arrived outside normal mode; they
 	// are shown once back in normal mode.
 	pending []*confirmState
@@ -151,6 +181,9 @@ type Model struct {
 
 	status    string
 	statusErr bool
+	// statusFromOut: the status is an App.Out line (warnMsg), which a later
+	// line may replace; other error statuses are kept until the next action.
+	statusFromOut bool
 
 	// quitRequested: quit once no operation is in flight. forceQuit: the
 	// user forced the quit with operations still running.
@@ -214,6 +247,105 @@ func (m *Model) projectsCmd() tea.Cmd {
 		names, err := be.ProjectNames()
 		return projectsMsg{names, err}
 	}
+}
+
+func (m *Model) reposCmd() tea.Cmd {
+	be, ctx := m.be, m.ctx
+	return func() tea.Msg {
+		names, err := be.AvailableRepos(ctx)
+		return reposMsg{names, err}
+	}
+}
+
+// syncProject preselects the form's project repos when the project field
+// names a known project other than the one already applied (loading them
+// asynchronously), and drops the preselection when the field is cleared.
+func (m *Model) syncProject() tea.Cmd {
+	f := m.form
+	if f == nil {
+		return nil
+	}
+	name := f.project()
+	if name == f.preProject || (name != "" && (name == f.loadingProject || name == f.projErrFor)) {
+		return nil
+	}
+	if name == "" {
+		m.applyFormProject("", nil)
+		return nil
+	}
+	known := false
+	for _, p := range f.projects {
+		known = known || p == name
+	}
+	if !known {
+		return nil
+	}
+	f.loadingProject = name
+	be := m.be
+	return func() tea.Msg {
+		repos, err := be.ProjectRepos(name)
+		return projectReposMsg{name, repos, err}
+	}
+}
+
+// applyFormProject preselects project name's repos in the form and, if the
+// form's picker is open, in its selection too (confirming it replaces the
+// form's repos).
+func (m *Model) applyFormProject(name string, repos []app.RepoArg) {
+	f := m.form
+	oldFrom := f.fromProject
+	f.applyProject(name, repos)
+	if m.picker != nil && m.pickTask == nil {
+		m.picker.sel = mergeProject(m.picker.sel, oldFrom, repos)
+	}
+}
+
+// openPicker shows the repo picker (for the form if t is nil, else to add
+// repos to t) and refreshes the available repos.
+func (m *Model) openPicker(t *app.TaskView, title string, sel []app.RepoArg, locked map[string]model.Mode) tea.Cmd {
+	m.picker = newPicker(title, sel, locked)
+	if m.repos != nil {
+		m.picker.available = m.repos // shown until the refresh arrives
+		m.picker.initCursor()
+	}
+	m.pickTask = t
+	m.mode = modePicker
+	return m.reposCmd()
+}
+
+// addStep runs AddRepo for repos[i] of task id.
+func (m *Model) addStep(id int64, slug string, repos []app.RepoArg, i int, added []app.RepoArg, failed []string) tea.Cmd {
+	m.busy[id] = fmt.Sprintf("add %s (%d/%d) to %s", repos[i].Name, i+1, len(repos), slug)
+	be, ctx, flush := m.be, m.ctx, m.flushOut
+	return func() tea.Msg {
+		_, err := be.AddRepo(ctx, slug, repos[i], false)
+		if flush != nil {
+			flush() // AddRepo's output lines land before this result
+		}
+		return addStepMsg{id: id, slug: slug, repos: repos, i: i, err: err, added: added, failed: failed}
+	}
+}
+
+// addSummary is the status text after an `a` run.
+func addSummary(slug string, added []app.RepoArg, failed []string) string {
+	var parts []string
+	if len(added) > 0 {
+		s := "added " + summary(added) + " to " + slug
+		var ro []string
+		for _, r := range added {
+			if r.Mode == model.ModeRO {
+				ro = append(ro, r.Name)
+			}
+		}
+		if len(ro) > 0 {
+			s += "; start a new session (s) to see " + strings.Join(ro, ", ")
+		}
+		parts = append(parts, s)
+	}
+	if len(failed) > 0 {
+		parts = append(parts, "failed: "+strings.Join(failed, "; "))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (m *Model) detailCmd(id int64, slug string) tea.Cmd {
@@ -403,10 +535,12 @@ func (m *Model) clampOffset() {
 
 // --- status line ---
 
-func (m *Model) setStatus(s string) { m.status, m.statusErr = s, false }
+func (m *Model) setStatus(s string) { m.setStatusErr(s, false) }
 
-func (m *Model) setErr(err error) {
-	m.status, m.statusErr = firstLine(err.Error()), true
+func (m *Model) setErr(err error) { m.setStatusErr(firstLine(err.Error()), true) }
+
+func (m *Model) setStatusErr(s string, isErr bool) {
+	m.status, m.statusErr, m.statusFromOut = s, isErr, false
 }
 
 func firstLine(s string) string {
@@ -546,19 +680,65 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.projects = msg.names
 			if m.form != nil {
 				m.form.projects = msg.names
+				return m.syncProject()
 			}
 		}
 		return nil
+	case projectReposMsg:
+		f := m.form
+		if f == nil {
+			return nil
+		}
+		if f.loadingProject == msg.name {
+			f.loadingProject = ""
+		}
+		if f.project() != msg.name {
+			return m.syncProject() // stale: load the current one
+		}
+		if msg.err != nil {
+			// Not preselected: submitting sends the project as is and
+			// NewTask reports the problem.
+			f.projErr, f.projErrFor = firstLine(msg.err.Error()), msg.name
+			return nil
+		}
+		m.applyFormProject(msg.name, msg.repos)
+		return nil
+	case reposMsg:
+		if msg.err == nil {
+			m.repos = msg.names
+		}
+		if m.picker != nil {
+			m.picker.setAvailable(msg.names, msg.err)
+		}
+		return nil
+	case addStepMsg:
+		added, failed := msg.added, msg.failed
+		r := msg.repos[msg.i]
+		if msg.err != nil {
+			failed = append(append([]string(nil), failed...), r.Name+": "+firstLine(msg.err.Error()))
+		} else {
+			added = append(append([]app.RepoArg(nil), added...), r)
+		}
+		if next := msg.i + 1; next < len(msg.repos) {
+			return m.addStep(msg.id, msg.slug, msg.repos, next, added, failed)
+		}
+		delete(m.busy, msg.id)
+		m.setStatusErr(firstLine(addSummary(msg.slug, added, failed)), len(failed) > 0)
+		return m.reload()
 	case warnMsg:
-		m.status = firstLine(string(msg))
-		m.statusErr = strings.HasPrefix(m.status, "warning:")
+		if m.statusErr && !m.statusFromOut {
+			return nil // never hide an error summary behind progress
+		}
+		s := firstLine(string(msg))
+		m.setStatusErr(s, strings.HasPrefix(s, "warning:"))
+		m.statusFromOut = true
 		return nil
 
 	case opMsg:
 		delete(m.busy, msg.id)
 		if msg.err != nil {
 			if msg.text != "" {
-				m.status, m.statusErr = firstLine(msg.text+"; "+msg.err.Error()), true
+				m.setStatusErr(firstLine(msg.text+"; "+msg.err.Error()), true)
 			} else {
 				m.setErr(fmt.Errorf("%s: %w", msg.op, msg.err))
 			}
@@ -614,7 +794,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 					text = msg.op + " " + msg.slug + ": " + s
 				}
 			}
-			m.status, m.statusErr = text, true
+			m.setStatusErr(text, true)
 		} else if msg.op == "open" {
 			m.setStatus("attached " + msg.slug)
 		}
@@ -672,6 +852,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return tea.Batch(cmds...)
 	}
 	switch m.mode {
+	case modePicker:
+		return m.pickerKey(msg)
 	case modeForm:
 		return m.formKey(msg)
 	case modeConfirm:
@@ -711,9 +893,52 @@ func (m *Model) applyFilter(f string) tea.Cmd {
 	return nil
 }
 
+// pickerKey handles a key in the repo picker.
+func (m *Model) pickerKey(msg tea.KeyMsg) tea.Cmd {
+	p, t := m.picker, m.pickTask
+	res := p.update(msg)
+	if res == pickContinue {
+		return nil
+	}
+	m.picker, m.pickTask = nil, nil
+	if t == nil { // the new-task form's picker
+		m.mode = modeForm
+		if m.form != nil {
+			if res == pickConfirm {
+				m.form.repos = p.selection()
+				m.form.err = ""
+				// Enter on Repos would reopen the picker: move on.
+				m.form.setFocus(fieldDesc)
+			}
+		} else {
+			m.mode = modeNormal
+		}
+		return nil
+	}
+	m.mode = modeNormal
+	if res == pickCancel {
+		m.setStatus("add cancelled")
+		return nil
+	}
+	sel := p.selection()
+	if len(sel) == 0 {
+		m.setStatus("add: nothing selected")
+		return nil
+	}
+	if op, busy := m.busy[t.Task.ID]; busy {
+		m.setStatus("busy: " + op + "…")
+		return nil
+	}
+	return m.addStep(t.Task.ID, t.Task.Slug, sel, 0, nil, nil)
+}
+
 func (m *Model) formKey(msg tea.KeyMsg) tea.Cmd {
 	res, cmd := m.form.update(msg)
 	switch res {
+	case formPick:
+		f := m.form
+		f.err = ""
+		return m.openPicker(nil, "Repos for the new task", f.repos, nil)
 	case formCancel:
 		m.form, m.mode = nil, modeNormal
 		m.setStatus("new task cancelled")
@@ -734,7 +959,7 @@ func (m *Model) formKey(msg tea.KeyMsg) tea.Cmd {
 			return newTaskMsg{t, err}
 		}
 	}
-	return cmd
+	return tea.Batch(cmd, m.syncProject())
 }
 
 func (m *Model) confirmKey(key string) tea.Cmd {
@@ -801,21 +1026,22 @@ func (m *Model) normalKey(key string) tea.Cmd {
 			m.form = newTaskForm(m.projects)
 		}
 		m.form.projects = m.projects
+		m.form.projErr, m.form.projErrFor = "", "" // retry a failed project load
 		m.form.setWidth(m.formInputWidth())
 		m.mode = modeForm
-		return m.projectsCmd()
+		return tea.Batch(m.projectsCmd(), m.syncProject())
 	}
 
 	t := m.selected()
 	if t == nil {
-		if strings.ContainsAny(key, "srdcpD12345") && len(key) == 1 || key == "enter" {
+		if strings.ContainsAny(key, "srdcpaD12345") && len(key) == 1 || key == "enter" {
 			m.setStatus("no task selected")
 		}
 		return nil
 	}
 	slug := t.Task.Slug
 	switch key {
-	case "enter", "s", "r", "d", "c", "p", "1", "2", "3", "4", "5":
+	case "enter", "s", "r", "d", "c", "p", "a", "1", "2", "3", "4", "5":
 		if op, busy := m.busy[t.Task.ID]; busy {
 			m.setStatus("busy: " + op + "…")
 			return nil
@@ -851,7 +1077,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 	case "d", "c":
 		verb := map[string]string{"d": "done", "c": "cancel"}[key]
 		if !t.Task.Status.Open() {
-			m.status, m.statusErr = fmt.Sprintf("%s: task %s is already %s", verb, slug, t.Task.Status), true
+			m.setStatusErr(fmt.Sprintf("%s: task %s is already %s", verb, slug, t.Task.Status), true)
 			return nil
 		}
 		m.confirm = &confirmState{verb: verb, id: t.Task.ID, slug: slug}
@@ -863,6 +1089,17 @@ func (m *Model) normalKey(key string) tea.Cmd {
 			res, err := be.PR(ctx, slug)
 			return prSummary(slug, res), err
 		})
+	case "a":
+		if !t.Task.Status.Open() {
+			m.setStatusErr(fmt.Sprintf("add: task is closed (%s is %s)", slug, t.Task.Status), true)
+			return nil
+		}
+		locked := map[string]model.Mode{}
+		for _, r := range t.Task.Repos {
+			locked[r.Name] = r.Mode
+		}
+		tv := *t
+		return m.openPicker(&tv, "Add repos to "+clean(slug), nil, locked)
 	case "D":
 		return m.exec("diff", slug, m.diffCmd(slug))
 	case "1", "2", "3", "4", "5":

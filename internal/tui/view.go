@@ -82,7 +82,9 @@ func (m *Model) View() string {
 		bodyH = 0
 	}
 	var body []string
-	if m.mode == modeForm && m.form != nil {
+	if m.mode == modePicker && m.picker != nil {
+		body = m.picker.lines(w, bodyH)
+	} else if m.mode == modeForm && m.form != nil {
 		body = m.formLines(w, bodyH)
 	} else {
 		lw := w
@@ -310,13 +312,15 @@ func (m *Model) helpLine(w int) string {
 	var s string
 	switch m.mode {
 	case modeForm:
-		s = "enter/↓ next  ↑ prev  tab next/complete project  ctrl+b backlog  enter on Backlog creates  esc cancel"
+		s = "enter/↓ next  ↑ prev  tab next/complete project  enter/space on Repos picks  ctrl+b backlog  enter on Backlog creates  esc cancel"
+	case modePicker:
+		s = "type to filter  ↑/↓ move  space none/rw/ro  enter confirm  esc clear filter/cancel"
 	case modeFilter:
 		s = "type to filter  enter apply  esc clear  ↑/↓ move"
 	case modeConfirm:
 		s = ""
 	default:
-		s = "n new  enter open  s session  r resume  d done  c cancel  p pr  D diff  1-5 status  / filter  q quit"
+		s = "n new  enter open  s session  r resume  a add repo  d done  c cancel  p pr  D diff  1-5 status  / filter  q quit"
 	}
 	return dimStyle.Render(trunc(s, w))
 }
@@ -347,13 +351,23 @@ func (m *Model) formLines(w, h int) []string {
 			label = headerStyle.Render(fmt.Sprintf("%-12s", fieldLabels[i]))
 		}
 		var val string
-		if i == fieldBacklog {
+		switch i {
+		case fieldBacklog:
 			val = "[ ]"
 			if f.backlog {
 				val = "[x]"
 			}
 			val += dimStyle.Render(" space / ctrl+b toggles")
-		} else {
+		case fieldRepos:
+			switch {
+			case len(f.repos) > 0:
+				val = summary(f.repos)
+			case f.project() != "" && f.project() != f.preProject:
+				val = dimStyle.Render("project " + clean(f.project()) + "'s repos")
+			default:
+				val = dimStyle.Render("none")
+			}
+		default:
 			val = f.inputs[i].View()
 		}
 		add(cursor + label + val)
@@ -363,6 +377,12 @@ func (m *Model) formLines(w, h int) []string {
 				hint = "projects: " + clean(strings.Join(f.projects, ", "))
 			}
 			add(dimStyle.Render("                " + hint))
+		}
+		if i == fieldProject && f.projErr != "" && f.projErrFor == f.project() {
+			add(errStyle.Render("                " + clean(f.projErr)))
+		}
+		if i == fieldRepos && i == f.focus {
+			add(dimStyle.Render("                enter or space opens the repo picker"))
 		}
 	}
 	add("")

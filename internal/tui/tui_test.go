@@ -34,6 +34,11 @@ type fakeBackend struct {
 	doneErr  error // returned by Done/Cancel when force is false
 	projects []string
 	newTask  *model.Task
+	// repos is AvailableRepos' result; projRepos ProjectRepos' per project.
+	repos     []string
+	projRepos map[string][]app.RepoArg
+	addErr    map[string]error    // AddRepo error per repo name
+	addOut    func(r app.RepoArg) // called by AddRepo (to write App.Out)
 }
 
 func (f *fakeBackend) rec(name string, args ...any) { f.calls = append(f.calls, call{name, args}) }
@@ -145,6 +150,38 @@ func (f *fakeBackend) ProjectNames() ([]string, error) { return f.projects, nil 
 
 func (f *fakeBackend) TaskDir(slug string) string { return "/tasks/" + slug }
 
+func (f *fakeBackend) ProjectRepos(name string) ([]app.RepoArg, error) {
+	f.rec("ProjectRepos", name)
+	r, ok := f.projRepos[name]
+	if !ok {
+		return nil, fmt.Errorf("project %q not found", name)
+	}
+	return r, nil
+}
+
+func (f *fakeBackend) AvailableRepos(ctx context.Context) ([]string, error) {
+	f.rec("AvailableRepos")
+	return f.repos, nil
+}
+
+func (f *fakeBackend) AddRepo(ctx context.Context, ref string, r app.RepoArg, noFetch bool) (*model.Task, error) {
+	f.rec("AddRepo", ref, r, noFetch)
+	if f.addOut != nil {
+		f.addOut(r)
+	}
+	if err := f.addErr[r.Name]; err != nil {
+		return nil, err
+	}
+	for i := range f.tasks {
+		if f.tasks[i].Task.Slug == ref {
+			f.tasks[i].Task.Repos = append(f.tasks[i].Task.Repos, model.TaskRepo{Name: r.Name, Mode: r.Mode})
+			t := f.tasks[i].Task
+			return &t, nil
+		}
+	}
+	return nil, fmt.Errorf("task %s not found", ref)
+}
+
 var t0 = time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 
 func tv(id int64, slug string, st model.Status, sessions ...model.Session) app.TaskView {
@@ -227,6 +264,18 @@ func keyMsg(k string) tea.KeyMsg {
 		msg = tea.KeyMsg{Type: tea.KeyCtrlB}
 	case "ctrl+c":
 		msg = tea.KeyMsg{Type: tea.KeyCtrlC}
+	case "ctrl+n":
+		msg = tea.KeyMsg{Type: tea.KeyCtrlN}
+	case "ctrl+p":
+		msg = tea.KeyMsg{Type: tea.KeyCtrlP}
+	case "ctrl+u":
+		msg = tea.KeyMsg{Type: tea.KeyCtrlU}
+	case "backspace":
+		msg = tea.KeyMsg{Type: tea.KeyBackspace}
+	case "pgdown":
+		msg = tea.KeyMsg{Type: tea.KeyPgDown}
+	case "pgup":
+		msg = tea.KeyMsg{Type: tea.KeyPgUp}
 	case " ":
 		msg = tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}}
 	default:
@@ -524,7 +573,8 @@ func TestDoneDirtyForce(t *testing.T) {
 }
 
 func TestNewTaskForm(t *testing.T) {
-	fb := &fakeBackend{tasks: sampleTasks(), projects: []string{"shop", "site"}}
+	fb := &fakeBackend{tasks: sampleTasks(), projects: []string{"shop", "site"}, repos: []string{"api", "docs", "web"},
+		projRepos: map[string][]app.RepoArg{"site": {{Name: "web", Mode: model.ModeRW}, {Name: "docs", Mode: model.ModeRO}}}}
 	m, _ := newTest(t, fb)
 	key(m, "n")
 	if m.mode != modeForm {
@@ -544,9 +594,49 @@ func TestNewTaskForm(t *testing.T) {
 	if !strings.Contains(plainView(m), "projects: shop, site") {
 		t.Fatalf("no project hint:\n%s", plainView(m))
 	}
+	// site's repos are preselected with the project's modes
+	if got := summary(m.form.repos); got != "web(rw) docs(ro)" || m.form.preProject != "site" {
+		t.Fatalf("preselection %q (pre %q); calls %v", got, m.form.preProject, fb.calls)
+	}
+	if fb.count("ProjectRepos") != 2 { // shop (unknown to the fake) then site
+		t.Fatalf("ProjectRepos calls: %d", fb.count("ProjectRepos"))
+	}
+	key(m, "enter") // → Repos
+	if !strings.Contains(plainView(m), "Repos       web(rw) docs(ro)") {
+		t.Fatalf("repos field:\n%s", plainView(m))
+	}
+	key(m, "enter") // opens the picker
+	if m.mode != modePicker || m.picker == nil {
+		t.Fatalf("picker not open: mode %d", m.mode)
+	}
+	v := plainView(m)
+	for _, want := range []string{"[rw] web", "[ro] docs", "[  ] api", "selected: web(rw) docs(ro)"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("picker lacks %q:\n%s", want, v)
+		}
+	}
+	key(m, " ") // api (highlighted first) → rw
+	key(m, "down")
+	key(m, " ") // docs ro → none
+	typeText(m, "we")
+	key(m, " ") // web rw → ro
 	key(m, "enter")
-	typeText(m, "api:rw docs:ro web")
-	key(m, "enter")
+	if m.mode != modeForm || summary(m.form.repos) != "web(ro) api(rw)" {
+		t.Fatalf("after picker: mode %d repos %q", m.mode, summary(m.form.repos))
+	}
+	// confirming moves on to Description: enter does not reopen the picker
+	if m.form.focus != fieldDesc {
+		t.Fatalf("focus after confirm: %d", m.form.focus)
+	}
+	key(m, "up")
+	// esc in the picker keeps the previous selection (and Repos focused)
+	key(m, " ")
+	key(m, " ")
+	key(m, "esc")
+	if m.mode != modeForm || summary(m.form.repos) != "web(ro) api(rw)" || m.form.focus != fieldRepos {
+		t.Fatalf("after esc: mode %d repos %q focus %d", m.mode, summary(m.form.repos), m.form.focus)
+	}
+	key(m, "down")
 	typeText(m, "the description")
 	key(m, "ctrl+b")
 	key(m, "enter") // focus backlog
@@ -556,8 +646,8 @@ func TestNewTaskForm(t *testing.T) {
 		t.Fatalf("no NewTask call; form err %q", m.form.err)
 	}
 	want := app.NewTaskOpts{
-		Title: "Add login", Project: "site", Description: "the description", Backlog: true,
-		Repos: []app.RepoArg{{Name: "api", Mode: model.ModeRW}, {Name: "docs", Mode: model.ModeRO}, {Name: "web", Mode: model.ModeRW}},
+		Title: "Add login", Project: "site", Description: "the description", Backlog: true, ExactRepos: true,
+		Repos: []app.RepoArg{{Name: "web", Mode: model.ModeRO}, {Name: "api", Mode: model.ModeRW}},
 	}
 	if got := c.args[0].(app.NewTaskOpts); !reflect.DeepEqual(got, want) {
 		t.Fatalf("opts\n got %+v\nwant %+v", got, want)
@@ -567,8 +657,73 @@ func TestNewTaskForm(t *testing.T) {
 	}
 }
 
+// The project preselection is replaced when the project changes, manual
+// picks are kept, and a project left alone (not yet loaded) is sent as is.
+func TestNewTaskFormProjectSwitch(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), projects: []string{"shop", "site"}, repos: []string{"api", "docs", "lib", "web"},
+		projRepos: map[string][]app.RepoArg{
+			"shop": {{Name: "api", Mode: model.ModeRW}, {Name: "lib", Mode: model.ModeRO}},
+			"site": {{Name: "web", Mode: model.ModeRW}},
+		}}
+	m, _ := newTest(t, fb)
+	key(m, "n")
+	typeText(m, "T")
+	key(m, "down")
+	key(m, "down") // Repos
+	key(m, " ")    // picker
+	typeText(m, "docs")
+	key(m, " ")
+	key(m, "enter") // → Description
+	key(m, "up")
+	key(m, "up") // Project
+	typeText(m, "shop")
+	if got := summary(m.form.repos); got != "api(rw) lib(ro) docs(rw)" {
+		t.Fatalf("shop preselect: %q", got)
+	}
+	for range "shop" {
+		key(m, "backspace")
+	}
+	typeText(m, "site")
+	if got := summary(m.form.repos); got != "web(rw) docs(rw)" {
+		t.Fatalf("site preselect: %q", got)
+	}
+	key(m, "ctrl+u") // textinput: clear the field → preselection dropped
+	if got := summary(m.form.repos); got != "docs(rw)" || m.form.preProject != "" {
+		t.Fatalf("cleared project: %q", got)
+	}
+	key(m, "down")
+	key(m, "down")
+	key(m, "down")
+	key(m, "enter")
+	c := fb.last("NewTask")
+	want := app.NewTaskOpts{Title: "T", Repos: []app.RepoArg{{Name: "docs", Mode: model.ModeRW}}}
+	if c == nil || !reflect.DeepEqual(c.args[0].(app.NewTaskOpts), want) {
+		t.Fatalf("opts %+v; err %q", c, m.lastForm.err)
+	}
+
+	// Project typed but its repos never loaded (no picker selection): sent
+	// as the project alone, so NewTask uses the project's repos.
+	fb.projRepos = nil
+	m.lastForm = nil
+	key(m, "n")
+	typeText(m, "U")
+	key(m, "down")
+	typeText(m, "shop") // load fails: not preselected
+	if !strings.Contains(plainView(m), "project \"shop\" not found") {
+		t.Fatalf("project error not shown:\n%s", plainView(m))
+	}
+	key(m, "down")
+	key(m, "down")
+	key(m, "down")
+	key(m, "enter")
+	if c := fb.last("NewTask"); c == nil || c.args[0].(app.NewTaskOpts).Title != "U" {
+		t.Fatalf("NewTask not called: %q", m.form.err)
+	}
+}
+
 func TestNewTaskFormValidation(t *testing.T) {
-	fb := &fakeBackend{tasks: sampleTasks()}
+	fb := &fakeBackend{tasks: sampleTasks(), repos: []string{"api"}, projects: []string{"shop"},
+		projRepos: map[string][]app.RepoArg{"shop": {{Name: "api", Mode: model.ModeRW}}}}
 	m, _ := newTest(t, fb)
 	key(m, "n")
 	key(m, "down")
@@ -584,14 +739,28 @@ func TestNewTaskFormValidation(t *testing.T) {
 	key(m, "up")
 	key(m, "up")
 	typeText(m, "T")
+	for i := 0; i < 4; i++ {
+		key(m, "down")
+	}
+	key(m, "enter") // no repos, no project
+	if fb.count("NewTask") != 0 || m.mode != modeForm || !strings.Contains(plainView(m), "pick at least one repo") {
+		t.Fatalf("no repos: calls %v err %q", fb.calls, m.form.err)
+	}
+	// a preselected project whose repos were all deselected
+	key(m, "up")
+	key(m, "up")
+	key(m, "up")
+	typeText(m, "shop")
+	key(m, "down")
+	key(m, "enter") // picker
+	key(m, " ")     // api rw → ro
+	key(m, " ")     // → none
 	key(m, "enter")
+	key(m, "down")
+	key(m, "down")
 	key(m, "enter")
-	typeText(m, "api:rx")
-	key(m, "enter")
-	key(m, "enter")
-	key(m, "enter")
-	if fb.count("NewTask") != 0 || m.mode != modeForm || !strings.Contains(plainView(m), "invalid mode") {
-		t.Fatalf("invalid repos: calls %v err %q", fb.calls, m.form.err)
+	if fb.count("NewTask") != 0 || !strings.Contains(m.form.err, "no repos selected") {
+		t.Fatalf("deselected all: err %q", m.form.err)
 	}
 	key(m, "esc")
 	if m.mode != modeNormal || fb.count("NewTask") != 0 {
@@ -599,22 +768,234 @@ func TestNewTaskFormValidation(t *testing.T) {
 	}
 }
 
-func TestParseRepos(t *testing.T) {
-	got, err := parseRepos(" a:rw, b:ro  c ")
-	if err != nil {
-		t.Fatal(err)
+func manyRepos(n int) []string {
+	var out []string
+	for i := 0; i < n; i++ {
+		out = append(out, fmt.Sprintf("repo-%03d", i))
 	}
-	want := []app.RepoArg{{Name: "a", Mode: model.ModeRW}, {Name: "b", Mode: model.ModeRO}, {Name: "c", Mode: model.ModeRW}}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatal(got)
+	return out
+}
+
+func TestPicker(t *testing.T) {
+	if v := strings.Join(newPicker("Pick", nil, nil).lines(40, 8), "\n"); !strings.Contains(ansi.Strip(v), "loading repos") {
+		t.Fatalf("loading: %s", v)
 	}
-	for _, bad := range []string{":rw", "a:x", "a/b", ".."} {
-		if _, err := parseRepos(bad); err == nil {
-			t.Errorf("%q accepted", bad)
+	p := newPicker("Pick", []app.RepoArg{{Name: "gone", Mode: model.ModeRO}}, map[string]model.Mode{"api": model.ModeRW})
+	p.setAvailable([]string{"api", "Bill-app", "docs", "web-app"}, nil)
+	// a selected repo missing on disk is still listed (sorted in)
+	if got := p.visible(); !reflect.DeepEqual(got, []string{"Bill-app", "api", "docs", "gone", "web-app"}) {
+		t.Fatalf("items %v", got)
+	}
+	upd := func(k string) pickResult { return p.update(keyMsg(k)) }
+	for _, r := range "BIL" {
+		upd(string(r))
+	}
+	if got := p.visible(); !reflect.DeepEqual(got, []string{"Bill-app"}) {
+		t.Fatalf("filter %q: %v", p.filter, got)
+	}
+	upd("backspace")
+	upd("backspace")
+	upd("backspace")
+	if p.filter != "" || len(p.visible()) != 5 {
+		t.Fatalf("backspace: %q %v", p.filter, p.visible())
+	}
+	upd("a") // Bill-app, api, web-app
+	if got := p.visible(); !reflect.DeepEqual(got, []string{"Bill-app", "api", "web-app"}) {
+		t.Fatalf("filter a: %v", got)
+	}
+	// mode cycling: none → rw → ro → none
+	upd(" ")
+	if p.modeOf("Bill-app") != model.ModeRW {
+		t.Fatal("not rw")
+	}
+	upd(" ")
+	if p.modeOf("Bill-app") != model.ModeRO {
+		t.Fatal("not ro")
+	}
+	upd(" ")
+	if p.modeOf("Bill-app") != "" {
+		t.Fatal("not none")
+	}
+	upd(" ")
+	// locked (in task) repos: dimmed, not selectable
+	upd("ctrl+n")
+	if p.current() != "api" {
+		t.Fatalf("current %q", p.current())
+	}
+	upd(" ")
+	if p.modeOf("api") != "" || !strings.Contains(p.msg, "already in the task") {
+		t.Fatalf("locked repo selected: %v %q", p.sel, p.msg)
+	}
+	view := ansi.Strip(strings.Join(p.lines(60, 10), "\n"))
+	if !strings.Contains(view, "[rw] api  (in task)") || !strings.Contains(view, "already in the task") {
+		t.Fatalf("locked row:\n%s", view)
+	}
+	upd("ctrl+n")
+	upd(" ")
+	upd("ctrl+p")
+	upd("ctrl+p")
+	if p.current() != "Bill-app" {
+		t.Fatalf("ctrl+p: %q", p.current())
+	}
+	upd("ctrl+u")
+	upd("up") // clamps at the top
+	if p.current() != "Bill-app" {
+		t.Fatalf("top clamp: %q", p.current())
+	}
+	want := []app.RepoArg{{Name: "gone", Mode: model.ModeRO}, {Name: "Bill-app", Mode: model.ModeRW}, {Name: "web-app", Mode: model.ModeRW}}
+	if !reflect.DeepEqual(p.selection(), want) {
+		t.Fatalf("selection %v", p.selection())
+	}
+	view = ansi.Strip(strings.Join(p.lines(60, 12), "\n"))
+	for _, s := range []string{"[ro] gone", "[rw] Bill-app", "[  ] docs", "selected: gone(ro) Bill-app(rw) web-app(rw)", "filter: "} {
+		if !strings.Contains(view, s) {
+			t.Fatalf("view lacks %q:\n%s", s, view)
 		}
 	}
-	if r, err := parseRepos(""); err != nil || r != nil {
-		t.Fatal("empty")
+	if upd("enter") != pickConfirm || upd("esc") != pickCancel {
+		t.Fatal("enter/esc")
+	}
+	upd("zzz")
+	if v := ansi.Strip(strings.Join(p.lines(40, 6), "\n")); !strings.Contains(v, "no repos match zzz") {
+		t.Fatalf("no match:\n%s", v)
+	}
+	// a pasted multi-rune string filters; spaces are dropped
+	p.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" do cs"), Paste: true})
+	if p.filter != "zzzdocs" {
+		t.Fatalf("paste: %q", p.filter)
+	}
+}
+
+func TestPickerScroll(t *testing.T) {
+	p := newPicker("Pick", nil, nil)
+	p.setAvailable(manyRepos(100), nil)
+	for _, size := range [][2]int{{1, 1}, {5, 2}, {10, 3}, {20, 5}, {30, 8}, {80, 24}} {
+		w, h := size[0], size[1]
+		p.cursor, p.offset = 0, 0
+		for i := 0; i < 120; i++ {
+			lines := p.lines(w, h)
+			if len(lines) != h {
+				t.Fatalf("%dx%d: %d lines", w, h, len(lines))
+			}
+			found := false
+			for _, l := range lines {
+				if ansi.StringWidth(l) > w {
+					t.Fatalf("%dx%d: line too wide: %q", w, h, ansi.Strip(l))
+				}
+				found = found || strings.Contains(ansi.Strip(l), p.current()) && w >= 20
+			}
+			if w >= 20 && !found {
+				t.Fatalf("%dx%d: cursor row %q not visible at step %d:\n%s", w, h, p.current(), i, ansi.Strip(strings.Join(lines, "\n")))
+			}
+			p.update(keyMsg("down"))
+		}
+		if p.current() != "repo-099" {
+			t.Fatalf("bottom clamp: %q", p.current())
+		}
+		p.update(keyMsg("pgup"))
+		if p.current() != "repo-089" {
+			t.Fatalf("pgup: %q", p.current())
+		}
+	}
+}
+
+func TestAddRepoFlow(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), repos: []string{"api", "docs", "lib", "web"},
+		addErr: map[string]error{"web": errors.New("repo web: boom")}}
+	m, _ := newTest(t, fb) // beta (backlog) selected; it has api rw, docs ro
+	if !strings.Contains(plainView(m), "a add repo") {
+		t.Fatal("help line lacks a")
+	}
+	key(m, "a")
+	if m.mode != modePicker || m.pickTask == nil || m.pickTask.Task.Slug != "beta" {
+		t.Fatalf("picker not open for beta: mode %d", m.mode)
+	}
+	v := plainView(m)
+	if !strings.Contains(v, "Add repos to beta") || !strings.Contains(v, "[rw] api  (in task)") || !strings.Contains(v, "[ro] docs  (in task)") {
+		t.Fatalf("add picker:\n%s", v)
+	}
+	// the cursor starts on the first repo not in the task
+	if cur := m.picker.current(); cur != "lib" || !strings.Contains(plainView(m), "> [  ] lib") {
+		t.Fatalf("initial cursor on %q:\n%s", cur, plainView(m))
+	}
+	key(m, "up") // docs: locked, still shows the cursor marker
+	if !strings.Contains(plainView(m), "> [ro] docs  (in task)") {
+		t.Fatalf("no cursor on locked row:\n%s", plainView(m))
+	}
+	key(m, " ")
+	if len(m.picker.sel) != 0 {
+		t.Fatal("locked repo selected")
+	}
+	key(m, "down") // lib: the hint stays until the selection changes
+	if !strings.Contains(plainView(m), "docs is already in the task") {
+		t.Fatalf("hint cleared by a move:\n%s", plainView(m))
+	}
+	key(m, " ")
+	if strings.Contains(plainView(m), "already in the task") {
+		t.Fatalf("hint kept after a selection change:\n%s", plainView(m))
+	}
+	key(m, " ") // lib ro
+	key(m, "down")
+	key(m, " ") // web rw
+	key(m, "down")
+	if !strings.Contains(plainView(m), "selected: lib(ro) web(rw)") {
+		t.Fatalf("summary:\n%s", plainView(m))
+	}
+	// Run step by step to watch progress.
+	cmd := press(m, "enter")
+	if m.mode != modeNormal || !strings.Contains(m.busy[2], "add lib (1/2) to beta") {
+		t.Fatalf("busy %q", m.busy[2])
+	}
+	if !strings.Contains(plainView(m), "working… add lib (1/2) to beta") {
+		t.Fatalf("no progress:\n%s", plainView(m))
+	}
+	_, next := m.Update(cmd())
+	if !strings.Contains(m.busy[2], "add web (2/2) to beta") {
+		t.Fatalf("busy after step 1: %q", m.busy[2])
+	}
+	// another op on the task waits
+	key(m, "a")
+	if m.mode != modeNormal || !strings.Contains(m.status, "busy") {
+		t.Fatalf("a while busy: mode %d status %q", m.mode, m.status)
+	}
+	drain(m, next)
+	var got []string
+	for _, c := range fb.calls {
+		if c.name == "AddRepo" {
+			got = append(got, fmt.Sprintf("%v %v %v", c.args[0], c.args[1], c.args[2]))
+		}
+	}
+	if want := []string{"beta {lib ro} false", "beta {web rw} false"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("AddRepo calls %v", got)
+	}
+	if _, busy := m.busy[2]; busy {
+		t.Fatal("still busy")
+	}
+	if !m.statusErr || !strings.Contains(m.status, "added lib(ro) to beta; start a new session (s) to see lib") ||
+		!strings.Contains(m.status, "failed: web: repo web: boom") {
+		t.Fatalf("status %q", m.status)
+	}
+
+	// esc cancels; enter with nothing selected does nothing
+	n := fb.count("AddRepo")
+	key(m, "a")
+	key(m, "esc")
+	key(m, "a")
+	key(m, "enter")
+	if fb.count("AddRepo") != n || m.mode != modeNormal || !strings.Contains(m.status, "nothing selected") {
+		t.Fatalf("cancel/empty: %d calls, status %q", fb.count("AddRepo")-n, m.status)
+	}
+}
+
+func TestAddRepoClosedTask(t *testing.T) {
+	fb := &fakeBackend{tasks: []app.TaskView{tv(1, "old", model.StatusDone)}, repos: []string{"api"}}
+	m, _ := newTest(t, fb)
+	key(m, "a")
+	if m.mode != modeNormal || !m.statusErr || !strings.Contains(m.status, "task is closed") {
+		t.Fatalf("mode %d status %q", m.mode, m.status)
+	}
+	if fb.count("AvailableRepos") != 0 {
+		t.Fatal("picker loaded repos for a closed task")
 	}
 }
 
@@ -718,7 +1099,7 @@ func TestOtherKeys(t *testing.T) {
 }
 
 func TestSmallSizes(t *testing.T) {
-	fb := &fakeBackend{tasks: sampleTasks(), projects: []string{"p"}}
+	fb := &fakeBackend{tasks: sampleTasks(), projects: []string{"p"}, repos: manyRepos(100)}
 	for i := 0; i < 30; i++ {
 		fb.tasks = append(fb.tasks, tv(int64(10+i), fmt.Sprintf("task-with-a-rather-long-slug-%d", i), model.StatusActive,
 			model.Session{ID: int64(i), State: model.StateWaiting, LastEventAt: t0}))
@@ -746,6 +1127,14 @@ func TestSmallSizes(t *testing.T) {
 		}
 		check(s[0], s[1])
 		key(m, "n")
+		check(s[0], s[1])
+		key(m, "down")
+		key(m, "down")
+		key(m, " ") // repo picker
+		check(s[0], s[1])
+		key(m, "esc")
+		key(m, "esc")
+		key(m, "a")
 		check(s[0], s[1])
 		key(m, "esc")
 		key(m, "d")
@@ -826,12 +1215,17 @@ func TestQuitWaitsForOps(t *testing.T) {
 	}
 
 	// a new task in flight counts too
+	fb.repos = []string{"api"}
 	m, _ = newTest(t, fb)
 	key(m, "n")
 	typeText(m, "x")
-	for i := 0; i < 4; i++ {
-		key(m, "down")
-	}
+	key(m, "down")
+	key(m, "down")
+	key(m, " ") // picker
+	key(m, " ") // api rw
+	key(m, "enter")
+	key(m, "down")
+	key(m, "down")
 	create := press(m, "enter")
 	if !m.creating || isQuit(press(m, "ctrl+c")) {
 		t.Fatal("ctrl+c quit while creating")
@@ -917,7 +1311,7 @@ func TestShutdown(t *testing.T) {
 func TestOrderedSend(t *testing.T) {
 	var mu sync.Mutex
 	var got []string
-	send, stop := orderedSend(func(s string) {
+	send, _, stop := orderedSend(func(s string) {
 		mu.Lock()
 		got = append(got, s)
 		mu.Unlock()
@@ -949,7 +1343,7 @@ func TestOrderedSend(t *testing.T) {
 	block := make(chan struct{})
 	defer close(block)
 	var fallback bytes.Buffer
-	send, stop = orderedSend(func(string) { <-block }, &fallback)
+	send, _, stop = orderedSend(func(string) { <-block }, &fallback)
 	for i := 0; i < 10; i++ {
 		send("x")
 	}
@@ -1157,5 +1551,221 @@ func TestMultiRuneKeys(t *testing.T) {
 	key(m, "abc")
 	if v := m.form.inputs[fieldTitle].Value(); v != "abc" {
 		t.Fatalf("form text %q", v)
+	}
+}
+
+// AddRepo's output lines travel through the ordered queue; the summary of
+// the `a` run must land after them, and no later progress line may hide an
+// error summary.
+func TestAddSummaryAfterOutput(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), repos: []string{"api", "docs", "lib", "web"},
+		addErr: map[string]error{"web": errors.New("repo web: boom")}}
+	m, _ := newTest(t, fb)
+	var mu sync.Mutex
+	var delivered []tea.Msg
+	send, flush, stop := orderedSend(func(s string) {
+		time.Sleep(20 * time.Millisecond) // a slow program: lines lag behind
+		mu.Lock()
+		delivered = append(delivered, warnMsg(s))
+		mu.Unlock()
+	}, io.Discard)
+	defer stop()
+	m.flushOut = flush
+	fb.addOut = func(r app.RepoArg) {
+		send("fetching " + r.Name + "...")
+		send("added " + r.Name + " (rw) to beta: worktree at /x")
+	}
+	// run cmd (one AddRepo step) as the program would: its result is
+	// handled after whatever the queue delivered while it ran, and lines
+	// the queue delivers later after it
+	feed := func() {
+		mu.Lock()
+		msgs := delivered
+		delivered = nil
+		mu.Unlock()
+		for _, x := range msgs {
+			m.Update(x)
+		}
+	}
+	step := func(cmd tea.Cmd) {
+		msg := cmd()
+		feed()
+		m.Update(msg)
+		flush()
+		feed()
+	}
+
+	key(m, "a")
+	key(m, " ") // lib rw
+	step(press(m, "enter"))
+	if m.statusErr || m.status != "added lib(rw) to beta" {
+		t.Fatalf("summary overwritten: %q (err %v)", m.status, m.statusErr)
+	}
+
+	key(m, "a")
+	key(m, "down")
+	key(m, " ") // web rw: fails
+	step(press(m, "enter"))
+	if !m.statusErr || !strings.Contains(m.status, "failed: web: repo web: boom") {
+		t.Fatalf("error summary overwritten: %q (err %v)", m.status, m.statusErr)
+	}
+	want := m.status
+	for _, line := range []string{"fetching api...", "warning: something else"} {
+		m.Update(warnMsg(line))
+		if m.status != want || !m.statusErr {
+			t.Fatalf("%q replaced the error summary: %q", line, m.status)
+		}
+	}
+	// once a new action sets the status, lines show again
+	key(m, "a")
+	key(m, "esc")
+	m.Update(warnMsg("fetching api..."))
+	if m.status != "fetching api..." || m.statusErr {
+		t.Fatalf("progress after action: %q", m.status)
+	}
+	m.Update(warnMsg("warning: w1"))
+	m.Update(warnMsg("warning: w2"))
+	m.Update(warnMsg("fetching docs..."))
+	if m.status != "fetching docs..." {
+		t.Fatalf("a line did not replace a line: %q", m.status)
+	}
+}
+
+func TestOrderedSendFlush(t *testing.T) {
+	var mu sync.Mutex
+	n := 0
+	send, flush, stop := orderedSend(func(string) {
+		time.Sleep(time.Millisecond)
+		mu.Lock()
+		n++
+		mu.Unlock()
+	}, io.Discard)
+	for i := 0; i < 20; i++ {
+		send("x")
+	}
+	flush()
+	mu.Lock()
+	if n != 20 {
+		t.Fatalf("flush returned after %d of 20 lines", n)
+	}
+	mu.Unlock()
+	stop()
+	done := make(chan struct{})
+	go func() { flush(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("flush blocked after stop")
+	}
+}
+
+// esc in the picker clears a filter first, then cancels.
+func TestPickerEscClearsFilter(t *testing.T) {
+	p := newPicker("Pick", nil, nil)
+	p.setAvailable([]string{"api", "web"}, nil)
+	p.update(keyMsg("w"))
+	if res := p.update(keyMsg("esc")); res != pickContinue || p.filter != "" || len(p.visible()) != 2 {
+		t.Fatalf("esc with filter: res %d filter %q", res, p.filter)
+	}
+	if res := p.update(keyMsg("esc")); res != pickCancel {
+		t.Fatalf("esc without filter: res %d", res)
+	}
+
+	fb := &fakeBackend{tasks: sampleTasks(), repos: []string{"api", "docs", "lib", "web"}}
+	m, _ := newTest(t, fb)
+	key(m, "a")
+	typeText(m, "we")
+	key(m, "esc")
+	if m.mode != modePicker || m.picker == nil || m.picker.filter != "" {
+		t.Fatalf("esc with filter left the picker: mode %d", m.mode)
+	}
+	key(m, "esc")
+	if m.mode != modeNormal || m.picker != nil {
+		t.Fatalf("esc without filter: mode %d", m.mode)
+	}
+}
+
+// Locked rows: the cursor marker is drawn on them, the cursor starts on
+// the first unlocked row (also when the repo list is already known) and
+// the "already in the task" hint survives moves.
+func TestPickerLockedRows(t *testing.T) {
+	locked := map[string]model.Mode{"api": model.ModeRW, "docs": model.ModeRO}
+	p := newPicker("Pick", nil, locked)
+	p.setAvailable([]string{"api", "docs", "lib", "web"}, nil)
+	if p.current() != "lib" {
+		t.Fatalf("initial cursor on %q", p.current())
+	}
+	p.update(keyMsg("home"))
+	p.update(keyMsg(" "))
+	view := ansi.Strip(strings.Join(p.lines(60, 10), "\n"))
+	if !strings.Contains(view, "> [rw] api  (in task)") || !strings.Contains(view, "api is already in the task") {
+		t.Fatalf("locked cursor row:\n%s", view)
+	}
+	p.update(keyMsg("down"))
+	p.update(keyMsg("down"))
+	if !strings.Contains(p.msg, "already in the task") {
+		t.Fatal("hint cleared by moving")
+	}
+	// a refresh after the user moved keeps the cursor where it is
+	p.setAvailable([]string{"api", "docs", "lib", "web"}, nil)
+	if p.current() != "lib" || !strings.Contains(p.msg, "already in the task") {
+		t.Fatalf("refresh moved the cursor to %q / dropped the hint", p.current())
+	}
+	p.update(keyMsg("x")) // filter change clears the hint
+	if p.msg != "" {
+		t.Fatalf("hint kept after filtering: %q", p.msg)
+	}
+
+	// everything locked: cursor on the first row
+	p = newPicker("Pick", nil, map[string]model.Mode{"a": model.ModeRO, "b": model.ModeRO})
+	p.setAvailable([]string{"a", "b"}, nil)
+	if p.current() != "a" {
+		t.Fatalf("all locked: %q", p.current())
+	}
+
+	// the second `a` opens with the known repo list: cursor on lib too
+	fb := &fakeBackend{tasks: sampleTasks(), repos: []string{"api", "docs", "lib", "web"}}
+	m, _ := newTest(t, fb)
+	key(m, "a")
+	key(m, "esc")
+	_, cmd := m.Update(keyMsg("a")) // repos refresh not yet delivered
+	if m.picker == nil || m.picker.current() != "lib" {
+		t.Fatalf("known repos: cursor not on lib")
+	}
+	drain(m, cmd)
+	if m.picker.current() != "lib" {
+		t.Fatalf("after refresh: cursor on %q", m.picker.current())
+	}
+}
+
+// Project repos that arrive while the form's picker is open are
+// preselected in the picker too, so confirming keeps them.
+func TestProjectReposWhilePickerOpen(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), projects: []string{"shop"}, repos: []string{"api", "docs", "lib", "web"},
+		projRepos: map[string][]app.RepoArg{"shop": {{Name: "api", Mode: model.ModeRW}, {Name: "lib", Mode: model.ModeRO}}}}
+	m, _ := newTest(t, fb)
+	key(m, "n")
+	typeText(m, "T")
+	key(m, "down")
+	// type the project but hold back the repos load
+	var load tea.Cmd
+	for _, r := range "shop" {
+		_, c := m.Update(keyMsg(string(r)))
+		load = c
+	}
+	key(m, "down") // Repos
+	key(m, " ")    // picker opens before the load completes
+	if m.mode != modePicker {
+		t.Fatalf("mode %d", m.mode)
+	}
+	key(m, "end")
+	key(m, " ") // web rw
+	drain(m, load)
+	if got := summary(m.picker.sel); got != "api(rw) lib(ro) web(rw)" {
+		t.Fatalf("picker selection %q", got)
+	}
+	key(m, "enter")
+	if got := summary(m.form.repos); got != "api(rw) lib(ro) web(rw)" || m.form.preProject != "shop" {
+		t.Fatalf("form repos after confirm %q (pre %q)", got, m.form.preProject)
 	}
 }
