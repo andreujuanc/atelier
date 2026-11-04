@@ -110,6 +110,32 @@ func (s SessionState) Live() bool {
 	return false
 }
 
+// TaskState returns the state that stands for a task's sessions, as its
+// list dot shows it: the highest of waiting > running > idle > stopped, or
+// "" when there are none of those (no sessions, or all ended).
+func TaskState(ss []Session) SessionState {
+	rank := func(st SessionState) int {
+		switch st {
+		case StateWaiting:
+			return 4
+		case StateRunning:
+			return 3
+		case StateIdle:
+			return 2
+		case StateStopped:
+			return 1
+		}
+		return 0
+	}
+	var best SessionState
+	for _, s := range ss {
+		if rank(s.State) > rank(best) {
+			best = s.State
+		}
+	}
+	return best
+}
+
 // Task is a unit of work spanning one or more repos.
 type Task struct {
 	ID          int64

@@ -644,6 +644,21 @@ func (c *cli) doctorCmd() *cobra.Command {
 	}
 }
 
+// statuslineCmd is Claude Code's status line command in task sessions
+// (main.go runs it before cobra; this keeps `atl statusline` a known command).
+func (c *cli) statuslineCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:                "statusline",
+		Short:              "Claude Code status line: the task title (internal)",
+		Hidden:             true,
+		DisableFlagParsing: true,
+		RunE: func(*cobra.Command, []string) error {
+			hook.StatusLineMain()
+			return nil
+		},
+	}
+}
+
 func (c *cli) hookCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:                "hook <event>",

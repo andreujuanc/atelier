@@ -527,21 +527,30 @@ func sessionInEnvTask(ctx context.Context, sess *model.Session, env func(string)
 // findTask resolves the task from ATL_TASK, else from cwd being inside
 // Paths.Tasks/<slug>. It returns nil, nil if neither matches.
 func findTask(ctx context.Context, in Input, env func(string) string, st *store.Store, p config.Paths) (*model.Task, error) {
+	return resolveTask(in.Cwd, env, p, func(slug string) (*model.Task, error) { return st.GetTaskBySlug(ctx, slug) })
+}
+
+// resolveTask is the task resolution order shared by the hook and `atl
+// statusline`: the ATL_TASK slug if get finds it, else the slug of cwd
+// under Paths.Tasks. get returns store.ErrNotFound for a missing slug; the
+// zero T and a nil error mean no match. Any other error is returned as is.
+func resolveTask[T any](cwd string, env func(string) string, p config.Paths, get func(slug string) (T, error)) (T, error) {
+	var zero T
 	if slug := env("ATL_TASK"); slug != "" {
-		task, err := st.GetTaskBySlug(ctx, slug)
+		t, err := get(slug)
 		if err == nil || !errors.Is(err, store.ErrNotFound) {
-			return task, err
+			return t, err
 		}
 	}
-	slug := slugFromCwd(in.Cwd, p)
+	slug := slugFromCwd(cwd, p)
 	if slug == "" {
-		return nil, nil
+		return zero, nil
 	}
-	task, err := st.GetTaskBySlug(ctx, slug)
+	t, err := get(slug)
 	if errors.Is(err, store.ErrNotFound) {
-		return nil, nil
+		return zero, nil
 	}
-	return task, err
+	return t, err
 }
 
 // slugFromCwd returns <slug> if cwd is Tasks/<slug> or below, else "".

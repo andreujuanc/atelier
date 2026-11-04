@@ -151,10 +151,7 @@ type querier interface {
 
 // getTask loads one task matching where/args, with repos.
 func (s *Store) getTask(ctx context.Context, desc, where string, args ...any) (*model.Task, error) {
-	t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE `+where, args...))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("task %s: %w", desc, ErrNotFound)
-	}
+	t, err := s.getTaskBrief(ctx, desc, where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -203,6 +200,25 @@ func (s *Store) GetTask(ctx context.Context, id int64) (*model.Task, error) {
 // GetTaskBySlug returns the task with the given slug, including its repos.
 func (s *Store) GetTaskBySlug(ctx context.Context, slug string) (*model.Task, error) {
 	return s.getTask(ctx, strconv.Quote(slug), "slug = ?", slug)
+}
+
+// GetTaskBrief returns the task with the given id without its repos (Repos
+// is nil): one query, for hot paths such as `atl statusline`.
+func (s *Store) GetTaskBrief(ctx context.Context, id int64) (*model.Task, error) {
+	return s.getTaskBrief(ctx, strconv.FormatInt(id, 10), "id = ?", id)
+}
+
+// GetTaskBriefBySlug is GetTaskBrief by slug.
+func (s *Store) GetTaskBriefBySlug(ctx context.Context, slug string) (*model.Task, error) {
+	return s.getTaskBrief(ctx, strconv.Quote(slug), "slug = ?", slug)
+}
+
+func (s *Store) getTaskBrief(ctx context.Context, desc, where string, args ...any) (*model.Task, error) {
+	t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE `+where, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("task %s: %w", desc, ErrNotFound)
+	}
+	return t, err
 }
 
 // ResolveTask finds a task by user-supplied reference: exact slug, else

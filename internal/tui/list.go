@@ -78,26 +78,34 @@ const (
 	dotWaiting
 )
 
-// aggregate returns the highest-priority state of ss.
+// aggregate returns the highest-priority state of ss (model.TaskState).
 func aggregate(ss []model.Session) dotKind {
-	k := dotNone
-	for _, s := range ss {
-		var sk dotKind
-		switch s.State {
-		case model.StateWaiting:
-			sk = dotWaiting
-		case model.StateRunning:
-			sk = dotRunning
-		case model.StateIdle:
-			sk = dotIdle
-		case model.StateStopped:
-			sk = dotStopped
-		}
-		if sk > k {
-			k = sk
-		}
+	switch model.TaskState(ss) {
+	case model.StateWaiting:
+		return dotWaiting
+	case model.StateRunning:
+		return dotRunning
+	case model.StateIdle:
+		return dotIdle
+	case model.StateStopped:
+		return dotStopped
 	}
-	return k
+	return dotNone
+}
+
+// state is the session state a dot stands for ("" for dotNone).
+func (k dotKind) state() model.SessionState {
+	switch k {
+	case dotWaiting:
+		return model.StateWaiting
+	case dotRunning:
+		return model.StateRunning
+	case dotIdle:
+		return model.StateIdle
+	case dotStopped:
+		return model.StateStopped
+	}
+	return ""
 }
 
 // humanAge formats d as 5s, 3m, 2h or 4d.

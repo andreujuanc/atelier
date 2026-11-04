@@ -243,6 +243,8 @@ grep -q "ATL_PORT_OFFSET=0" "$T/CLAUDE.md" || fail "CLAUDE.md lacks ATL_PORT_OFF
 grep -q "$W/bin/atl.*hook SessionStart" "$T/.claude/settings.json" || fail "settings.json hooks do not point at $W/bin/atl:
 $(cat "$T/.claude/settings.json")"
 grep -q "hook PreToolUse" "$T/.claude/settings.json" || fail "settings.json lacks the PreToolUse hook"
+grep -qF "\"command\": \"'$W/bin/atl' statusline\"" "$T/.claude/settings.json" || fail "settings.json lacks the statusLine:
+$(cat "$T/.claude/settings.json")"
 expect_eq "setup port offset" "$(cat "$E2E_OUT/setup-fix-login")" "0"
 expect_eq "task status" "$(task_field fix-login status)" "active"
 
@@ -296,6 +298,15 @@ expect_eq "PreToolUse on ro repo exit code" "$rc" "2"
 rc=0
 hook PreToolUse "$(ev PreToolUse ",\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$T/api/new.txt\"}")" || rc=$?
 expect_eq "PreToolUse on rw worktree exit code" "$rc" "0"
+
+step "status line"
+out="$(printf '{"session_id":"%s","cwd":"%s","workspace":{"current_dir":"%s"}}' "$CID" "$T/api" "$T/api" | NO_COLOR=1 atl statusline)" ||
+	fail "atl statusline failed"
+expect_eq "status line by session id" "$out" "● Fix login"
+out="$(printf '{"session_id":"nope","cwd":"%s"}' "$ATL_TASKS/second-task" | NO_COLOR=1 atl statusline)" || fail "atl statusline (cwd) failed"
+expect_eq "status line by cwd" "$out" "● Second task"
+out="$(printf 'not json' | ATL_TASK=fix-login atl statusline 2>&1)" || fail "atl statusline (bad input) exit code"
+expect_eq "status line on bad input" "$out" ""
 
 # ---- crash recovery + resume -----------------------------------------------
 
