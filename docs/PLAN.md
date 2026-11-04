@@ -176,6 +176,11 @@ func (s *Store) SetSessionState(ctx, id int64, st model.SessionState, at time.Ti
 func (s *Store) MarkStoppedIfLive(ctx, id int64, at time.Time) (bool, error) // only if live AND tmux_target != '' (Recover)
 func (s *Store) ClaimStopped(ctx, id int64, at time.Time) (bool, error)      // stopped → idle, clears tmux_target (Resume claim)
 func (s *Store) SetSessionLaunch(ctx, id int64, tmuxTarget, name string) error // only those two columns
+func (s *Store) SetClaudeSession(ctx, id int64, cid string, at time.Time) error   // claude id + state idle (hook SessionStart)
+func (s *Store) SetClaudeSessionID(ctx, id int64, cid string, at time.Time) error // claude id only (SessionStart source=compact)
+func (s *Store) SetStateIf(ctx, id int64, from, to model.SessionState, at time.Time) (bool, error)
+func (s *Store) TouchSession(ctx, id int64, at time.Time) error
+func OpenWithTimeout(path string, busy time.Duration) (*Store, error)        // hook uses 500ms; Open = 3s
 func (s *Store) TouchTask(ctx, id int64) error                 // updated_at = now
 ```
 

@@ -671,3 +671,175 @@ func TestSessionTransitions(t *testing.T) {
 		t.Errorf("SetSessionLaunch(9999) err = %v", err)
 	}
 }
+
+func TestHookSessionUpdates(t *testing.T) {
+	s, _ := openTest(t)
+	ctx := context.Background()
+	task := mkTask(t, s, "t", model.StatusActive, 0)
+	at := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+	get := func(id int64) model.Session {
+		g, err := s.GetSession(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return *g
+	}
+	mk := func(st model.SessionState) model.Session {
+		ss := &model.Session{TaskID: task.ID, ClaudeSessionID: "old", TmuxTarget: "@7", Name: "n", State: st}
+		if err := s.CreateSession(ctx, ss); err != nil {
+			t.Fatal(err)
+		}
+		return get(ss.ID)
+	}
+
+	// SetClaudeSession: from any state → idle, new claude id, last_event_at; nothing else.
+	for _, st := range model.AllSessionStates {
+		before := mk(st)
+		if err := s.SetClaudeSession(ctx, before.ID, "new", at); err != nil {
+			t.Fatal(err)
+		}
+		want := before
+		want.ClaudeSessionID, want.State, want.LastEventAt = "new", model.StateIdle, at
+		if g := get(before.ID); g != want {
+			t.Errorf("SetClaudeSession from %s: %+v, want %+v", st, g, want)
+		}
+	}
+	if err := s.SetClaudeSession(ctx, 9999, "x", at); !errors.Is(err, ErrNotFound) {
+		t.Errorf("SetClaudeSession(9999) err = %v", err)
+	}
+
+	// SetStateIf: only from the given state.
+	for _, st := range model.AllSessionStates {
+		before := mk(st)
+		ok, err := s.SetStateIf(ctx, before.ID, model.StateWaiting, model.StateRunning, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := st == model.StateWaiting; ok != want {
+			t.Errorf("SetStateIf(waiting→running) from %s = %v", st, ok)
+		}
+		want := before
+		if st == model.StateWaiting {
+			want.State, want.LastEventAt = model.StateRunning, at
+		}
+		if g := get(before.ID); g != want {
+			t.Errorf("SetStateIf from %s: %+v, want %+v", st, g, want)
+		}
+	}
+	if ok, err := s.SetStateIf(ctx, 9999, model.StateWaiting, model.StateRunning, at); ok || err != nil {
+		t.Errorf("SetStateIf(9999) = %v, %v", ok, err)
+	}
+	if _, err := s.SetStateIf(ctx, 1, "bogus", model.StateRunning, at); err == nil {
+		t.Error("SetStateIf with invalid state: want error")
+	}
+
+	// TouchSession: last_event_at only.
+	before := mk(model.StateRunning)
+	if err := s.TouchSession(ctx, before.ID, at); err != nil {
+		t.Fatal(err)
+	}
+	want := before
+	want.LastEventAt = at
+	if g := get(before.ID); g != want {
+		t.Errorf("TouchSession: %+v, want %+v", g, want)
+	}
+	if err := s.TouchSession(ctx, 9999, at); !errors.Is(err, ErrNotFound) {
+		t.Errorf("TouchSession(9999) err = %v", err)
+	}
+}
+
+func TestSetClaudeSessionID(t *testing.T) {
+	s, _ := openTest(t)
+	ctx := context.Background()
+	task := mkTask(t, s, "t", model.StatusActive, 0)
+	at := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+	for _, st := range model.AllSessionStates {
+		ss := &model.Session{TaskID: task.ID, ClaudeSessionID: "old", TmuxTarget: "@7", Name: "n", State: st}
+		if err := s.CreateSession(ctx, ss); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := s.GetSession(ctx, ss.ID)
+		if err := s.SetClaudeSessionID(ctx, ss.ID, "compacted", at); err != nil {
+			t.Fatal(err)
+		}
+		want := *before
+		want.ClaudeSessionID, want.LastEventAt = "compacted", at
+		if g, _ := s.GetSession(ctx, ss.ID); *g != want {
+			t.Errorf("SetClaudeSessionID from %s: %+v, want %+v", st, *g, want)
+		}
+	}
+	if err := s.SetClaudeSessionID(ctx, 9999, "x", at); !errors.Is(err, ErrNotFound) {
+		t.Errorf("SetClaudeSessionID(9999) err = %v", err)
+	}
+}
+
+// TestOpenCurrentSchemaNoWriteLock checks that opening an up-to-date
+// database does not need the write lock, and that OpenWithTimeout sets the
+// busy timeout.
+func TestOpenCurrentSchemaNoWriteLock(t *testing.T) {
+	s, path := openTest(t)
+	ctx := context.Background()
+	c, err := s.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	defer c.ExecContext(ctx, "ROLLBACK")
+
+	start := time.Now()
+	s2, err := OpenWithTimeout(path, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("open while another connection holds the write lock: %v", err)
+	}
+	defer s2.Close()
+	if d := time.Since(start); d > 90*time.Millisecond {
+		t.Errorf("open took %v; it should not wait on the write lock", d)
+	}
+	var bt int
+	if err := s2.db.QueryRow("PRAGMA busy_timeout").Scan(&bt); err != nil || bt != 100 {
+		t.Errorf("busy_timeout = %d, %v; want 100", bt, err)
+	}
+	if _, err := s2.GetTaskBySlug(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("read while locked: %v", err)
+	}
+}
+
+func TestOpenConcurrentFreshDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fresh.db")
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			s.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+func TestOpenNewerSchema(t *testing.T) {
+	s, path := openTest(t)
+	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", len(migrations)+1)); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if s2, err := Open(path); err == nil || !strings.Contains(err.Error(), "newer than this binary") {
+		if s2 != nil {
+			s2.Close()
+		}
+		t.Errorf("Open newer schema: err = %v", err)
+	}
+}

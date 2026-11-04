@@ -10,8 +10,8 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | M1 models + store + migrations | done (reviewed, 1 fix round) |
 | M2 git worktree management | done (reviewed, 1 fix round) |
 | M3 tmux + session launch/resume/attach | done (reviewed, 1 fix round) |
-| M4 hook, state machine, ro guard, CLAUDE.md/settings.json | in progress |
-| M5 CLI | todo |
+| M4 hook, state machine, ro guard, CLAUDE.md/settings.json | done (reviewed, 2 fix rounds + guard re-review) |
+| M5 CLI | in progress |
 | M6 TUI | todo |
 | M7 projects, scripts, ports, diff, pr | todo |
 | M8 crash recovery + e2e | todo |
@@ -37,3 +37,6 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 - (M3) Recover implemented in M3 (Resume needs it); M8 keeps startup wiring + e2e.
 - (M3) needs tmux ≥ 3.2. Liveness = tagged window with ≥1 non-dead pane. Store gained MarkStoppedIfLive / ClaimStopped / SetSessionLaunch.
 - (M3, known) tiny residual race Recover-vs-Resume; remain-on-exit dead windows are not killed on resume (M8 could kill dead tagged windows).
+- (M4) hook latency ~5ms. stdin cap 64 MiB; oversized PreToolUse fails closed. Guard: kernel-style path walk (cleaned + uncleaned), ~ expansion, exact-key file_path/notebook_path.
+- (M4) ATL_SESSION trusted for SessionStart only if row's claude id empty or source ∈ {clear,resume,compact}; nested `claude` (startup) gets its own row. compact doesn't change state.
+- (M4) settings.json merged (user keys/hooks kept; atl* `hook <Event>` entries replaced), atomic write. Known: case-insensitive FS (macOS) not handled by guard.

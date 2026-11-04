@@ -189,3 +189,49 @@ func (s *Store) changed(ctx context.Context, query string, args ...any) (bool, e
 	n, err := res.RowsAffected()
 	return n > 0, err
 }
+
+// SetClaudeSession records the Claude session id reported by a SessionStart
+// hook and sets state to idle and last_event_at (now if at is zero), leaving
+// every other column untouched. It works from any state (resume of a stopped
+// or ended session).
+func (s *Store) SetClaudeSession(ctx context.Context, id int64, claudeSessionID string, at time.Time) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET claude_session_id = ?, state = 'idle',
+		last_event_at = ? WHERE id = ?`, claudeSessionID, toMS(normTime(at)), id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res, "session", id)
+}
+
+// SetClaudeSessionID records a new Claude session id (e.g. after
+// auto-compaction) and sets last_event_at (now if at is zero), leaving state
+// and every other column untouched.
+func (s *Store) SetClaudeSessionID(ctx context.Context, id int64, claudeSessionID string, at time.Time) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET claude_session_id = ?, last_event_at = ? WHERE id = ?`,
+		claudeSessionID, toMS(normTime(at)), id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res, "session", id)
+}
+
+// SetStateIf moves a session from state from to state to (last_event_at =
+// at, now if zero) only if it is currently in from, reporting whether the
+// row changed. An unknown id is not an error.
+func (s *Store) SetStateIf(ctx context.Context, id int64, from, to model.SessionState, at time.Time) (bool, error) {
+	if !from.Valid() || !to.Valid() {
+		return false, fmt.Errorf("store: invalid session state transition %q -> %q", from, to)
+	}
+	return s.changed(ctx, `UPDATE sessions SET state = ?, last_event_at = ? WHERE id = ? AND state = ?`,
+		string(to), toMS(normTime(at)), id, string(from))
+}
+
+// TouchSession sets a session's last_event_at (now if at is zero) only.
+func (s *Store) TouchSession(ctx context.Context, id int64, at time.Time) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET last_event_at = ? WHERE id = ?`,
+		toMS(normTime(at)), id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res, "session", id)
+}

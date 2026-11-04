@@ -67,14 +67,26 @@ CREATE INDEX sessions_task ON sessions(task_id);
 CREATE INDEX sessions_claude ON sessions(claude_session_id);`,
 }
 
+// DefaultBusyTimeout is how long Open waits on a locked database.
+const DefaultBusyTimeout = 3 * time.Second
+
 // Open opens (creating if needed) the database at path, creating its parent
-// directory, and applies pending migrations.
+// directory, and applies pending migrations. It is
+// OpenWithTimeout(path, DefaultBusyTimeout).
+func Open(path string) (*Store, error) { return OpenWithTimeout(path, DefaultBusyTimeout) }
+
+// OpenWithTimeout is Open with an explicit busy timeout: how long a
+// statement waits for a lock held by another connection before failing
+// with SQLITE_BUSY.
 //
 // Pragmas are passed as DSN "_pragma" parameters so the driver applies them
 // to every pooled connection. Transactions use BEGIN IMMEDIATE ("_txlock")
 // so concurrent writers wait on busy_timeout instead of failing with
 // SQLITE_BUSY on a read→write lock upgrade.
-func Open(path string) (*Store, error) {
+func OpenWithTimeout(path string, busy time.Duration) (*Store, error) {
+	if busy < 0 {
+		busy = 0
+	}
 	if path == "" {
 		return nil, errors.New("store: empty database path")
 	}
@@ -85,7 +97,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store: create db dir: %w", err)
 	}
 	q := url.Values{}
-	q.Add("_pragma", "busy_timeout(3000)")
+	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busy.Milliseconds()))
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "foreign_keys(ON)")
 	q.Add("_pragma", "synchronous(NORMAL)")
@@ -105,21 +117,23 @@ func Open(path string) (*Store, error) {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
+// migrate applies pending migrations. The common case (schema current) is
+// a plain read of user_version with no write transaction, so concurrent
+// opens (one per hook invocation) never contend for the write lock; only a
+// needed migration takes BEGIN IMMEDIATE and re-checks the version inside
+// it, since another process may have migrated in the meantime.
 func (s *Store) migrate(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	v, err := userVersion(ctx, s.db)
+	if err != nil || v == len(migrations) {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE (_txlock)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var v int
-	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
+	if v, err = userVersion(ctx, tx); err != nil || v == len(migrations) {
 		return err
-	}
-	if v > len(migrations) {
-		return fmt.Errorf("database schema version %d is newer than this binary supports (%d)", v, len(migrations))
-	}
-	if v == len(migrations) {
-		return nil
 	}
 	for i := v; i < len(migrations); i++ {
 		if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
@@ -131,6 +145,21 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// userVersion reads PRAGMA user_version, failing if the schema is newer
+// than this binary supports.
+func userVersion(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (int, error) {
+	var v int
+	if err := q.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
+		return 0, err
+	}
+	if v > len(migrations) {
+		return 0, fmt.Errorf("database schema version %d is newer than this binary supports (%d)", v, len(migrations))
+	}
+	return v, nil
 }
 
 // now returns the current time truncated to millisecond precision in UTC,
