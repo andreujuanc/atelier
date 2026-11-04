@@ -119,8 +119,11 @@ func TestAssistantGuard(t *testing.T) {
 			filepath.Join(dir, "a") + `","notebook_path":[]}}`, 2, "not allowed"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			var errb bytes.Buffer
-			code := run([]string{EventAssistantGuard}, strings.NewReader(c.stdin), &errb, envOf(nil))
+			var outb, errb bytes.Buffer
+			code := run([]string{EventAssistantGuard}, strings.NewReader(c.stdin), &outb, &errb, envOf(nil))
+			if outb.Len() != 0 {
+				t.Errorf("unexpected stdout %q", outb.String())
+			}
 			if code != c.want || !strings.Contains(errb.String(), c.wantErr) {
 				t.Errorf("exit=%d stderr=%q; want %d with %q", code, errb.String(), c.want, c.wantErr)
 			}
@@ -132,8 +135,8 @@ func TestAssistantGuard(t *testing.T) {
 
 	t.Run("tilde inside when home is the dir", func(t *testing.T) {
 		t.Setenv("HOME", dir)
-		var errb bytes.Buffer
-		code := run([]string{EventAssistantGuard}, strings.NewReader(assistantInput("Write", dir, "file_path", "~/n.md")), &errb, envOf(nil))
+		var outb, errb bytes.Buffer
+		code := run([]string{EventAssistantGuard}, strings.NewReader(assistantInput("Write", dir, "file_path", "~/n.md")), &outb, &errb, envOf(nil))
 		if code != 0 {
 			t.Errorf("exit=%d stderr=%q", code, errb.String())
 		}
@@ -145,8 +148,8 @@ func TestAssistantGuard(t *testing.T) {
 		t.Cleanup(func() { maxInput = old })
 		big := `{"tool_name":"Write","cwd":"/","tool_input":{"file_path":"` + filepath.Join(dir, "a") +
 			`","content":"` + strings.Repeat("x", 4096) + `"}}`
-		var errb bytes.Buffer
-		if code := run([]string{EventAssistantGuard}, strings.NewReader(big), &errb, envOf(nil)); code != 2 {
+		var outb, errb bytes.Buffer
+		if code := run([]string{EventAssistantGuard}, strings.NewReader(big), &outb, &errb, envOf(nil)); code != 2 || outb.Len() != 0 {
 			t.Errorf("exit=%d stderr=%q", code, errb.String())
 		}
 	})

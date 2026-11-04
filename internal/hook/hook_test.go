@@ -604,8 +604,11 @@ func TestUnreadableInput(t *testing.T) {
 		{"oversized Stop ignored", EventStop, `{"session_id":"s","x":"` + big + `"}`, "", 0},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			var errb bytes.Buffer
-			code := run([]string{c.event}, strings.NewReader(c.stdin), &errb, env)
+			var outb, errb bytes.Buffer
+			code := run([]string{c.event}, strings.NewReader(c.stdin), &outb, &errb, env)
+			if outb.Len() != 0 {
+				t.Errorf("unexpected stdout %q", outb.String())
+			}
 			if code != c.want || !strings.Contains(errb.String(), c.wantErr) {
 				t.Errorf("exit=%d stderr=%q; want %d with %q", code, errb.String(), c.want, c.wantErr)
 			}
@@ -723,7 +726,7 @@ func TestMainProcess(t *testing.T) {
 		var walls []time.Duration
 		for i := 0; i < 7; i++ {
 			exit, out, errOut, wall := runMain(t, "SessionStart", in)
-			if exit != 0 || out != "" || errOut != "" {
+			if exit != 0 || errOut != "" || !strings.Contains(sessionStartContext(t, out), "- Slug: fix") {
 				t.Fatalf("exit=%d stdout=%q stderr=%q", exit, out, errOut)
 			}
 			walls = append(walls, wall)

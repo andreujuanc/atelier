@@ -17,6 +17,7 @@ var (
 	accent      = lipgloss.AdaptiveColor{Light: "#B5179E", Dark: "#F7768E"}
 	subtle      = lipgloss.AdaptiveColor{Light: "#888888", Dark: "#666666"}
 	errColor    = lipgloss.AdaptiveColor{Light: "#C00000", Dark: "#FF5F5F"}
+	okColor     = lipgloss.AdaptiveColor{Light: "#2E8B57", Dark: "#9ECE6A"}
 	headerStyle = lipgloss.NewStyle().Bold(true)
 	selStyle    = lipgloss.NewStyle().Reverse(true)
 	markStyle   = lipgloss.NewStyle().Foreground(accent).Bold(true)
@@ -26,7 +27,30 @@ var (
 	errStyle    = lipgloss.NewStyle().Foreground(errColor)
 	titleStyle  = lipgloss.NewStyle().Bold(true)
 	sepStyle    = lipgloss.NewStyle().Foreground(subtle)
+	runStyle    = lipgloss.NewStyle().Foreground(okColor)
+	idleStyle   = lipgloss.NewStyle().Foreground(subtle)
+	stopStyle   = lipgloss.NewStyle().Foreground(errColor).Faint(true)
 )
+
+// dotFor returns the glyph (one cell) and style of a task row's state dot.
+func dotFor(k dotKind) (string, lipgloss.Style) {
+	switch k {
+	case dotWaiting:
+		return "●", waitStyle
+	case dotRunning:
+		return "●", runStyle
+	case dotIdle:
+		return "●", idleStyle
+	case dotStopped:
+		return "○", stopStyle
+	}
+	return " ", lipgloss.NewStyle()
+}
+
+// legend explains the list row marks (help line, when it fits).
+var legend = dimStyle.Render("● ") + waitStyle.Render("waiting") + dimStyle.Render("/") +
+	runStyle.Render("running") + dimStyle.Render("/") + idleStyle.Render("idle") +
+	"  " + markStyle.Render("*") + dimStyle.Render(" uncommitted")
 
 // minSplitWidth is the narrowest terminal that shows the details pane.
 const minSplitWidth = 40
@@ -162,27 +186,54 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 		return headerStyle.Render(trunc(label, w))
 	}
 	t := r.task
-	marker := "  "
-	if hasWaiting(t.Sessions) {
-		marker = "● "
-	}
+	glyph, dotStyle := dotFor(aggregate(t.Sessions))
 	busy := ""
 	if _, ok := m.busy[t.Task.ID]; ok {
 		busy = " …"
 	}
-	text := clean(t.Task.Slug)
-	if title := clean(t.Task.Title); title != "" && title != text {
-		text += "  " + title
+	star := ""
+	if t.Task.Status.Open() && m.dirty[t.Task.ID] {
+		star = "*"
 	}
-	text = trunc(text, w-len([]rune(marker))-len([]rune(busy)))
-	line := text + busy
+	slug := clean(t.Task.Slug)
+	title := ""
+	if tt := clean(t.Task.Title); tt != "" && tt != slug {
+		title = "  " + tt
+	}
+	// Width budget after the dot and busy suffix; the star is kept even
+	// when the slug has to be truncated.
+	avail := w - 2 - ansi.StringWidth(busy)
+	slugT := trunc(slug, avail-len(star))
+	rest := avail - ansi.StringWidth(slugT) - len(star)
+	if rest < 0 || slugT == "" {
+		star, rest = "", max(rest, 0)
+	}
+	titleT := ""
+	if ansi.StringWidth(slugT) == ansi.StringWidth(slug) {
+		titleT = trunc(title, rest)
+	}
+	base, starStyle := lipgloss.NewStyle(), markStyle
 	if sel {
-		return selStyle.Render(fit(marker+line, w))
+		base, starStyle = selStyle, markStyle.Reverse(true)
 	}
-	if marker != "  " {
-		return markStyle.Render(marker) + line
+	text := slugT + star + titleT + busy
+	pad := ""
+	if sel {
+		if n := w - 2 - ansi.StringWidth(text); n > 0 {
+			pad = strings.Repeat(" ", n)
+		}
 	}
-	return marker + line
+	line := base.Render(slugT)
+	if star != "" {
+		line += starStyle.Render(star)
+	}
+	if s := titleT + busy + pad; s != "" {
+		line += base.Render(s)
+	}
+	if w < 2 {
+		return trunc(dotStyle.Render(glyph)+" ", w)
+	}
+	return dotStyle.Render(glyph) + " " + line
 }
 
 func (m *Model) detailLines(w, h int) []string {
@@ -354,6 +405,9 @@ func (m *Model) helpLine(w int) string {
 		s = ""
 	default:
 		s = "n new  enter open  s session  r resume  a add repo  m note  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  q quit"
+		if ansi.StringWidth(s)+2+ansi.StringWidth(legend) <= w {
+			return dimStyle.Render(s+"  ") + legend
+		}
 	}
 	return dimStyle.Render(trunc(s, w))
 }

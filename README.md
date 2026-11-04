@@ -168,6 +168,13 @@ on paths inside read-only repos. Hook failures never block Claude (except the
 read-only guard) and are logged to `hook.log`. The assistant's `AssistantGuard` hook
 (see above) fails closed: input it cannot inspect is refused.
 
+On SessionStart (startup, resume, `/clear`, compaction) inside a task, `atl hook
+SessionStart` also prints Claude Code's `hookSpecificOutput.additionalContext` JSON with
+fresh task context (title, status, branch, repos with their base branch or read-only
+warning, `ATL_PORT_OFFSET`, the 5 newest notes; at most 2500 characters), so a session
+sees current notes without any file being rewritten. This is the only hook output on
+stdout; if the context cannot be built the error goes to `hook.log` and nothing is printed.
+
 ## Tests
 
 `go test ./...` runs unit tests and `test/e2e.sh` (skipped with `-short`), which

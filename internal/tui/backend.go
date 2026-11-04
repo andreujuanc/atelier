@@ -24,6 +24,9 @@ type Backend interface {
 	Cancel(ctx context.Context, ref string, force bool) (*model.Task, error)
 	PR(ctx context.Context, ref string) ([]app.PRResult, error)
 	Recover(ctx context.Context) (int, error)
+	// DirtyTasks maps open task ids to true when any of their rw worktrees
+	// has uncommitted changes.
+	DirtyTasks(ctx context.Context) (map[int64]bool, error)
 	ProjectNames() ([]string, error)
 	// ProjectRepos returns project name's repos with their default modes.
 	ProjectRepos(name string) ([]app.RepoArg, error)

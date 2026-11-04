@@ -300,6 +300,10 @@ against `Paths.RepoPath(name)` of every ro repo of the resolved task. Inside →
 `atelier: <path> is inside read-only repo <name>; edit it in a rw repo instead`. Task unresolvable or any error →
 exit 0 (fail open) and log.
 
+SessionStart output: for sessions inside a task, after the DB update, print one JSON line
+`{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":...}}` (task, repos + base, ro warning, port offset,
+≤5 latest notes, ≤2500 chars). This is the ONLY stdout output of `atl hook`.
+
 Performance/robustness: no cobra on this path; one DB open; total budget <50ms. All errors appended to
 `Paths.HookLog()` with timestamp + event; exit 0 except the ro block. Never prints to stdout.
 
