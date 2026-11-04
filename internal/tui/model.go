@@ -38,6 +38,7 @@ const (
 	modePicker
 	modeNote
 	modeSessions
+	modeRename
 )
 
 // confirmState is a pending done/cancel confirmation.
@@ -205,6 +206,11 @@ type Model struct {
 	noteInput textinput.Model
 	noteID    int64
 	noteSlug  string
+	// renameInput is the `t` title being edited for task renameID/renameSlug.
+	renameInput textinput.Model
+	renameID    int64
+	renameSlug  string
+	renameOrig  string // the title the input was prefilled with
 	// pending holds dirty refusals that arrived outside normal mode; they
 	// are shown once back in normal mode.
 	pending []*confirmState
@@ -242,6 +248,11 @@ func New(ctx context.Context, be Backend) *Model {
 	ni.Placeholder = "a note for this task (enter saves, esc cancels)"
 	ni.Cursor.SetMode(cursor.CursorStatic)
 	ni.CharLimit = 2000
+	ri := textinput.New()
+	ri.Prompt = "title> "
+	ri.Placeholder = "the task's new title (enter saves, esc cancels)"
+	ri.Cursor.SetMode(cursor.CursorStatic)
+	ri.CharLimit = 500
 	return &Model{
 		be:  be,
 		ctx: ctx,
@@ -252,6 +263,7 @@ func New(ctx context.Context, be Backend) *Model {
 		diffCmd:      func(slug string) *exec.Cmd { return exec.Command("atl", "diff", slug) },
 		filterInput:  fi,
 		noteInput:    ni,
+		renameInput:  ri,
 		busy:         map[int64]string{},
 		dirtyTimeout: dirtyTimeout,
 		width:        80,
@@ -657,6 +669,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.form.setWidth(m.formInputWidth())
 		}
 		m.noteInput.Width = m.noteInputWidth()
+		m.renameInput.Width = m.renameInputWidth()
 		return nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -913,6 +926,10 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		var cmd tea.Cmd
 		m.noteInput, cmd = m.noteInput.Update(msg)
 		return cmd
+	case modeRename:
+		var cmd tea.Cmd
+		m.renameInput, cmd = m.renameInput.Update(msg)
+		return cmd
 	}
 	return nil
 }
@@ -970,6 +987,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.filterKey(msg)
 	case modeNote:
 		return m.noteKey(msg)
+	case modeRename:
+		return m.renameKey(msg)
 	case modeSessions:
 		return m.sessionsKey(msg)
 	}
@@ -1010,6 +1029,53 @@ func (m *Model) noteKey(msg tea.KeyMsg) tea.Cmd {
 	}
 	var cmd tea.Cmd
 	m.noteInput, cmd = m.noteInput.Update(msg)
+	return cmd
+}
+
+// renameKey handles a key while a task's title is being edited (`t`).
+func (m *Model) renameKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeNormal
+		m.renameInput.Blur()
+		m.setStatus("rename cancelled")
+		return nil
+	case "enter":
+		title, err := model.NormalizeTitle(m.renameInput.Value())
+		if errors.Is(err, model.ErrTitleEmpty) {
+			m.setStatusErr("rename: the title cannot be empty (esc cancels)", true)
+			return nil
+		} else if err != nil {
+			m.setStatusErr("rename: "+err.Error()+" (esc cancels)", true)
+			return nil
+		}
+		if title == m.renameOrig {
+			m.mode = modeNormal
+			m.renameInput.Blur()
+			m.setStatus("rename: title unchanged")
+			return nil
+		}
+		if op, busy := m.busy[m.renameID]; busy {
+			m.setStatus("busy: " + op + "… (enter again to save, esc cancels)")
+			return nil
+		}
+		m.mode = modeNormal
+		m.renameInput.Blur()
+		id, slug, be, ctx := m.renameID, m.renameSlug, m.be, m.ctx
+		m.busy[id] = "rename " + slug
+		return func() tea.Msg {
+			t, err := be.Rename(ctx, slug, title)
+			if err != nil {
+				return opMsg{id: id, op: "rename", err: err}
+			}
+			return opMsg{id: id, op: "rename", text: "renamed " + slug + " to " + clean(t.Title)}
+		}
+	}
+	if m.statusErr {
+		m.setStatus("") // a validation error goes away once the user edits
+	}
+	var cmd tea.Cmd
+	m.renameInput, cmd = m.renameInput.Update(msg)
 	return cmd
 }
 
@@ -1221,14 +1287,14 @@ func (m *Model) normalKey(key string) tea.Cmd {
 
 	t := m.selected()
 	if t == nil {
-		if strings.ContainsAny(key, "srdcpamD12345") && len(key) == 1 || key == "enter" {
+		if strings.ContainsAny(key, "srdcpamtD12345") && len(key) == 1 || key == "enter" {
 			m.setStatus("no task selected")
 		}
 		return nil
 	}
 	slug := t.Task.Slug
 	switch key {
-	case "enter", "s", "r", "d", "c", "p", "a", "m", "1", "2", "3", "4", "5":
+	case "enter", "s", "r", "d", "c", "p", "a", "m", "t", "1", "2", "3", "4", "5":
 		if op, busy := m.busy[t.Task.ID]; busy {
 			m.setStatus("busy: " + op + "…")
 			return nil
@@ -1293,6 +1359,15 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		m.noteInput.Width = m.noteInputWidth()
 		m.noteInput.Focus()
 		m.mode = modeNote
+		return nil
+	case "t":
+		m.renameID, m.renameSlug, m.renameOrig = t.Task.ID, slug, clean(t.Task.Title)
+		m.renameInput.SetValue(m.renameOrig)
+		m.renameInput.CursorEnd()
+		m.renameInput.Width = m.renameInputWidth()
+		m.renameInput.Focus()
+		m.setStatus("")
+		m.mode = modeRename
 		return nil
 	case "D":
 		return m.exec("diff", slug, m.diffCmd(slug))
@@ -1367,4 +1442,10 @@ func (m *Model) busyOps() []string {
 // terminal width minus its prompt (0 or less means unlimited).
 func (m *Model) noteInputWidth() int {
 	return m.width - len(m.noteInput.Prompt) - 1
+}
+
+// renameInputWidth is the visible width of the `t` title input (see
+// noteInputWidth).
+func (m *Model) renameInputWidth() int {
+	return m.width - len(m.renameInput.Prompt) - 1
 }

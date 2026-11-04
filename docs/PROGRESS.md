@@ -69,6 +69,7 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | Dockerfile: UTF-8 + tmux 256/RGB (rendering artifacts) | done |
 | `ATL_CONTEXT` env var: per-environment text appended to every task session's SessionStart context (sanitised, ≤1000 bytes, notes dropped first) | done |
 | TUI `enter` asks instead of assuming: session picker (New session, live, resumable past sessions with transcript titles); `atl open --session ID` / `--new`; Store.ClaimFrom, tmux SelectWindow; `atl show` session titles | done |
+| TUI list rows show the task title only (slug in the details pane; `/` still matches slug + title); `atl rename <task> <title...>` / TUI `t` (title only: slug, branch, tmux, dirs unchanged; model.NormalizeTitle, Store.UpdateTaskTitle, App.Rename rewrites an open task's CLAUDE.md); assistant: `atl rename` in ask + command reference | done |
 | idea: Claude on the right pane of the TUI (tmux join-pane) instead of full-screen attach | idea (user wants it later) |
 | optional: skip-fetch toggle in TUI new-task form / SSH ControlMaster in box (YubiKey touch per fetch) | idea |
 

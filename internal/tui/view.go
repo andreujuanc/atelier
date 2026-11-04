@@ -205,39 +205,35 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 	if t.Task.Status.Open() && m.dirty[t.Task.ID] {
 		star = "*"
 	}
-	slug := clean(t.Task.Slug)
-	title := ""
-	if tt := clean(t.Task.Title); tt != "" && tt != slug {
-		title = "  " + tt
+	// The list shows the title only (the slug is in the details pane); a
+	// task with a blank title falls back to its slug.
+	title := clean(t.Task.Title)
+	if title == "" {
+		title = clean(t.Task.Slug)
 	}
 	// Width budget after the dot and busy suffix; the star is kept even
-	// when the slug has to be truncated.
+	// when the title has to be truncated.
 	avail := w - 2 - ansi.StringWidth(busy)
-	slugT := trunc(slug, avail-len(star))
-	rest := avail - ansi.StringWidth(slugT) - len(star)
-	if rest < 0 || slugT == "" {
-		star, rest = "", max(rest, 0)
-	}
-	titleT := ""
-	if ansi.StringWidth(slugT) == ansi.StringWidth(slug) {
-		titleT = trunc(title, rest)
+	titleT := trunc(title, avail-len(star))
+	if avail-ansi.StringWidth(titleT)-len(star) < 0 || titleT == "" {
+		star = ""
 	}
 	base, starStyle := lipgloss.NewStyle(), markStyle
 	if sel {
 		base, starStyle = selStyle, markStyle.Reverse(true)
 	}
-	text := slugT + star + titleT + busy
+	text := titleT + star + busy
 	pad := ""
 	if sel {
 		if n := w - 2 - ansi.StringWidth(text); n > 0 {
 			pad = strings.Repeat(" ", n)
 		}
 	}
-	line := base.Render(slugT)
+	line := base.Render(titleT)
 	if star != "" {
 		line += starStyle.Render(star)
 	}
-	if s := titleT + busy + pad; s != "" {
+	if s := busy + pad; s != "" {
 		line += base.Render(s)
 	}
 	// The dot keeps its colour on the selected row; the space after it
@@ -374,6 +370,8 @@ func (m *Model) statusLine(w int) string {
 		return trunc(m.filterInput.View(), w)
 	case m.mode == modeNote:
 		return trunc(m.noteInput.View(), w)
+	case m.mode == modeRename:
+		return trunc(m.renameInput.View(), w)
 	}
 	if ops := m.busyOps(); len(ops) > 0 {
 		s = markStyle.Render("working… ") + clean(strings.Join(ops, ", "))
@@ -416,10 +414,16 @@ func (m *Model) helpLine(w int) string {
 		s = "type to filter  enter apply  esc clear  ↑/↓ move"
 	case modeNote:
 		s = "type a note for " + clean(m.noteSlug) + "  enter save  esc cancel"
+	case modeRename:
+		if m.statusErr && m.status != "" {
+			// a refused title: the error replaces the help until the next edit
+			return errStyle.Render(trunc(clean(m.status), w))
+		}
+		s = "new title for " + clean(m.renameSlug) + " (slug, branch and dirs stay)  enter save  esc cancel"
 	case modeConfirm:
 		s = ""
 	default:
-		s = "n new  enter open  s session  r resume  a add repo  m note  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  q quit"
+		s = "n new  enter open  s session  r resume  a add repo  m note  t rename  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  q quit"
 		for _, l := range legends {
 			if ansi.StringWidth(s)+2+ansi.StringWidth(l) <= w {
 				return dimStyle.Render(s+"  ") + l

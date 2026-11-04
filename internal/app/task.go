@@ -538,6 +538,59 @@ func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error 
 	return a.Store.SetTaskStatus(ctx, t.ID, st)
 }
 
+// Rename changes a task's title (any status) and returns the updated task.
+// The title is trimmed and its space runs collapsed; an empty title or one
+// with control characters is rejected. Only the title changes: the slug,
+// branch atl/<slug>, tmux session and dirs keep the original name. An open
+// task's generated CLAUDE.md (if present) is rewritten with the new title;
+// failing that is a warning, the rename stands.
+func (a *App) Rename(ctx context.Context, ref, title string) (*model.Task, error) {
+	title, err := model.NormalizeTitle(title)
+	if err != nil {
+		return nil, err
+	}
+	t, err := a.Store.ResolveTask(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.Store.UpdateTaskTitle(ctx, t.ID, title); err != nil {
+		return nil, err
+	}
+	if nt, err := a.Store.GetTask(ctx, t.ID); err == nil {
+		t = nt
+	} else {
+		t.Title = title
+	}
+	if t.Status.Open() {
+		if err := a.rewriteClaudeMD(ctx, t.ID); err != nil {
+			a.warnf("task %s renamed but CLAUDE.md not updated: %v", t.Slug, err)
+		}
+	}
+	return t, nil
+}
+
+// rewriteClaudeMD regenerates an open task's CLAUDE.md from the DB if the
+// file exists (it is never created here: done/cancel remove it). It holds
+// the per-task lock so it cannot interleave with AddRepo's rewrite.
+func (a *App) rewriteClaudeMD(ctx context.Context, id int64) error {
+	unlock, err := a.lockTask(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	t, err := a.Store.GetTask(ctx, id)
+	if err != nil {
+		return err
+	}
+	dir := a.Paths.TaskDir(t.Slug)
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); errors.Is(err, os.ErrNotExist) || !t.Status.Open() {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return gen.WriteClaudeMD(dir, *t, a.repoInfos(t))
+}
+
 // Done closes a task as done and returns it (with its new status); see
 // finish.
 func (a *App) Done(ctx context.Context, ref string, force bool) (*model.Task, error) {

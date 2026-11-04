@@ -43,6 +43,7 @@ type fakeBackend struct {
 	addOut     func(r app.RepoArg)    // called by AddRepo (to write App.Out)
 	notes      map[string]*model.Note // latest note per slug (Get's LatestNote)
 	noteErr    error
+	renameErr  error
 	assistErr  error
 	assistHint string
 	dirty      map[int64]bool // DirtyTasks' result
@@ -255,6 +256,21 @@ func (f *fakeBackend) AddNote(ctx context.Context, ref, body, author string) (*m
 	n := &model.Note{ID: int64(len(f.calls)), Body: body, Author: author, CreatedAt: t0.Add(55 * time.Minute)}
 	f.notes[ref] = n
 	return n, nil
+}
+
+func (f *fakeBackend) Rename(ctx context.Context, ref, title string) (*model.Task, error) {
+	f.rec("Rename", ref, title)
+	if f.renameErr != nil {
+		return nil, f.renameErr
+	}
+	for i := range f.tasks {
+		if f.tasks[i].Task.Slug == ref {
+			f.tasks[i].Task.Title = title
+			t := f.tasks[i].Task
+			return &t, nil
+		}
+	}
+	return nil, fmt.Errorf("task %s not found", ref)
 }
 
 var t0 = time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -527,10 +543,10 @@ func TestWaitingMarkerAndHighlight(t *testing.T) {
 	fb.tasks[0].Sessions = []model.Session{{ID: 3, Name: "claude-3", State: model.StateEnded, LastEventAt: t0}}
 	m, _ := newTest(t, fb)
 	v := plainView(m)
-	if !strings.Contains(v, "● gamma") {
+	if !strings.Contains(v, "● Title of gamma") {
 		t.Fatalf("no waiting marker:\n%s", v)
 	}
-	if strings.Contains(v, "● alpha") || strings.Contains(v, "● beta") {
+	if strings.Contains(v, "● Title of alpha") || strings.Contains(v, "● Title of beta") {
 		t.Fatalf("marker on non-waiting task:\n%s", v)
 	}
 	key(m, "j")
@@ -1479,7 +1495,7 @@ func TestSanitize(t *testing.T) {
 		t.Fatalf("%d lines, want %d", n, m.height)
 	}
 	v := plainView(m)
-	for _, want := range []string{"beta  evil [2J second line tab", "evil [2J second line tab", "]0;pwn desc", "p q"} {
+	for _, want := range []string{"\n  evil [2J second line tab", "evil [2J second line tab", "]0;pwn desc", "p q"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("view missing %q:\n%s", want, v)
 		}
@@ -2136,13 +2152,14 @@ func TestRowDots(t *testing.T) {
 		tv(6, "stops", model.StatusActive, sess(8, model.StateStopped), sess(9, model.StateEnded)),
 	}}
 	m, _ := newTest(t, fb)
-	want := map[string]string{"ended": "  ended", "empty": "  empty", "waits": "● waits", "runs": "● runs", "idles": "● idles", "stops": "○ stops"}
-	for slug, prefix := range want {
+	want := map[string]string{"ended": "  ", "empty": "  ", "waits": "● ", "runs": "● ", "idles": "● ", "stops": "○ "}
+	for slug, dot := range want {
+		prefix := dot + "Title of " + slug
 		for _, sel := range []bool{false, true} {
 			if sel {
 				selectSlug(t, m, slug)
 			}
-			if l := listLine(t, m, slug); !strings.HasPrefix(l, prefix+"  Title of "+slug) {
+			if l := listLine(t, m, slug); !strings.HasPrefix(l, prefix) {
 				t.Errorf("%s (sel %v): %q, want prefix %q", slug, sel, l, prefix)
 			}
 		}
@@ -2158,12 +2175,12 @@ func TestDirtyStar(t *testing.T) {
 		t.Fatalf("DirtyTasks at start: %d", fb.count("DirtyTasks"))
 	}
 	for slug, want := range map[string]string{
-		"alpha": "  alpha*  Title of alpha",
-		"beta":  "  beta  Title of beta",
-		"gamma": "● gamma*  Title of gamma",
-		"delta": "  delta  Title of delta",
-		"shut":  "  shut  Title of shut", // closed: never starred
-		"busy":  "● busy*  Title of busy",
+		"alpha": "  Title of alpha* ",
+		"beta":  "  Title of beta ",
+		"gamma": "● Title of gamma* ",
+		"delta": "  Title of delta ",
+		"shut":  "  Title of shut ", // closed: never starred
+		"busy":  "● Title of busy* ",
 	} {
 		for _, sel := range []bool{false, true} {
 			if sel {
@@ -2174,11 +2191,13 @@ func TestDirtyStar(t *testing.T) {
 			}
 		}
 	}
-	// the star survives truncation of a long slug
+	// the star survives truncation of a long title
+	fb.tasks[0].Task.Title = "alpha has a long title"
+	drain(m, m.reload())
 	m.Update(tea.WindowSizeMsg{Width: 12, Height: 20})
 	found := false
 	for _, l := range strings.Split(plainView(m), "\n") {
-		if strings.HasPrefix(l, "  alph") || strings.HasPrefix(l, "  al") {
+		if strings.HasPrefix(l, "  alpha") {
 			found = true
 			if !strings.Contains(l, "*") || ansi.StringWidth(l) > 12 {
 				t.Errorf("narrow alpha row %q", l)
@@ -2551,5 +2570,179 @@ func TestChoiceRowSnippetFits(t *testing.T) {
 				t.Fatalf("lines(%d,%d) = %d lines", w, h, len(got))
 			}
 		}
+	}
+}
+
+// titledTasks are tasks whose titles share nothing with their slugs.
+func titledTasks() []app.TaskView {
+	ts := []app.TaskView{
+		tv(1, "fix-login", model.StatusActive),
+		tv(2, "spike-cache", model.StatusBacklog),
+		tv(3, "long-one", model.StatusActive),
+	}
+	ts[0].Task.Title = "Repair the sign-in page"
+	ts[1].Task.Title = "Try Redis"
+	ts[2].Task.Title = "A very long title that will never fit in the narrow left pane of the list"
+	return ts
+}
+
+func TestListShowsTitleNotSlug(t *testing.T) {
+	fb := &fakeBackend{tasks: titledTasks(), dirty: map[int64]bool{3: true}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "fix-login")
+	var left []string
+	for _, l := range strings.Split(plainView(m), "\n") {
+		left = append(left, strings.SplitN(l, "│", 2)[0])
+	}
+	list := strings.Join(left, "\n")
+	for _, want := range []string{"  Repair the sign-in page", "  Try Redis", "  A very long title"} {
+		if !strings.Contains(list, want) {
+			t.Errorf("list lacks %q:\n%s", want, list)
+		}
+	}
+	for _, slug := range []string{"fix-login", "spike-cache", "long-one"} {
+		if strings.Contains(list, slug) {
+			t.Errorf("list shows slug %q:\n%s", slug, list)
+		}
+	}
+	// long titles are truncated to the pane, keeping the dirty star
+	for _, l := range left {
+		if strings.Contains(l, "A very long") {
+			if !strings.Contains(l, "…*") || ansi.StringWidth(strings.TrimRight(l, " ")) > 48 {
+				t.Errorf("long title row %q", l)
+			}
+		}
+	}
+	// the slug is still in the details pane
+	if v := plainView(m); !strings.Contains(v, "slug      fix-login") || !strings.Contains(v, "Repair the sign-in page") {
+		t.Fatalf("details pane:\n%s", v)
+	}
+	// a blank title falls back to the slug
+	fb.tasks[1].Task.Title = " \t"
+	drain(m, m.reload())
+	if !strings.Contains(plainView(m), "  spike-cache") {
+		t.Fatalf("blank title not replaced by the slug:\n%s", plainView(m))
+	}
+}
+
+func TestFilterMatchesSlugAndTitle(t *testing.T) {
+	fb := &fakeBackend{tasks: titledTasks()}
+	m, _ := newTest(t, fb)
+	for _, c := range []struct {
+		filter string
+		want   []string
+	}{
+		{"spike", []string{"#backlog", "spike-cache"}}, // slug only
+		{"REDIS", []string{"#backlog", "spike-cache"}}, // title only, any case
+		{"sign-in", []string{"#active", "fix-login"}},  // title
+		{"login", []string{"#active", "fix-login"}},    // slug
+		{"nothing-matches", nil},
+	} {
+		key(m, "/")
+		m.filterInput.SetValue("")
+		typeText(m, c.filter)
+		key(m, "enter")
+		if got := rowSlugs(m); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("filter %q: rows %v, want %v", c.filter, got, c.want)
+		}
+	}
+}
+
+func TestRenameKey(t *testing.T) {
+	fb := &fakeBackend{tasks: titledTasks()}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "fix-login")
+	if v := plainView(m); !strings.Contains(v, "t rename") {
+		t.Fatalf("help lacks t:\n%s", v)
+	}
+
+	// t opens the input prefilled with the current title; esc cancels
+	key(m, "t")
+	if m.mode != modeRename || m.renameInput.Value() != "Repair the sign-in page" {
+		t.Fatalf("t: mode %v value %q", m.mode, m.renameInput.Value())
+	}
+	if v := plainView(m); !strings.Contains(v, "title> Repair the sign-in page") || !strings.Contains(v, "enter save  esc cancel") {
+		t.Fatalf("rename input not shown:\n%s", v)
+	}
+	typeText(m, " NOT SAVED")
+	key(m, "esc")
+	if m.mode != modeNormal || fb.count("Rename") != 0 || !strings.Contains(m.status, "cancelled") {
+		t.Fatalf("esc: mode %v calls %d status %q", m.mode, fb.count("Rename"), m.status)
+	}
+	if fb.tasks[0].Task.Title != "Repair the sign-in page" {
+		t.Fatal("esc changed the title")
+	}
+
+	// enter saves (async, busy while running); typed keys don't trigger commands
+	key(m, "t")
+	if m.renameInput.Value() != "Repair the sign-in page" {
+		t.Fatalf("not prefilled again: %q", m.renameInput.Value())
+	}
+	m.renameInput.SetValue("")
+	typeText(m, "  d s q   Fix login  ")
+	if m.mode != modeRename || m.confirm != nil || fb.count("NewSession") != 0 {
+		t.Fatal("keys leaked to normal mode")
+	}
+	cmd := press(m, "enter")
+	if m.mode != modeNormal || m.busy[1] != "rename fix-login" {
+		t.Fatalf("after enter: mode %v busy %v", m.mode, m.busy)
+	}
+	drain(m, cmd)
+	c := fb.last("Rename")
+	if c == nil || c.args[0] != "fix-login" || c.args[1] != "d s q Fix login" {
+		t.Fatalf("Rename call %+v", c)
+	}
+	if len(m.busy) != 0 || m.status != "renamed fix-login to d s q Fix login" {
+		t.Fatalf("busy %v status %q", m.busy, m.status)
+	}
+	if l := listLine(t, m, "d s q Fix login"); !strings.Contains(l, "d s q Fix login") {
+		t.Fatalf("list not updated: %q", l)
+	}
+
+	// empty title: refused, input stays open with an error; esc then cancels
+	key(m, "t")
+	m.renameInput.SetValue("   ")
+	key(m, "enter")
+	if m.mode != modeRename || fb.count("Rename") != 1 || !m.statusErr || !strings.Contains(plainView(m), "cannot be empty") {
+		t.Fatalf("empty: mode %v calls %d status %q", m.mode, fb.count("Rename"), m.status)
+	}
+	typeText(m, "x") // editing clears the error
+	if m.statusErr {
+		t.Fatalf("error kept while editing: %q", m.status)
+	}
+	key(m, "esc")
+	if m.mode != modeNormal || fb.count("Rename") != 1 {
+		t.Fatal("esc after an empty title")
+	}
+
+	// unchanged title: nothing saved
+	key(m, "t")
+	key(m, "enter")
+	if m.mode != modeNormal || fb.count("Rename") != 1 || !strings.Contains(m.status, "unchanged") {
+		t.Fatalf("unchanged: calls %d status %q", fb.count("Rename"), m.status)
+	}
+
+	// backend errors land in the status line
+	fb.renameErr = errors.New("database is locked")
+	key(m, "t")
+	typeText(m, "!")
+	key(m, "enter")
+	if !m.statusErr || !strings.Contains(m.status, "rename: database is locked") {
+		t.Fatalf("error status %q", m.status)
+	}
+
+	// busy task: t refused
+	m.busy[1] = "pr fix-login"
+	key(m, "t")
+	if m.mode != modeNormal || !strings.Contains(m.status, "busy") {
+		t.Fatalf("busy: mode %v status %q", m.mode, m.status)
+	}
+	delete(m.busy, 1)
+
+	// resizing while editing resizes the input
+	key(m, "t")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	if want := 80 - len(m.renameInput.Prompt) - 1; m.renameInput.Width != want {
+		t.Fatalf("rename input width after resize = %d, want %d", m.renameInput.Width, want)
 	}
 }

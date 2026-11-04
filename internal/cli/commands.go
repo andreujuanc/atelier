@@ -455,6 +455,30 @@ func (c *cli) statusCmd() *cobra.Command {
 	}
 }
 
+func (c *cli) renameCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "rename <task> <new title...>",
+		Short: "Change a task's title (slug, branch, tmux session and dirs keep the original name); prints the new title",
+		Args:  args(cobra.MinimumNArgs(2)),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			title, err := model.NormalizeTitle(strings.Join(a[1:], " "))
+			if err != nil {
+				return usageError{err}
+			}
+			ap, err := c.App()
+			if err != nil {
+				return err
+			}
+			t, err := ap.Rename(cmd.Context(), a[0], title)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(c.stdout, t.Title)
+			return nil
+		},
+	}
+}
+
 func (c *cli) diffCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "diff <task>",

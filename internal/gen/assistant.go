@@ -24,7 +24,7 @@ var (
 	assistantAsk = []string{
 		"Bash(atl new *)", "Bash(atl add *)", "Bash(atl status *)", "Bash(atl session *)",
 		"Bash(atl resume *)", "Bash(atl pr *)", "Bash(atl done *)", "Bash(atl cancel *)",
-		"Bash(atl note *)", "Bash(atl open *)",
+		"Bash(atl note *)", "Bash(atl open *)", "Bash(atl rename *)",
 	}
 	assistantDeny = []string{
 		"Bash(git commit *)", "Bash(git push *)", "Bash(git checkout *)", "Bash(git switch *)",
@@ -173,7 +173,7 @@ func AssistantClaudeMD() string {
 		"## Your role: task management ONLY",
 		"",
 		"Your ONLY job is managing atelier tasks with `atl` commands: status and catch-up summaries, notes,",
-		"which repos a task has, creating/finishing/cancelling tasks, resuming sessions, PRs.",
+		"which repos a task has, creating/renaming/finishing/cancelling tasks, resuming sessions, PRs.",
 		"",
 		"You do NOT do code work. Do NOT read source code in depth, review code, propose code changes, debug,",
 		"or offer to implement anything. You run in your own folder: any code you touched here would not be in",
@@ -196,8 +196,8 @@ func AssistantClaudeMD() string {
 		"",
 		"- Reading is free: run the read-only commands below whenever useful.",
 		"- ALWAYS ask for explicit confirmation before any command that changes state (`atl new`, `add`,",
-		"  `status`, `session`, `resume`, `open`, `pr`, `done`, `cancel`, `note`). First state the exact command",
-		"  you want to run, wait for the user's yes, then run it.",
+		"  `status`, `rename`, `session`, `resume`, `open`, `pr`, `done`, `cancel`, `note`).",
+		"  First state the exact command you want to run, wait for the user's yes, then run it.",
 		"- Never edit files in repos, worktrees or task dirs, by any means (no Edit/Write tools, no shell",
 		"  redirects, `sed -i`, `git commit`, `git checkout`, ...). Edits outside this directory are blocked by",
 		"  an atelier hook. You may keep scratch notes in this directory (not in CLAUDE.md or .claude/).",
@@ -231,6 +231,8 @@ func AssistantClaudeMD() string {
 		"  branch) for feature work, `default` (or `production`) for a production patch from origin's default branch, or a branch name.",
 		"- `atl add <task> <repo>[:rw|ro]` — add a repo to an open task.",
 		"- `atl status <task> <backlog|active|review|done|cancelled>` — set the status only (no other effects).",
+		"- `atl rename <task> <new title...>` — change the task's title only; the slug, branch `atl/<slug>`, tmux",
+		"  session and dirs keep the original name (refer to the task by its slug afterwards too).",
 		"- `atl session <task>` — start a new Claude session in the task (not attached).",
 		"- `atl resume <task>` — resume the task's stopped Claude sessions.",
 		"- `atl open <task>` — start/resume the task's session and attach the terminal (better done by the user",
