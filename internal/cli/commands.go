@@ -319,16 +319,38 @@ func (c *cli) lsCmd() *cobra.Command {
 }
 
 func (c *cli) openCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "open <task>",
+	var sessionID int64
+	var newSession bool
+	cmd := &cobra.Command{
+		Use:   "open <task> [--session ID | --new]",
 		Short: "Ensure the task's tmux session (resume or start Claude) and attach to it",
-		Args:  args(cobra.ExactArgs(1)),
+		Long: "Ensure the task's tmux session and attach to it.\n\n" +
+			"Without flags: attach if a Claude window is live, else resume the task's stopped sessions,\n" +
+			"else start a new session. --session ID opens that session of the task (a live one is\n" +
+			"selected, an ended or stopped one is resumed with claude --resume); --new starts a new\n" +
+			"session. Either way the window is selected before attaching.",
+		Args: args(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
+			hasSession := cmd.Flags().Changed("session")
+			if hasSession && newSession {
+				return usagef("--session and --new are mutually exclusive")
+			}
+			if hasSession && sessionID <= 0 {
+				return usagef("--session must be a positive session id")
+			}
 			ap, err := c.App()
 			if err != nil {
 				return err
 			}
-			attach, err := ap.Open(cmd.Context(), a[0])
+			var attach *exec.Cmd
+			switch {
+			case hasSession:
+				attach, err = ap.OpenSession(cmd.Context(), a[0], sessionID)
+			case newSession:
+				attach, err = ap.OpenNew(cmd.Context(), a[0])
+			default:
+				attach, err = ap.Open(cmd.Context(), a[0])
+			}
 			if err != nil {
 				return err
 			}
@@ -339,6 +361,9 @@ func (c *cli) openCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().Int64Var(&sessionID, "session", 0, "open this session (id from atl show): attach to it if live, else resume it")
+	cmd.Flags().BoolVar(&newSession, "new", false, "start a new Claude session and attach to it")
+	return cmd
 }
 
 func (c *cli) assistantCmd() *cobra.Command {

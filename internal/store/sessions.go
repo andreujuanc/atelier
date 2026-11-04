@@ -194,10 +194,23 @@ func (s *Store) MarkStoppedIfLaunch(ctx context.Context, l Launch, at time.Time)
 // window for the session. The target is cleared because the old window is
 // gone and a live row with an empty target is one Recover leaves alone while
 // its window is launched; the launcher records the new window with
-// SetSessionLaunch.
+// SetSessionLaunch. It is ClaimFrom(ctx, id, StateStopped, at).
 func (s *Store) ClaimStopped(ctx context.Context, id int64, at time.Time) (bool, error) {
+	return s.ClaimFrom(ctx, id, model.StateStopped, at)
+}
+
+// ClaimFrom is the resume claim for a session the caller saw in state from,
+// which must be stopped or ended (a past session): like ClaimStopped, it
+// atomically moves the session to idle, clears its tmux_target and bumps its
+// launch sequence, but only if the session is still in state from (the
+// caller checks it has a Claude session id; hooks never clear one). It reports whether this caller won; only the
+// winner may launch `claude --resume` for it.
+func (s *Store) ClaimFrom(ctx context.Context, id int64, from model.SessionState, at time.Time) (bool, error) {
+	if from != model.StateStopped && from != model.StateEnded {
+		return false, fmt.Errorf("store: cannot claim a session for resume from state %q", from)
+	}
 	return s.changed(ctx, `UPDATE sessions SET state = 'idle', tmux_target = '', launch_seq = launch_seq + 1,
-		last_event_at = ? WHERE id = ? AND state = 'stopped'`, toMS(normTime(at)), id)
+		last_event_at = ? WHERE id = ? AND state = ?`, toMS(normTime(at)), id, string(from))
 }
 
 // SetSessionLaunch records the tmux window and name of a launched session and

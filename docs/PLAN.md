@@ -179,7 +179,8 @@ func (s *Store) UpdateSession(ctx, sess *model.Session) error  // writes all mut
 func (s *Store) SetSessionState(ctx, id int64, st model.SessionState, at time.Time) error
 func (s *Store) ListLaunchedLive(ctx) ([]model.Session, ...)                  // live rows with tmux_target != '' + launch_seq snapshot (Recover)
 func (s *Store) MarkStoppedIfLaunch(ctx, id, target, launchSeq, at) (bool, error) // CAS on target + launch_seq (Recover)
-func (s *Store) ClaimStopped(ctx, id int64, at time.Time) (bool, error)      // stopped → idle, clears tmux_target (Resume claim)
+func (s *Store) ClaimStopped(ctx, id int64, at time.Time) (bool, error)      // stopped → idle, clears tmux_target (Resume claim) = ClaimFrom(stopped)
+func (s *Store) ClaimFrom(ctx, id int64, from SessionState, at time.Time) (bool, error) // from ∈ {stopped, ended}: CAS on the state the caller saw → idle, clears target, launch_seq+1 (OpenSession claim)
 func (s *Store) SetSessionLaunch(ctx, id int64, tmuxTarget, name string) error // only those two columns
 func (s *Store) SetClaudeSession(ctx, id int64, cid string, at time.Time) error   // claude id + state idle (hook SessionStart)
 func (s *Store) SetClaudeSessionID(ctx, id int64, cid string, at time.Time) error // claude id only (SessionStart source=compact)
@@ -227,6 +228,7 @@ func (c *Client) TaggedWindows(ctx) (map[string]string, error) // tag → window
 func (c *Client) KillTaggedWindows(ctx, tag, except string) error // exact @atl_session match; Resume kills stale windows after launching
 func (c *Client) KillSession(ctx, name string) error           // missing session is not an error
 func (c *Client) AttachCmd(name string) *exec.Cmd               // $TMUX set → switch-client -t, else attach-session -t
+func (c *Client) SelectWindow(ctx, window string) error         // select-window -t @N (open a chosen session's window)
 ```
 
 Windows are identified by tag `@atl_session=<sessions.id>` (window ids are reused after a server restart, so
@@ -366,7 +368,13 @@ type RepoStatus struct { Name string; Mode model.Mode; Path string; Dirty bool; 
 func ClaudeArgv(roPaths []string, resumeID string) []string   // ["claude", ("--resume", id)?, "--add-dir", p...]
 func (a *App) NewSession(ctx, ref string) (*model.Session, error) // row (state idle) → tmux window → save target
 func (a *App) Resume(ctx, ref string) (int, error)  // Recover, then relaunch every stopped session with a claude id; stopped w/o id → ended
-func (a *App) Open(ctx, ref string) (*exec.Cmd, error) // ensure tmux session (resume stopped, else NewSession), return AttachCmd
+func (a *App) Open(ctx, ref string) (*exec.Cmd, error) // ensure tmux session (resume stopped, else NewSession), return AttachCmd (plain `atl open`)
+// open.go: choosing a session (TUI enter, `atl open --session/--new`)
+type SessionChoice struct { Session model.Session; Live bool; Window string; Title, LastPrompt string }
+func (a *App) OpenChoices(ctx, ref string) ([]SessionChoice, error) // Recover; live sessions with a live tagged window, then (open tasks only) ended/stopped with a claude id whose recorded transcript exists (no path recorded = kept); each group last_event_at desc
+func (a *App) OpenOrChoose(ctx, ref string) (*exec.Cmd, []SessionChoice, error) // choices if any (nothing launched), else OpenNew's attach cmd
+func (a *App) OpenSession(ctx, ref string, sessionID int64) (*exec.Cmd, error) // live → select its window; past → ClaimFrom + claude --resume (failed launch restores the state); then AttachCmd
+func (a *App) OpenNew(ctx, ref string) (*exec.Cmd, error)                      // NewSession, select its window, AttachCmd
 // M5 task.go
 func (a *App) NewTask(ctx, o NewTaskOpts) (*model.Task, error)
 func (a *App) List(ctx, statuses ...model.Status) ([]TaskView, error) // RepoStatus filled (dirty check) only by Get
@@ -426,7 +434,7 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 | `atl ls [--status S[,S...]\|all] [--json]` | default: open statuses. Text columns: `ID SLUG STATUS PROJECT SESSIONS TITLE` (sessions like `2 (1 waiting)`) |
 | `atl add <task> <name>[:rw\|ro] [--no-fetch]` | add a repo to an open task; prints `slug\trepo\tmode\tpath` |
 | `atl repos` | list repos available under `$ATL_REPOS` |
-| `atl open <task>` | `App.Open` then run attach cmd with stdio attached |
+| `atl open <task> [--session ID \| --new]` | `App.Open` (no flags; unchanged), `App.OpenSession` (`--session`) or `App.OpenNew` (`--new`), then run attach cmd with stdio attached. The flags are mutually exclusive (usage error) |
 | `atl session <task>` | new Claude session (does not attach; prints window) |
 | `atl resume <task>` | `App.Resume`; prints count |
 | `atl status <task> <status>` | `App.SetStatus` |
@@ -452,10 +460,14 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 - Right pane: title, slug, project, branch, port offset, task dir; repos (`rw`/`ro`, dirty `*`); sessions
   (`claude-<id>  <state>  <age since last_event_at>`), waiting rendered highlighted (bold + accent colour).
 - Repo picker (new-task form and `a`): list of `App.AvailableRepos`, type to filter, space cycles none→rw→ro, enter confirms, esc clears filter then cancels; project repos preselected.
-- Keys: `n` new (form: title, project, repos via picker, description, backlog toggle), `enter` open (tea.ExecProcess on the
-  attach cmd), `s` new session, `r` resume, `d` done / `c` cancel (y/N confirm; if refused because dirty, offer `F`
+- Keys: `n` new (form: title, project, repos via picker, description, backlog toggle), `enter` open (`App.OpenOrChoose`;
+  attach cmd → tea.ExecProcess; choices → session picker), `s` new session, `r` resume, `d` done / `c` cancel (y/N confirm; if refused because dirty, offer `F`
   force), `p` pr, `D` diff (ExecProcess `$PAGER`), `1-5` set status (`AllStatuses` order, plain SetStatus), `a` add repos to the selected task (picker),
   `/` filter (substring on slug/title), `j/k`/arrows move, `q`/ctrl-c quit.
+- Session picker (`enter` on a task with sessions): row 0 "New session" (`App.OpenNew`), then `App.OpenChoices` order; row =
+  state, age, title (transcript: newest `custom-title`, else newest `ai-title`/`summary`, else first user prompt, else window
+  name; head+tail 1 MiB of a large transcript), window name and last prompt if they fit. ↑/↓ (ctrl+p/n, j/k, pgup/pgdown,
+  home/end) move, enter → `App.OpenSession` / `App.OpenNew` then ExecProcess, esc cancels. Same look as the repo picker.
 - Ticks: reload from DB every 1s (`App.List`; dirty status via `App.Get` for selected task only, at most every 3s);
   `App.Recover` every 5s. Errors shown in a status line, never crash.
 - Model logic (update/selection/grouping/filter) unit-tested without a terminal.
@@ -484,7 +496,7 @@ Part A — data the assistant reads:
 - Migration v3 also: `task_notes(id INTEGER PK, task_id FK ON DELETE CASCADE, body TEXT, author TEXT CHECK IN ('user','assistant'), created_at INTEGER)`.
 - `atl show <task> [--json]`: task fields, task dir, repos (mode, path, dirty, commits ahead of base, last commit sha/subject/date,
   pushed = local ref refs/remotes/origin/atl/<slug> exists — no network), sessions (state, last_event_at, claude id,
-  transcript_path), notes (newest first).
+  transcript_path, title from the transcript or ""), notes (newest first).
 - `atl transcript <task> [--session ID] [--tail N=20]`: condensed last N user/assistant text turns from the transcript JSONL
   (tool calls/results summarised as one line or skipped); default = most recent session with a transcript.
 - `atl note <task> <text...> [--author user|assistant]`, `atl notes <task>`. TUI: details pane shows latest note; key `m` adds a note.

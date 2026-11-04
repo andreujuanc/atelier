@@ -431,3 +431,42 @@ func TestKillTaggedWindows(t *testing.T) {
 		t.Fatal("KillTaggedWindows(\"\") succeeded")
 	}
 }
+
+func TestSelectWindow(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	a, err := c.NewWindow(ctx, WindowSpec{Session: "atl-s", Name: "a", Argv: []string{"sleep", "300"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.NewWindow(ctx, WindowSpec{Session: "atl-s", Name: "b", Argv: []string{"sleep", "300"}}); err != nil {
+		t.Fatal(err)
+	}
+	cur := func() string {
+		out, err := c.run(ctx, "list-windows", "-t", "=atl-s", "-F", "#{window_active} #{window_name}")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, l := range strings.Split(out, "\n") {
+			if name, ok := strings.CutPrefix(l, "1 "); ok {
+				return name
+			}
+		}
+		return ""
+	}
+	if got := cur(); got != "b" {
+		t.Fatalf("current window = %q, want the newest (b)", got)
+	}
+	if err := c.SelectWindow(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if got := cur(); got != "a" {
+		t.Fatalf("current window after SelectWindow = %q, want a", got)
+	}
+	if err := c.SelectWindow(ctx, "a"); err == nil {
+		t.Error("SelectWindow accepted a non-id target")
+	}
+	if err := c.SelectWindow(ctx, "@9999"); err == nil {
+		t.Error("SelectWindow of a missing window succeeded")
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/andreujuanc/atelier/internal/model"
 )
@@ -259,10 +260,152 @@ func toolLine(b transcriptBlock) string {
 
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 
+// cleanLine is oneLine after turning control and format characters (ESC,
+// bidi overrides, ...) into spaces: transcript text safe to show on one line.
+func cleanLine(s string) string {
+	return oneLine(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return ' '
+		}
+		return r
+	}, s))
+}
+
 func firstChars(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {
 		return s
 	}
 	return string(r[:n]) + "…"
+}
+
+// transcriptInfo is what the session picker shows from a transcript.
+type transcriptInfo struct {
+	// Title is Claude Code's own title for the conversation: the newest
+	// custom title (/rename), else the newest generated one ("ai-title" or
+	// an older "summary" entry); "" if none was seen.
+	Title       string
+	FirstPrompt string // the first real user prompt seen, one line
+	LastPrompt  string // the last real user prompt seen, one line
+}
+
+// transcriptWindow caps how much of a transcript readTranscriptInfo scans:
+// a file larger than twice this is read only at its head and tail.
+const transcriptWindow = 1 << 20
+
+// Display caps (runes) for transcript-derived one-line texts.
+const (
+	maxTitleRunes  = 120
+	maxPromptRunes = 200
+)
+
+// readTranscriptInfo reads a session's title and first/last user prompts
+// from its Claude Code transcript (see transcriptInfo). Large files are
+// scanned only in their first and last transcriptWindow bytes (the first
+// prompt is at the head, the last prompt and the newest titles near the
+// tail), so a title or prompt in the middle of a huge file may be missed.
+func readTranscriptInfo(path string) (transcriptInfo, error) {
+	var info transcriptInfo
+	f, err := os.Open(path)
+	if err != nil {
+		return info, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return info, err
+	}
+	var chunks [][]byte
+	if size := fi.Size(); size <= 2*transcriptWindow {
+		b, err := io.ReadAll(io.LimitReader(f, 2*transcriptWindow))
+		if err != nil {
+			return info, err
+		}
+		chunks = append(chunks, b)
+	} else {
+		head := make([]byte, transcriptWindow)
+		if _, err := io.ReadFull(f, head); err != nil {
+			return info, err
+		}
+		if i := bytes.LastIndexByte(head, '\n'); i >= 0 {
+			head = head[:i+1] // drop the partial last line
+		}
+		tail := make([]byte, transcriptWindow)
+		if _, err := f.ReadAt(tail, size-transcriptWindow); err != nil && !errors.Is(err, io.EOF) {
+			return info, err
+		}
+		if i := bytes.IndexByte(tail, '\n'); i >= 0 {
+			tail = tail[i+1:] // drop the partial first line
+		}
+		chunks = append(chunks, head, tail)
+	}
+	var custom, generated string
+	for _, c := range chunks {
+		for len(c) > 0 {
+			line := c
+			if i := bytes.IndexByte(c, '\n'); i >= 0 {
+				line, c = c[:i], c[i+1:]
+			} else {
+				c = nil
+			}
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
+			}
+			var e struct {
+				Type        string `json:"type"`
+				CustomTitle string `json:"customTitle"`
+				AITitle     string `json:"aiTitle"`
+				Summary     string `json:"summary"`
+			}
+			if json.Unmarshal(line, &e) != nil {
+				continue
+			}
+			switch e.Type {
+			case "custom-title":
+				if t := cleanLine(e.CustomTitle); t != "" {
+					custom = t
+				}
+			case "ai-title":
+				if t := cleanLine(e.AITitle); t != "" {
+					generated = t
+				}
+			case "summary":
+				if t := cleanLine(e.Summary); t != "" {
+					generated = t
+				}
+			case "user":
+				if role, text, _, ok := parseEntry(line); ok && role == "user" {
+					if p := userPrompt(text); p != "" {
+						if info.FirstPrompt == "" {
+							info.FirstPrompt = p
+						}
+						info.LastPrompt = p
+					}
+				}
+			}
+		}
+	}
+	info.Title = custom
+	if info.Title == "" {
+		info.Title = generated
+	}
+	info.Title = firstChars(info.Title, maxTitleRunes)
+	info.FirstPrompt = firstChars(info.FirstPrompt, maxPromptRunes)
+	info.LastPrompt = firstChars(info.LastPrompt, maxPromptRunes)
+	return info, nil
+}
+
+// userPrompt returns the text the human typed in a condensed user turn, on
+// one line: lines that are only a bracketed marker ("[command: /clear]",
+// "[Request interrupted by user]", ...) are dropped; "" if nothing is left.
+func userPrompt(text string) string {
+	var keep []string
+	for _, l := range strings.Split(text, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || (strings.HasPrefix(l, "[") && strings.HasSuffix(l, "]")) {
+			continue
+		}
+		keep = append(keep, l)
+	}
+	return cleanLine(strings.Join(keep, " "))
 }

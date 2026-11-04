@@ -116,6 +116,8 @@ func (m *Model) View() string {
 	var body []string
 	if m.mode == modePicker && m.picker != nil {
 		body = m.picker.lines(w, bodyH)
+	} else if m.mode == modeSessions && m.sessPick != nil {
+		body = m.sessPick.lines(w, bodyH, m.now())
 	} else if m.mode == modeForm && m.form != nil {
 		body = m.formLines(w, bodyH)
 	} else {
@@ -408,6 +410,8 @@ func (m *Model) helpLine(w int) string {
 		s = "enter/↓ next  ↑ prev  tab next/complete project  enter/space on Repos picks  space/←/→ on Base toggles  ctrl+b backlog  enter on Backlog creates  esc cancel"
 	case modePicker:
 		s = "type to filter  ↑/↓ move  space none/rw/ro  enter confirm  esc clear filter/cancel"
+	case modeSessions:
+		s = "↑/↓ move  enter open (live: attach, past: resume)  esc cancel"
 	case modeFilter:
 		s = "type to filter  enter apply  esc clear  ↑/↓ move"
 	case modeNote:

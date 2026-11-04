@@ -68,6 +68,7 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | TUI list: status dot per task (waiting>running>idle>stopped) + `*` for dirty open tasks (App.DirtyTasks, 5s async) | done (reviewed + nits) |
 | Dockerfile: UTF-8 + tmux 256/RGB (rendering artifacts) | done |
 | `ATL_CONTEXT` env var: per-environment text appended to every task session's SessionStart context (sanitised, ≤1000 bytes, notes dropped first) | done |
+| TUI `enter` asks instead of assuming: session picker (New session, live, resumable past sessions with transcript titles); `atl open --session ID` / `--new`; Store.ClaimFrom, tmux SelectWindow; `atl show` session titles | done |
 | idea: Claude on the right pane of the TUI (tmux join-pane) instead of full-screen attach | idea (user wants it later) |
 | optional: skip-fetch toggle in TUI new-task form / SSH ControlMaster in box (YubiKey touch per fetch) | idea |
 
@@ -77,3 +78,5 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 - (follow-up) Branch cleanup: gitx.UniqueCommits (commits not reachable from any other local branch or remote-tracking ref; local refs only). Done/Cancel force-delete when 0, else keep + report.
 - (follow-up) Assistant: never types into a live session (paste buffer + hint instead); `--continue` only if a conversation exists; flock-serialised launch; deny rules for common repo mutators. Known: TUI hint barely visible because attach starts immediately (could chain `display-message` into the attach cmd).
 - (user) Team branches features from dev/develop, production patches from main → task base selection (PLAN §3 NewTask). PRs target each repo's base_branch.
+- (user, 2026-11-04) Open picker: "ask instead of assuming". TUI enter → App.OpenOrChoose: no openable sessions → new session + attach; else picker (New session, live sessions, ended/stopped with claude id + existing transcript; live first, newest activity first). Live → select-window + attach; past → Store.ClaimFrom (CAS on the observed state, launch_seq+1) + `claude --resume`, failed launch restores ended/stopped; others untouched (`r` unchanged). Plain `atl open` unchanged; `--session`/`--new` mutually exclusive.
+- (user) Session titles read from the transcript when the picker opens (no DB column): newest `{"type":"custom-title","customTitle"}` (/rename) wins over newest `{"type":"ai-title","aiTitle"}` / legacy `{"type":"summary"}` (formats checked against real transcripts: ai-title is re-appended often, also after a rename), else first user prompt, else window name. Only the first and last 1 MiB of a >2 MiB transcript are scanned. Rows with no recorded transcript path are kept (pre-v3 rows); a recorded but missing file is dropped.

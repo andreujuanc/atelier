@@ -48,6 +48,9 @@ type fakeBackend struct {
 	dirty      map[int64]bool // DirtyTasks' result
 	dirtyErr   error
 	dirtyHang  bool // DirtyTasks blocks until its context is done
+	// choices are OpenOrChoose's sessions per slug (none: it attaches).
+	choices map[string][]app.SessionChoice
+	openErr error
 }
 
 func (f *fakeBackend) rec(name string, args ...any) { f.calls = append(f.calls, call{name, args}) }
@@ -105,8 +108,33 @@ func (f *fakeBackend) NewTask(ctx context.Context, o app.NewTaskOpts) (*model.Ta
 	return &model.Task{ID: 999, Slug: model.Slugify(o.Title), Title: o.Title}, nil
 }
 
-func (f *fakeBackend) Open(ctx context.Context, ref string) (*exec.Cmd, error) {
-	f.rec("Open", ref)
+// OpenOrChoose returns the attach command when the task has a live window
+// (f.live) or nothing to choose from (a new session "starts"), else
+// f.choices[ref].
+func (f *fakeBackend) OpenOrChoose(ctx context.Context, ref string) (*exec.Cmd, []app.SessionChoice, error) {
+	f.rec("OpenOrChoose", ref)
+	if f.openErr != nil {
+		return nil, nil, f.openErr
+	}
+	if c := f.choices[ref]; len(c) > 0 {
+		return nil, append([]app.SessionChoice(nil), c...), nil
+	}
+	return exec.Command("true"), nil, nil
+}
+
+func (f *fakeBackend) OpenSession(ctx context.Context, ref string, sessionID int64) (*exec.Cmd, error) {
+	f.rec("OpenSession", ref, sessionID)
+	if f.openErr != nil {
+		return nil, f.openErr
+	}
+	return exec.Command("true"), nil
+}
+
+func (f *fakeBackend) OpenNew(ctx context.Context, ref string) (*exec.Cmd, error) {
+	f.rec("OpenNew", ref)
+	if f.openErr != nil {
+		return nil, f.openErr
+	}
 	return exec.Command("true"), nil
 }
 
@@ -1143,7 +1171,7 @@ func TestOtherKeys(t *testing.T) {
 	key(m, "r")
 	key(m, "p")
 	key(m, "enter")
-	for _, n := range []string{"NewSession", "Resume", "PR", "Open"} {
+	for _, n := range []string{"NewSession", "Resume", "PR", "OpenOrChoose"} {
 		if c := fb.last(n); c == nil || c.args[0] != "beta" {
 			t.Errorf("%s: %+v", n, c)
 		}
@@ -2325,6 +2353,202 @@ func TestDotsSmallSizes(t *testing.T) {
 						t.Fatalf("%dx%d: line too wide: %q", w, h, ansi.Strip(l))
 					}
 				}
+			}
+		}
+	}
+}
+
+func choice(id int64, st model.SessionState, live bool, title, last string, age time.Duration) app.SessionChoice {
+	return app.SessionChoice{
+		Session: model.Session{ID: id, Name: fmt.Sprintf("claude-%d", id), State: st, LastEventAt: t0.Add(time.Hour - age)},
+		Live:    live, Title: title, LastPrompt: last,
+	}
+}
+
+// runOpen runs the command an open step returned and feeds its openMsg back,
+// returning the follow-up command (the exec, if it attached).
+func runOpen(t *testing.T, m *Model, cmd tea.Cmd) tea.Cmd {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("no open command")
+	}
+	msg := cmd()
+	if _, ok := msg.(openMsg); !ok {
+		t.Fatalf("open step returned %T", msg)
+	}
+	_, next := m.Update(msg)
+	return next
+}
+
+func isExec(cmd tea.Cmd) bool {
+	return cmd != nil && strings.Contains(fmt.Sprintf("%T", cmd()), "execMsg")
+}
+
+func TestOpenNoSessionsAttachesDirectly(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "alpha")
+	next := runOpen(t, m, press(m, "enter"))
+	if !isExec(next) || m.mode != modeNormal || m.sessPick != nil {
+		t.Fatalf("enter without sessions: exec=%v mode=%v", next != nil, m.mode)
+	}
+	if c := fb.last("OpenOrChoose"); c == nil || c.args[0] != "alpha" || fb.count("OpenNew")+fb.count("OpenSession") != 0 {
+		t.Fatalf("calls %+v", fb.calls)
+	}
+	if _, busy := m.busy[1]; busy {
+		t.Fatal("task still busy after open")
+	}
+}
+
+func TestOpenSessionPicker(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), choices: map[string][]app.SessionChoice{"gamma": {
+		choice(7, model.StateWaiting, true, "Fix the login redirect", "now add a test", 2*time.Minute),
+		choice(5, model.StateEnded, false, "Refactor the session store", "run the tests again", 3*time.Hour),
+		choice(4, model.StateStopped, false, "claude-4", "", 50*time.Hour),
+	}}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+
+	// Enter shows the picker and launches nothing.
+	if next := runOpen(t, m, press(m, "enter")); next != nil {
+		t.Fatalf("picker step returned a command")
+	}
+	if m.mode != modeSessions || m.sessPick == nil || m.sessPick.cursor != 0 {
+		t.Fatalf("mode %v picker %+v", m.mode, m.sessPick)
+	}
+	v := plainView(m)
+	for _, s := range []string{"Open gamma", "> New session", "1 live (attach), 2 past",
+		"waiting  2m ago   Fix the login redirect  claude-7  last: now add a test",
+		"ended    3h ago   Refactor the session store  claude-5  last: run the tests again",
+		"stopped  2d ago   claude-4", "↑/↓ move  enter open (live: attach, past: resume)  esc cancel"} {
+		if !strings.Contains(v, s) {
+			t.Errorf("picker view lacks %q:\n%s", s, v)
+		}
+	}
+	if strings.Contains(v, "claude-4  claude-4") {
+		t.Errorf("name repeated when it is the title:\n%s", v)
+	}
+	// New session first, then the sessions in the backend's order.
+	lines := strings.Split(v, "\n")
+	idx := func(s string) int {
+		for i, l := range lines {
+			if strings.Contains(l, s) {
+				return i
+			}
+		}
+		return -1
+	}
+	if !(idx("New session") < idx("Fix the login") && idx("Fix the login") < idx("Refactor") && idx("Refactor") < idx("stopped")) {
+		t.Errorf("row order wrong:\n%s", v)
+	}
+
+	// Navigation stays within the rows.
+	for _, c := range []struct {
+		key  string
+		want int
+	}{{"up", 0}, {"down", 1}, {"j", 2}, {"down", 3}, {"down", 3}, {"k", 2}, {"ctrl+p", 1}, {"ctrl+n", 2}, {"pgup", 0}, {"pgdown", 3}} {
+		key(m, c.key)
+		if m.sessPick.cursor != c.want {
+			t.Fatalf("after %s cursor = %d, want %d", c.key, m.sessPick.cursor, c.want)
+		}
+	}
+	if !strings.Contains(plainView(m), "> stopped  2d ago") {
+		t.Errorf("highlight not on the stopped session:\n%s", plainView(m))
+	}
+
+	// Esc launches nothing.
+	key(m, "esc")
+	if m.mode != modeNormal || m.sessPick != nil || !strings.Contains(m.status, "cancelled") {
+		t.Fatalf("esc: mode %v status %q", m.mode, m.status)
+	}
+	if fb.count("OpenNew")+fb.count("OpenSession") != 0 {
+		t.Fatalf("esc launched something: %+v", fb.calls)
+	}
+
+	// Enter on "New session" starts one and attaches.
+	runOpen(t, m, press(m, "enter"))
+	cmd := press(m, "enter")
+	if m.mode != modeNormal || m.busy[3] == "" {
+		t.Fatalf("after pick: mode %v busy %v", m.mode, m.busy)
+	}
+	if next := runOpen(t, m, cmd); !isExec(next) {
+		t.Fatal("new session did not attach")
+	}
+	if c := fb.last("OpenNew"); c == nil || c.args[0] != "gamma" || fb.count("OpenSession") != 0 {
+		t.Fatalf("calls %+v", fb.calls)
+	}
+
+	// Enter on a past session resumes exactly that one and attaches.
+	runOpen(t, m, press(m, "enter"))
+	key(m, "down")
+	key(m, "down")
+	if next := runOpen(t, m, press(m, "enter")); !isExec(next) {
+		t.Fatal("past session did not attach")
+	}
+	if c := fb.last("OpenSession"); c == nil || c.args[0] != "gamma" || c.args[1] != int64(5) {
+		t.Fatalf("OpenSession %+v", c)
+	}
+
+	// A live session too (attach with its window selected: the backend's job).
+	runOpen(t, m, press(m, "enter"))
+	key(m, "down")
+	runOpen(t, m, press(m, "enter"))
+	if c := fb.last("OpenSession"); c == nil || c.args[1] != int64(7) {
+		t.Fatalf("OpenSession %+v", c)
+	}
+
+	// Errors land in the status line.
+	runOpen(t, m, press(m, "enter"))
+	fb.openErr = errors.New("session 5 was resumed meanwhile")
+	key(m, "down")
+	key(m, "enter")
+	if !strings.Contains(m.status, "open: session 5 was resumed meanwhile") || !m.statusErr || m.mode != modeNormal {
+		t.Fatalf("status %q mode %v", m.status, m.mode)
+	}
+}
+
+func TestOpenChoicesWhileBusyElsewhere(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), choices: map[string][]app.SessionChoice{
+		"gamma": {choice(7, model.StateIdle, true, "t", "", time.Minute)}}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+	cmd := press(m, "enter")
+	key(m, "/") // the user moved on before the choices arrived
+	if next := runOpen(t, m, cmd); next != nil || m.mode != modeFilter || m.sessPick != nil {
+		t.Fatalf("picker yanked the user out of the filter: mode %v", m.mode)
+	}
+	if !strings.Contains(m.status, "press enter again") {
+		t.Fatalf("status %q", m.status)
+	}
+}
+
+func TestChoiceRowSnippetFits(t *testing.T) {
+	c := choice(5, model.StateEnded, false, "Refactor the session store", "run the tests again", time.Hour)
+	now := t0.Add(time.Hour)
+	wide := ansi.Strip(choiceRow(c, false, 120, now))
+	if !strings.Contains(wide, "Refactor the session store  claude-5  last: run the tests again") {
+		t.Fatalf("wide row %q", wide)
+	}
+	// Narrow: the snippet goes first, then the name; the title stays.
+	mid := ansi.Strip(choiceRow(c, false, 60, now))
+	if strings.Contains(mid, "last:") || !strings.Contains(mid, "Refactor the session store") {
+		t.Fatalf("mid row %q", mid)
+	}
+	narrow := ansi.Strip(choiceRow(c, true, 40, now))
+	if strings.Contains(narrow, "claude-5") || !strings.Contains(narrow, "> ended    1h ago   Refactor") || ansi.StringWidth(narrow) != 40 {
+		t.Fatalf("narrow row %q", narrow)
+	}
+	// Same text as the title: no snippet.
+	c.LastPrompt = c.Title
+	if s := ansi.Strip(choiceRow(c, false, 200, now)); strings.Contains(s, "last:") {
+		t.Fatalf("snippet repeats the title: %q", s)
+	}
+	// Tiny sizes never panic.
+	p := newSessionPicker(1, "x", []app.SessionChoice{c})
+	for w := 0; w < 12; w++ {
+		for h := 0; h < 8; h++ {
+			if got := p.lines(w, h, now); h > 0 && w > 0 && len(got) != h {
+				t.Fatalf("lines(%d,%d) = %d lines", w, h, len(got))
 			}
 		}
 	}
