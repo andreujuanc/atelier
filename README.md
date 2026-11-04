@@ -21,6 +21,8 @@ docker build -t atelier \
 
 Inside the image tmux stays out of the way: run `atl`, press Enter on a task to open
 Claude full screen, and press **Ctrl-q** to go back to the TUI (Claude keeps running).
+Claude's own status line, under its prompt, shows which task you are in (see
+[Status line](#status-line)).
 
 ## Usage
 
@@ -182,7 +184,7 @@ are serialised by `.launch.lock` in that dir; a session whose `assistant` window
 dead is replaced. Its tmux window is not tracked
 by atelier: crash recovery, `done` and `cancel` never touch it.
 
-Every `atl` invocation (except `hook` and `doctor`) first marks sessions whose tmux
+Every `atl` invocation (except `hook`, `statusline` and `doctor`) first marks sessions whose tmux
 window is gone as `stopped`; the TUI also does so every few seconds.
 
 ## Base branch
@@ -246,7 +248,11 @@ mode = "ro"     # not a worktree: passed to claude with --add-dir, edits blocked
 
 atelier writes `<taskdir>/.claude/settings.json` (merged with any existing keys) with
 hooks that run `atl hook <event>` for SessionStart, UserPromptSubmit, Notification,
-PostToolUse, Stop, SessionEnd and PreToolUse. They keep session state current
+PostToolUse, Stop, SessionEnd and PreToolUse, and a `statusLine` that runs
+`atl statusline` (see [Status line](#status-line)). The file is rewritten before every
+Claude launch (new session, resume, `open --session`), so the `atl` path stays current and
+existing tasks pick up new entries on their next launch; your own keys and hooks in it are
+kept. Your global `~/.claude/settings.json` is never touched. They keep session state current
 (`running`, `waiting` on permission prompts, `idle`, `ended`; `stopped` comes from
 crash recovery) and record each session's transcript path, and the PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
 on paths inside read-only repos. Hook failures never block Claude (except the
@@ -264,6 +270,20 @@ environment (e.g. a devcontainer's `containerEnv`: "no language runtimes here; r
 inside each repo's container via docker"), its text (newlines kept, up to 1000 bytes) is added
 as an "Environment notes" section before the notes. This is the only hook output on
 stdout; if the context cannot be built the error goes to `hook.log` and nothing is printed.
+
+## Status line
+
+A task's Claude session shows the task it belongs to at the bottom of Claude Code's
+screen, e.g. `● Fix login`, also when it runs full screen with the tmux status bar hidden.
+The dot has the colour the TUI uses for the session's state (waiting, running, idle);
+`NO_COLOR` makes it plain, and `COLORFGBG` with a light background picks the TUI's
+light-theme colours. Claude Code runs `atl statusline` with the session's JSON on stdin;
+atelier finds the task from the Claude session id, else `ATL_TASK`, else the working
+directory under `$ATL_TASKS/<slug>/`, and prints the title on one line (control characters
+removed, cut at 80 columns). It prints nothing if it can't tell (errors go to `hook.log`).
+If a task's `.claude/settings.json` already has a `statusLine` of yours, atelier leaves it
+alone; its own entry (`<atl> statusline`) is updated in place. Like hooks, Claude Code runs
+it only in trusted workspaces and not with `disableAllHooks`.
 
 ## Tests
 

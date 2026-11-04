@@ -141,7 +141,8 @@ func TestWriteSettingsFresh(t *testing.T) {
 	}
 	sf, raw, text := readSettings(t, dir)
 	checkAtelierHooks(t, sf, "/usr/local/bin/atl")
-	if len(raw) != 1 || len(sf.Hooks) != len(hookEvents) {
+	checkStatusLine(t, raw, "/usr/local/bin/atl")
+	if len(raw) != 2 || len(sf.Hooks) != len(hookEvents) {
 		t.Errorf("unexpected keys: %s", text)
 	}
 	if !strings.Contains(text, `"command": "'/usr/local/bin/atl' hook PreToolUse"`) ||
@@ -321,4 +322,83 @@ func TestClaudeMDTitleWhitespace(t *testing.T) {
 	if !strings.Contains(got, "\n# Fix the login flow\n\n") {
 		t.Errorf("heading not collapsed:\n%s", got)
 	}
+}
+
+// checkStatusLine fails unless raw's statusLine is exactly atelier's entry
+// for atlBin (type command, "<atl> statusline").
+func checkStatusLine(t *testing.T, raw map[string]any, atlBin string) {
+	t.Helper()
+	sl, _ := raw["statusLine"].(map[string]any)
+	if sl == nil || sl["type"] != "command" || sl["command"] != "'"+atlBin+"' statusline" {
+		t.Errorf("statusLine = %#v, want atelier's command for %s", raw["statusLine"], atlBin)
+	}
+}
+
+func TestWriteSettingsStatusLine(t *testing.T) {
+	const bin = "/opt/atl/bin/atl"
+	write := func(t *testing.T, existing string) (settingsFile, map[string]any, string) {
+		t.Helper()
+		dir := t.TempDir()
+		if existing != "" {
+			os.MkdirAll(filepath.Join(dir, ".claude"), 0o755)
+			if err := os.WriteFile(filepath.Join(dir, ".claude", "settings.json"), []byte(existing), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i := 0; i < 2; i++ { // idempotent
+			if err := WriteSettings(dir, bin); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return readSettings(t, dir)
+	}
+	userHooks := `"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify-send done"}]}]}`
+
+	t.Run("added next to existing hooks", func(t *testing.T) {
+		sf, raw, text := write(t, `{"model": "opus", `+userHooks+`}`)
+		checkStatusLine(t, raw, bin)
+		checkAtelierHooks(t, sf, bin)
+		if raw["model"] != "opus" || strings.Count(text, `"notify-send done"`) != 1 {
+			t.Errorf("user settings lost:\n%s", text)
+		}
+	})
+	t.Run("user's own statusLine kept", func(t *testing.T) {
+		for _, own := range []string{
+			`{"type": "command", "command": "~/.claude/statusline.sh", "padding": 0}`,
+			`{"type": "command", "command": "atl statusline --mine"}`,
+			`{"type": "command", "command": "atlas statusline"}`,
+			`{"type": "static", "command": "atl statusline"}`,
+			`"not an object"`,
+			`null`,
+		} {
+			sf, raw, text := write(t, `{"statusLine": `+own+`, `+userHooks+`}`)
+			var want any
+			json.Unmarshal([]byte(own), &want)
+			wantJSON, _ := json.Marshal(want)
+			if got, _ := json.Marshal(raw["statusLine"]); string(got) != string(wantJSON) {
+				t.Errorf("user statusLine %s changed:\n%s", own, text)
+			}
+			checkAtelierHooks(t, sf, bin)
+		}
+	})
+	t.Run("atelier's own entry updated in place", func(t *testing.T) {
+		for _, old := range []string{
+			`{"type": "command", "command": "'/old/path/atl' statusline", "padding": 2}`,
+			`{"type": "command", "command": "/usr/bin/atl-dev statusline"}`,
+			`{"command": "'` + bin + `' statusline"}`,
+			`{"type": "command", "command": "  atl   statusline  ", "refreshInterval": 5}`,
+		} {
+			sf, raw, text := write(t, `{"statusLine": `+old+`, `+userHooks+`}`)
+			checkStatusLine(t, raw, bin)
+			checkAtelierHooks(t, sf, bin)
+			sl := raw["statusLine"].(map[string]any)
+			if strings.Contains(old, "padding") && sl["padding"] != float64(2) ||
+				strings.Contains(old, "refreshInterval") && sl["refreshInterval"] != float64(5) {
+				t.Errorf("extra keys of atelier's entry lost:\n%s", text)
+			}
+			if strings.Contains(text, "/old/path") || strings.Contains(text, "atl-dev") {
+				t.Errorf("stale command kept:\n%s", text)
+			}
+		}
+	})
 }

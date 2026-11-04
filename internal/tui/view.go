@@ -11,40 +11,55 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/palette"
 )
 
 var (
-	accent      = lipgloss.AdaptiveColor{Light: "#B5179E", Dark: "#F7768E"}
-	subtle      = lipgloss.AdaptiveColor{Light: "#888888", Dark: "#666666"}
-	errColor    = lipgloss.AdaptiveColor{Light: "#C00000", Dark: "#FF5F5F"}
-	okColor     = lipgloss.AdaptiveColor{Light: "#2E8B57", Dark: "#9ECE6A"}
+	accent      = adaptive(palette.Accent)
+	subtle      = adaptive(palette.Subtle)
+	errColor    = adaptive(palette.Err)
+	okColor     = adaptive(palette.OK)
 	headerStyle = lipgloss.NewStyle().Bold(true)
 	selStyle    = lipgloss.NewStyle().Reverse(true)
 	markStyle   = lipgloss.NewStyle().Foreground(accent).Bold(true)
-	waitStyle   = lipgloss.NewStyle().Foreground(accent).Bold(true)
 	dimStyle    = lipgloss.NewStyle().Faint(true)
 	labelStyle  = lipgloss.NewStyle().Foreground(subtle)
 	errStyle    = lipgloss.NewStyle().Foreground(errColor)
 	titleStyle  = lipgloss.NewStyle().Bold(true)
 	sepStyle    = lipgloss.NewStyle().Foreground(subtle)
-	runStyle    = lipgloss.NewStyle().Foreground(okColor)
-	idleStyle   = lipgloss.NewStyle().Foreground(subtle)
-	stopStyle   = lipgloss.NewStyle().Foreground(errColor).Faint(true)
+	// Session state styles come from the palette, shared with `atl statusline`.
+	waitStyle = lookStyle(palette.StateLook(model.StateWaiting))
+	runStyle  = lookStyle(palette.StateLook(model.StateRunning))
+	idleStyle = lookStyle(palette.StateLook(model.StateIdle))
+	stopStyle = lookStyle(palette.StateLook(model.StateStopped))
 )
+
+func adaptive(c palette.Color) lipgloss.AdaptiveColor {
+	return lipgloss.AdaptiveColor{Light: c.Light, Dark: c.Dark}
+}
+
+// lookStyle is the lipgloss style of a palette look.
+func lookStyle(l palette.Look) lipgloss.Style {
+	s := lipgloss.NewStyle()
+	if l.Color != (palette.Color{}) {
+		s = s.Foreground(adaptive(l.Color))
+	}
+	if l.Bold {
+		s = s.Bold(true)
+	}
+	if l.Faint {
+		s = s.Faint(true)
+	}
+	return s
+}
 
 // dotFor returns the glyph (one cell) and style of a task row's state dot.
 func dotFor(k dotKind) (string, lipgloss.Style) {
-	switch k {
-	case dotWaiting:
-		return "●", waitStyle
-	case dotRunning:
-		return "●", runStyle
-	case dotIdle:
-		return "●", idleStyle
-	case dotStopped:
-		return "○", stopStyle
+	st := k.state()
+	if st == "" {
+		return " ", lipgloss.NewStyle()
 	}
-	return " ", lipgloss.NewStyle()
+	return palette.StateLook(st).Glyph, stateStyle(st)
 }
 
 // legends explain the list row marks (help line): the first that fits is

@@ -19,8 +19,11 @@ import (
 
 // TestMain lets tests re-exec the test binary as `atl hook <args>`.
 func TestMain(m *testing.M) {
-	if os.Getenv("ATL_HOOK_TEST_MAIN") == "1" {
+	switch os.Getenv("ATL_HOOK_TEST_MAIN") {
+	case "1":
 		os.Exit(Main(strings.Fields(os.Getenv("ATL_HOOK_TEST_ARGS"))))
+	case "statusline":
+		os.Exit(StatusLineMain())
 	}
 	os.Exit(m.Run())
 }

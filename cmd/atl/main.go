@@ -10,8 +10,14 @@ import (
 
 func main() {
 	// Fast path: Claude Code hooks must not pay for cobra or the CLI setup.
-	if len(os.Args) > 1 && os.Args[1] == "hook" {
-		os.Exit(hook.Main(os.Args[2:]))
+	// So must Claude Code's status line command.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "hook":
+			os.Exit(hook.Main(os.Args[2:]))
+		case "statusline":
+			os.Exit(hook.StatusLineMain())
+		}
 	}
 	os.Exit(cli.Execute())
 }

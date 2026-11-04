@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -35,13 +36,22 @@ func HookCommand(atlBin, event string) string {
 	return ShellQuote(atlBin) + " hook " + event
 }
 
-// WriteSettings writes <taskDir>/.claude/settings.json with atelier's hooks.
+// StatusLineCommand returns atelier's Claude Code status line command: the
+// shell-quoted atlBin followed by " statusline".
+func StatusLineCommand(atlBin string) string {
+	return ShellQuote(atlBin) + " statusline"
+}
+
+// WriteSettings writes <taskDir>/.claude/settings.json with atelier's hooks
+// and status line ("statusLine": {"type":"command","command":"<atl> statusline"}).
 //
 // It is safe to re-run: if the file exists and is valid JSON, every other
 // top-level key and every non-atelier hook entry is kept, and existing
 // atelier entries are replaced (so there are never duplicates and the atl
-// path stays current). A file that is not a valid settings object is
-// backed up to settings.json.bak and replaced. The write is atomic.
+// path stays current). A statusLine atelier did not write is left alone;
+// atelier's own is updated in place (other keys in it, e.g. padding, are
+// kept). A file that is not a valid settings object is backed up to
+// settings.json.bak and replaced. The write is atomic.
 func WriteSettings(taskDir, atlBin string) error {
 	path, root, err := loadSettings(taskDir)
 	if err != nil {
@@ -55,7 +65,38 @@ func WriteSettings(taskDir, atlBin string) error {
 		setAtelierHook(hooks, ev.Name, ev.Matcher, ev.Name, atlBin)
 	}
 	root["hooks"] = hooks
+	setStatusLine(root, atlBin)
 	return saveSettings(path, root)
+}
+
+// setStatusLine sets root's statusLine to atelier's command unless it holds
+// one atelier did not write (see isAtelierStatusLine).
+func setStatusLine(root map[string]any, atlBin string) {
+	entry := map[string]any{}
+	if cur, ok := root["statusLine"]; ok {
+		if !isAtelierStatusLine(cur, atlBin) {
+			return
+		}
+		entry = cur.(map[string]any)
+	}
+	entry["type"] = "command"
+	entry["command"] = StatusLineCommand(atlBin)
+	root["statusLine"] = entry
+}
+
+// isAtelierStatusLine reports whether v is a statusLine object written by
+// atelier: a "command" that is "<binary> statusline" with an atl binary (as
+// for hook commands, see isAtelierCommand).
+func isAtelierStatusLine(v any, atlBin string) bool {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	if typ, ok := m["type"]; ok && typ != "command" {
+		return false
+	}
+	cmd, ok := m["command"].(string)
+	return ok && isAtlInvocation(cmd, atlBin, "statusline")
 }
 
 // setAtelierHook replaces atelier's `hook <cmdEvent>` entries under the
@@ -182,9 +223,16 @@ func removeAtelierHooks(groups []any, event, atlBin string) []any {
 // or not) or a path whose basename is an atl binary name (see isAtlName),
 // so entries written by a renamed or moved binary are recognised too.
 func isAtelierCommand(cmd, event, atlBin string) bool {
+	return isAtlInvocation(cmd, atlBin, "hook", event)
+}
+
+// isAtlInvocation reports whether cmd is "<binary> <args...>" (nothing
+// else) where the binary word is atlBin (quoted or not) or a path whose
+// basename is an atl binary name (see isAtlName).
+func isAtlInvocation(cmd, atlBin string, args ...string) bool {
 	cmd = strings.TrimSpace(cmd)
 	raw, word := firstWord(cmd)
-	if rest := strings.Fields(cmd[len(raw):]); raw == "" || len(rest) != 2 || rest[0] != "hook" || rest[1] != event {
+	if raw == "" || !slices.Equal(strings.Fields(cmd[len(raw):]), args) {
 		return false
 	}
 	return raw == ShellQuote(atlBin) || word == atlBin || isAtlName(filepath.Base(word))
