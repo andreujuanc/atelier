@@ -167,7 +167,7 @@ func handleMain(p config.Paths, stdout, stderr io.Writer, env func(string) strin
 		logError(p, stderr, event, in.SessionID, err)
 	}
 	if event == EventSessionStart && taskID != 0 && stdout != nil {
-		if err := writeSessionContext(ctx, stdout, st, p, taskID, now); err != nil {
+		if err := writeSessionContext(ctx, stdout, st, p, taskID, env(envContextVar), now); err != nil {
 			logError(p, stderr, event, in.SessionID, fmt.Errorf("session context: %w", err))
 		}
 	}

@@ -302,7 +302,9 @@ exit 0 (fail open) and log.
 
 SessionStart output: for sessions inside a task, after the DB update, print one JSON line
 `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":...}}` (task, repos + base, ro warning, port offset,
-≤5 latest notes, ≤2500 chars). This is the ONLY stdout output of `atl hook`.
+≤5 latest notes, ≤2500 chars). If the hook's environment has a non-blank `ATL_CONTEXT`, its sanitised text (newlines
+kept, other control/format chars → spaces, ≤1000 bytes) is added as an "Environment notes (ATL_CONTEXT)" section after the
+port offset; notes are dropped before it is cut. This is the ONLY stdout output of `atl hook`.
 
 Performance/robustness: no cobra on this path; one DB open; total budget <50ms. All errors appended to
 `Paths.HookLog()` with timestamp + event; exit 0 except the ro block. Never prints to stdout.
