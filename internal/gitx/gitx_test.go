@@ -13,6 +13,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // TestMain isolates git from the user's global/system config and supplies an
@@ -828,5 +829,105 @@ func TestUntracked(t *testing.T) {
 	}
 	if _, err := Untracked(ctx, filepath.Join(f.root, "nope")); err == nil {
 		t.Fatal("want error for missing worktree")
+	}
+}
+
+func TestLastCommitAndRefExists(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, base := f.addWorktree(t, ctx, "lc")
+	sha, subj, when, err := LastCommit(ctx, wt)
+	if err != nil || sha != base || subj != "initial" || when.IsZero() {
+		t.Fatalf("LastCommit = %q %q %v %v", sha, subj, when, err)
+	}
+	commitFile(t, wt, "a.txt", "a\n", "feat: subject with\x01 odd bytes and | pipes")
+	sha, subj, when, err = LastCommit(ctx, wt)
+	if err != nil || sha != git(t, wt, "rev-parse", "HEAD") || subj != "feat: subject with\x01 odd bytes and | pipes" {
+		t.Fatalf("LastCommit = %q %q %v", sha, subj, err)
+	}
+	if d := time.Since(when); d < -time.Minute || d > time.Hour {
+		t.Fatalf("when = %v", when)
+	}
+	if _, _, _, err := LastCommit(ctx, filepath.Join(f.root, "nope")); err == nil {
+		t.Fatal("LastCommit on missing dir succeeded")
+	}
+
+	ref := "refs/remotes/origin/atl/lc"
+	ok, err := RefExists(ctx, wt, ref)
+	if err != nil || ok {
+		t.Fatalf("before push: %v, %v", ok, err)
+	}
+	git(t, wt, "push", "-q", "origin", "atl/lc")
+	for _, dir := range []string{wt, f.repo} { // refs are shared by worktrees
+		ok, err = RefExists(ctx, dir, ref)
+		if err != nil || !ok {
+			t.Fatalf("after push (%s): %v, %v", dir, ok, err)
+		}
+	}
+	if ok, err := RefExists(ctx, wt, "refs/remotes/origin/atl"); err != nil || ok {
+		t.Fatalf("prefix ref: %v, %v", ok, err)
+	}
+	if _, err := RefExists(ctx, filepath.Join(f.root, "nope"), ref); err == nil {
+		t.Fatal("RefExists on missing dir succeeded")
+	}
+}
+
+func TestUniqueCommits(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "u")
+	want := func(label string, n int) {
+		t.Helper()
+		got, err := UniqueCommits(ctx, f.repo, "atl/u")
+		if err != nil || got != n {
+			t.Fatalf("%s: UniqueCommits = %d, %v; want %d", label, got, err, n)
+		}
+	}
+	want("no commits", 0)
+	commitFile(t, wt, "a", "a\n", "a")
+	want("one commit", 1)
+	commitFile(t, wt, "b", "b\n", "b")
+	want("two commits", 2)
+
+	// Pushed (and the remote-tracking ref present locally) → nothing lost.
+	git(t, wt, "push", "-q", "origin", "atl/u")
+	want("pushed", 0)
+	commitFile(t, wt, "c", "c\n", "c")
+	want("one past the push", 1)
+
+	// Contained in another local branch → nothing lost.
+	git(t, f.repo, "branch", "keep", "atl/u")
+	want("in another branch", 0)
+	commitFile(t, wt, "d", "d\n", "d")
+	want("one past the other branch", 1)
+
+	// Any remote-tracking ref counts, whatever its name.
+	git(t, f.repo, "branch", "-D", "keep")
+	git(t, wt, "push", "-q", "origin", "atl/u:other", ":atl/u")
+	if _, err := RevParse(ctx, f.repo, "refs/remotes/origin/atl/u"); err == nil {
+		t.Fatal("origin/atl/u still exists")
+	}
+	want("pushed under another name", 0)
+
+	if _, err := UniqueCommits(ctx, f.repo, "atl/missing"); err == nil {
+		t.Fatal("missing branch: expected error")
+	}
+}
+
+// Only local refs are consulted: commits pushed to origin are unique until a
+// fetch creates the remote-tracking ref.
+func TestUniqueCommitsLocalRefsOnly(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "v")
+	commitFile(t, wt, "a", "a\n", "a")
+	// Push without updating the remote-tracking ref.
+	git(t, wt, "push", "-q", f.origin, "atl/v")
+	if n, err := UniqueCommits(ctx, f.repo, "atl/v"); err != nil || n != 1 {
+		t.Fatalf("before fetch: %d, %v", n, err)
+	}
+	git(t, f.repo, "fetch", "-q", "origin")
+	if n, err := UniqueCommits(ctx, f.repo, "atl/v"); err != nil || n != 0 {
+		t.Fatalf("after fetch: %d, %v", n, err)
 	}
 }

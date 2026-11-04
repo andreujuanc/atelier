@@ -309,6 +309,14 @@ func (b *trackedBackend) AddRepo(ctx context.Context, ref string, r app.RepoArg,
 	return b.Backend.AddRepo(ctx, ref, r, noFetch)
 }
 
+func (b *trackedBackend) AddNote(ctx context.Context, ref, body, author string) (*model.Note, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.AddNote(ctx, ref, body, author)
+}
+
 // lineWriter calls send for each complete non-empty line written, in
 // order (send is called with the writer's lock held).
 type lineWriter struct {

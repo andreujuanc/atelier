@@ -10,14 +10,14 @@ import (
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
-const sessionCols = `id, task_id, claude_session_id, tmux_target, name, state, created_at, last_event_at`
+const sessionCols = `id, task_id, claude_session_id, tmux_target, name, state, created_at, last_event_at, transcript_path`
 
 func scanSession(sc scanner) (*model.Session, error) {
 	var ss model.Session
 	var state string
 	var created, last int64
 	if err := sc.Scan(&ss.ID, &ss.TaskID, &ss.ClaudeSessionID, &ss.TmuxTarget, &ss.Name,
-		&state, &created, &last); err != nil {
+		&state, &created, &last, &ss.TranscriptPath); err != nil {
 		return nil, err
 	}
 	ss.State = model.SessionState(state)
@@ -59,10 +59,10 @@ func (s *Store) CreateSession(ctx context.Context, sess *model.Session) error {
 	}
 	created, last := normTime(sess.CreatedAt), normTime(sess.LastEventAt)
 	res, err := s.db.ExecContext(ctx, `INSERT INTO sessions
-		(task_id, claude_session_id, tmux_target, name, state, created_at, last_event_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		(task_id, claude_session_id, tmux_target, name, state, created_at, last_event_at, transcript_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.TaskID, sess.ClaudeSessionID, sess.TmuxTarget, sess.Name, string(sess.State),
-		toMS(created), toMS(last))
+		toMS(created), toMS(last), sess.TranscriptPath)
 	if err != nil {
 		return fmt.Errorf("store: insert session for task %d: %w", sess.TaskID, err)
 	}
@@ -266,4 +266,24 @@ func (s *Store) TouchSession(ctx context.Context, id int64, at time.Time) error 
 		return err
 	}
 	return checkAffected(res, "session", id)
+}
+
+// SetTranscriptPath records the Claude Code transcript file of a session
+// (reported by every SessionStart hook), leaving every other column
+// untouched.
+func (s *Store) SetTranscriptPath(ctx context.Context, id int64, path string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET transcript_path = ? WHERE id = ?`, path, id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res, "session", id)
+}
+
+// SetTranscriptPathIfEmpty records a session's transcript file only if none
+// is recorded yet (hooks other than SessionStart fill a gap but never
+// overwrite). An unknown id is not an error.
+func (s *Store) SetTranscriptPathIfEmpty(ctx context.Context, id int64, path string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET transcript_path = ?
+		WHERE id = ? AND transcript_path = ''`, path, id)
+	return err
 }

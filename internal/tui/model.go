@@ -33,6 +33,7 @@ const (
 	modeForm
 	modeConfirm
 	modePicker
+	modeNote
 )
 
 // confirmState is a pending done/cancel confirmation.
@@ -171,6 +172,10 @@ type Model struct {
 	// picker belongs to the new-task form.
 	pickTask *app.TaskView
 	repos    []string // last AvailableRepos result
+	// noteInput is the `m` note being typed for task noteID/noteSlug.
+	noteInput textinput.Model
+	noteID    int64
+	noteSlug  string
 	// pending holds dirty refusals that arrived outside normal mode; they
 	// are shown once back in normal mode.
 	pending []*confirmState
@@ -201,6 +206,11 @@ func New(ctx context.Context, be Backend) *Model {
 	fi.Prompt = "/"
 	fi.Placeholder = "filter"
 	fi.Cursor.SetMode(cursor.CursorStatic)
+	ni := textinput.New()
+	ni.Prompt = "note> "
+	ni.Placeholder = "a note for this task (enter saves, esc cancels)"
+	ni.Cursor.SetMode(cursor.CursorStatic)
+	ni.CharLimit = 2000
 	return &Model{
 		be:  be,
 		ctx: ctx,
@@ -210,6 +220,7 @@ func New(ctx context.Context, be Backend) *Model {
 		},
 		diffCmd:     func(slug string) *exec.Cmd { return exec.Command("atl", "diff", slug) },
 		filterInput: fi,
+		noteInput:   ni,
 		busy:        map[int64]string{},
 		width:       80,
 		height:      24,
@@ -599,6 +610,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		if m.form != nil {
 			m.form.setWidth(m.formInputWidth())
 		}
+		m.noteInput.Width = m.noteInputWidth()
 		return nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -801,9 +813,14 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return m.reload()
 	}
 
-	if m.mode == modeFilter {
+	switch m.mode {
+	case modeFilter:
 		var cmd tea.Cmd
 		m.filterInput, cmd = m.filterInput.Update(msg)
+		return cmd
+	case modeNote:
+		var cmd tea.Cmd
+		m.noteInput, cmd = m.noteInput.Update(msg)
 		return cmd
 	}
 	return nil
@@ -860,8 +877,47 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.confirmKey(key)
 	case modeFilter:
 		return m.filterKey(msg)
+	case modeNote:
+		return m.noteKey(msg)
 	}
 	return m.normalKey(key)
+}
+
+// noteKey handles a key while a note is being typed (`m`).
+func (m *Model) noteKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeNormal
+		m.noteInput.Blur()
+		m.setStatus("note cancelled")
+		return nil
+	case "enter":
+		body := strings.TrimSpace(m.noteInput.Value())
+		if body == "" {
+			m.mode = modeNormal
+			m.noteInput.Blur()
+			m.setStatus("note: empty, not saved")
+			return nil
+		}
+		if op, busy := m.busy[m.noteID]; busy {
+			m.setStatus("busy: " + op + "… (enter again to save, esc cancels)")
+			return nil
+		}
+		m.mode = modeNormal
+		m.noteInput.Blur()
+		id, slug, be, ctx := m.noteID, m.noteSlug, m.be, m.ctx
+		m.busy[id] = "note " + slug
+		return func() tea.Msg {
+			text := "note added to " + slug
+			if _, err := be.AddNote(ctx, slug, body, model.AuthorUser); err != nil {
+				return opMsg{id: id, op: "note", err: err}
+			}
+			return opMsg{id: id, op: "note", text: text}
+		}
+	}
+	var cmd tea.Cmd
+	m.noteInput, cmd = m.noteInput.Update(msg)
+	return cmd
 }
 
 func (m *Model) filterKey(msg tea.KeyMsg) tea.Cmd {
@@ -1034,14 +1090,14 @@ func (m *Model) normalKey(key string) tea.Cmd {
 
 	t := m.selected()
 	if t == nil {
-		if strings.ContainsAny(key, "srdcpaD12345") && len(key) == 1 || key == "enter" {
+		if strings.ContainsAny(key, "srdcpamD12345") && len(key) == 1 || key == "enter" {
 			m.setStatus("no task selected")
 		}
 		return nil
 	}
 	slug := t.Task.Slug
 	switch key {
-	case "enter", "s", "r", "d", "c", "p", "a", "1", "2", "3", "4", "5":
+	case "enter", "s", "r", "d", "c", "p", "a", "m", "1", "2", "3", "4", "5":
 		if op, busy := m.busy[t.Task.ID]; busy {
 			m.setStatus("busy: " + op + "…")
 			return nil
@@ -1100,6 +1156,13 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		}
 		tv := *t
 		return m.openPicker(&tv, "Add repos to "+clean(slug), nil, locked)
+	case "m":
+		m.noteID, m.noteSlug = t.Task.ID, slug
+		m.noteInput.SetValue("")
+		m.noteInput.Width = m.noteInputWidth()
+		m.noteInput.Focus()
+		m.mode = modeNote
+		return nil
 	case "D":
 		return m.exec("diff", slug, m.diffCmd(slug))
 	case "1", "2", "3", "4", "5":
@@ -1145,4 +1208,10 @@ func (m *Model) busyOps() []string {
 	}
 	sort.Strings(ops)
 	return ops
+}
+
+// noteInputWidth is the visible width of the `m` note input: the full
+// terminal width minus its prompt (0 or less means unlimited).
+func (m *Model) noteInputWidth() int {
+	return m.width - len(m.noteInput.Prompt) - 1
 }

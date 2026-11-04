@@ -36,11 +36,13 @@ type NewTaskOpts struct {
 	ExactRepos bool
 }
 
-// TaskView is a task with its sessions and (from Get only) repo status.
+// TaskView is a task with its sessions and (from Get only) repo status
+// and latest note.
 type TaskView struct {
 	Task       model.Task
 	Sessions   []model.Session
 	RepoStatus []RepoStatus
+	LatestNote *model.Note // Get only; nil if the task has no notes
 }
 
 // RepoStatus describes one repo of a task on disk.
@@ -426,8 +428,8 @@ func (a *App) List(ctx context.Context, statuses ...model.Status) ([]TaskView, e
 	return out, nil
 }
 
-// Get returns one task with sessions and repo status (dirty check for rw
-// worktrees).
+// Get returns one task with sessions, latest note and repo status (dirty
+// check for rw worktrees).
 func (a *App) Get(ctx context.Context, ref string) (*TaskView, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
@@ -437,7 +439,14 @@ func (a *App) Get(ctx context.Context, ref string) (*TaskView, error) {
 	if err != nil {
 		return nil, err
 	}
+	notes, err := a.Store.ListNotes(ctx, t.ID, 1)
+	if err != nil {
+		return nil, err
+	}
 	v := &TaskView{Task: *t, Sessions: sessions, RepoStatus: make([]RepoStatus, 0, len(t.Repos))}
+	if len(notes) > 0 {
+		v.LatestNote = &notes[0]
+	}
 	for _, r := range t.Repos {
 		rs := RepoStatus{Name: r.Name, Mode: r.Mode, Path: a.RepoPathFor(t, r)}
 		if r.Mode == model.ModeRW {
@@ -478,8 +487,9 @@ func (a *App) Cancel(ctx context.Context, ref string, force bool) (*model.Task, 
 
 // finish closes an open task: refuses if a rw worktree has uncommitted
 // changes (unless force), kills its tmux session, ends its sessions, runs
-// teardown, removes its worktrees (branches are kept) and generated files,
-// removes the task dir if it is then empty and sets the status. Worktrees
+// teardown, removes its worktrees and generated files, deletes each task
+// branch that has no unpushed commits (see cleanupBranch), removes the task
+// dir if it is then empty and sets the status. Worktrees
 // whose dir was deleted by hand are skipped by the dirty check but still
 // removed (pruned) so their branch is no longer "used by worktree".
 func (a *App) finish(ctx context.Context, ref string, force bool, to model.Status) (*model.Task, error) {
@@ -555,6 +565,7 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		}
 		a.warnf("teardown for task %s: %v", t.Slug, err)
 	}
+	var removed []wt
 	for _, w := range wts {
 		if err := gitx.RemoveWorktree(ctx, w.repo, w.path, force); err != nil {
 			if !force {
@@ -566,7 +577,12 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 				return fmt.Errorf("task %s: repo %s: %w", t.Slug, w.name, err)
 			}
 			a.warnf("remove worktree %s: %v", w.path, err)
+			continue
 		}
+		removed = append(removed, w)
+	}
+	for _, w := range removed {
+		a.cleanupBranch(ctx, w.name, w.repo, t.Branch)
 	}
 	dir := a.Paths.TaskDir(t.Slug)
 	if err := os.Remove(filepath.Join(dir, "CLAUDE.md")); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -583,4 +599,34 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		}
 	}
 	return a.Store.SetTaskStatus(ctx, t.ID, to)
+}
+
+// cleanupBranch deletes the task branch in the canonical repo after its
+// worktree was removed, but only when nothing would be lost: every commit on
+// it must be reachable from another local branch or a remote-tracking ref
+// (local refs only; nothing is fetched). Otherwise the branch is kept. A
+// missing branch is ignored; failures are warnings, never errors.
+func (a *App) cleanupBranch(ctx context.Context, name, repo, branch string) {
+	ok, err := gitx.RefExists(ctx, repo, "refs/heads/"+branch)
+	if err != nil {
+		a.warnf("branch %s in %s: %v", branch, name, err)
+		return
+	}
+	if !ok {
+		return
+	}
+	n, err := gitx.UniqueCommits(ctx, repo, branch)
+	if err != nil {
+		a.warnf("kept branch %s in %s: %v", branch, name, err)
+		return
+	}
+	if n > 0 {
+		fmt.Fprintf(a.out(), "kept branch %s in %s (%d unpushed commit(s))\n", branch, name, n)
+		return
+	}
+	if err := gitx.DeleteBranch(ctx, repo, branch); err != nil {
+		a.warnf("delete branch %s in %s: %v", branch, name, err)
+		return
+	}
+	fmt.Fprintf(a.out(), "deleted branch %s in %s\n", branch, name)
 }

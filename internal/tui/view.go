@@ -205,6 +205,9 @@ func (m *Model) detailLines(w, h int) []string {
 	if d := clean(firstLine(task.Description)); d != "" {
 		kv("desc", d)
 	}
+	if m.detail != nil && m.detail.Task.ID == task.ID && m.detail.LatestNote != nil {
+		add(m.noteLine(m.detail.LatestNote, w))
+	}
 
 	add("")
 	add(headerStyle.Render("Repos"))
@@ -268,6 +271,23 @@ func (m *Model) detailLines(w, h int) []string {
 	return out
 }
 
+// noteLine renders a task's latest note on one line of width w: a dim
+// "note:" label (styled like the other detail keys), the sanitized body
+// (truncated) and its dim age.
+func (m *Model) noteLine(n *model.Note, w int) string {
+	label := labelStyle.Render(fmt.Sprintf("%-9s", "note:")) + " "
+	age := "  " + humanAge(m.now().Sub(n.CreatedAt)) + " ago"
+	if n.Author == model.AuthorAssistant {
+		age += " (assistant)"
+	}
+	body := clean(n.Body)
+	bw := w - 10 - ansi.StringWidth(age)
+	if bw < 8 {
+		return label + trunc(body, w-10)
+	}
+	return label + trunc(body, bw) + dimStyle.Render(age)
+}
+
 func orDash(s string) string {
 	if s == "" {
 		return "-"
@@ -288,6 +308,8 @@ func (m *Model) statusLine(w int) string {
 		return trunc(s, w)
 	case m.mode == modeFilter:
 		return trunc(m.filterInput.View(), w)
+	case m.mode == modeNote:
+		return trunc(m.noteInput.View(), w)
 	}
 	if ops := m.busyOps(); len(ops) > 0 {
 		s = markStyle.Render("working… ") + clean(strings.Join(ops, ", "))
@@ -317,10 +339,12 @@ func (m *Model) helpLine(w int) string {
 		s = "type to filter  ↑/↓ move  space none/rw/ro  enter confirm  esc clear filter/cancel"
 	case modeFilter:
 		s = "type to filter  enter apply  esc clear  ↑/↓ move"
+	case modeNote:
+		s = "type a note for " + clean(m.noteSlug) + "  enter save  esc cancel"
 	case modeConfirm:
 		s = ""
 	default:
-		s = "n new  enter open  s session  r resume  a add repo  d done  c cancel  p pr  D diff  1-5 status  / filter  q quit"
+		s = "n new  enter open  s session  r resume  a add repo  m note  d done  c cancel  p pr  D diff  1-5 status  / filter  q quit"
 	}
 	return dimStyle.Render(trunc(s, w))
 }

@@ -546,7 +546,12 @@ func TestDone(t *testing.T) {
 	if n := worktreeCount(t, e.canonical("api")); n != 1 {
 		t.Fatalf("%d worktrees after done", n)
 	}
-	git(t, e.canonical("api"), "rev-parse", "--verify", "refs/heads/atl/finish-me")
+	// No commits of its own → the branch is deleted (only in rw repos).
+	assertNoBranch(t, e.canonical("api"), "atl/finish-me")
+	if out := e.app.Out.(*bytes.Buffer).String(); !strings.Contains(out, "deleted branch atl/finish-me in api\n") ||
+		strings.Contains(out, " in docs") {
+		t.Fatalf("output: %q", out)
+	}
 	if !exists(e.canonical("docs")) {
 		t.Fatal("ro repo removed")
 	}
@@ -575,7 +580,7 @@ func TestDone(t *testing.T) {
 }
 
 // A worktree dir deleted by hand does not block Done, and its metadata is
-// pruned so the (kept) branch can be deleted afterwards.
+// pruned so the branch (no commits of its own) can be deleted.
 func TestDoneMissingWorktree(t *testing.T) {
 	e := newTaskEnv(t)
 	ctx := context.Background()
@@ -598,8 +603,127 @@ func TestDoneMissingWorktree(t *testing.T) {
 	if n := worktreeCount(t, api); n != 1 {
 		t.Fatalf("%d worktrees after done", n)
 	}
-	git(t, api, "rev-parse", "--verify", "refs/heads/atl/gone") // Done keeps branches
-	git(t, api, "branch", "-D", "atl/gone")                     // no longer used by a worktree
+	assertNoBranch(t, api, "atl/gone")
+}
+
+func assertNoBranch(t *testing.T, repo, branch string) {
+	t.Helper()
+	if err := exec.Command("git", "-C", repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch).Run(); err == nil {
+		t.Fatalf("branch %s still exists in %s", branch, repo)
+	}
+}
+
+// commitIn commits a new file in the task's worktree for repo.
+func (e *taskEnv) commitIn(t *testing.T, slug, repo, file string) string {
+	t.Helper()
+	wt := e.app.Paths.WorktreePath(slug, repo)
+	if err := os.WriteFile(filepath.Join(wt, file), []byte(file+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, wt, "add", file)
+	git(t, wt, "commit", "-q", "-m", "add "+file)
+	return git(t, wt, "rev-parse", "HEAD")
+}
+
+// Done/Cancel delete the task branch only when every commit on it is
+// reachable from another local branch or a remote-tracking ref.
+func TestFinishBranchCleanup(t *testing.T) {
+	cases := []struct {
+		name    string
+		cancel  bool
+		prepare func(t *testing.T, e *taskEnv, slug string)
+		kept    bool
+	}{
+		{name: "no commits", prepare: func(*testing.T, *taskEnv, string) {}},
+		{name: "pushed", prepare: func(t *testing.T, e *taskEnv, slug string) {
+			e.commitIn(t, slug, "api", "f")
+			wt := e.app.Paths.WorktreePath(slug, "api")
+			// Plain push to the URL (no tracking ref), then fetch creates
+			// refs/remotes/origin/atl/<slug>.
+			git(t, wt, "push", "-q", e.origin("api"), "atl/"+slug)
+			git(t, e.canonical("api"), "fetch", "-q", "origin")
+			git(t, e.canonical("api"), "rev-parse", "--verify", "refs/remotes/origin/atl/"+slug)
+		}},
+		{name: "unpushed", kept: true, prepare: func(t *testing.T, e *taskEnv, slug string) {
+			e.commitIn(t, slug, "api", "f")
+		}},
+		{name: "in other branch", prepare: func(t *testing.T, e *taskEnv, slug string) {
+			sha := e.commitIn(t, slug, "api", "f")
+			git(t, e.canonical("api"), "branch", "other", sha)
+		}},
+		{name: "cancel no commits", cancel: true, prepare: func(*testing.T, *taskEnv, string) {}},
+		{name: "cancel unpushed", cancel: true, kept: true, prepare: func(t *testing.T, e *taskEnv, slug string) {
+			e.commitIn(t, slug, "api", "f")
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := newTaskEnv(t)
+			ctx := context.Background()
+			e.addRepo(t, "api", "main")
+			task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "br", Repos: []RepoArg{{"api", model.ModeRW}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.prepare(t, e, task.Slug)
+			e.app.Out.(*bytes.Buffer).Reset()
+			if c.cancel {
+				_, err = e.app.Cancel(ctx, task.Slug, false)
+			} else {
+				_, err = e.app.Done(ctx, task.Slug, false)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := e.app.Out.(*bytes.Buffer).String()
+			if c.kept {
+				git(t, e.canonical("api"), "rev-parse", "--verify", "refs/heads/atl/br")
+				if !strings.Contains(out, "kept branch atl/br in api (1 unpushed commit(s))") {
+					t.Fatalf("output: %q", out)
+				}
+			} else {
+				assertNoBranch(t, e.canonical("api"), "atl/br")
+				if !strings.Contains(out, "deleted branch atl/br in api") {
+					t.Fatalf("output: %q", out)
+				}
+			}
+		})
+	}
+}
+
+// --force discards a dirty worktree but still protects unpushed commits.
+func TestDoneForceKeepsUnpushedBranch(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "web", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "forced",
+		Repos: []RepoArg{{"api", model.ModeRW}, {"web", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.commitIn(t, task.Slug, "api", "f")
+	e.commitIn(t, task.Slug, "api", "g")
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	if err := os.WriteFile(filepath.Join(wt, "wip"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.app.Done(ctx, task.Slug, false); err == nil {
+		t.Fatal("dirty Done succeeded")
+	}
+	if _, err := e.app.Done(ctx, task.Slug, true); err != nil {
+		t.Fatal(err)
+	}
+	if exists(wt) || worktreeCount(t, e.canonical("api")) != 1 {
+		t.Fatal("worktree not removed")
+	}
+	git(t, e.canonical("api"), "rev-parse", "--verify", "refs/heads/atl/forced")
+	assertNoBranch(t, e.canonical("web"), "atl/forced")
+	out := e.app.Out.(*bytes.Buffer).String()
+	if !strings.Contains(out, "kept branch atl/forced in api (2 unpushed commit(s))") ||
+		!strings.Contains(out, "deleted branch atl/forced in web") {
+		t.Fatalf("output: %q", out)
+	}
 }
 
 func TestCancelLeavesNonEmptyDir(t *testing.T) {
@@ -636,7 +760,10 @@ func TestCancelLeavesNonEmptyDir(t *testing.T) {
 	if got.Status != model.StatusCancelled {
 		t.Fatalf("status %s", got.Status)
 	}
-	git(t, e.canonical("api"), "rev-parse", "--verify", "refs/heads/atl/drop")
+	git(t, e.canonical("api"), "rev-parse", "--verify", "refs/heads/atl/drop") // unpushed commit
+	if out := e.app.Out.(*bytes.Buffer).String(); !strings.Contains(out, "kept branch atl/drop in api (1 unpushed commit(s))") {
+		t.Fatalf("output: %q", out)
+	}
 }
 
 func TestPrepareTaskDir(t *testing.T) {

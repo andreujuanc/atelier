@@ -293,6 +293,25 @@ func DeleteBranch(ctx context.Context, repo, branch string) error {
 	return err
 }
 
+// UniqueCommits returns the number of commits reachable from the local
+// branch that are not reachable from any other local branch or any
+// remote-tracking ref, i.e. the commits that deleting the branch would lose.
+// It only looks at local refs (no fetch). A missing branch is an error.
+func UniqueCommits(ctx context.Context, repo, branch string) (int, error) {
+	// --exclude patterns are relative to refs/heads/ for --branches and
+	// apply to the next --branches only.
+	out, err := run(ctx, repo, "rev-list", "--count", "refs/heads/"+branch,
+		"--not", "--exclude="+branch, "--branches", "--remotes")
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(out)
+	if err != nil {
+		return 0, fmt.Errorf("git rev-list: unexpected output %q", out)
+	}
+	return n, nil
+}
+
 // IsDirty reports whether the worktree has uncommitted changes, counting
 // untracked files (regardless of status.showUntrackedFiles). It takes no
 // optional locks, so it is safe to poll while other git commands run.
@@ -414,4 +433,37 @@ func Untracked(ctx context.Context, worktree string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// LastCommit returns the sha, subject and committer date of HEAD in
+// worktree.
+func LastCommit(ctx context.Context, worktree string) (sha, subject string, when time.Time, err error) {
+	out, err := run(ctx, worktree, "-c", "log.showSignature=false", "log", "-1", "--format=%H%x00%ct%x00%s", "HEAD", "--")
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	parts := strings.SplitN(out, "\x00", 3)
+	if len(parts) != 3 {
+		return "", "", time.Time{}, fmt.Errorf("git log: unexpected output %q", out)
+	}
+	secs, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("git log: unexpected date %q", parts[1])
+	}
+	return parts[0], parts[2], time.Unix(secs, 0).UTC(), nil
+}
+
+// RefExists reports whether the fully qualified ref (e.g.
+// "refs/remotes/origin/atl/x") exists in repo. It never touches the
+// network.
+func RefExists(ctx context.Context, repo, ref string) (bool, error) {
+	_, err := run(ctx, repo, "show-ref", "--verify", "--quiet", ref)
+	if err == nil {
+		return true, nil
+	}
+	var ge *Error
+	if errors.As(err, &ge) && ge.ExitCode == 1 && ge.Stderr == "" {
+		return false, nil
+	}
+	return false, err
 }

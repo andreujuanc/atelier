@@ -69,6 +69,17 @@ CREATE INDEX sessions_claude ON sessions(claude_session_id);`,
 	// for the session, so Recover can compare-and-set against the launch it
 	// observed even if tmux reuses a window id after a server restart.
 	`ALTER TABLE sessions ADD COLUMN launch_seq INTEGER NOT NULL DEFAULT 0;`,
+	// v3: the Claude Code transcript of a session (from hook input) and
+	// free-form notes on a task (atelier assistant).
+	`ALTER TABLE sessions ADD COLUMN transcript_path TEXT NOT NULL DEFAULT '';
+CREATE TABLE task_notes (
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  body TEXT NOT NULL,
+  author TEXT NOT NULL CHECK (author IN ('user','assistant')),
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX task_notes_task ON task_notes(task_id);`,
 }
 
 // DefaultBusyTimeout is how long Open waits on a locked database.

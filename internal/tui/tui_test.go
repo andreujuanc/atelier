@@ -37,8 +37,10 @@ type fakeBackend struct {
 	// repos is AvailableRepos' result; projRepos ProjectRepos' per project.
 	repos     []string
 	projRepos map[string][]app.RepoArg
-	addErr    map[string]error    // AddRepo error per repo name
-	addOut    func(r app.RepoArg) // called by AddRepo (to write App.Out)
+	addErr    map[string]error       // AddRepo error per repo name
+	addOut    func(r app.RepoArg)    // called by AddRepo (to write App.Out)
+	notes     map[string]*model.Note // latest note per slug (Get's LatestNote)
+	noteErr   error
 }
 
 func (f *fakeBackend) rec(name string, args ...any) { f.calls = append(f.calls, call{name, args}) }
@@ -81,6 +83,7 @@ func (f *fakeBackend) Get(ctx context.Context, ref string) (*app.TaskView, error
 				}
 				v.RepoStatus = append(v.RepoStatus, rs)
 			}
+			v.LatestNote = f.notes[ref]
 			return &v, nil
 		}
 	}
@@ -180,6 +183,19 @@ func (f *fakeBackend) AddRepo(ctx context.Context, ref string, r app.RepoArg, no
 		}
 	}
 	return nil, fmt.Errorf("task %s not found", ref)
+}
+
+func (f *fakeBackend) AddNote(ctx context.Context, ref, body, author string) (*model.Note, error) {
+	f.rec("AddNote", ref, body, author)
+	if f.noteErr != nil {
+		return nil, f.noteErr
+	}
+	if f.notes == nil {
+		f.notes = map[string]*model.Note{}
+	}
+	n := &model.Note{ID: int64(len(f.calls)), Body: body, Author: author, CreatedAt: t0.Add(55 * time.Minute)}
+	f.notes[ref] = n
+	return n, nil
 }
 
 var t0 = time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -1768,4 +1784,143 @@ func TestProjectReposWhilePickerOpen(t *testing.T) {
 	if got := summary(m.form.repos); got != "api(rw) lib(ro) web(rw)" || m.form.preProject != "shop" {
 		t.Fatalf("form repos after confirm %q (pre %q)", got, m.form.preProject)
 	}
+}
+
+func TestNoteDisplay(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), notes: map[string]*model.Note{
+		"alpha": {ID: 1, Body: "line one\nline\x1b[31m two " + strings.Repeat("long ", 40), Author: model.AuthorUser, CreatedAt: t0.Add(30 * time.Minute)},
+	}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "alpha")
+	v := plainView(m)
+	var line string
+	for _, l := range strings.Split(v, "\n") {
+		if strings.Contains(l, "note:") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("no note line:\n%s", v)
+	}
+	if !strings.Contains(line, "note:     line one line [31m two long") || !strings.Contains(line, "…  30m ago") {
+		t.Fatalf("note line %q", line)
+	}
+	if strings.Contains(m.View(), "\x1b[31m two") {
+		t.Fatal("unsanitized note rendered")
+	}
+	for _, l := range strings.Split(v, "\n") {
+		if ansi.StringWidth(l) > 120 {
+			t.Fatalf("line wider than terminal: %q", l)
+		}
+	}
+
+	// assistant notes are marked; tasks without notes show none
+	fb.notes["alpha"] = &model.Note{ID: 2, Body: "short", Author: model.AuthorAssistant, CreatedAt: t0.Add(59 * time.Minute)}
+	m.Update(listTickMsg{})
+	drain(m, m.reload())
+	if v := plainView(m); !strings.Contains(v, "note:     short  1m ago (assistant)") {
+		t.Fatalf("assistant note:\n%s", v)
+	}
+	selectTask(t, m, "beta")
+	if v := plainView(m); strings.Contains(v, "note:") {
+		t.Fatalf("note shown for a task without notes:\n%s", v)
+	}
+}
+
+func TestNoteKey(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+	if !strings.Contains(plainView(m), "m note") {
+		t.Fatal("help lacks m")
+	}
+
+	// esc cancels
+	key(m, "m")
+	if m.mode != modeNote {
+		t.Fatalf("mode = %v", m.mode)
+	}
+	typeText(m, "nope")
+	key(m, "esc")
+	if m.mode != modeNormal || fb.count("AddNote") != 0 || !strings.Contains(m.status, "cancelled") {
+		t.Fatalf("esc: mode %v calls %d status %q", m.mode, fb.count("AddNote"), m.status)
+	}
+
+	// enter saves (async, busy while running), typed keys don't trigger commands
+	key(m, "m")
+	if v := plainView(m); !strings.Contains(v, "note>") || !strings.Contains(v, "enter save") {
+		t.Fatalf("note input not shown:\n%s", v)
+	}
+	typeText(m, "d s q waiting on review")
+	if m.mode != modeNote || m.confirm != nil || fb.count("NewSession") != 0 {
+		t.Fatal("keys leaked to normal mode")
+	}
+	cmd := press(m, "enter")
+	if m.mode != modeNormal || m.busy[3] != "note gamma" {
+		t.Fatalf("after enter: mode %v busy %v", m.mode, m.busy)
+	}
+	if !strings.Contains(plainView(m), "working… note gamma") {
+		t.Fatalf("busy not shown:\n%s", plainView(m))
+	}
+	drain(m, cmd)
+	c := fb.last("AddNote")
+	if c == nil || c.args[0] != "gamma" || c.args[1] != "d s q waiting on review" || c.args[2] != model.AuthorUser {
+		t.Fatalf("AddNote call %+v", c)
+	}
+	if len(m.busy) != 0 || m.status != "note added to gamma" {
+		t.Fatalf("busy %v status %q", m.busy, m.status)
+	}
+	if v := plainView(m); !strings.Contains(v, "note:     d s q waiting on review  5m ago") {
+		t.Fatalf("new note not shown after reload:\n%s", v)
+	}
+
+	// empty note is not saved; reopened input starts empty
+	key(m, "m")
+	if m.noteInput.Value() != "" {
+		t.Fatalf("input not reset: %q", m.noteInput.Value())
+	}
+	// resizing while typing resizes the input too
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	if want := 80 - len(m.noteInput.Prompt) - 1; m.noteInput.Width != want {
+		t.Fatalf("note input width after resize = %d, want %d", m.noteInput.Width, want)
+	}
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	key(m, " ")
+	key(m, "enter")
+	if fb.count("AddNote") != 1 || !strings.Contains(m.status, "empty") {
+		t.Fatalf("empty note: calls %d status %q", fb.count("AddNote"), m.status)
+	}
+
+	// errors land in the status line
+	fb.noteErr = errors.New("database is locked")
+	key(m, "m")
+	typeText(m, "x")
+	key(m, "enter")
+	if !m.statusErr || !strings.Contains(m.status, "note: database is locked") {
+		t.Fatalf("error status %q", m.status)
+	}
+
+	// busy task: m refused
+	m.busy[3] = "pr gamma"
+	key(m, "m")
+	if m.mode != modeNormal || !strings.Contains(m.status, "busy") {
+		t.Fatalf("busy: mode %v status %q", m.mode, m.status)
+	}
+}
+
+// selectTask selects the task with slug and loads its detail (as the
+// debounced selection fetch would).
+func selectTask(t *testing.T, m *Model, slug string) {
+	t.Helper()
+	for i := 0; i < len(m.rows) && (m.selected() == nil || m.selected().Task.Slug != slug); i++ {
+		key(m, "k")
+	}
+	for i := 0; i < len(m.rows) && (m.selected() == nil || m.selected().Task.Slug != slug); i++ {
+		key(m, "j")
+	}
+	sel := m.selected()
+	if sel == nil || sel.Task.Slug != slug {
+		t.Fatalf("cannot select %s (rows %v)", slug, rowSlugs(m))
+	}
+	drain(m, m.detailCmd(sel.Task.ID, slug))
 }

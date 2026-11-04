@@ -29,6 +29,7 @@ type Backend interface {
 	ProjectRepos(name string) ([]app.RepoArg, error)
 	AvailableRepos(ctx context.Context) ([]string, error)
 	AddRepo(ctx context.Context, ref string, r app.RepoArg, noFetch bool) (*model.Task, error)
+	AddNote(ctx context.Context, ref, body, author string) (*model.Note, error)
 	TaskDir(slug string) string
 }
 

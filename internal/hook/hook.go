@@ -32,7 +32,8 @@ type Input struct {
 	Message          string          `json:"message"`           // Notification
 	NotificationType string          `json:"notification_type"` // Notification: permission_prompt | idle_prompt | ...
 	ToolName         string          `json:"tool_name"`
-	ToolInput        json.RawMessage `json:"tool_input"` // file_path / notebook_path
+	ToolInput        json.RawMessage `json:"tool_input"`      // file_path / notebook_path
+	TranscriptPath   string          `json:"transcript_path"` // every event: the session's transcript JSONL
 }
 
 // Hook event names handled by atelier.
@@ -324,10 +325,33 @@ func transition(ctx context.Context, event string, in Input, env func(string) st
 			return err
 		}
 		return st.CreateSession(ctx, &model.Session{TaskID: task.ID, ClaudeSessionID: in.SessionID,
-			State: model.StateIdle, CreatedAt: now, LastEventAt: now})
+			State: model.StateIdle, CreatedAt: now, LastEventAt: now, TranscriptPath: in.TranscriptPath})
 	}
+	if err := transitionState(ctx, event, in, sess.ID, st, now); err != nil {
+		return err
+	}
+	return recordTranscript(ctx, event, in, sess, st)
+}
 
-	id := sess.ID
+// recordTranscript stores the event's transcript path: SessionStart (any
+// source: /clear, resume and compaction may start a new file) overwrites,
+// other events only fill an empty one. At most one statement, and none
+// when the row already has the value.
+func recordTranscript(ctx context.Context, event string, in Input, sess *model.Session, st *store.Store) error {
+	if in.TranscriptPath == "" || in.TranscriptPath == sess.TranscriptPath {
+		return nil
+	}
+	if event == EventSessionStart {
+		return st.SetTranscriptPath(ctx, sess.ID, in.TranscriptPath)
+	}
+	if sess.TranscriptPath != "" {
+		return nil
+	}
+	return st.SetTranscriptPathIfEmpty(ctx, sess.ID, in.TranscriptPath)
+}
+
+// transitionState applies event's state change to session id.
+func transitionState(ctx context.Context, event string, in Input, id int64, st *store.Store, now time.Time) error {
 	switch event {
 	case EventSessionStart:
 		if in.Source == "compact" {

@@ -718,7 +718,7 @@ func TestMainProcess(t *testing.T) {
 		if raceEnabled {
 			t.Skip("race-instrumented binaries start too slowly to measure hook latency")
 		}
-		in := `{"session_id":"c-main","cwd":"` + f.p.TaskDir("fix") + `","hook_event_name":"SessionStart","source":"startup"}`
+		in := `{"session_id":"c-main","cwd":"` + f.p.TaskDir("fix") + `","hook_event_name":"SessionStart","source":"startup","transcript_path":"/tmp/t.jsonl"}`
 		runMain(t, "SessionStart", in) // warm the page cache
 		var walls []time.Duration
 		for i := 0; i < 7; i++ {
@@ -758,5 +758,50 @@ func TestROGuardRepoAddedLater(t *testing.T) {
 	exit, msg, err := Handle(ctx, EventPreToolUse, in, env, f.st, f.p, now)
 	if exit != 2 || err != nil || !strings.Contains(msg, "inside read-only repo docs2") {
 		t.Fatalf("after add: %d %q %v", exit, msg, err)
+	}
+}
+
+// TestTranscriptPath: SessionStart (every source) stores transcript_path;
+// other events fill it only while empty and never overwrite it.
+func TestTranscriptPath(t *testing.T) {
+	ctx := context.Background()
+	f := setup(t)
+	s := f.session(t, model.StateIdle, "")
+	env := envOf(map[string]string{"ATL_SESSION": itoa(s.ID), "ATL_TASK": "fix"})
+	cwd := f.p.TaskDir("fix")
+	step := func(event string, in Input, want string) {
+		t.Helper()
+		in.Cwd = cwd
+		if _, _, err := Handle(ctx, event, in, env, f.st, f.p, now); err != nil {
+			t.Fatalf("%s: %v", event, err)
+		}
+		if got := f.get(t, s.ID).TranscriptPath; got != want {
+			t.Fatalf("after %s %+v: transcript = %q, want %q", event, in, got, want)
+		}
+	}
+	step(EventUserPromptSubmit, Input{}, "")                                               // no path: nothing
+	step(EventUserPromptSubmit, Input{TranscriptPath: "/t/early.jsonl"}, "/t/early.jsonl") // fills empty
+	step(EventStop, Input{TranscriptPath: "/t/other.jsonl"}, "/t/early.jsonl")             // never overwrites
+	step(EventSessionStart, Input{SessionID: "c1", Source: "startup", TranscriptPath: "/t/c1.jsonl"}, "/t/c1.jsonl")
+	step(EventNotification, Input{SessionID: "c1", Message: "x", TranscriptPath: "/t/zz.jsonl"}, "/t/c1.jsonl")
+	step(EventPostToolUse, Input{SessionID: "c1", TranscriptPath: "/t/zz.jsonl"}, "/t/c1.jsonl")
+	step(EventSessionEnd, Input{SessionID: "c1", TranscriptPath: "/t/zz.jsonl"}, "/t/c1.jsonl")
+	step(EventSessionStart, Input{SessionID: "c2", Source: "resume", TranscriptPath: "/t/c2.jsonl"}, "/t/c2.jsonl")
+	step(EventSessionStart, Input{SessionID: "c3", Source: "compact", TranscriptPath: "/t/c3.jsonl"}, "/t/c3.jsonl")
+	step(EventSessionStart, Input{SessionID: "c4", Source: "clear"}, "/t/c3.jsonl") // empty path keeps the old one
+	if g := f.get(t, s.ID); g.ClaudeSessionID != "c4" || g.State != model.StateIdle {
+		t.Fatalf("row = %+v", g)
+	}
+
+	// A session row created by SessionStart (claude not launched by atl)
+	// gets the path at creation.
+	env2 := envOf(map[string]string{"ATL_TASK": "fix"})
+	in := Input{SessionID: "fresh", Source: "startup", Cwd: cwd, TranscriptPath: "/t/fresh.jsonl"}
+	if _, _, err := Handle(ctx, EventSessionStart, in, env2, f.st, f.p, now); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := f.st.GetSessionByClaudeID(ctx, "fresh")
+	if err != nil || fresh.TranscriptPath != "/t/fresh.jsonl" {
+		t.Fatalf("fresh = %+v, %v", fresh, err)
 	}
 }

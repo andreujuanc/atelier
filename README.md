@@ -37,20 +37,40 @@ atl resume fix-login      # after a crash/reboot: relaunch stopped sessions with
 atl status fix-login review
 atl diff fix-login        # git diff of each rw repo vs its base commit (paged on a TTY)
 atl pr fix-login          # gh pr create per rw repo with pushed commits; status → review
-atl done fix-login [--force]    # teardown, remove worktrees (branches kept), kill tmux
+atl show fix-login [--json]     # task, repos (dirty, commits ahead, last commit, pushed), sessions, notes
+atl transcript fix-login [--session ID] [--tail N]  # last N (20; 0 = all) turns of a Claude session
+atl note fix-login waiting on design review [--author user|assistant]
+atl notes fix-login       # notes, newest first
+atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
 atl cancel fix-login [--force]
 atl doctor
 atl                       # TUI (on a terminal)
 ```
 
 TUI keys: `n` new task, `enter` open, `s` new session, `r` resume, `a` add repos to the
-selected task, `d` done, `c` cancel, `p` pr, `D` diff, `1`-`5` status, `/` filter, `q` quit.
+selected task, `m` add a note to the selected task (`enter` saves, `esc` cancels), `d` done,
+`c` cancel, `p` pr, `D` diff, `1`-`5` status, `/` filter, `q` quit. The details pane shows
+the task's latest note.
 Repos (in the new-task form and for `a`) are picked from a list of `$ATL_REPOS`: type to
 filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter` confirms, `esc` cancels.
 Choosing a project in the form preselects its repos.
 
 `<task>` is a slug, numeric id, or unique slug prefix. atelier never pushes:
 push `atl/<slug>` yourself before `atl pr`.
+
+`atl done`/`atl cancel` remove each worktree and then delete its `atl/<slug>` branch
+only if nothing would be lost: every commit on it must be reachable from another local
+branch or a remote-tracking ref (local refs only, no fetch), e.g. after you pushed it or
+when it has no commits of its own. Otherwise the branch is kept and reported
+(`kept branch atl/<slug> in <repo> (N unpushed commit(s))`); `--force` only discards
+uncommitted changes, never unpushed commits.
+
+`atl show` never touches the network: "pushed" means the local remote-tracking ref
+`origin/atl/<slug>` exists (as of your last push or fetch). `--json` prints a stable
+snake_case object (see `internal/cli/info.go`). `atl transcript` reads the Claude Code
+transcript JSONL recorded by the hooks and condenses it to user/assistant text; tool
+calls become one-line `[tool: Name] …` summaries and tool results are skipped. Notes
+work on closed tasks too.
 
 Every `atl` invocation (except `hook` and `doctor`) first marks sessions whose tmux
 window is gone as `stopped`; the TUI also does so every few seconds.
@@ -97,7 +117,7 @@ atelier writes `<taskdir>/.claude/settings.json` (merged with any existing keys)
 hooks that run `atl hook <event>` for SessionStart, UserPromptSubmit, Notification,
 PostToolUse, Stop, SessionEnd and PreToolUse. They keep session state current
 (`running`, `waiting` on permission prompts, `idle`, `ended`; `stopped` comes from
-crash recovery), and the PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
+crash recovery) and record each session's transcript path, and the PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
 on paths inside read-only repos. Hook failures never block Claude (except the
 read-only guard) and are logged to `hook.log`.
 

@@ -395,7 +395,7 @@ task stays. Worktrees are created even for backlog tasks.
 Done/Cancel flow: resolve task; if !force and any rw worktree dirty → error listing dirty repos; kill tmux session;
 mark live/stopped sessions ended; (M7) run teardown per rw worktree (failure aborts unless force); RemoveWorktree
 (force passes `--force`); remove generated `CLAUDE.md` and `.claude/`; remove task dir only if empty (else warn);
-status done/cancelled. Branches are kept.
+status done/cancelled. Branches: after its worktree is removed, `atl/<slug>` is deleted iff gitx.UniqueCommits == 0 (no commits unique to it vs other local branches/remote-tracking refs), else kept and reported.
 
 Diff: for each rw repo, header `==> <repo> (<branch> vs <base_commit[:8]>)` then `git diff <base_commit>`; CLI pipes
 through `$PAGER` when stdout is a TTY.

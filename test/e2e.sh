@@ -327,14 +327,23 @@ out="$(atl done fix-login --force 2>&1)" || fail "atl done --force failed: $out"
 if git -C "$ATL_REPOS/api" worktree list --porcelain | grep -qx "worktree $T/api"; then
 	fail "api worktree still registered: $(git -C "$ATL_REPOS/api" worktree list)"
 fi
-git -C "$ATL_REPOS/api" rev-parse -q --verify refs/heads/atl/fix-login >/dev/null || fail "branch atl/fix-login was deleted"
+# Its commit was pushed (origin/atl/fix-login), so the branch is deleted.
+if git -C "$ATL_REPOS/api" rev-parse -q --verify refs/heads/atl/fix-login >/dev/null; then
+	fail "pushed branch atl/fix-login was kept"
+fi
+[[ "$out" == *"deleted branch atl/fix-login in api"* ]] || fail "atl done branch message: $out"
 if tm has-session -t "=atl-fix-login" 2>/dev/null; then fail "tmux session atl-fix-login still exists"; fi
 expect_eq "status after done" "$(task_field fix-login status)" "done"
 
 # ---- cancel ----------------------------------------------------------------
 
 step cancel
+echo "wip" >"$ATL_TASKS/second-task/api/wip.txt"
+git -C "$ATL_TASKS/second-task/api" add wip.txt
+git -C "$ATL_TASKS/second-task/api" commit -q -m "unpushed work"
 out="$(atl cancel second-task 2>&1)" || fail "atl cancel failed: $out"
+[[ "$out" == *"kept branch atl/second-task in api (1 unpushed commit(s))"* ]] || fail "atl cancel branch message: $out"
+git -C "$ATL_REPOS/api" rev-parse -q --verify refs/heads/atl/second-task >/dev/null || fail "unpushed branch atl/second-task was deleted"
 expect_eq "status after cancel" "$(task_field second-task status)" "cancelled"
 [[ -e "$E2E_OUT/teardown-second-task" ]] || fail "teardown did not run for second-task"
 [[ ! -e "$ATL_TASKS/second-task/api" ]] || fail "second-task worktree still exists"
