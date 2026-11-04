@@ -621,6 +621,38 @@ func TestSessionTransitions(t *testing.T) {
 		t.Errorf("ClaimStopped(9999) = %v, %v", ok, err)
 	}
 
+	// ClaimFrom: only from the state the caller saw (stopped or ended), once,
+	// bumping launch_seq like ClaimStopped.
+	for _, st := range model.AllSessionStates {
+		_, err := s.ClaimFrom(ctx, 1, st, at)
+		if valid := st == model.StateStopped || st == model.StateEnded; valid != (err == nil) {
+			t.Errorf("ClaimFrom(from %s) err = %v", st, err)
+		}
+	}
+	ended := mk(model.StateEnded)
+	if ok, err := s.ClaimFrom(ctx, ended.ID, model.StateStopped, at); ok || err != nil {
+		t.Errorf("ClaimFrom(ended session, from stopped) = %v, %v", ok, err)
+	}
+	var seq0, seq1 int64
+	if err := s.db.QueryRowContext(ctx, `SELECT launch_seq FROM sessions WHERE id = ?`, ended.ID).Scan(&seq0); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.ClaimFrom(ctx, ended.ID, model.StateEnded, at); !ok || err != nil {
+		t.Errorf("ClaimFrom(ended) = %v, %v", ok, err)
+	}
+	if g := get(ended.ID); g.State != model.StateIdle || g.TmuxTarget != "" || g.ClaudeSessionID != "cid" || !g.LastEventAt.Equal(at) {
+		t.Errorf("after ClaimFrom(ended): %+v", g)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT launch_seq FROM sessions WHERE id = ?`, ended.ID).Scan(&seq1); err != nil {
+		t.Fatal(err)
+	}
+	if seq1 != seq0+1 {
+		t.Errorf("launch_seq %d → %d, want +1", seq0, seq1)
+	}
+	if ok, err := s.ClaimFrom(ctx, ended.ID, model.StateEnded, at); ok || err != nil {
+		t.Errorf("second ClaimFrom(ended) = %v, %v", ok, err)
+	}
+
 	// SetSessionLaunch: only target and name.
 	ss := mk(model.StateRunning)
 	before := get(ss.ID)

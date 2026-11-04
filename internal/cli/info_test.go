@@ -125,7 +125,7 @@ func TestShowNotesTranscript(t *testing.T) {
 	for _, s := range []string{"Task\n", "  slug         fix\n", "  base         auto\n", "the description",
 		"\nRepos\n  api (rw)  " + wt + "\n    base origin/main\n",
 		"clean, 1 commit(s) ahead of base, not pushed", "work in progress", "\nSessions\n  1 claude-1  idle",
-		"transcript  " + transcript, "\nNotes\n", "assistant] from the assistant"} {
+		"transcript  " + transcript, "    title       Fix it [31m please\n", "\nNotes\n", "assistant] from the assistant"} {
 		if !strings.Contains(out, s) {
 			t.Errorf("show lacks %q:\n%s", s, out)
 		}
@@ -161,7 +161,7 @@ func TestShowNotesTranscript(t *testing.T) {
 	}
 	s := raw["sessions"].([]any)[0].(map[string]any)
 	if got := keys(s); !reflect.DeepEqual(got, []string{"claude_session_id", "created_at", "id", "last_event_at", "name",
-		"state", "tmux_target", "transcript_path"}) || s["transcript_path"] != transcript {
+		"state", "title", "tmux_target", "transcript_path"}) || s["transcript_path"] != transcript || s["title"] != "Fix it [31m please" {
 		t.Fatalf("session %v", s)
 	}
 	notes := raw["notes"].([]any)

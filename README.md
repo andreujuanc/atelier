@@ -33,6 +33,8 @@ atl add fix-login docs:ro           # ro: listed in CLAUDE.md; running sessions 
 atl repos                 # git repos in $ATL_REPOS, one per line
 atl ls [--status active,review|all] [--json]
 atl open fix-login        # ensure the tmux session (resume or start Claude), attach
+atl open fix-login --session 3   # open that session: select it if live, else claude --resume it; attach
+atl open fix-login --new  # start a new Claude session and attach to it
 atl session fix-login     # start another Claude session (window) in the task
 atl resume fix-login      # after a crash/reboot: relaunch stopped sessions with claude --resume
 atl status fix-login review
@@ -49,7 +51,7 @@ atl doctor
 atl                       # TUI (on a terminal)
 ```
 
-TUI keys: `n` new task, `enter` open, `s` new session, `r` resume, `a` add repos to the
+TUI keys: `n` new task, `enter` open (see below), `s` new session, `r` resume, `a` add repos to the
 selected task, `m` add a note to the selected task (`enter` saves, `esc` cancels), `d` done,
 `c` cancel, `p` pr, `D` diff, `A` assistant (about the selected task), `1`-`5` status,
 `/` filter, `q` quit. The details pane shows the task's latest note.
@@ -58,6 +60,23 @@ filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter` confirms, `
 Choosing a project in the form preselects its repos. The form's Base field toggles
 (`space`, `←`/`→`; `enter` moves on) between "auto (dev → develop → default)" and
 "production patch (default branch)".
+
+`enter` on a task with no sessions starts a new Claude session and attaches. If the task
+has sessions, it asks instead of guessing: a picker lists "New session" first, then the
+live sessions (running, waiting, idle with a live window), then the past ones you can
+resume (ended or stopped, with a Claude session id and a transcript file that still
+exists), each group newest activity first. Each row shows the state, how long ago it was
+last active, the conversation title, the window name and, if there is room, the last
+prompt. The title is Claude Code's own (a `/rename` title, else the one it generated),
+else the first prompt, else the window name; it is read from the transcript when the
+picker opens (only the first and last MiB of a large one). `↑`/`↓` move, `enter`
+picks, `esc` cancels and launches nothing. A live session is attached to with its window
+selected; a past one is resumed (`claude --resume <id>`, only that one: other stopped
+sessions are left for `r`) and attached to; "New session" works like `s` and attaches.
+Plain `atl open` (no flags) keeps its old behaviour for scripts: attach if a window is
+live, else resume the stopped sessions, else start a new one. `atl open --session` and
+`--new` are mutually exclusive; `--session` refuses another task's session, sessions
+without a Claude id or whose transcript is gone, and resuming in a closed task.
 
 `<task>` is a slug, numeric id, or unique slug prefix. atelier never pushes:
 push `atl/<slug>` yourself before `atl pr`.
@@ -69,7 +88,8 @@ refs only, no fetch), e.g. after you pushed it or when it has no commits of its 
 (`kept branch atl/<slug> in <repo> (N unpushed commit(s))`); `--force` only discards
 uncommitted changes, never unpushed commits.
 
-`atl show` never touches the network: "pushed" means the local remote-tracking ref
+`atl show` also prints each session's title (from its transcript; `--json`: `title`,
+`""` when none). It never touches the network: "pushed" means the local remote-tracking ref
 `origin/atl/<slug>` exists (as of your last push or fetch). `--json` prints a stable
 snake_case object (see `internal/cli/info.go`). `atl transcript` reads the Claude Code
 transcript JSONL recorded by the hooks and condenses it to user/assistant text; tool
@@ -183,5 +203,5 @@ stdout; if the context cannot be built the error goes to `hook.log` and nothing 
 
 `go test ./...` runs unit tests and `test/e2e.sh` (skipped with `-short`), which
 builds `atl`, creates fake repos and a project in a temp dir and drives
-new → session → hooks → crash recovery → resume → diff → pr → done against an
+new → session → hooks → crash recovery → resume → open --session → diff → pr → done against an
 isolated tmux server, with `claude` and `gh` replaced by `test/stubs`.

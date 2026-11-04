@@ -37,6 +37,7 @@ const (
 	modeConfirm
 	modePicker
 	modeNote
+	modeSessions
 )
 
 // confirmState is a pending done/cancel confirmation.
@@ -94,11 +95,14 @@ type (
 		task *model.Task
 		err  error
 	}
+	// openMsg ends an open step: cmd attaches; choices (cmd nil) are the
+	// sessions to pick from (OpenOrChoose).
 	openMsg struct {
-		id   int64
-		slug string
-		cmd  *exec.Cmd
-		err  error
+		id      int64
+		slug    string
+		cmd     *exec.Cmd
+		choices []app.SessionChoice
+		err     error
 	}
 	assistantMsg struct {
 		cmd  *exec.Cmd
@@ -195,6 +199,8 @@ type Model struct {
 	// picker belongs to the new-task form.
 	pickTask *app.TaskView
 	repos    []string // last AvailableRepos result
+	// sessPick is the session picker Enter opened (modeSessions).
+	sessPick *sessionPicker
 	// noteInput is the `m` note being typed for task noteID/noteSlug.
 	noteInput textinput.Model
 	noteID    int64
@@ -858,7 +864,20 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.setErr(fmt.Errorf("open: %w", msg.err))
 			return m.reload()
 		}
-		return m.exec("open", msg.slug, msg.cmd)
+		if msg.cmd != nil {
+			return m.exec("open", msg.slug, msg.cmd)
+		}
+		if len(msg.choices) == 0 { // defensive: the backend returns one or the other
+			return m.reload()
+		}
+		if m.mode != modeNormal || m.quitRequested {
+			// Don't yank the user out of the form/filter/another prompt.
+			m.setStatus("open " + msg.slug + ": it has sessions to choose from — press enter again")
+			return nil
+		}
+		m.sessPick = newSessionPicker(msg.id, msg.slug, msg.choices)
+		m.mode = modeSessions
+		return nil
 	case assistantMsg:
 		m.assisting = false
 		if msg.err != nil {
@@ -951,6 +970,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.filterKey(msg)
 	case modeNote:
 		return m.noteKey(msg)
+	case modeSessions:
+		return m.sessionsKey(msg)
 	}
 	return m.normalKey(key)
 }
@@ -1019,6 +1040,42 @@ func (m *Model) applyFilter(f string) tea.Cmd {
 		return m.selectionChanged()
 	}
 	return nil
+}
+
+// sessionsKey handles a key in the session picker: enter attaches to a live
+// session, resumes a past one or starts a new one; esc launches nothing.
+func (m *Model) sessionsKey(msg tea.KeyMsg) tea.Cmd {
+	p := m.sessPick
+	if p == nil {
+		m.mode = modeNormal
+		return nil
+	}
+	res := p.update(msg)
+	if res == pickContinue {
+		return nil
+	}
+	m.sessPick, m.mode = nil, modeNormal
+	if res == pickCancel {
+		m.setStatus("open " + p.slug + " cancelled")
+		return nil
+	}
+	if op, busy := m.busy[p.taskID]; busy {
+		m.setStatus("busy: " + op + "…")
+		return nil
+	}
+	id, slug, be, ctx := p.taskID, p.slug, m.be, m.ctx
+	m.busy[id] = "open " + slug
+	if c := p.picked(); c != nil {
+		sid := c.Session.ID
+		return func() tea.Msg {
+			cmd, err := be.OpenSession(ctx, slug, sid)
+			return openMsg{id: id, slug: slug, cmd: cmd, err: err}
+		}
+	}
+	return func() tea.Msg {
+		cmd, err := be.OpenNew(ctx, slug)
+		return openMsg{id: id, slug: slug, cmd: cmd, err: err}
+	}
 }
 
 // pickerKey handles a key in the repo picker.
@@ -1182,8 +1239,8 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		m.busy[t.Task.ID] = "open " + slug
 		be, ctx, id := m.be, m.ctx, t.Task.ID
 		return func() tea.Msg {
-			c, err := be.Open(ctx, slug)
-			return openMsg{id: id, slug: slug, cmd: c, err: err}
+			c, choices, err := be.OpenOrChoose(ctx, slug)
+			return openMsg{id: id, slug: slug, cmd: c, choices: choices, err: err}
 		}
 	case "s":
 		be := m.be

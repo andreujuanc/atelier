@@ -26,7 +26,8 @@ const wrapWidth = 100
 //	 "repos":[{"name":"api","mode":"rw","path":"/home/u/tasks/fix-login/api","base_branch":"dev","dirty":true,"ahead":2,
 //	           "pushed":false,"unpushed":2,"last_commit":{"sha":"…","subject":"…","date":"…"},"error":""}],
 //	 "sessions":[{"id":3,"name":"claude-3","claude_session_id":"…","state":"waiting","tmux_target":"@4",
-//	              "created_at":"…","last_event_at":"…","transcript_path":"/home/u/.claude/projects/…/….jsonl"}],
+//	              "created_at":"…","last_event_at":"…","transcript_path":"/home/u/.claude/projects/…/….jsonl",
+//	              "title":"Fix the login redirect"}],
 //	 "notes":[{"id":7,"author":"user","body":"…","created_at":"…"}]}
 //
 // base is the task's base choice: "" (auto: origin/dev, else develop, else
@@ -36,7 +37,8 @@ const wrapWidth = 100
 // the repo directory is gone, else a git error or "". unpushed is the
 // number of commits not in origin/<branch> when pushed, else equal to
 // ahead (0 when the repo directory is gone). ahead, pushed and unpushed are
-// always 0/false for ro repos. notes are newest first; repos, sessions and
+// always 0/false for ro repos. A session's title comes from its transcript
+// (Claude Code's title, else the first user prompt; "" if none). notes are newest first; repos, sessions and
 // notes are never null.
 type jsonShow struct {
 	ID          int64             `json:"id"`
@@ -84,6 +86,7 @@ type jsonShowSession struct {
 	CreatedAt       string `json:"created_at"`
 	LastEventAt     string `json:"last_event_at"`
 	TranscriptPath  string `json:"transcript_path"`
+	Title           string `json:"title"`
 }
 
 type jsonNote struct {
@@ -112,7 +115,7 @@ func showJSON(d *app.TaskDetail) jsonShow {
 	for _, s := range d.Sessions {
 		out.Sessions = append(out.Sessions, jsonShowSession{ID: s.ID, Name: s.Name, ClaudeSessionID: s.ClaudeSessionID,
 			State: string(s.State), TmuxTarget: s.TmuxTarget, CreatedAt: rfc3339(s.CreatedAt),
-			LastEventAt: rfc3339(s.LastEventAt), TranscriptPath: s.TranscriptPath})
+			LastEventAt: rfc3339(s.LastEventAt), TranscriptPath: s.TranscriptPath, Title: d.SessionTitles[s.ID]})
 	}
 	for _, n := range d.Notes {
 		out.Notes = append(out.Notes, noteJSON(n))
@@ -222,6 +225,9 @@ func writeShow(w io.Writer, d *app.TaskDetail) {
 			name = "claude-" + strconv.FormatInt(s.ID, 10)
 		}
 		fmt.Fprintf(w, "  %d %s  %s  last event %s\n", s.ID, name, s.State, localTime(s.LastEventAt))
+		if title := d.SessionTitles[s.ID]; title != "" {
+			fmt.Fprintf(w, "    title       %s\n", sanitize(title))
+		}
 		if s.ClaudeSessionID != "" {
 			fmt.Fprintf(w, "    claude id   %s\n", s.ClaudeSessionID)
 		}

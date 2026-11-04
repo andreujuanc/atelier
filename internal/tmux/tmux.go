@@ -329,6 +329,18 @@ func (c *Client) WindowAlive(ctx context.Context, session, window string) (bool,
 	return strings.TrimSpace(first) == "0", nil
 }
 
+// SelectWindow makes window (an id, "@N") the current window of its
+// session, so attaching to the session shows it.
+func (c *Client) SelectWindow(ctx context.Context, window string) error {
+	if !strings.HasPrefix(window, "@") {
+		return fmt.Errorf("tmux: select window: bad window id %q", window)
+	}
+	if _, err := c.run(ctx, "select-window", "-t", window); err != nil {
+		return fmt.Errorf("tmux: select window %s: %w", window, err)
+	}
+	return nil
+}
+
 // SetBuffer puts text in a new automatic paste buffer, the one tmux's
 // paste-buffer (prefix ]) pastes by default.
 func (c *Client) SetBuffer(ctx context.Context, text string) error {

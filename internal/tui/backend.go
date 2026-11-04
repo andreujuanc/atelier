@@ -16,7 +16,14 @@ type Backend interface {
 	List(ctx context.Context) ([]app.TaskView, error)
 	Get(ctx context.Context, ref string) (*app.TaskView, error)
 	NewTask(ctx context.Context, o app.NewTaskOpts) (*model.Task, error)
-	Open(ctx context.Context, ref string) (*exec.Cmd, error)
+	// OpenOrChoose returns either the command that attaches to the task
+	// (a new session was started: nothing to choose from) or the sessions
+	// to choose from (live first, then resumable past ones).
+	OpenOrChoose(ctx context.Context, ref string) (*exec.Cmd, []app.SessionChoice, error)
+	// OpenSession attaches to a live session or resumes a past one, with
+	// its window selected; OpenNew starts a new session and attaches.
+	OpenSession(ctx context.Context, ref string, sessionID int64) (*exec.Cmd, error)
+	OpenNew(ctx context.Context, ref string) (*exec.Cmd, error)
 	NewSession(ctx context.Context, ref string) (*model.Session, error)
 	Resume(ctx context.Context, ref string) (int, error)
 	SetStatus(ctx context.Context, ref string, st model.Status) error

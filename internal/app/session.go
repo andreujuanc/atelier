@@ -155,7 +155,7 @@ func (a *App) Resume(ctx context.Context, ref string) (int, error) {
 		if !claimed {
 			continue // resumed (or ended) by someone else meanwhile
 		}
-		if err := a.resumeClaimed(ctx, t, c.ID, dir); err != nil {
+		if _, err := a.resumeClaimed(ctx, t, c.ID, dir, model.StateStopped); err != nil {
 			errs = append(errs, fmt.Errorf("task %s: resume session %d: %w", t.Slug, c.ID, err))
 			continue
 		}
@@ -165,16 +165,16 @@ func (a *App) Resume(ctx context.Context, ref string) (int, error) {
 }
 
 // resumeClaimed launches `claude --resume` for a session this caller has
-// claimed, then kills any other window still tagged with the session (e.g. a
-// dead remain-on-exit window) and records the new window; on a failed launch
-// it puts the session back to stopped (see Resume).
-func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir string) (err error) {
+// claimed (from state restore: stopped or ended), then kills any other window
+// still tagged with the session (e.g. a dead remain-on-exit window) and
+// records the new window, returning its id; on a failed launch it puts the
+// session back to restore (see Resume).
+func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir string, restore model.SessionState) (win string, err error) {
 	bg := context.WithoutCancel(ctx)
 	s, err := a.Store.GetSession(bg, id)
 	if err == nil && s.ClaudeSessionID == "" {
 		err = errors.New("no claude session id")
 	}
-	var win string
 	if err == nil {
 		if s.Name == "" {
 			s.Name = windowName(s.ID)
@@ -182,10 +182,10 @@ func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir st
 		win, err = a.launch(ctx, t, s, dir, s.ClaudeSessionID)
 	}
 	if err != nil {
-		if serr := a.Store.SetSessionState(bg, id, model.StateStopped, a.now()); serr != nil {
+		if serr := a.Store.SetSessionState(bg, id, restore, a.now()); serr != nil {
 			err = errors.Join(err, serr)
 		}
-		return err
+		return "", err
 	}
 	// A crashed claude under remain-on-exit leaves a dead window carrying the
 	// session's tag; drop it (and anything else still tagged with this
@@ -196,9 +196,9 @@ func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir st
 		a.warnf("session %d: kill old windows: %v", id, kerr)
 	}
 	if err := a.Store.SetSessionLaunch(bg, id, win, s.Name); err != nil {
-		return fmt.Errorf("record window %s: %w", win, err)
+		return "", fmt.Errorf("record window %s: %w", win, err)
 	}
-	return nil
+	return win, nil
 }
 
 // Open makes sure the task has a live Claude window — resuming stopped

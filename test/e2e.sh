@@ -315,6 +315,22 @@ expect_eq "session count after resume" "$(sess_count fix-login)" "1"
 tm has-session -t "=atl-fix-login" 2>/dev/null || fail "tmux session atl-fix-login not recreated"
 [[ -n "$(sess_field fix-login tmux_target)" ]] || fail "resumed session has no tmux target"
 
+step "open --session (resume an ended session)"
+rc=0
+atl open fix-login --session 1 --new >/dev/null 2>&1 || rc=$?
+expect_eq "open --session with --new exit code" "$rc" "2"
+SID="$(sess_field fix-login id)"
+hook SessionEnd "$(ev SessionEnd)" || fail "hook SessionEnd"
+expect_state fix-login ended "after the user exits claude"
+tm kill-window -t "$(sess_field fix-login tmux_target)"
+# Attaching needs a terminal, so only the resume before it can succeed here.
+out="$(atl open fix-login --session "$SID" </dev/null 2>&1)" && fail "atl open attached without a terminal: $out"
+[[ "$out" == *"attach:"* ]] || fail "atl open --session failed before attaching: $out"
+resumed_twice() { [[ "$(grep -cF "sid=$CID argv=[--resume][$CID][--add-dir][$ATL_REPOS/docs]" "$E2E_LOG")" == 2 ]]; }
+wait_for "stub claude relaunched again with --resume $CID" resumed_twice
+expect_state fix-login idle "after open --session"
+expect_eq "session count after open --session" "$(sess_count fix-login)" "1"
+
 # ---- diff ------------------------------------------------------------------
 
 step diff

@@ -213,12 +213,28 @@ func (b *trackedBackend) NewTask(ctx context.Context, o app.NewTaskOpts) (*model
 	return b.Backend.NewTask(ctx, o)
 }
 
-func (b *trackedBackend) Open(ctx context.Context, ref string) (*exec.Cmd, error) {
+func (b *trackedBackend) OpenOrChoose(ctx context.Context, ref string) (*exec.Cmd, []app.SessionChoice, error) {
+	if !b.tr.begin() {
+		return nil, nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.OpenOrChoose(ctx, ref)
+}
+
+func (b *trackedBackend) OpenSession(ctx context.Context, ref string, sessionID int64) (*exec.Cmd, error) {
 	if !b.tr.begin() {
 		return nil, errStopped
 	}
 	defer b.tr.end()
-	return b.Backend.Open(ctx, ref)
+	return b.Backend.OpenSession(ctx, ref, sessionID)
+}
+
+func (b *trackedBackend) OpenNew(ctx context.Context, ref string) (*exec.Cmd, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.OpenNew(ctx, ref)
 }
 
 func (b *trackedBackend) NewSession(ctx context.Context, ref string) (*model.Session, error) {

@@ -20,6 +20,10 @@ type TaskDetail struct {
 	Repos    []RepoDetail
 	Sessions []model.Session // created_at asc
 	Notes    []model.Note    // newest first
+	// SessionTitles maps a session id to its conversation title, read from
+	// its transcript: Claude Code's title, else the first user prompt.
+	// Sessions without one (no or unreadable transcript) are absent.
+	SessionTitles map[int64]string
 }
 
 // RepoDetail is the git state of one repo of a task. For rw repos it
@@ -76,6 +80,19 @@ func (a *App) Show(ctx context.Context, ref string) (*TaskDetail, error) {
 		Repos: make([]RepoDetail, 0, len(t.Repos))}
 	for _, r := range t.Repos {
 		d.Repos = append(d.Repos, a.repoDetail(ctx, t, r))
+	}
+	d.SessionTitles = map[int64]string{}
+	for _, s := range sessions {
+		if s.TranscriptPath == "" {
+			continue
+		}
+		if info, err := readTranscriptInfo(s.TranscriptPath); err == nil {
+			if title := info.Title; title != "" {
+				d.SessionTitles[s.ID] = title
+			} else if info.FirstPrompt != "" {
+				d.SessionTitles[s.ID] = info.FirstPrompt
+			}
+		}
 	}
 	return d, nil
 }
