@@ -4,13 +4,16 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/gen"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/store"
 	"github.com/andreujuanc/atelier/internal/tmux"
@@ -72,9 +75,18 @@ func (a *App) now() time.Time {
 }
 
 // prepareTaskDir refreshes generated files in the task dir before a Claude
-// window is launched. M5 makes it write .claude/settings.json (always) and
-// CLAUDE.md (only if missing) via internal/gen.
+// window is launched: .claude/settings.json is always rewritten (keeping the
+// atl path current) and CLAUDE.md is written only if missing.
 func (a *App) prepareTaskDir(ctx context.Context, t *model.Task) error {
+	dir := a.Paths.TaskDir(t.Slug)
+	if err := gen.WriteSettings(dir, a.AtlBin); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); errors.Is(err, os.ErrNotExist) {
+		return gen.WriteClaudeMD(dir, *t, a.repoInfos(t))
+	} else if err != nil {
+		return err
+	}
 	return nil
 }
 

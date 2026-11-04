@@ -2,11 +2,16 @@
 package main
 
 import (
-	"fmt"
 	"os"
+
+	"github.com/andreujuanc/atelier/internal/cli"
+	"github.com/andreujuanc/atelier/internal/hook"
 )
 
 func main() {
-	fmt.Fprintln(os.Stderr, "atl: not implemented yet")
-	os.Exit(1)
+	// Fast path: Claude Code hooks must not pay for cobra or the CLI setup.
+	if len(os.Args) > 1 && os.Args[1] == "hook" {
+		os.Exit(hook.Main(os.Args[2:]))
+	}
+	os.Exit(cli.Execute())
 }

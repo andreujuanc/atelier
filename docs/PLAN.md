@@ -162,6 +162,8 @@ func (s *Store) GetTask(ctx, id int64) (*model.Task, error)      // with Repos (
 func (s *Store) GetTaskBySlug(ctx, slug string) (*model.Task, error)
 func (s *Store) ResolveTask(ctx, ref string) (*model.Task, error) // exact slug, else numeric id, else unique slug prefix
 func (s *Store) ListTasks(ctx, statuses ...model.Status) ([]model.Task, error) // none = all; order: status order, updated_at desc
+func (s *Store) CreateTaskAutoPort(ctx, t *model.Task) error   // one tx: unique slug + free port + insert (used by NewTask)
+func (s *Store) DeleteTask(ctx, id int64) error
 func (s *Store) SetTaskStatus(ctx, id int64, st model.Status) error // bumps updated_at
 func (s *Store) UniqueSlug(ctx, base string) (string, error)   // base, base-2, base-3 ...
 func (s *Store) NextPortOffset(ctx) (int, error)               // lowest multiple of 100 not used by an Open() task
@@ -198,6 +200,7 @@ func RemoveWorktree(ctx, repo, path string, force bool) error // worktree remove
 func IsDirty(ctx, worktree string) (bool, error)       // status --porcelain non-empty (untracked counts)
 func CommitsAhead(ctx, worktree, base string) (int, error) // rev-list --count base..HEAD
 func Diff(ctx, worktree, base string, color bool, w io.Writer) error // git diff [--color=always] base
+func DeleteBranch(ctx, repo, branch string) error      // branch -D (NewTask rollback only)
 func RemoteBranchExists(ctx, worktree, branch string) (bool, error) // git ls-remote --heads origin branch (atelier never pushes)
 ```
 
@@ -358,8 +361,9 @@ func (a *App) NewTask(ctx, o NewTaskOpts) (*model.Task, error)
 func (a *App) List(ctx, statuses ...model.Status) ([]TaskView, error) // RepoStatus filled (dirty check) only by Get
 func (a *App) Get(ctx, ref string) (*TaskView, error)
 func (a *App) SetStatus(ctx, ref string, st model.Status) error  // plain status change, no side effects
-func (a *App) Done(ctx, ref string, force bool) error
-func (a *App) Cancel(ctx, ref string, force bool) error
+func (a *App) Done(ctx, ref string, force bool) (*model.Task, error)
+func (a *App) Cancel(ctx, ref string, force bool) (*model.Task, error)
+func (a *App) RepoPathFor(t *model.Task, repo model.TaskRepo) string // worktree (rw) or canonical (ro)
 func (a *App) Doctor(ctx) []Check  // type Check struct{ Name string; OK, Warn bool; Detail string }
 // M7
 func (a *App) Diff(ctx, ref string, w io.Writer, color bool) error

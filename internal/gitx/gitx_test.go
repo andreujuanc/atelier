@@ -340,6 +340,28 @@ func TestAddWorktree(t *testing.T) {
 	}
 }
 
+func TestDeleteBranch(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "del")
+	if err := DeleteBranch(ctx, f.repo, "atl/del"); err == nil {
+		t.Fatal("deleted a branch checked out in a worktree")
+	}
+	if err := RemoveWorktree(ctx, f.repo, wt, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteBranch(ctx, f.repo, "atl/del"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RevParse(ctx, f.repo, "refs/heads/atl/del"); err == nil {
+		t.Fatal("branch still exists")
+	}
+	err := DeleteBranch(ctx, f.repo, "atl/del")
+	if err == nil || !strings.Contains(err.Error(), "git branch") {
+		t.Fatalf("missing branch err = %v", err)
+	}
+}
+
 func TestWorktreePathWithSpaces(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)

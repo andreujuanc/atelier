@@ -11,8 +11,8 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | M2 git worktree management | done (reviewed, 1 fix round) |
 | M3 tmux + session launch/resume/attach | done (reviewed, 1 fix round) |
 | M4 hook, state machine, ro guard, CLAUDE.md/settings.json | done (reviewed, 2 fix rounds + guard re-review) |
-| M5 CLI | in progress |
-| M6 TUI | todo |
+| M5 CLI | done (reviewed, 1 fix round) |
+| M6 TUI | in progress |
 | M7 projects, scripts, ports, diff, pr | todo |
 | M8 crash recovery + e2e | todo |
 
@@ -40,3 +40,6 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 - (M4) hook latency ~5ms. stdin cap 64 MiB; oversized PreToolUse fails closed. Guard: kernel-style path walk (cleaned + uncleaned), ~ expansion, exact-key file_path/notebook_path.
 - (M4) ATL_SESSION trusted for SessionStart only if row's claude id empty or source ∈ {clear,resume,compact}; nested `claude` (startup) gets its own row. compact doesn't change state.
 - (M4) settings.json merged (user keys/hooks kept; atl* `hook <Event>` entries replaced), atomic write. Known: case-insensitive FS (macOS) not handled by guard.
+- (M5) NewTask inserts the row first (CreateTaskAutoPort: atomic slug+port), then worktrees/gen; full rollback incl. branches it created. Existing task dir on disk → error (not a new slug).
+- (M5) doctor: Warn = OK&&Warn; tmux < 3.2 FAIL. Project TOML rejects unknown keys. Repo names .claude/CLAUDE.md/./.. rejected.
+- (M5) Done/Cancel prune hand-deleted worktrees; tmux errors (other than not installed) abort unless --force.

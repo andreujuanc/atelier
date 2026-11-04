@@ -287,6 +287,12 @@ func RemoveWorktree(ctx context.Context, repo, path string, force bool) error {
 	return err
 }
 
+// DeleteBranch force-deletes the local branch in repo (`git branch -D`).
+func DeleteBranch(ctx context.Context, repo, branch string) error {
+	_, err := run(ctx, repo, "branch", "-D", branch)
+	return err
+}
+
 // IsDirty reports whether the worktree has uncommitted changes, counting
 // untracked files (regardless of status.showUntrackedFiles). It takes no
 // optional locks, so it is safe to poll while other git commands run.
