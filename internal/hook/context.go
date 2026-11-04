@@ -20,7 +20,12 @@ const (
 	contextMaxLen  = 2500 // bytes (so also at most this many characters)
 	contextNotes   = 5    // newest notes included
 	contextNoteLen = 300  // characters per note body
+	contextEnvLen  = 1000 // bytes of ATL_CONTEXT text
 )
+
+// envContextVar names the environment variable whose text is appended to
+// every task session's start context (e.g. set per devcontainer).
+const envContextVar = "ATL_CONTEXT"
 
 // sessionStartOutput is Claude Code's SessionStart hook JSON output.
 type sessionStartOutput struct {
@@ -31,9 +36,10 @@ type sessionStartOutput struct {
 }
 
 // writeSessionContext builds the task context for task id and writes it to
-// w as one SessionStart JSON object. Nothing is written on error.
-func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p config.Paths, taskID int64, now time.Time) error {
-	text, err := sessionContext(ctx, st, p, taskID, now)
+// w as one SessionStart JSON object. envText is the raw ATL_CONTEXT value
+// (may be empty). Nothing is written on error.
+func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p config.Paths, taskID int64, envText string, now time.Time) error {
+	text, err := sessionContext(ctx, st, p, taskID, envText, now)
 	if err != nil {
 		return err
 	}
@@ -50,7 +56,7 @@ func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p co
 
 // sessionContext loads task id and its newest notes (one task query, one
 // repos query, one notes query) and renders them.
-func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID int64, now time.Time) (string, error) {
+func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID int64, envText string, now time.Time) (string, error) {
 	t, err := st.GetTask(ctx, taskID)
 	if err != nil {
 		return "", err
@@ -59,13 +65,15 @@ func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID
 	if err != nil {
 		return "", err
 	}
-	return renderContext(*t, notes, p, now), nil
+	return renderContext(*t, notes, p, envText, now), nil
 }
 
 // renderContext renders the SessionStart task context: plain markdown of
-// at most contextMaxLen bytes. Notes are dropped (oldest first, then the
-// last one kept is shortened) before anything else is cut.
-func renderContext(t model.Task, notes []model.Note, p config.Paths, now time.Time) string {
+// at most contextMaxLen bytes. envText (the raw ATL_CONTEXT value) is
+// sanitised and, if not blank, rendered as its own section after
+// ATL_PORT_OFFSET. Notes are dropped (oldest first, then the last one kept
+// is shortened) before anything else is cut.
+func renderContext(t model.Task, notes []model.Note, p config.Paths, envText string, now time.Time) string {
 	slug := oneLine(t.Slug)
 	branch := t.Branch
 	if branch == "" {
@@ -93,6 +101,9 @@ func renderContext(t model.Task, notes []model.Note, p config.Paths, now time.Ti
 		w("- %s (rw, worktree %s%s)\n", name, oneLine(p.WorktreePath(t.Slug, r.Name)), from)
 	}
 	w("\nATL_PORT_OFFSET=%d\n", t.PortOffset)
+	if env := envBlock(envText); env != "" {
+		w("\nEnvironment notes (%s):\n%s\n", envContextVar, env)
+	}
 
 	footer := fmt.Sprintf("\nUse `atl note %s \"...\"` to leave a status note for later sessions.\n", slug)
 	fixed := head.String()
@@ -141,6 +152,29 @@ func oneLine(s string) string {
 		return r
 	}, s)
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// envBlock sanitises the ATL_CONTEXT text: line breaks are kept (\r\n and
+// \r become \n), other control and format characters become spaces (as in
+// oneLine), surrounding whitespace is trimmed, and the result is cut to
+// contextEnvLen bytes on a rune boundary, ending with "…" when cut.
+func envBlock(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' {
+			return r
+		}
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return ' '
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+	if len(s) > contextEnvLen {
+		s = strings.TrimRight(truncateBytes(s, contextEnvLen-len("…")), " \n") + "…"
+	}
+	return s
 }
 
 // truncateRunes shortens s to at most n characters, ending with "…" when cut.

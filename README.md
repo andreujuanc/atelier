@@ -132,6 +132,7 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `XDG_CONFIG_HOME` | `~/.config` — projects in `atelier/projects/<name>.toml` |
 | `ATL_TMUX_SOCKET` | unset — tmux socket name (`tmux -L`) if you don't use the default server |
 | `ATL_BIN` | the running binary — `atl` path written into hook commands |
+| `ATL_CONTEXT` | unset — extra text appended to every task session's start context |
 
 Claude windows and scripts get `ATL_TASK`, `ATL_TASK_DIR`, `ATL_PORT_OFFSET`
 (0, 100, 200… unique per open task) plus the project's `env`; scripts also get
@@ -172,7 +173,10 @@ On SessionStart (startup, resume, `/clear`, compaction) inside a task, `atl hook
 SessionStart` also prints Claude Code's `hookSpecificOutput.additionalContext` JSON with
 fresh task context (title, status, branch, repos with their base branch or read-only
 warning, `ATL_PORT_OFFSET`, the 5 newest notes; at most 2500 characters), so a session
-sees current notes without any file being rewritten. This is the only hook output on
+sees current notes without any file being rewritten. If `ATL_CONTEXT` is set in the hook's
+environment (e.g. a devcontainer's `containerEnv`: "no language runtimes here; run tests
+inside each repo's container via docker"), its text (newlines kept, up to 1000 bytes) is added
+as an "Environment notes" section before the notes. This is the only hook output on
 stdout; if the context cannot be built the error goes to `hook.log` and nothing is printed.
 
 ## Tests

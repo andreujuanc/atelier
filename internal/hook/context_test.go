@@ -201,6 +201,30 @@ func TestSessionStartContext(t *testing.T) {
 		}
 	})
 
+	t.Run("ATL_CONTEXT appended from the hook env", func(t *testing.T) {
+		in := Input{SessionID: "c-env", Cwd: dir, Source: "startup"}
+		_, plain, _ := runHook(t, EventSessionStart, in, nil)
+		code, out, errOut := runHook(t, EventSessionStart, in, map[string]string{"ATL_CONTEXT": "  No runtimes here.\r\nRun tests via docker.\n"})
+		if code != 0 || errOut != "" {
+			t.Fatalf("exit=%d stderr=%q", code, errOut)
+		}
+		got := sessionStartContext(t, out)
+		want := "\nATL_PORT_OFFSET=300\n\nEnvironment notes (ATL_CONTEXT):\nNo runtimes here.\nRun tests via docker.\n\nNotes (newest first):\n"
+		if !strings.Contains(got, want) {
+			t.Errorf("context lacks %q:\n%s", want, got)
+		}
+		_, blank, _ := runHook(t, EventSessionStart, in, map[string]string{"ATL_CONTEXT": " \t\n "})
+		body := func(s string) string { return strings.SplitN(sessionStartContext(t, s), "\n", 2)[1] } // drop the timestamped heading
+		if body(blank) != body(plain) || strings.Contains(body(plain), "Environment notes") {
+			t.Errorf("blank ATL_CONTEXT changed the context:\n%s\nvs\n%s", body(blank), body(plain))
+		}
+		code, out, errOut = runHook(t, EventSessionStart, Input{SessionID: "x-env", Cwd: f.root, Source: "startup"},
+			map[string]string{"ATL_CONTEXT": "hello"})
+		if code != 0 || out != "" || errOut != "" {
+			t.Errorf("outside a task: exit=%d stdout=%q stderr=%q", code, out, errOut)
+		}
+	})
+
 	t.Run("no output for other events", func(t *testing.T) {
 		in := Input{SessionID: "c1", Cwd: dir, ToolName: "Edit", ToolInput: toolInput("file_path", filepath.Join(dir, "api", "x")),
 			NotificationType: "permission_prompt"}
@@ -238,10 +262,10 @@ func TestSessionStartContext(t *testing.T) {
 		}
 		st.Close()
 		var out bytes.Buffer
-		if err := writeSessionContext(context.Background(), &out, st, f.p, task.ID, now); err == nil || out.Len() != 0 {
+		if err := writeSessionContext(context.Background(), &out, st, f.p, task.ID, "", now); err == nil || out.Len() != 0 {
 			t.Errorf("err=%v stdout=%q", err, out.String())
 		}
-		if err := writeSessionContext(context.Background(), &out, f.st, f.p, 9999, now); err == nil || out.Len() != 0 {
+		if err := writeSessionContext(context.Background(), &out, f.st, f.p, 9999, "", now); err == nil || out.Len() != 0 {
 			t.Errorf("missing task: err=%v stdout=%q", err, out.String())
 		}
 	})
@@ -261,7 +285,7 @@ func TestRenderContextLimits(t *testing.T) {
 			{Body: "line one\nline\ttwo\x00\x07 \u200b\x1b[31mred", Author: "user", CreatedAt: day(2)},
 			{Body: strings.Repeat("é", 1000), Author: "assistant", CreatedAt: day(1)},
 		}
-		got := renderContext(task, notes, p, now)
+		got := renderContext(task, notes, p, "", now)
 		if !strings.Contains(got, "- Title: evil [2J title next\n") {
 			t.Errorf("title not sanitised:\n%q", got)
 		}
@@ -288,7 +312,7 @@ func TestRenderContextLimits(t *testing.T) {
 		for i := 0; i < 5; i++ {
 			notes = append(notes, model.Note{Body: fmt.Sprintf("N%d ", i) + strings.Repeat("x", 400), Author: "user", CreatedAt: day(20 - i)})
 		}
-		got := renderContext(task, notes, p, now)
+		got := renderContext(task, notes, p, "", now)
 		if len(got) > contextMaxLen || !utf8.ValidString(got) {
 			t.Fatalf("len %d > %d", len(got), contextMaxLen)
 		}
@@ -306,9 +330,114 @@ func TestRenderContextLimits(t *testing.T) {
 		for i := 0; i < 80; i++ {
 			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-%02d", i), Mode: model.ModeRO})
 		}
-		got := renderContext(task, []model.Note{{Body: "hi", Author: "user", CreatedAt: day(1)}}, p, now)
+		got := renderContext(task, []model.Note{{Body: "hi", Author: "user", CreatedAt: day(1)}}, p, "", now)
 		if len(got) > contextMaxLen || !strings.HasSuffix(got, footer) || strings.Contains(got, "Notes") {
 			t.Errorf("len %d:\n%s", len(got), got)
+		}
+	})
+}
+
+func TestRenderContextEnv(t *testing.T) {
+	p := config.Paths{Tasks: "/t", Repos: "/r"}
+	day := func(d int) time.Time { return time.Date(2026, 3, d, 0, 0, 0, 0, time.UTC) }
+	base := model.Task{Slug: "s", Title: "T", Status: model.StatusActive, Branch: "atl/s", PortOffset: 100,
+		Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "main"}}}
+	notes := []model.Note{{Body: "hi", Author: "user", CreatedAt: day(1)}}
+	footer := "\nUse `atl note s \"...\"` to leave a status note for later sessions.\n"
+	const head = "\nEnvironment notes (ATL_CONTEXT):\n"
+	section := func(t *testing.T, got string) string {
+		t.Helper()
+		i := strings.Index(got, head)
+		if i < 0 {
+			t.Fatalf("no ATL_CONTEXT section:\n%s", got)
+		}
+		rest := got[i+len(head):]
+		j := strings.Index(rest, "\n\n")
+		if j < 0 {
+			t.Fatalf("section not terminated:\n%q", rest)
+		}
+		return rest[:j]
+	}
+
+	t.Run("placed after ATL_PORT_OFFSET, before notes", func(t *testing.T) {
+		got := renderContext(base, notes, p, "Use docker for tests.", now)
+		want := "\nATL_PORT_OFFSET=100\n" + head + "Use docker for tests.\n\nNotes (newest first):\n- 2026-03-01 [user] hi\n" + footer
+		if !strings.HasSuffix(got, want) {
+			t.Errorf("got:\n%s", got)
+		}
+		got = renderContext(base, nil, p, "x", now)
+		if !strings.HasSuffix(got, "\nATL_PORT_OFFSET=100\n"+head+"x\n"+footer) {
+			t.Errorf("no notes:\n%s", got)
+		}
+	})
+
+	t.Run("unset or blank: unchanged", func(t *testing.T) {
+		plain := renderContext(base, notes, p, "", now)
+		if strings.Contains(plain, "Environment notes") {
+			t.Fatalf("section without ATL_CONTEXT:\n%s", plain)
+		}
+		for _, v := range []string{" ", "\t\n\r\n  ", "\x1b\u202e\u200b"} {
+			if got := renderContext(base, notes, p, v, now); got != plain {
+				t.Errorf("%q changed the output:\n%s", v, got)
+			}
+		}
+	})
+
+	t.Run("sanitised, newlines kept", func(t *testing.T) {
+		got := renderContext(base, notes, p, "\n  line one\r\nline\ttwo\x1b[31m\rthree \u202eevil\u200b\x00x\xff \n\n", now)
+		if s := section(t, got); s != "line one\nline two [31m\nthree  evil  x" {
+			t.Errorf("section %q", s)
+		}
+		for _, r := range got {
+			if r != '\n' && (r < 0x20 || r == 0x7f || r == '\u202e' || r == '\u200b' || r == utf8.RuneError) {
+				t.Fatalf("control/format char %U in context", r)
+			}
+		}
+	})
+
+	t.Run("capped at 1000 bytes", func(t *testing.T) {
+		exact := strings.Repeat("a", contextEnvLen)
+		if s := section(t, renderContext(base, nil, p, exact, now)); s != exact {
+			t.Errorf("%d-byte text cut to %d", len(exact), len(s))
+		}
+		got := renderContext(base, nil, p, "b"+strings.Repeat("é", 1000), now)
+		s := section(t, got)
+		if len(s) > contextEnvLen || !utf8.ValidString(s) || !strings.HasSuffix(s, "é…") || !strings.HasPrefix(s, "bé") {
+			t.Errorf("len %d, valid %v, tail %q", len(s), utf8.ValidString(s), s[len(s)-8:])
+		}
+		if len(s) < contextEnvLen-len("é") {
+			t.Errorf("cut too short: %d", len(s))
+		}
+	})
+
+	t.Run("overall cap: notes dropped first", func(t *testing.T) {
+		task := base
+		for i := 0; i < 12; i++ {
+			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-with-a-long-name-%02d", i), Mode: model.ModeRO})
+		}
+		var many []model.Note
+		for i := 0; i < 5; i++ {
+			many = append(many, model.Note{Body: fmt.Sprintf("N%d ", i) + strings.Repeat("x", 400), Author: "user", CreatedAt: day(20 - i)})
+		}
+		env := strings.Repeat("env text ", 200)
+		got := renderContext(task, many, p, env, now)
+		if len(got) > contextMaxLen || !utf8.ValidString(got) || !strings.HasSuffix(got, footer) {
+			t.Fatalf("len %d > %d or footer lost:\n%s", len(got), contextMaxLen, got)
+		}
+		if s := section(t, got); len(s) > contextEnvLen || !strings.HasSuffix(s, "…") || !strings.HasPrefix(s, "env text env") {
+			t.Errorf("section cut wrongly (len %d): %q", len(s), s)
+		}
+		if strings.Contains(got, "N1 ") {
+			t.Errorf("older notes kept:\n%s", got)
+		}
+
+		// A fixed part too big for notes: notes go, the cap and footer hold.
+		for i := 12; i < 30; i++ {
+			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-with-a-long-name-%02d", i), Mode: model.ModeRO})
+		}
+		got = renderContext(task, many, p, env, now)
+		if len(got) > contextMaxLen || !utf8.ValidString(got) || !strings.HasSuffix(got, footer) || strings.Contains(got, "Notes") {
+			t.Errorf("pathological: len %d:\n%s", len(got), got)
 		}
 	})
 }

@@ -67,6 +67,7 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | Task context injected at SessionStart (hookSpecificOutput.additionalContext: task, repos+base, ro warning, port, 5 latest notes) instead of CLAUDE.md | done (reviewed) |
 | TUI list: status dot per task (waiting>running>idle>stopped) + `*` for dirty open tasks (App.DirtyTasks, 5s async) | done (reviewed + nits) |
 | Dockerfile: UTF-8 + tmux 256/RGB (rendering artifacts) | done |
+| `ATL_CONTEXT` env var: per-environment text appended to every task session's SessionStart context (sanitised, ≤1000 bytes, notes dropped first) | done |
 | idea: Claude on the right pane of the TUI (tmux join-pane) instead of full-screen attach | idea (user wants it later) |
 | optional: skip-fetch toggle in TUI new-task form / SSH ControlMaster in box (YubiKey touch per fetch) | idea |
 
