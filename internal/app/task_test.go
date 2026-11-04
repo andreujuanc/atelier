@@ -651,6 +651,10 @@ func TestFinishBranchCleanup(t *testing.T) {
 			sha := e.commitIn(t, slug, "api", "f")
 			git(t, e.canonical("api"), "branch", "other", sha)
 		}},
+		{name: "alias symref", kept: true, prepare: func(t *testing.T, e *taskEnv, slug string) {
+			e.commitIn(t, slug, "api", "f")
+			git(t, e.canonical("api"), "symbolic-ref", "refs/heads/alias", "refs/heads/atl/"+slug)
+		}},
 		{name: "cancel no commits", cancel: true, prepare: func(*testing.T, *taskEnv, string) {}},
 		{name: "cancel unpushed", cancel: true, kept: true, prepare: func(t *testing.T, e *taskEnv, slug string) {
 			e.commitIn(t, slug, "api", "f")
@@ -688,6 +692,38 @@ func TestFinishBranchCleanup(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A branch that moves between the unique-commit check and the delete is kept
+// (compare-and-delete against the tip read before the check).
+func TestFinishBranchMovedBeforeDelete(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "race", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canon := e.canonical("api")
+	var moved string
+	beforeBranchDelete = func(repo, branch string) {
+		// A new commit on the branch, made from the canonical repo.
+		tree := git(t, repo, "rev-parse", "refs/heads/"+branch+"^{tree}")
+		moved = git(t, repo, "commit-tree", "-p", "refs/heads/"+branch, "-m", "late", tree)
+		git(t, repo, "update-ref", "refs/heads/"+branch, moved)
+	}
+	t.Cleanup(func() { beforeBranchDelete = nil })
+	e.app.Out.(*bytes.Buffer).Reset()
+	if _, err := e.app.Done(ctx, task.Slug, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, canon, "rev-parse", "refs/heads/atl/race"); got != moved {
+		t.Fatalf("branch tip %s, want %s", got, moved)
+	}
+	out := e.app.Out.(*bytes.Buffer).String()
+	if !strings.Contains(out, "warning: delete branch atl/race in api:") || strings.Contains(out, "deleted branch") {
+		t.Fatalf("output: %q", out)
 	}
 }
 

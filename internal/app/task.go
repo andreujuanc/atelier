@@ -601,10 +601,16 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 	return a.Store.SetTaskStatus(ctx, t.ID, to)
 }
 
+// beforeBranchDelete, if set (tests only), runs in cleanupBranch between the
+// unique-commit check and the delete.
+var beforeBranchDelete func(repo, branch string)
+
 // cleanupBranch deletes the task branch in the canonical repo after its
-// worktree was removed, but only when nothing would be lost: every commit on
-// it must be reachable from another local branch or a remote-tracking ref
-// (local refs only; nothing is fetched). Otherwise the branch is kept. A
+// worktree was removed, but only when no commits on it would be lost: every
+// commit on it must be reachable from another local branch or a
+// remote-tracking ref (local refs only; nothing is fetched). Otherwise the
+// branch is kept. The tip is read before the check and the delete is a
+// compare-and-delete against it, so a branch that moved meanwhile is kept. A
 // missing branch is ignored; failures are warnings, never errors.
 func (a *App) cleanupBranch(ctx context.Context, name, repo, branch string) {
 	ok, err := gitx.RefExists(ctx, repo, "refs/heads/"+branch)
@@ -615,7 +621,12 @@ func (a *App) cleanupBranch(ctx context.Context, name, repo, branch string) {
 	if !ok {
 		return
 	}
-	n, err := gitx.UniqueCommits(ctx, repo, branch)
+	tip, err := gitx.RevParse(ctx, repo, "refs/heads/"+branch)
+	if err != nil {
+		a.warnf("kept branch %s in %s: %v", branch, name, err)
+		return
+	}
+	n, err := gitx.UniqueCommitsAt(ctx, repo, branch, tip)
 	if err != nil {
 		a.warnf("kept branch %s in %s: %v", branch, name, err)
 		return
@@ -624,7 +635,10 @@ func (a *App) cleanupBranch(ctx context.Context, name, repo, branch string) {
 		fmt.Fprintf(a.out(), "kept branch %s in %s (%d unpushed commit(s))\n", branch, name, n)
 		return
 	}
-	if err := gitx.DeleteBranch(ctx, repo, branch); err != nil {
+	if beforeBranchDelete != nil {
+		beforeBranchDelete(repo, branch)
+	}
+	if err := gitx.DeleteBranchIfAt(ctx, repo, branch, tip); err != nil {
 		a.warnf("delete branch %s in %s: %v", branch, name, err)
 		return
 	}

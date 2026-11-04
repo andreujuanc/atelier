@@ -914,6 +914,84 @@ func TestUniqueCommits(t *testing.T) {
 	}
 }
 
+// A symbolic ref that resolves to the branch (directly or via a chain, local
+// or remote) does not count as another ref; one aimed elsewhere does.
+func TestUniqueCommitsSymref(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "x")
+	commitFile(t, wt, "a", "a\n", "a")
+	git(t, f.repo, "symbolic-ref", "refs/heads/alias", "refs/heads/atl/x")
+	git(t, f.repo, "symbolic-ref", "refs/heads/alias2", "refs/heads/alias")
+	git(t, f.repo, "symbolic-ref", "refs/remotes/origin/aimed", "refs/heads/atl/x")
+	if n, err := UniqueCommits(ctx, f.repo, "atl/x"); err != nil || n != 1 {
+		t.Fatalf("with aliases: %d, %v; want 1", n, err)
+	}
+	git(t, f.repo, "branch", "keep", "atl/x")
+	git(t, f.repo, "symbolic-ref", "refs/heads/other", "refs/heads/keep")
+	git(t, f.repo, "branch", "-D", "keep")
+	// "other" now dangles; it must not break the count.
+	if n, err := UniqueCommits(ctx, f.repo, "atl/x"); err != nil || n != 1 {
+		t.Fatalf("dangling symref: %d, %v; want 1", n, err)
+	}
+	git(t, f.repo, "branch", "keep", "atl/x")
+	if n, err := UniqueCommits(ctx, f.repo, "atl/x"); err != nil || n != 0 {
+		t.Fatalf("symref to another branch: %d, %v; want 0", n, err)
+	}
+}
+
+// Many refs are passed on stdin, not argv.
+func TestUniqueCommitsManyRefs(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "m")
+	commitFile(t, wt, "a", "a\n", "a")
+	var in strings.Builder
+	base := git(t, f.repo, "rev-parse", "HEAD")
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&in, "create refs/heads/many/%s-%d %s\n", strings.Repeat("x", 40), i, base)
+	}
+	cmd := exec.Command("git", "-C", f.repo, "update-ref", "--stdin")
+	cmd.Env = testEnv(t)
+	cmd.Stdin = strings.NewReader(in.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("update-ref: %v %s", err, out)
+	}
+	if n, err := UniqueCommits(ctx, f.repo, "atl/m"); err != nil || n != 1 {
+		t.Fatalf("%d, %v; want 1", n, err)
+	}
+}
+
+func TestDeleteBranchIfAt(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "cad")
+	old := git(t, wt, "rev-parse", "HEAD")
+	commitFile(t, wt, "a", "a\n", "a")
+	tip := git(t, wt, "rev-parse", "HEAD")
+	if err := DeleteBranchIfAt(ctx, f.repo, "atl/cad", tip); err == nil {
+		t.Fatal("deleted a branch checked out in a worktree")
+	}
+	if err := RemoveWorktree(ctx, f.repo, wt, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteBranchIfAt(ctx, f.repo, "atl/cad", old); err == nil {
+		t.Fatal("deleted with a stale oid")
+	}
+	if got, err := RevParse(ctx, f.repo, "refs/heads/atl/cad"); err != nil || got != tip {
+		t.Fatalf("branch after stale delete: %s, %v", got, err)
+	}
+	if err := DeleteBranchIfAt(ctx, f.repo, "atl/cad", tip); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RevParse(ctx, f.repo, "refs/heads/atl/cad"); err == nil {
+		t.Fatal("branch still exists")
+	}
+	if err := DeleteBranchIfAt(ctx, f.repo, "atl/cad", tip); err == nil {
+		t.Fatal("missing branch: expected error")
+	}
+}
+
 // Only local refs are consulted: commits pushed to origin are unique until a
 // fetch creates the remote-tracking ref.
 func TestUniqueCommitsLocalRefsOnly(t *testing.T) {

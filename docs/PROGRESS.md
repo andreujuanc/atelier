@@ -61,8 +61,8 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | Repo picker in TUI + add repo to existing task (`a`, `atl add`, `atl repos`) | done (reviewed, 1 fix round) |
 | SessionEnd on container shutdown marks sessions `ended` (should be `stopped`, resumable) | todo |
 | atelier assistant — Part A (transcript_path, notes, show, transcript) | done (reviewed, 1 fix round) |
-| atelier assistant — Part B (assistant session, `atl assistant`, TUI `A`) | todo |
-| done/cancel delete the local atl/<slug> branch when nothing would be lost (no own commits, or all pushed); keep + report otherwise | done (reviewed; nits in progress) |
+| atelier assistant — Part B (assistant session, `atl assistant`, TUI `A`) | in progress |
+| done/cancel delete the local atl/<slug> branch when nothing would be lost (no own commits, or all pushed); keep + report otherwise | done (reviewed + safety nits fixed) |
 | optional: skip-fetch toggle in TUI new-task form / SSH ControlMaster in box (YubiKey touch per fetch) | idea |
 
 - (follow-up) NewTaskOpts.ExactRepos for the picker; runSetup takes a repo filter; validRepoArg shared; store.ErrDuplicate; Backend gained ProjectRepos/AvailableRepos/AddRepo.

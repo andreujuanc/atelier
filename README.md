@@ -59,9 +59,9 @@ Choosing a project in the form preselects its repos.
 push `atl/<slug>` yourself before `atl pr`.
 
 `atl done`/`atl cancel` remove each worktree and then delete its `atl/<slug>` branch
-only if nothing would be lost: every commit on it must be reachable from another local
-branch or a remote-tracking ref (local refs only, no fetch), e.g. after you pushed it or
-when it has no commits of its own. Otherwise the branch is kept and reported
+only if no commits on the branch would be lost (the branch's reflog is not kept): every
+commit on it must be reachable from another local branch or a remote-tracking ref (local
+refs only, no fetch), e.g. after you pushed it or when it has no commits of its own. Otherwise the branch is kept and reported
 (`kept branch atl/<slug> in <repo> (N unpushed commit(s))`); `--force` only discards
 uncommitted changes, never unpushed commits.
 

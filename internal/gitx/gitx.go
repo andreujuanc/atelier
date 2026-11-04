@@ -140,6 +140,19 @@ func run(ctx context.Context, dir string, args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// runInput is run with input fed to git's stdin.
+func runInput(ctx context.Context, dir, input string, args ...string) (string, error) {
+	var stdout, stderr bytes.Buffer
+	cmd := command(ctx, dir, args...)
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", wrap(ctx, args, stderr.String(), err)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
 func samePath(a, b string) bool {
 	ra, err := filepath.EvalSymlinks(a)
 	if err != nil {
@@ -293,15 +306,98 @@ func DeleteBranch(ctx context.Context, repo, branch string) error {
 	return err
 }
 
+// DeleteBranchIfAt deletes the local branch in repo only if its tip is
+// still oid (a compare-and-delete via `git update-ref -d`). If the branch
+// moved, is missing, or is checked out in a worktree, it fails and the
+// branch is left untouched.
+func DeleteBranchIfAt(ctx context.Context, repo, branch, oid string) error {
+	if oid == "" {
+		return fmt.Errorf("delete branch %s: empty expected oid", branch)
+	}
+	ref := "refs/heads/" + branch
+	// update-ref does not refuse a branch checked out in a worktree (unlike
+	// `git branch -D`), so check that first.
+	out, err := run(ctx, repo, "worktree", "list", "--porcelain")
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if line == "branch "+ref {
+			return fmt.Errorf("delete branch %s: checked out in a worktree", branch)
+		}
+	}
+	_, err = run(ctx, repo, "update-ref", "-d", ref, oid)
+	return err
+}
+
 // UniqueCommits returns the number of commits reachable from the local
 // branch that are not reachable from any other local branch or any
 // remote-tracking ref, i.e. the commits that deleting the branch would lose.
 // It only looks at local refs (no fetch). A missing branch is an error.
 func UniqueCommits(ctx context.Context, repo, branch string) (int, error) {
-	// --exclude patterns are relative to refs/heads/ for --branches and
-	// apply to the next --branches only.
-	out, err := run(ctx, repo, "rev-list", "--count", "refs/heads/"+branch,
-		"--not", "--exclude="+branch, "--branches", "--remotes")
+	tip, err := RevParse(ctx, repo, "refs/heads/"+branch)
+	if err != nil {
+		return 0, err
+	}
+	return UniqueCommitsAt(ctx, repo, branch, tip)
+}
+
+// UniqueCommitsAt is UniqueCommits counted from the commit tip (the
+// branch's tip as read earlier by the caller) instead of the branch's
+// current tip. Neither the branch itself nor any symbolic ref that resolves
+// to it (e.g. refs/heads/alias -> refs/heads/<branch>) counts as another
+// ref.
+func UniqueCommitsAt(ctx context.Context, repo, branch, tip string) (int, error) {
+	self := "refs/heads/" + branch
+	out, err := run(ctx, repo, "for-each-ref", "--format=%(refname)%00%(symref)%00%(objectname)",
+		"refs/heads", "refs/remotes")
+	if err != nil {
+		return 0, err
+	}
+	type entry struct{ symref, oid string }
+	refs := map[string]entry{}
+	var order []string
+	for _, line := range strings.Split(out, "\n") {
+		if line == "" {
+			continue
+		}
+		f := strings.SplitN(line, "\x00", 3)
+		if len(f) != 3 {
+			return 0, fmt.Errorf("git for-each-ref: unexpected output %q", line)
+		}
+		refs[f[0]] = entry{symref: f[1], oid: f[2]}
+		order = append(order, f[0])
+	}
+	// resolvesToSelf follows symref chains (with a cycle guard) and reports
+	// whether name ends up at the branch.
+	resolvesToSelf := func(name string) bool {
+		seen := map[string]bool{}
+		for name != "" && !seen[name] {
+			if name == self {
+				return true
+			}
+			seen[name] = true
+			e, ok := refs[name]
+			if !ok {
+				return false
+			}
+			name = e.symref
+		}
+		return false
+	}
+	// Revisions go on stdin so that many refs cannot overflow argv.
+	var in strings.Builder
+	in.WriteString(tip + "\n")
+	done := map[string]bool{}
+	for _, name := range order {
+		e := refs[name]
+		if e.oid == "" || done[e.oid] || resolvesToSelf(name) {
+			continue
+		}
+		done[e.oid] = true
+		in.WriteString("^" + e.oid + "\n")
+	}
+	out, err = runInput(ctx, repo, in.String(), "rev-list", "--count", "--stdin")
 	if err != nil {
 		return 0, err
 	}
