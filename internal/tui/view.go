@@ -47,10 +47,18 @@ func dotFor(k dotKind) (string, lipgloss.Style) {
 	return " ", lipgloss.NewStyle()
 }
 
-// legend explains the list row marks (help line, when it fits).
-var legend = dimStyle.Render("● ") + waitStyle.Render("waiting") + dimStyle.Render("/") +
-	runStyle.Render("running") + dimStyle.Render("/") + idleStyle.Render("idle") +
-	"  " + markStyle.Render("*") + dimStyle.Render(" uncommitted")
+// legends explain the list row marks (help line): the first that fits is
+// shown, none when neither does.
+var legends = []string{
+	legendDots + "  " + stopStyle.Render("○") + dimStyle.Render(" stopped") + legendStar,
+	legendDots + legendStar,
+}
+
+var (
+	legendDots = dimStyle.Render("● ") + waitStyle.Render("waiting") + dimStyle.Render("/") +
+		runStyle.Render("running") + dimStyle.Render("/") + idleStyle.Render("idle")
+	legendStar = "  " + markStyle.Render("*") + dimStyle.Render(" uncommitted")
+)
 
 // minSplitWidth is the narrowest terminal that shows the details pane.
 const minSplitWidth = 40
@@ -230,10 +238,13 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 	if s := titleT + busy + pad; s != "" {
 		line += base.Render(s)
 	}
+	// The dot keeps its colour on the selected row; the space after it
+	// takes the row's base style so the highlight is continuous.
+	sep := base.Render(" ")
 	if w < 2 {
-		return trunc(dotStyle.Render(glyph)+" ", w)
+		return trunc(dotStyle.Render(glyph)+sep, w)
 	}
-	return dotStyle.Render(glyph) + " " + line
+	return dotStyle.Render(glyph) + sep + line
 }
 
 func (m *Model) detailLines(w, h int) []string {
@@ -405,8 +416,10 @@ func (m *Model) helpLine(w int) string {
 		s = ""
 	default:
 		s = "n new  enter open  s session  r resume  a add repo  m note  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  q quit"
-		if ansi.StringWidth(s)+2+ansi.StringWidth(legend) <= w {
-			return dimStyle.Render(s+"  ") + legend
+		for _, l := range legends {
+			if ansi.StringWidth(s)+2+ansi.StringWidth(l) <= w {
+				return dimStyle.Render(s+"  ") + l
+			}
 		}
 	}
 	return dimStyle.Render(trunc(s, w))

@@ -16,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
@@ -46,6 +47,7 @@ type fakeBackend struct {
 	assistHint string
 	dirty      map[int64]bool // DirtyTasks' result
 	dirtyErr   error
+	dirtyHang  bool // DirtyTasks blocks until its context is done
 }
 
 func (f *fakeBackend) rec(name string, args ...any) { f.calls = append(f.calls, call{name, args}) }
@@ -164,6 +166,10 @@ func (f *fakeBackend) Recover(ctx context.Context) (int, error) {
 
 func (f *fakeBackend) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
 	f.rec("DirtyTasks")
+	if f.dirtyHang {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if f.dirtyErr != nil {
 		return nil, f.dirtyErr
 	}
@@ -2168,14 +2174,15 @@ func TestDirtyTicks(t *testing.T) {
 		}
 		return n
 	}
+	// Init runs one check; its result arms the (single) next tick
 	if countTicks() != 1 || fb.count("DirtyTasks") != 1 || !m.dirty[1] || m.dirtying {
 		t.Fatalf("start: ticks %d calls %d dirty %v", countTicks(), fb.count("DirtyTasks"), m.dirty)
 	}
-	// a tick reschedules itself once and starts one check
+	// a tick starts one check and does not reschedule itself
 	*sched = nil
 	fb.dirty = map[int64]bool{2: true}
 	_, cmd := m.Update(dirtyTickMsg{})
-	if countTicks() != 1 || len(*sched) != 1 || !m.dirtying {
+	if countTicks() != 0 || !m.dirtying || cmd == nil {
 		t.Fatalf("tick: sched %v dirtying %v", *sched, m.dirtying)
 	}
 	if fb.count("DirtyTasks") != 1 {
@@ -2184,26 +2191,28 @@ func TestDirtyTicks(t *testing.T) {
 	if !m.dirty[1] {
 		t.Fatal("last result dropped before the new one arrived")
 	}
-	// a second tick while the check is in flight starts nothing new
-	*sched = nil
-	_, cmd2 := m.Update(dirtyTickMsg{})
-	drain(m, cmd2)
-	if countTicks() != 1 || fb.count("DirtyTasks") != 1 {
-		t.Fatalf("in-flight tick: ticks %d calls %d", countTicks(), fb.count("DirtyTasks"))
+	// a stray tick while the check is in flight starts and arms nothing
+	if _, cmd2 := m.Update(dirtyTickMsg{}); cmd2 != nil || countTicks() != 0 {
+		t.Fatalf("in-flight tick: cmd %v ticks %d", cmd2 != nil, countTicks())
 	}
+	// the next tick is armed only once the check finished
 	drain(m, cmd)
 	if fb.count("DirtyTasks") != 2 || m.dirtying || m.dirty[1] || !m.dirty[2] {
 		t.Fatalf("result not applied: %v", m.dirty)
 	}
+	if countTicks() != 1 {
+		t.Fatalf("ticks after result: %d", countTicks())
+	}
 	if !strings.Contains(listLine(t, m, "beta"), "beta*") || strings.Contains(listLine(t, m, "alpha"), "alpha*") {
 		t.Fatalf("view:\n%s", plainView(m))
 	}
-	// an error keeps the last result and is reported once
+	// an error keeps the last result, is reported once and still re-arms
 	fb.dirtyErr = errors.New("boom")
+	*sched = nil
 	_, cmd = m.Update(dirtyTickMsg{})
 	drain(m, cmd)
-	if !m.dirty[2] || !m.statusErr || !strings.Contains(m.status, "boom") {
-		t.Fatalf("error: dirty %v status %q", m.dirty, m.status)
+	if !m.dirty[2] || !m.statusErr || !strings.Contains(m.status, "boom") || countTicks() != 1 {
+		t.Fatalf("error: dirty %v status %q ticks %d", m.dirty, m.status, countTicks())
 	}
 	m.status, m.statusErr = "", false
 	_, cmd = m.Update(dirtyTickMsg{})
@@ -2220,13 +2229,73 @@ func TestDirtyTicks(t *testing.T) {
 	}
 }
 
+func TestDirtyTimeout(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), dirty: map[int64]bool{1: true}}
+	m, sched := newTest(t, fb)
+	if m.dirtyTimeout != dirtyTimeout {
+		t.Fatalf("default timeout %v", m.dirtyTimeout)
+	}
+	m.dirtyTimeout = 20 * time.Millisecond
+	fb.dirtyHang = true
+	for i := 0; i < 2; i++ {
+		*sched = nil
+		_, cmd := m.Update(dirtyTickMsg{})
+		drain(m, cmd)
+		if m.dirtying || !m.dirty[1] || len(*sched) != 1 {
+			t.Fatalf("hung check %d: dirtying %v dirty %v sched %v", i, m.dirtying, m.dirty, *sched)
+		}
+		if i == 0 && (!m.statusErr || !strings.Contains(m.status, "timed out")) {
+			t.Fatalf("timeout not shown: %q", m.status)
+		}
+		if i == 1 && m.status != "" {
+			t.Fatalf("timeout shown again: %q", m.status)
+		}
+		m.status, m.statusErr = "", false
+	}
+	// recovery clears the error so a later timeout is shown again
+	fb.dirtyHang, fb.dirty = false, map[int64]bool{2: true}
+	_, cmd := m.Update(dirtyTickMsg{})
+	drain(m, cmd)
+	if !m.dirty[2] || m.dirtyErr != "" {
+		t.Fatalf("after recovery: dirty %v err %q", m.dirty, m.dirtyErr)
+	}
+}
+
+func TestSelectedRowSeparator(t *testing.T) {
+	old := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	t.Cleanup(func() { lipgloss.SetColorProfile(old) })
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	var r row
+	for _, x := range m.rows {
+		if x.isTask() && x.task.Task.Slug == "gamma" {
+			r = x
+		}
+	}
+	glyph, dotStyle := dotFor(aggregate(r.task.Sessions))
+	dot := dotStyle.Render(glyph)
+	if l := m.rowLine(r, true, 40); !strings.HasPrefix(l, dot+selStyle.Render(" ")) {
+		t.Fatalf("selected row %q", l)
+	}
+	if l := m.rowLine(r, false, 40); !strings.HasPrefix(l, dot+" ") {
+		t.Fatalf("unselected row %q", l)
+	}
+}
+
 func TestLegend(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks()}
 	m, _ := newTest(t, fb)
 	m.Update(tea.WindowSizeMsg{Width: 200, Height: 30})
 	lines := strings.Split(plainView(m), "\n")
-	if help := lines[len(lines)-1]; !strings.Contains(help, "● waiting/running/idle  * uncommitted") || ansi.StringWidth(help) > 200 {
+	if help := lines[len(lines)-1]; !strings.Contains(help, "● waiting/running/idle  ○ stopped  * uncommitted") || ansi.StringWidth(help) > 200 {
 		t.Fatalf("wide help %q", help)
+	}
+	// just too narrow for the stopped mark: the short legend
+	m.Update(tea.WindowSizeMsg{Width: ansi.StringWidth(lines[len(lines)-1]) - 1, Height: 30})
+	lines = strings.Split(plainView(m), "\n")
+	if help := lines[len(lines)-1]; !strings.Contains(help, "● waiting/running/idle  * uncommitted") || strings.Contains(help, "stopped") {
+		t.Fatalf("short legend %q", help)
 	}
 	for _, w := range []int{120, 80, 30} {
 		m.Update(tea.WindowSizeMsg{Width: w, Height: 30})
