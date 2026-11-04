@@ -12,8 +12,8 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 | M3 tmux + session launch/resume/attach | done (reviewed, 1 fix round) |
 | M4 hook, state machine, ro guard, CLAUDE.md/settings.json | done (reviewed, 2 fix rounds + guard re-review) |
 | M5 CLI | done (reviewed, 1 fix round) |
-| M6 TUI | in progress |
-| M7 projects, scripts, ports, diff, pr | todo |
+| M6 TUI | done (reviewed, 1 fix round) |
+| M7 projects, scripts, ports, diff, pr | in progress |
 | M8 crash recovery + e2e | todo |
 
 ## Decisions
@@ -43,3 +43,5 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 - (M5) NewTask inserts the row first (CreateTaskAutoPort: atomic slug+port), then worktrees/gen; full rollback incl. branches it created. Existing task dir on disk → error (not a new slug).
 - (M5) doctor: Warn = OK&&Warn; tmux < 3.2 FAIL. Project TOML rejects unknown keys. Repo names .claude/CLAUDE.md/./.. rejected.
 - (M5) Done/Cancel prune hand-deleted worktrees; tmux errors (other than not installed) abort unless --force.
+- (M6) bubbletea v1.3.10 / lipgloss v1.1.0 / bubbles v0.21.0 (newer bubbles bumps go directive). Root `atl` runs TUI only on a TTY. TUI Backend interface + adapter over *app.App; App.Out → status line while running.
+- (M6) q with ops in flight waits for them (second ctrl+c forces). D runs `atl diff <slug>` via ExecProcess. Titles are whitespace-collapsed at creation.

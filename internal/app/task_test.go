@@ -397,6 +397,19 @@ func TestNewTaskDirExists(t *testing.T) {
 	}
 }
 
+func TestNewTaskTitleWhitespace(t *testing.T) {
+	e := newTaskEnv(t)
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(context.Background(), NewTaskOpts{Title: " Fix\n  the\t\r\nlogin  ",
+		Description: "line one\nline two", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRO}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Title != "Fix the login" || task.Slug != "fix-the-login" || task.Description != "line one\nline two" {
+		t.Fatalf("task = %+v", task)
+	}
+}
+
 func TestNewTaskProject(t *testing.T) {
 	e := newTaskEnv(t)
 	e.addRepo(t, "api", "main")

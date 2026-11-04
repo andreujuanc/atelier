@@ -143,7 +143,8 @@ func checkRepo(ctx context.Context, name, path string) error {
 // writes CLAUDE.md and .claude/settings.json. Any failure after the insert
 // rolls everything back.
 func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
-	title := strings.TrimSpace(o.Title)
+	// The title is one line: collapse whitespace runs (newlines included).
+	title := strings.Join(strings.Fields(o.Title), " ")
 	if title == "" {
 		return nil, errors.New("title is required")
 	}

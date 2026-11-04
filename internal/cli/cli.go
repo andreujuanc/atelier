@@ -18,6 +18,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/tmux"
+	"github.com/andreujuanc/atelier/internal/tui"
 )
 
 // Exit codes.
@@ -141,8 +142,17 @@ func (c *cli) rootCmd() *cobra.Command {
 			"across one or more repos; Claude runs inside tmux.",
 		SilenceErrors: true,
 		SilenceUsage:  true,
-		// TODO(M6): run the TUI.
-		RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
+		// With no subcommand: the TUI on a terminal, else the help.
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !isTerminal(os.Stdin) || !isTerminal(c.stdout) {
+				return cmd.Help()
+			}
+			ap, err := c.App()
+			if err != nil {
+				return err
+			}
+			return tui.RunContext(cmd.Context(), ap)
+		},
 	}
 	root.CompletionOptions.HiddenDefaultCmd = true
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
