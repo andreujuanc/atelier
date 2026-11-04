@@ -326,9 +326,10 @@ func (c *cli) openCmd() *cobra.Command {
 		Short: "Ensure the task's tmux session (resume or start Claude) and attach to it",
 		Long: "Ensure the task's tmux session and attach to it.\n\n" +
 			"Without flags: attach if a Claude window is live, else resume the task's stopped sessions,\n" +
-			"else start a new session. --session ID opens that session of the task (a live one is\n" +
-			"selected, an ended or stopped one is resumed with claude --resume); --new starts a new\n" +
-			"session. Either way the window is selected before attaching.",
+			"else start a new session. --session ID opens that session of the task (one with a live\n" +
+			"window is selected, an ended or stopped one is resumed with claude --resume if it can\n" +
+			"be found from the task dir); --new starts a new session. Either way the window is\n" +
+			"selected before attaching.",
 		Args: args(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
 			hasSession := cmd.Flags().Changed("session")
