@@ -123,7 +123,7 @@ func TestTransitions(t *testing.T) {
 		{"compact keeps running", model.StateRunning, EventSessionStart, Input{SessionID: "new", Source: "compact"}, model.StateRunning, true},
 		{"compact keeps waiting", model.StateWaiting, EventSessionStart, Input{SessionID: "new", Source: "compact"}, model.StateWaiting, true},
 		{"compact keeps idle", model.StateIdle, EventSessionStart, Input{SessionID: "new", Source: "compact"}, model.StateIdle, true},
-		{"start from running (/clear)", model.StateRunning, EventSessionStart, Input{SessionID: "new", Source: "clear"}, model.StateIdle, true},
+		{"start after SessionEnd (/clear)", model.StateEnded, EventSessionStart, Input{SessionID: "new", Source: "clear"}, model.StateIdle, true},
 		{"prompt", model.StateIdle, EventUserPromptSubmit, Input{}, model.StateRunning, true},
 		{"prompt from waiting", model.StateWaiting, EventUserPromptSubmit, Input{}, model.StateRunning, true},
 		{"permission typed", model.StateRunning, EventNotification, Input{NotificationType: "permission_prompt", Message: "Claude needs your permission to use Bash"}, model.StateWaiting, true},
@@ -273,7 +273,7 @@ func TestSessionResolution(t *testing.T) {
 	})
 
 	t.Run("nested claude does not hijack the parent row", func(t *testing.T) {
-		for _, source := range []string{"startup", ""} {
+		for _, source := range []string{"startup", "", "resume", "clear"} {
 			f := setup(t)
 			parent := f.session(t, model.StateRunning, "parent")
 			env := envOf(map[string]string{"ATL_SESSION": itoa(parent.ID), "ATL_TASK": "fix"})
@@ -326,7 +326,10 @@ func TestSessionResolution(t *testing.T) {
 				t.Errorf("sessions = %d, want 2", n)
 			}
 
-			// /clear in the parent still moves the parent row to the new id.
+			// /clear in the parent (SessionEnd, then SessionStart) still
+			// moves the parent row to the new id.
+			step(EventStop, Input{SessionID: "parent"})
+			step(EventSessionEnd, Input{SessionID: "parent"})
 			step(EventSessionStart, Input{SessionID: "parent2", Source: "clear"})
 			if g := f.get(t, parent.ID); g.ClaudeSessionID != "parent2" || g.State != model.StateIdle || !g.LastEventAt.Equal(now) {
 				t.Errorf("parent after /clear = %+v", g)
