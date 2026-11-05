@@ -59,6 +59,7 @@ func setup(t *testing.T) string {
 	t.Cleanup(func() { _ = exec.Command("tmux", "-L", sock, "kill-server").Run() })
 	for k, v := range map[string]string{
 		"HOME":            root,
+		"ATL_WORKSPACE":   "", // never the developer's real workspace
 		"TMUX":            "",
 		"ATL_REPOS":       filepath.Join(root, "repos"),
 		"ATL_TASKS":       filepath.Join(root, "tasks"),
