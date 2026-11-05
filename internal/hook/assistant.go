@@ -66,8 +66,9 @@ func assistantGuardedTool(name string) bool {
 // (exit 0) an Edit/Write/MultiEdit/NotebookEdit only when every form of its
 // target path (relative to cwd, ~-expanded, resolved through symlinks the
 // way the kernel would) lands inside Paths.AssistantDir(), but not in its
-// generated CLAUDE.md or .claude/ (the assistant must not loosen its own
-// permissions). Anything else, including a target it cannot resolve, is
+// generated CLAUDE.md, .claude/, CLAUDE.local.md (auto-loaded instructions)
+// or .mcp.json (adds tools): the assistant must not loosen its own
+// permissions. Anything else, including a target it cannot resolve, is
 // blocked (exit 2 with msg); err carries details for the log.
 func AssistantGuard(in Input, p config.Paths) (exit int, msg string, err error) {
 	if !assistantGuardedTool(in.ToolName) {
@@ -107,7 +108,8 @@ func AssistantGuard(in Input, p config.Paths) (exit int, msg string, err error) 
 			// Case-insensitive: on a case-insensitive file system
 			// "claude.md" or ".Claude/" is the same file.
 			first, _, _ := strings.Cut(rel, string(filepath.Separator))
-			if strings.EqualFold(rel, "CLAUDE.md") || strings.EqualFold(first, ".claude") {
+			if strings.EqualFold(rel, "CLAUDE.md") || strings.EqualFold(rel, "CLAUDE.local.md") ||
+				strings.EqualFold(rel, ".mcp.json") || strings.EqualFold(first, ".claude") {
 				return false
 			}
 			return true

@@ -174,7 +174,8 @@ tell `atl notes X` from `atl notes X --set` (quoting, `--set=true`, flag order),
 `atl show <task> --notes` (or `--json`), which is allowed; common repo mutators (`git commit`, `push`,
 `checkout`, `reset`, `rebase`, `merge`, `stash`, `rm`, `mv`, `cp`, `sed -i`, `tee`, ...) are
 denied, and the `atl hook AssistantGuard` PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
-outside that dir (and on its own `CLAUDE.md` and `.claude/`, in any letter case). Bash and MCP
+outside that dir (and on its own `CLAUDE.md`, `CLAUDE.local.md`, `.mcp.json` and `.claude/`, in
+any letter case). Bash and MCP
 tools cannot be fully sandboxed; the deny rules cover the common cases so that your global
 allow rules can't let the assistant change repos. It runs `claude --continue` when Claude Code
 has a previous conversation for that dir (a `*.jsonl` under
