@@ -1326,6 +1326,19 @@ func TestQuitWaitsForOps(t *testing.T) {
 		if isQuit(press(m, "q")) {
 			t.Fatal("second q quit with an op in flight")
 		}
+		// input that the pending quit would throw away is refused, also
+		// on a task that is not busy
+		press(m, "j")
+		if sel := m.selected(); sel == nil || m.busy[sel.Task.ID] != "" {
+			t.Fatal("no idle task selected")
+		}
+		for _, k := range []string{"n", "t", "a", "d", "c", "/"} {
+			press(m, k)
+			if m.mode != modeNormal || m.form != nil || m.confirm != nil ||
+				!strings.Contains(plainView(m), "quitting when they finish") {
+				t.Fatalf("%s: %q opened input while quitting (mode %v):\n%s", first, k, m.mode, plainView(m))
+			}
+		}
 		// the op ends: the TUI quits by itself
 		_, cmd := m.Update(op())
 		if !isQuit(cmd) || m.Forced() {

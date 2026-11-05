@@ -661,7 +661,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func quitText(n int) string {
-	return fmt.Sprintf("%d operation(s) running — press q again to quit after they finish, ctrl+c again to force", n)
+	return fmt.Sprintf("%d operation(s) running — quitting when they finish, ctrl+c again to force", n)
 }
 
 // requestQuit quits now if nothing is in flight; otherwise the first
@@ -1241,6 +1241,15 @@ func (m *Model) confirmKey(key string) tea.Cmd {
 }
 
 func (m *Model) normalKey(key string) tea.Cmd {
+	switch key {
+	case "n", "t", "a", "d", "c", "/":
+		// The pending quit fires in any mode: input opened now would be
+		// thrown away.
+		if m.quitRequested {
+			m.setStatus(quitText(len(m.busyOps())))
+			return nil
+		}
+	}
 	switch key {
 	case "q":
 		return m.requestQuit(key)
