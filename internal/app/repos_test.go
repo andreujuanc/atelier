@@ -509,3 +509,44 @@ func TestAddRepoTaskClosedMeanwhile(t *testing.T) {
 		t.Fatalf("repos %+v", g.Repos)
 	}
 }
+
+// Done waits for the per-task lock and then uses the repo list as it is
+// under the lock, so a repo added meanwhile has its worktree removed too.
+func TestDoneWaitsForAddRepo(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "web", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Racing", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := e.app.lockTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.app.Done(ctx, task.Slug, false)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("Done did not wait for the lock: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// What AddRepo does under the lock.
+	web := e.canonical("web")
+	wt := e.app.Paths.WorktreePath(task.Slug, "web")
+	git(t, web, "worktree", "add", "-q", "-b", task.Branch, wt, "main")
+	if err := e.app.Store.AddTaskRepo(ctx, task.ID, model.TaskRepo{Name: "web", Mode: model.ModeRW}); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if exists(wt) || worktreeCount(t, web) != 1 {
+		t.Fatal("worktree of the repo added meanwhile left behind")
+	}
+}

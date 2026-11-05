@@ -572,10 +572,10 @@ func (a *App) Rename(ctx context.Context, ref, title string) (*model.Task, error
 
 // rewriteClaudeMD regenerates an open task's CLAUDE.md from the DB if the
 // file exists (it is never created here: done/cancel remove it). It holds
-// the per-task lock so it cannot interleave with AddRepo's rewrite. It
-// never creates the task dir either (finishTask removes it without the
-// lock): a task dir that is gone is an error, which Rename reports as a
-// warning.
+// the per-task lock so it cannot interleave with AddRepo's rewrite or with
+// done/cancel (which close the task under the lock, so a rewrite waiting
+// for it then sees the task closed). It never creates the task dir either:
+// a task dir that is gone is an error, which Rename reports as a warning.
 func (a *App) rewriteClaudeMD(ctx context.Context, id int64) error {
 	unlock, err := a.lockTask(ctx, id)
 	if err != nil {
@@ -633,6 +633,18 @@ func (a *App) Cancel(ctx context.Context, ref string, force bool) (*model.Task, 
 func (a *App) finish(ctx context.Context, ref string, force bool, to model.Status) (*model.Task, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
+		return nil, err
+	}
+	// Under the per-task lock (held until the status is set) a concurrent
+	// AddRepo cannot add a worktree this call would not remove; re-read
+	// the task so its repo list is current. Nothing below takes the lock
+	// again (flock is per open file: that would deadlock).
+	unlock, err := a.lockTask(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
 		return nil, err
 	}
 	if err := a.finishTask(ctx, t, force, to); err != nil {
