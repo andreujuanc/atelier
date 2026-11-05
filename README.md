@@ -305,3 +305,7 @@ command or hook migrates it).
 builds `atl`, creates fake repos and a project in a temp dir and drives
 new → session → hooks → crash recovery → resume → open --session → diff → pr → done against an
 isolated tmux server, with `claude` and `gh` replaced by `test/stubs`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

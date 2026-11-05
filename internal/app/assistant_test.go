@@ -237,7 +237,7 @@ func TestAssistantArgv(t *testing.T) {
 func TestClaudeProjectKey(t *testing.T) {
 	for in, want := range map[string]string{
 		"/repos/atelier":                         "-repos-atelier",
-		"/home/juan/atelier-ed/tasks/try-it":     "-home-juan-atelier-ed-tasks-try-it",
+		"/home/u/my-tasks/try-it":                "-home-u-my-tasks-try-it",
 		"/home/u/.local/share/atelier/assistant": "-home-u--local-share-atelier-assistant",
 		"/a/b_c d.e~f":                           "-a-b-c-d-e-f",
 		"/x/é😀":                                  "-x----",
