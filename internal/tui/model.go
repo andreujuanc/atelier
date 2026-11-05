@@ -661,7 +661,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func quitText(n int) string {
-	return fmt.Sprintf("%d operation(s) running — press q again to quit after they finish, ctrl+c again to force", n)
+	return fmt.Sprintf("%d operation(s) running — quitting when they finish, ctrl+c again to force", n)
 }
 
 // requestQuit quits now if nothing is in flight; otherwise the first
@@ -899,6 +899,12 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			return m.reload()
 		}
 		if msg.cmd != nil {
+			if m.mode != modeNormal || m.quitRequested {
+				// Don't attach over the form/filter/editor: the keys
+				// typed there would go to Claude. Its window is running.
+				m.setStatus("open " + msg.slug + ": ready — press enter again")
+				return m.reload()
+			}
 			return m.exec("open", msg.slug, msg.cmd)
 		}
 		if len(msg.choices) == 0 { // defensive: the backend returns one or the other
@@ -916,6 +922,15 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		m.assisting = false
 		if msg.err != nil {
 			m.setErr(fmt.Errorf("assistant: %w", msg.err))
+			return nil
+		}
+		if m.mode != modeNormal || m.quitRequested {
+			// As for open: don't attach over another mode.
+			text := "assistant ready — press A again"
+			if msg.hint != "" {
+				text += "; " + msg.hint
+			}
+			m.setStatus(text)
 			return nil
 		}
 		if msg.hint != "" {
@@ -1241,6 +1256,15 @@ func (m *Model) confirmKey(key string) tea.Cmd {
 }
 
 func (m *Model) normalKey(key string) tea.Cmd {
+	switch key {
+	case "n", "t", "a", "d", "c", "/":
+		// The pending quit fires in any mode: input opened now would be
+		// thrown away.
+		if m.quitRequested {
+			m.setStatus(quitText(len(m.busyOps())))
+			return nil
+		}
+	}
 	switch key {
 	case "q":
 		return m.requestQuit(key)

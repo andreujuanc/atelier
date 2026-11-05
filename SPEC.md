@@ -67,7 +67,7 @@ atl resume <task>
 atl status <task> <status>
 atl diff <task>            # git diff per rw repo, paged
 atl pr <task>              # gh pr create per rw repo that has commits; status → review
-atl done <task> [--force]  # teardown, remove worktrees (refuse if uncommitted unless --force), kill tmux, status=done
+atl done <task> [--force]  # teardown, remove worktrees (refuse if uncommitted unless --force; always refuse if HEAD has commits on no ref), kill tmux, status=done
 atl cancel <task> [--force]
 atl hook <event>           # internal
 atl doctor                 # check git, tmux, claude, gh, dirs, DB

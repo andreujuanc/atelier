@@ -439,6 +439,22 @@ func IsDirty(ctx context.Context, worktree string) (bool, error) {
 	return out != "", nil
 }
 
+// OrphanCommits returns the number of commits reachable from the
+// worktree's HEAD that no branch, remote-tracking ref or tag reaches: commits
+// made on a detached HEAD (or during a stopped rebase) that removing the
+// worktree would make unreachable. It only looks at local refs (no fetch).
+func OrphanCommits(ctx context.Context, worktree string) (int, error) {
+	out, err := run(ctx, worktree, "rev-list", "--count", "HEAD", "--not", "--branches", "--remotes", "--tags")
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(out)
+	if err != nil {
+		return 0, fmt.Errorf("git rev-list: unexpected output %q", out)
+	}
+	return n, nil
+}
+
 // CommitsAhead returns the number of commits in HEAD that are not in base.
 func CommitsAhead(ctx context.Context, worktree, base string) (int, error) {
 	out, err := run(ctx, worktree, "rev-list", "--count", base+"..HEAD")

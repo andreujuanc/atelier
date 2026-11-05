@@ -512,6 +512,26 @@ func TestCommitsAhead(t *testing.T) {
 	}
 }
 
+func TestOrphanCommits(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "o")
+	commitFile(t, wt, "a.txt", "a\n", "a")
+	if n, err := OrphanCommits(ctx, wt); err != nil || n != 0 {
+		t.Fatalf("on branch: n = %d, %v", n, err)
+	}
+	git(t, wt, "checkout", "-q", "--detach")
+	commitFile(t, wt, "b.txt", "b\n", "b")
+	commitFile(t, wt, "c.txt", "c\n", "c")
+	if n, err := OrphanCommits(ctx, wt); err != nil || n != 2 {
+		t.Fatalf("detached: n = %d, %v", n, err)
+	}
+	git(t, wt, "tag", "keep")
+	if n, err := OrphanCommits(ctx, wt); err != nil || n != 0 {
+		t.Fatalf("tagged: n = %d, %v", n, err)
+	}
+}
+
 func TestDiff(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)

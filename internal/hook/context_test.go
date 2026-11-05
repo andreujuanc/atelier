@@ -142,7 +142,8 @@ func TestSessionStartContext(t *testing.T) {
 	})
 
 	t.Run("ATL_SESSION row on clear, resume and compact", func(t *testing.T) {
-		s := &model.Session{TaskID: task.ID, ClaudeSessionID: "old", State: model.StateRunning, LastEventAt: now}
+		// Ended: a real /clear or /resume fires SessionEnd first.
+		s := &model.Session{TaskID: task.ID, ClaudeSessionID: "old", State: model.StateEnded, LastEventAt: now}
 		if err := f.st.CreateSession(context.Background(), s); err != nil {
 			t.Fatal(err)
 		}

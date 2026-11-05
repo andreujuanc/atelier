@@ -572,10 +572,10 @@ func (a *App) Rename(ctx context.Context, ref, title string) (*model.Task, error
 
 // rewriteClaudeMD regenerates an open task's CLAUDE.md from the DB if the
 // file exists (it is never created here: done/cancel remove it). It holds
-// the per-task lock so it cannot interleave with AddRepo's rewrite. It
-// never creates the task dir either (finishTask removes it without the
-// lock): a task dir that is gone is an error, which Rename reports as a
-// warning.
+// the per-task lock so it cannot interleave with AddRepo's rewrite or with
+// done/cancel (which close the task under the lock, so a rewrite waiting
+// for it then sees the task closed). It never creates the task dir either:
+// a task dir that is gone is an error, which Rename reports as a warning.
 func (a *App) rewriteClaudeMD(ctx context.Context, id int64) error {
 	unlock, err := a.lockTask(ctx, id)
 	if err != nil {
@@ -622,8 +622,9 @@ func (a *App) Cancel(ctx context.Context, ref string, force bool) (*model.Task, 
 	return a.finish(ctx, ref, force, model.StatusCancelled)
 }
 
-// finish closes an open task: refuses if a rw worktree has uncommitted
-// changes (unless force), kills its tmux session, ends its sessions, runs
+// finish closes an open task: refuses if a rw worktree's HEAD has commits
+// no branch, remote-tracking ref or tag reaches (even with force) or has
+// uncommitted changes (unless force), kills its tmux session, ends its sessions, runs
 // teardown, removes its worktrees and generated files, deletes each task
 // branch that has no unpushed commits (see cleanupBranch), removes the task
 // dir if it is then empty and sets the status. Worktrees
@@ -632,6 +633,18 @@ func (a *App) Cancel(ctx context.Context, ref string, force bool) (*model.Task, 
 func (a *App) finish(ctx context.Context, ref string, force bool, to model.Status) (*model.Task, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
+		return nil, err
+	}
+	// Under the per-task lock (held until the status is set) a concurrent
+	// AddRepo cannot add a worktree this call would not remove; re-read
+	// the task so its repo list is current. Nothing below takes the lock
+	// again (flock is per open file: that would deadlock).
+	unlock, err := a.lockTask(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
 		return nil, err
 	}
 	if err := a.finishTask(ctx, t, force, to); err != nil {
@@ -657,6 +670,29 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		p := a.Paths.WorktreePath(t.Slug, r.Name)
 		_, serr := os.Stat(p)
 		wts = append(wts, wt{r.Name, a.Paths.RepoPath(r.Name), p, errors.Is(serr, os.ErrNotExist)})
+	}
+	// Commits only HEAD reaches (detached HEAD, stopped rebase) would be
+	// lost with the worktree; --force never discards commits.
+	var orphans []string
+	for _, w := range wts {
+		if w.missing {
+			continue
+		}
+		n, err := gitx.OrphanCommits(ctx, w.path)
+		if err != nil {
+			if !force {
+				return fmt.Errorf("task %s: repo %s: %w (use --force to remove anyway)", t.Slug, w.name, err)
+			}
+			a.warnf("repo %s: %v", w.name, err)
+			continue
+		}
+		if n > 0 {
+			orphans = append(orphans, fmt.Sprintf("%s: HEAD has %d commit(s) not on any branch", w.name, n))
+		}
+	}
+	if len(orphans) > 0 {
+		return fmt.Errorf("task %s: %s (detached HEAD or rebase in progress); put them on a branch first",
+			t.Slug, strings.Join(orphans, "; "))
 	}
 	if !force {
 		var dirty []string

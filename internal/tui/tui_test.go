@@ -1326,6 +1326,19 @@ func TestQuitWaitsForOps(t *testing.T) {
 		if isQuit(press(m, "q")) {
 			t.Fatal("second q quit with an op in flight")
 		}
+		// input that the pending quit would throw away is refused, also
+		// on a task that is not busy
+		press(m, "j")
+		if sel := m.selected(); sel == nil || m.busy[sel.Task.ID] != "" {
+			t.Fatal("no idle task selected")
+		}
+		for _, k := range []string{"n", "t", "a", "d", "c", "/"} {
+			press(m, k)
+			if m.mode != modeNormal || m.form != nil || m.confirm != nil ||
+				!strings.Contains(plainView(m), "quitting when they finish") {
+				t.Fatalf("%s: %q opened input while quitting (mode %v):\n%s", first, k, m.mode, plainView(m))
+			}
+		}
 		// the op ends: the TUI quits by itself
 		_, cmd := m.Update(op())
 		if !isQuit(cmd) || m.Forced() {
@@ -2434,6 +2447,36 @@ func TestOpenChoicesWhileBusyElsewhere(t *testing.T) {
 		t.Fatalf("picker yanked the user out of the filter: mode %v", m.mode)
 	}
 	if !strings.Contains(m.status, "press enter again") {
+		t.Fatalf("status %q", m.status)
+	}
+}
+
+// An attach that arrives after the user moved to another mode (or asked to
+// quit) is not run: the keys typed there must not go to Claude.
+func TestLateAttachDoesNotStealKeys(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "alpha")
+	cmd := press(m, "enter")
+	key(m, "/")
+	if next := runOpen(t, m, cmd); isExec(next) || m.mode != modeFilter {
+		t.Fatalf("late open attached: mode %v", m.mode)
+	}
+	if !strings.Contains(m.status, "open alpha: ready — press enter again") {
+		t.Fatalf("status %q", m.status)
+	}
+	if _, busy := m.busy[1]; busy {
+		t.Fatal("task still busy after open")
+	}
+
+	fbh := &fakeBackend{tasks: sampleTasks(), assistHint: "press Ctrl-b ] to paste"}
+	m, _ = newTest(t, fbh)
+	cmd = press(m, "A")
+	key(m, "/")
+	if _, next := m.Update(cmd()); next != nil || m.mode != modeFilter || m.assisting {
+		t.Fatalf("late assistant attached: mode %v assisting %v", m.mode, m.assisting)
+	}
+	if !strings.Contains(m.status, "assistant ready — press A again; press Ctrl-b ] to paste") {
 		t.Fatalf("status %q", m.status)
 	}
 }

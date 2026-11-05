@@ -19,8 +19,11 @@ docker build -t atelier \
   --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 ```
 
-Inside the image tmux stays out of the way: run `atl`, press Enter on a task to open
-Claude full screen, and press **Ctrl-q** to go back to the TUI (Claude keeps running).
+Run it with `docker run -it atelier` (plus your mounts). The container starts a plain
+shell, not tmux: run `atl` there, press Enter on a task to open Claude full screen, and
+press **Ctrl-q** to go back to the TUI (Claude keeps running in tmux). Don't start `atl`
+inside a tmux session in the container: Ctrl-q would then detach that tmux client instead
+of returning to the TUI.
 Claude's own status line, under its prompt, shows which task you are in (see
 [Status line](#status-line)).
 
@@ -61,7 +64,9 @@ TUI keys: `n` new task, `enter` open (see below), `s` new session, `r` resume, `
 selected task, `m` edit the selected task's notes in place (see [Notes](#notes)), `t` rename
 the selected task (an input prefilled with its title; `enter` saves, `esc` cancels), `d` done,
 `c` cancel, `p` pr, `D` diff, `A` assistant (about the selected task), `1`-`5` status,
-`/` filter (matches the slug or the title), `q` quit. The task list shows each task's title
+`/` filter (matches the slug or the title), `q` quit (while operations are running it
+waits for them and then quits; `ctrl+c` again forces it; meanwhile `n`, `t`, `a`, `d`, `c`
+and `/` are refused so no input is lost). The task list shows each task's title
 (with its session-state dot and `*` for uncommitted changes), truncated to the pane; the slug
 is in the details pane, with the task's notes below the details.
 Repos (in the new-task form and for `a`) are picked from a list of `$ATL_REPOS`: type to
@@ -86,7 +91,10 @@ transcript when the picker opens (only the first and last MiB of a large one). `
 move, `enter` picks, `esc` cancels and launches nothing. A live session is attached to
 with its window selected (never resumed over); a past one is resumed (`claude --resume
 <id>`, only that one: other stopped sessions are left for `r`) and attached to; "New
-session" works like `s` and attaches. Plain `atl open` (no flags) keeps its old behaviour
+session" works like `s` and attaches. If an open (or `A`) finishes after you moved on to
+something else (the notes editor, a form, the filter, a prompt) or asked to quit, it does
+not attach and steal your keys: the status line says "ready — press enter again" (`A`
+again for the assistant). Plain `atl open` (no flags) keeps its old behaviour
 for scripts: attach if a window is live, else resume the stopped sessions, else start a
 new one. `atl open --session` and `--new` are mutually exclusive; `--session` attaches to
 a session with a live window like the picker, and refuses another task's session, past
@@ -147,7 +155,9 @@ only if no commits on the branch would be lost (the branch's reflog is not kept)
 commit on it must be reachable from another local branch or a remote-tracking ref (local
 refs only, no fetch), e.g. after you pushed it or when it has no commits of its own. Otherwise the branch is kept and reported
 (`kept branch atl/<slug> in <repo> (N unpushed commit(s))`); `--force` only discards
-uncommitted changes, never unpushed commits.
+uncommitted changes, never unpushed commits. They also refuse, even with `--force`, while a
+worktree's HEAD has commits no branch, remote-tracking ref or tag reaches (a detached HEAD
+or a rebase in progress): put them on a branch first.
 
 `atl show` also prints each session's title (from its transcript; `--json`: `title`,
 `""` when none). It never touches the network: "pushed" means the local remote-tracking ref
@@ -171,7 +181,8 @@ tell `atl notes X` from `atl notes X --set` (quoting, `--set=true`, flag order),
 `atl show <task> --notes` (or `--json`), which is allowed; common repo mutators (`git commit`, `push`,
 `checkout`, `reset`, `rebase`, `merge`, `stash`, `rm`, `mv`, `cp`, `sed -i`, `tee`, ...) are
 denied, and the `atl hook AssistantGuard` PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
-outside that dir (and on its own `CLAUDE.md` and `.claude/`, in any letter case). Bash and MCP
+outside that dir (and on its own `CLAUDE.md`, `CLAUDE.local.md`, `.mcp.json` and `.claude/`, in
+any letter case). Bash and MCP
 tools cannot be fully sandboxed; the deny rules cover the common cases so that your global
 allow rules can't let the assistant change repos. It runs `claude --continue` when Claude Code
 has a previous conversation for that dir (a `*.jsonl` under
