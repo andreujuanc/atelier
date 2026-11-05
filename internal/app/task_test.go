@@ -873,3 +873,31 @@ func TestTmuxVersionCheck(t *testing.T) {
 		}
 	}
 }
+
+// Commits only a detached HEAD reaches block Done/Cancel, even with --force,
+// before anything is torn down.
+func TestFinishRefusesOrphanCommits(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "detached", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	git(t, wt, "checkout", "-q", "--detach")
+	e.commitIn(t, task.Slug, "api", "f")
+	for _, force := range []bool{false, true} {
+		_, err := e.app.Cancel(ctx, task.Slug, force)
+		if err == nil || !strings.Contains(err.Error(), "api: HEAD has 1 commit(s) not on any branch") {
+			t.Fatalf("force=%v: err = %v", force, err)
+		}
+		if !exists(wt) {
+			t.Fatal("refused Cancel removed the worktree")
+		}
+	}
+	git(t, wt, "branch", "keep")
+	if _, err := e.app.Cancel(ctx, task.Slug, false); err != nil {
+		t.Fatal(err)
+	}
+}

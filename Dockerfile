@@ -54,4 +54,7 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
 ENV PATH=/home/$USERNAME/.local/bin:$PATH \
     CLAUDE_CONFIG_DIR=/home/$USERNAME/.claude
 WORKDIR /home/$USERNAME
-CMD ["tmux", "new", "-A", "-s", "main"]
+# A plain shell, not tmux: atl must run outside tmux so opening a task
+# attaches (not switch-client) and Ctrl-q's detach returns to the TUI
+# instead of detaching the container's main tmux client and exiting.
+CMD ["bash", "-l"]
