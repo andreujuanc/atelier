@@ -622,8 +622,9 @@ func (a *App) Cancel(ctx context.Context, ref string, force bool) (*model.Task, 
 	return a.finish(ctx, ref, force, model.StatusCancelled)
 }
 
-// finish closes an open task: refuses if a rw worktree has uncommitted
-// changes (unless force), kills its tmux session, ends its sessions, runs
+// finish closes an open task: refuses if a rw worktree's HEAD has commits
+// no branch, remote-tracking ref or tag reaches (even with force) or has
+// uncommitted changes (unless force), kills its tmux session, ends its sessions, runs
 // teardown, removes its worktrees and generated files, deletes each task
 // branch that has no unpushed commits (see cleanupBranch), removes the task
 // dir if it is then empty and sets the status. Worktrees
@@ -657,6 +658,29 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		p := a.Paths.WorktreePath(t.Slug, r.Name)
 		_, serr := os.Stat(p)
 		wts = append(wts, wt{r.Name, a.Paths.RepoPath(r.Name), p, errors.Is(serr, os.ErrNotExist)})
+	}
+	// Commits only HEAD reaches (detached HEAD, stopped rebase) would be
+	// lost with the worktree; --force never discards commits.
+	var orphans []string
+	for _, w := range wts {
+		if w.missing {
+			continue
+		}
+		n, err := gitx.OrphanCommits(ctx, w.path)
+		if err != nil {
+			if !force {
+				return fmt.Errorf("task %s: repo %s: %w (use --force to remove anyway)", t.Slug, w.name, err)
+			}
+			a.warnf("repo %s: %v", w.name, err)
+			continue
+		}
+		if n > 0 {
+			orphans = append(orphans, fmt.Sprintf("%s: HEAD has %d commit(s) not on any branch", w.name, n))
+		}
+	}
+	if len(orphans) > 0 {
+		return fmt.Errorf("task %s: %s (detached HEAD or rebase in progress); put them on a branch first",
+			t.Slug, strings.Join(orphans, "; "))
 	}
 	if !force {
 		var dirty []string

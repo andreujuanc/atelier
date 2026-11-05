@@ -147,7 +147,9 @@ only if no commits on the branch would be lost (the branch's reflog is not kept)
 commit on it must be reachable from another local branch or a remote-tracking ref (local
 refs only, no fetch), e.g. after you pushed it or when it has no commits of its own. Otherwise the branch is kept and reported
 (`kept branch atl/<slug> in <repo> (N unpushed commit(s))`); `--force` only discards
-uncommitted changes, never unpushed commits.
+uncommitted changes, never unpushed commits. They also refuse, even with `--force`, while a
+worktree's HEAD has commits no branch, remote-tracking ref or tag reaches (a detached HEAD
+or a rebase in progress): put them on a branch first.
 
 `atl show` also prints each session's title (from its transcript; `--json`: `title`,
 `""` when none). It never touches the network: "pushed" means the local remote-tracking ref
