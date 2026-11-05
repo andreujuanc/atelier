@@ -899,6 +899,12 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			return m.reload()
 		}
 		if msg.cmd != nil {
+			if m.mode != modeNormal || m.quitRequested {
+				// Don't attach over the form/filter/editor: the keys
+				// typed there would go to Claude. Its window is running.
+				m.setStatus("open " + msg.slug + ": ready — press enter again")
+				return m.reload()
+			}
 			return m.exec("open", msg.slug, msg.cmd)
 		}
 		if len(msg.choices) == 0 { // defensive: the backend returns one or the other
@@ -916,6 +922,15 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		m.assisting = false
 		if msg.err != nil {
 			m.setErr(fmt.Errorf("assistant: %w", msg.err))
+			return nil
+		}
+		if m.mode != modeNormal || m.quitRequested {
+			// As for open: don't attach over another mode.
+			text := "assistant ready — press A again"
+			if msg.hint != "" {
+				text += "; " + msg.hint
+			}
+			m.setStatus(text)
 			return nil
 		}
 		if msg.hint != "" {

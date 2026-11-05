@@ -2451,6 +2451,36 @@ func TestOpenChoicesWhileBusyElsewhere(t *testing.T) {
 	}
 }
 
+// An attach that arrives after the user moved to another mode (or asked to
+// quit) is not run: the keys typed there must not go to Claude.
+func TestLateAttachDoesNotStealKeys(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "alpha")
+	cmd := press(m, "enter")
+	key(m, "/")
+	if next := runOpen(t, m, cmd); isExec(next) || m.mode != modeFilter {
+		t.Fatalf("late open attached: mode %v", m.mode)
+	}
+	if !strings.Contains(m.status, "open alpha: ready — press enter again") {
+		t.Fatalf("status %q", m.status)
+	}
+	if _, busy := m.busy[1]; busy {
+		t.Fatal("task still busy after open")
+	}
+
+	fbh := &fakeBackend{tasks: sampleTasks(), assistHint: "press Ctrl-b ] to paste"}
+	m, _ = newTest(t, fbh)
+	cmd = press(m, "A")
+	key(m, "/")
+	if _, next := m.Update(cmd()); next != nil || m.mode != modeFilter || m.assisting {
+		t.Fatalf("late assistant attached: mode %v assisting %v", m.mode, m.assisting)
+	}
+	if !strings.Contains(m.status, "assistant ready — press A again; press Ctrl-b ] to paste") {
+		t.Fatalf("status %q", m.status)
+	}
+}
+
 func TestChoiceRowSnippetFits(t *testing.T) {
 	c := choice(5, model.StateEnded, false, "Refactor the session store", "run the tests again", time.Hour)
 	now := t0.Add(time.Hour)
