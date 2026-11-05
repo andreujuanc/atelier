@@ -222,14 +222,29 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 
 | variable | default |
 |---|---|
+| `ATL_WORKSPACE` | unset — one folder for everything atelier owns (see below) |
 | `ATL_REPOS` | `~/repos` — canonical clones, `$ATL_REPOS/<name>` (never edited) |
-| `ATL_TASKS` | `~/tasks` — task dirs, `$ATL_TASKS/<slug>/` |
-| `XDG_DATA_HOME` | `~/.local/share` — DB at `atelier/atelier.db` |
-| `XDG_STATE_HOME` | `~/.local/state` — hook errors in `atelier/hook.log` |
-| `XDG_CONFIG_HOME` | `~/.config` — projects in `atelier/projects/<name>.toml` |
+| `ATL_TASKS` | `$ATL_WORKSPACE/tasks`, else `~/tasks` — task dirs, `$ATL_TASKS/<slug>/` |
+| `XDG_DATA_HOME` | `~/.local/share` — DB at `atelier/atelier.db` (ignored with `ATL_WORKSPACE`) |
+| `XDG_STATE_HOME` | `~/.local/state` — hook errors in `atelier/hook.log` (ignored with `ATL_WORKSPACE`) |
+| `XDG_CONFIG_HOME` | `~/.config` — projects in `atelier/projects/<name>.toml` (ignored with `ATL_WORKSPACE`) |
 | `ATL_TMUX_SOCKET` | unset — tmux socket name (`tmux -L`) if you don't use the default server |
 | `ATL_BIN` | the running binary — `atl` path written into hook commands |
 | `ATL_CONTEXT` | unset — extra text appended to every task session's start context |
+
+With `ATL_WORKSPACE` set (it must be an existing directory, so a typo or a missing mount
+is an error rather than a new empty database), atelier keeps everything in it, and you can
+keep several independent workspaces (e.g. one per box):
+
+```
+$ATL_WORKSPACE/
+  tasks/      task dirs and worktrees (unless ATL_TASKS is set)
+  data/       atelier.db, assistant/
+  config/     projects/<name>.toml
+  state/      hook.log
+```
+
+`atl doctor` prints the workspace and every path it resolved.
 
 Claude windows and scripts get `ATL_TASK`, `ATL_TASK_DIR`, `ATL_PORT_OFFSET`
 (0, 100, 200… unique per open task) plus the project's `env`; scripts also get
