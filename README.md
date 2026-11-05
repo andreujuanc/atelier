@@ -19,7 +19,8 @@ docker build -t atelier \
   --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 ```
 
-Inside the image tmux stays out of the way: run `atl`, press Enter on a task to open
+The container starts a plain shell (not inside tmux), and tmux stays out of the way: run
+`atl` there, press Enter on a task to open
 Claude full screen, and press **Ctrl-q** to go back to the TUI (Claude keeps running).
 Claude's own status line, under its prompt, shows which task you are in (see
 [Status line](#status-line)).
