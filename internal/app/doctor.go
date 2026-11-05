@@ -54,6 +54,9 @@ func (a *App) Doctor(ctx context.Context) []Check {
 		}()
 	}
 	wg.Wait()
+	if a.Paths.Workspace != "" {
+		checks = append(checks, pass("workspace", a.Paths.Workspace))
+	}
 	checks = append(checks,
 		a.checkTasksDir(),
 		a.checkReposDir(),

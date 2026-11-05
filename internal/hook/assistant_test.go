@@ -22,6 +22,7 @@ func assistantSetup(t *testing.T) (config.Paths, string) {
 	}
 	for k, v := range map[string]string{
 		"HOME":            root,
+		"ATL_WORKSPACE":   "", // never the developer's real workspace
 		"ATL_REPOS":       filepath.Join(root, "repos"),
 		"ATL_TASKS":       filepath.Join(root, "tasks"),
 		"XDG_DATA_HOME":   filepath.Join(root, "data"),
