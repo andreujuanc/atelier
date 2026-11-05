@@ -443,8 +443,10 @@ func isPermissionPrompt(in Input) bool {
 // claude_session_id is empty, equals the event's session id, or the event
 // carries none. Because the variable is inherited, a nested `claude` run
 // from inside the session also sees it, so on an id mismatch it is trusted
-// only for a SessionStart that legitimately changes the id (source clear,
-// resume or compact). Otherwise — a nested process's startup, or any other
+// only for a SessionStart that legitimately changes the id: source compact
+// (which can happen mid-turn), or clear/resume while the row is not
+// mid-turn (a real /clear or /resume ends the session first; a nested
+// `claude --resume` runs during the parent's turn). Otherwise — a nested process's startup, or any other
 // event from it — the row is looked up by claude session id instead, and
 // the parent row is never touched (a nested SessionStart then creates its
 // own row). The ATL_SESSION row with an empty claude id is also only a
@@ -462,7 +464,8 @@ func findSession(ctx context.Context, event string, in Input, env func(string) s
 			if event == EventSessionStart {
 				return envSess, nil // first start of a session atl launched
 			}
-		case event == EventSessionStart && idChangingSource(in.Source):
+		case event == EventSessionStart && idChangingSource(in.Source) &&
+			(in.Source == "compact" || !midTurn(envSess.State)):
 			return envSess, nil
 		default:
 			envSess = nil // another (nested) Claude process: not this row
@@ -473,6 +476,11 @@ func findSession(ctx context.Context, event string, in Input, env func(string) s
 		return envSess, nil
 	}
 	return sess, err
+}
+
+// midTurn reports whether a session in state s is in the middle of a turn.
+func midTurn(s model.SessionState) bool {
+	return s == model.StateRunning || s == model.StateWaiting
 }
 
 // idChangingSource reports whether a SessionStart source means the same
