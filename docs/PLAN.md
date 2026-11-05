@@ -331,7 +331,7 @@ exit 0 (fail open) and log.
 SessionStart output: for sessions inside a task, after the DB update, print one JSON line
 `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":...}}` (task, repos + base, ro warning, port offset,
 "Notes:" section with the task's notes text, ≤2500 bytes). If the hook's environment has a non-blank `ATL_CONTEXT`, its sanitised text (newlines
-kept, other control/format chars → spaces, ≤1000 bytes) is added as an "Environment notes (ATL_CONTEXT)" section after the
+kept, other control/format chars → spaces, ≤1000 bytes; longer makes app.New and doctor fail, the hook only cuts it) is added as an "Environment notes (ATL_CONTEXT)" section after the
 port offset. Priority: fixed info and ATL_CONTEXT first, then notes; the footer ("Use `atl note <slug> \"...\"` …") always
 survives. Notes that don't fit keep their END (appended lines are the newest): cut at a line start (else a rune boundary when
 one line is too long), prefixed with "… (earlier notes truncated; `atl notes <slug>` for all)"; with less than 40 bytes of room
@@ -493,7 +493,7 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 | `atl done <task> [--force]` / `atl cancel <task> [--force]` | |
 | `atl hook <event>` | internal; handled before cobra in main.go |
 | `atl statusline` | internal (hidden): Claude Code status line for task sessions, see §3 `internal/hook`; handled before cobra |
-| `atl doctor` | checks: git, tmux, claude, gh on PATH (+version), Tasks dir, DB opens + migrated, hook log dir writable. `$ATL_REPOS` (default ~/repos) missing → **warning** (not a failure). Exit 1 if any check fails (warnings don't) |
+| `atl doctor` | checks: git, tmux, claude, gh on PATH (+version), Tasks dir, DB opens + migrated, hook log dir writable, `ATL_CONTEXT` (when set) ≤1000 bytes after sanitising. `$ATL_REPOS` (default ~/repos) missing → **warning** (not a failure). Exit 1 if any check fails (warnings don't) |
 
 `atl ls --json` → array of:
 ```json
