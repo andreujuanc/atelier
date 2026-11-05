@@ -60,6 +60,7 @@ func setup(t *testing.T) string {
 	for k, v := range map[string]string{
 		"HOME":            root,
 		"ATL_WORKSPACE":   "", // never the developer's real workspace
+		"ATL_CONTEXT":     "",
 		"TMUX":            "",
 		"ATL_REPOS":       filepath.Join(root, "repos"),
 		"ATL_TASKS":       filepath.Join(root, "tasks"),
@@ -217,6 +218,38 @@ func TestRootAndDoctor(t *testing.T) {
 	if strings.Contains(out, "FAIL") != (code == 1) {
 		t.Fatalf("doctor exit %d with output\n%s", code, out)
 	}
+}
+
+func TestEnvContextTooLong(t *testing.T) {
+	setup(t)
+	t.Setenv("ATL_CONTEXT", strings.Repeat("a", 1001))
+	code, _, errOut := atl(t, "ls")
+	if code != 1 || !strings.Contains(errOut, "$ATL_CONTEXT is 1001 bytes, max 1000") {
+		t.Fatalf("ls: %d %q", code, errOut)
+	}
+	code, out, _ := atl(t, "doctor")
+	if code != 1 || doctorLevel(out, "ATL_CONTEXT") != "FAIL" {
+		t.Fatalf("doctor: %d\n%s", code, out)
+	}
+
+	// Surrounding whitespace does not count (the hook trims it too).
+	t.Setenv("ATL_CONTEXT", "  "+strings.Repeat("a", 1000)+"\n")
+	if code, _, errOut := atl(t, "ls"); code != 0 {
+		t.Fatalf("ls at the limit: %d %q", code, errOut)
+	}
+	if _, out, _ := atl(t, "doctor"); doctorLevel(out, "ATL_CONTEXT") != "ok" {
+		t.Fatalf("doctor at the limit:\n%s", out)
+	}
+}
+
+// doctorLevel returns the level doctor printed for check name, or "".
+func doctorLevel(out, name string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[1] == name {
+			return f[0]
+		}
+	}
+	return ""
 }
 
 func TestSessionsSummary(t *testing.T) {

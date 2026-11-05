@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 	"unicode"
@@ -185,11 +186,35 @@ func oneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-// envBlock sanitises the ATL_CONTEXT text: line breaks are kept (\r\n and
-// \r become \n), other control and format characters become spaces (as in
-// oneLine), surrounding whitespace is trimmed, and the result is cut to
-// contextEnvLen bytes on a rune boundary, ending with "…" when cut.
+// CheckEnvContext returns an error when $ATL_CONTEXT, once sanitised, is
+// longer than the hook passes on. atl refuses to start with such a value
+// (the hook itself still only cuts it: failing there would silently lose
+// the whole session context).
+func CheckEnvContext() error {
+	return checkEnvContext(os.Getenv(envContextVar))
+}
+
+func checkEnvContext(raw string) error {
+	if n := len(sanitiseEnv(raw)); n > contextEnvLen {
+		return fmt.Errorf("$%s is %d bytes, max %d", envContextVar, n, contextEnvLen)
+	}
+	return nil
+}
+
+// envBlock sanitises the ATL_CONTEXT text (see sanitiseEnv) and cuts the
+// result to contextEnvLen bytes on a rune boundary, ending with "…" when cut.
 func envBlock(s string) string {
+	s = sanitiseEnv(s)
+	if len(s) > contextEnvLen {
+		s = strings.TrimRight(truncateBytes(s, contextEnvLen-len("…")), " \n") + "…"
+	}
+	return s
+}
+
+// sanitiseEnv keeps line breaks (\r\n and \r become \n), turns other control
+// and format characters into spaces (as in oneLine) and trims surrounding
+// whitespace.
+func sanitiseEnv(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
 	s = strings.Map(func(r rune) rune {
@@ -201,11 +226,7 @@ func envBlock(s string) string {
 		}
 		return r
 	}, s)
-	s = strings.TrimSpace(s)
-	if len(s) > contextEnvLen {
-		s = strings.TrimRight(truncateBytes(s, contextEnvLen-len("…")), " \n") + "…"
-	}
-	return s
+	return strings.TrimSpace(s)
 }
 
 // truncateBytes cuts s to at most n bytes on a rune boundary.

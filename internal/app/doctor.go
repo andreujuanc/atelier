@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/store"
 )
 
@@ -63,7 +64,18 @@ func (a *App) Doctor(ctx context.Context) []Check {
 		a.checkDB(ctx),
 		a.checkStateDir(),
 	)
+	if os.Getenv("ATL_CONTEXT") != "" {
+		checks = append(checks, checkEnvContext())
+	}
 	return checks
+}
+
+func checkEnvContext() Check {
+	const name = "ATL_CONTEXT"
+	if err := hook.CheckEnvContext(); err != nil {
+		return fail(name, err.Error())
+	}
+	return pass(name, "fits")
 }
 
 func checkTool(ctx context.Context, name string, args []string, ver func(string) Check) Check {
