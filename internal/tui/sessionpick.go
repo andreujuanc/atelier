@@ -15,7 +15,8 @@ import (
 
 // sessionPicker is the modal list Enter shows for a task that has sessions
 // to choose from: "New session" first, then the task's live sessions and
-// its resumable past ones (in the order app.OpenChoices returns them). It
+// its resumable past ones (in the order app.OpenChoices returns them),
+// opening on the most recently active session. It
 // looks and moves like the repo picker: up/down (ctrl+p/ctrl+n, j/k),
 // pgup/pgdown, home/end move, enter picks, esc cancels.
 type sessionPicker struct {
@@ -26,8 +27,17 @@ type sessionPicker struct {
 	offset  int // first visible row shown
 }
 
+// newSessionPicker starts with the most recently active session highlighted
+// (live or past; the first in list order on a tie), so enter continues
+// where you left off; "New session" is one row up.
 func newSessionPicker(id int64, slug string, choices []app.SessionChoice) *sessionPicker {
-	return &sessionPicker{taskID: id, slug: slug, choices: choices}
+	p := &sessionPicker{taskID: id, slug: slug, choices: choices}
+	for i, c := range choices {
+		if p.cursor == 0 || c.Session.LastEventAt.After(choices[p.cursor-1].Session.LastEventAt) {
+			p.cursor = i + 1
+		}
+	}
+	return p
 }
 
 func (p *sessionPicker) rows() int { return len(p.choices) + 1 }

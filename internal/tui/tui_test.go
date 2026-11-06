@@ -2342,12 +2342,13 @@ func TestOpenSessionPicker(t *testing.T) {
 	if next := runOpen(t, m, press(m, "enter")); next != nil {
 		t.Fatalf("picker step returned a command")
 	}
-	if m.mode != modeSessions || m.sessPick == nil || m.sessPick.cursor != 0 {
+	// It opens on the most recently active session.
+	if m.mode != modeSessions || m.sessPick == nil || m.sessPick.cursor != 1 {
 		t.Fatalf("mode %v picker %+v", m.mode, m.sessPick)
 	}
 	v := plainView(m)
-	for _, s := range []string{"Open gamma", "> New session", "1 live (attach), 2 past",
-		"waiting  2m ago   Fix the login redirect  claude-7  last: now add a test",
+	for _, s := range []string{"Open gamma", "  New session", "1 live (attach), 2 past",
+		"> waiting  2m ago   Fix the login redirect  claude-7  last: now add a test",
 		"ended    3h ago   Refactor the session store  claude-5  last: run the tests again",
 		"stopped  2d ago   claude-4", "↑/↓ move  enter open (live: attach, past: resume)  esc cancel"} {
 		if !strings.Contains(v, s) {
@@ -2396,6 +2397,7 @@ func TestOpenSessionPicker(t *testing.T) {
 
 	// Enter on "New session" starts one and attaches.
 	runOpen(t, m, press(m, "enter"))
+	key(m, "up")
 	cmd := press(m, "enter")
 	if m.mode != modeNormal || m.busy[3] == "" {
 		t.Fatalf("after pick: mode %v busy %v", m.mode, m.busy)
@@ -2410,7 +2412,6 @@ func TestOpenSessionPicker(t *testing.T) {
 	// Enter on a past session resumes exactly that one and attaches.
 	runOpen(t, m, press(m, "enter"))
 	key(m, "down")
-	key(m, "down")
 	if next := runOpen(t, m, press(m, "enter")); !isExec(next) {
 		t.Fatal("past session did not attach")
 	}
@@ -2418,9 +2419,9 @@ func TestOpenSessionPicker(t *testing.T) {
 		t.Fatalf("OpenSession %+v", c)
 	}
 
-	// A live session too (attach with its window selected: the backend's job).
+	// A live session too (attach with its window selected: the backend's
+	// job); plain enter picks the most recent one.
 	runOpen(t, m, press(m, "enter"))
-	key(m, "down")
 	runOpen(t, m, press(m, "enter"))
 	if c := fb.last("OpenSession"); c == nil || c.args[1] != int64(7) {
 		t.Fatalf("OpenSession %+v", c)
@@ -2433,6 +2434,29 @@ func TestOpenSessionPicker(t *testing.T) {
 	key(m, "enter")
 	if !strings.Contains(m.status, "open: session 5 was resumed meanwhile") || !m.statusErr || m.mode != modeNormal {
 		t.Fatalf("status %q mode %v", m.status, m.mode)
+	}
+}
+
+func TestSessionPickerStartsOnMostRecent(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		choices []app.SessionChoice
+		want    int
+	}{
+		{"past newer than live", []app.SessionChoice{
+			choice(7, model.StateIdle, true, "live", "", 3*time.Hour),
+			choice(5, model.StateEnded, false, "past", "", time.Minute),
+			choice(4, model.StateEnded, false, "older", "", 2*time.Hour),
+		}, 2},
+		{"tie keeps list order", []app.SessionChoice{
+			choice(7, model.StateIdle, true, "a", "", time.Hour),
+			choice(5, model.StateEnded, false, "b", "", time.Hour),
+		}, 1},
+		{"none", nil, 0},
+	} {
+		if got := newSessionPicker(1, "x", tc.choices).cursor; got != tc.want {
+			t.Errorf("%s: cursor %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }
 
