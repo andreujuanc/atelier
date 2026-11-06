@@ -14,6 +14,7 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/gen"
+	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/store"
 	"github.com/andreujuanc/atelier/internal/tmux"
@@ -37,6 +38,9 @@ func New(out io.Writer) (*App, error) {
 	}
 	paths, err := config.Resolve()
 	if err != nil {
+		return nil, err
+	}
+	if err := hook.CheckEnvContext(); err != nil {
 		return nil, err
 	}
 	bin := os.Getenv("ATL_BIN")
