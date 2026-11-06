@@ -485,7 +485,7 @@ func TestROGuard(t *testing.T) {
 		{"notebook_path inside ro", "notebook_path", filepath.Join(docs, "nb.ipynb"), taskDir, taskEnv, true, false},
 		{"rw worktree allowed", "file_path", filepath.Join(f.p.WorktreePath("fix", "api"), "main.go"), taskDir, taskEnv, false, false},
 		{"relative rw allowed", "file_path", "api/main.go", taskDir, taskEnv, false, false},
-		{"rw canonical not ro", "file_path", filepath.Join(f.p.RepoPath("api"), "main.go"), taskDir, taskEnv, false, false},
+		{"rw canonical clone blocked", "file_path", filepath.Join(f.p.RepoPath("api"), "main.go"), taskDir, taskEnv, true, false},
 		{"sibling prefix allowed", "file_path", filepath.Join(f.p.RepoPath("docs2"), "a.md"), taskDir, taskEnv, false, false},
 		{"task from cwd", "file_path", filepath.Join(docs, "a.md"), filepath.Join(taskDir, "api"), envOf(nil), true, false},
 		{"unknown task fails open", "file_path", filepath.Join(docs, "a.md"), "/tmp", envOf(map[string]string{"ATL_TASK": "nope"}), false, true},
@@ -495,14 +495,18 @@ func TestROGuard(t *testing.T) {
 		{"tilde without cwd still expanded", "file_path", "~/repos/docs", "", taskEnv, true, false},
 		{"bare tilde is home, allowed", "file_path", "~", taskDir, taskEnv, false, false},
 		{"tilde literal under cwd", "file_path", "~/a.md", filepath.Join(taskDir, "tilde"), taskEnv, true, false},
-		{"tilde into rw allowed", "file_path", "~/repos/api/main.go", taskDir, taskEnv, false, false},
+		{"tilde into rw canonical blocked", "file_path", "~/repos/api/main.go", taskDir, taskEnv, true, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			in := Input{SessionID: "s", Cwd: c.cwd, ToolName: "Write", ToolInput: toolInput(c.key, c.path)}
 			exit, msg, err := Handle(ctx, EventPreToolUse, in, c.env, f.st, f.p, now)
 			if c.block {
-				if exit != 2 || !strings.Contains(msg, "is inside read-only repo docs; edit it in a rw repo instead") ||
+				want := "is inside read-only repo docs; edit it in a rw repo instead"
+				if strings.Contains(c.path, "api") {
+					want = "is inside the original clone of api; edit the task's worktree " + f.p.WorktreePath("fix", "api") + " instead"
+				}
+				if exit != 2 || !strings.Contains(msg, want) ||
 					!strings.HasPrefix(msg, "atelier: /") || err != nil {
 					t.Errorf("want block, got %d %q %v", exit, msg, err)
 				}
