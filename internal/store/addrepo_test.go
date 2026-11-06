@@ -94,3 +94,60 @@ func TestAddTaskRepoClosedTask(t *testing.T) {
 		}
 	}
 }
+
+func TestUpgradeTaskRepo(t *testing.T) {
+	s, _ := openTest(t)
+	ctx := context.Background()
+	task := mkTask(t, s, "fix", model.StatusActive, 0,
+		model.TaskRepo{Name: "zeta", Mode: model.ModeRW, BaseBranch: "main", BaseCommit: "abc"},
+		model.TaskRepo{Name: "alpha", Mode: model.ModeRO},
+		model.TaskRepo{Name: "beta", Mode: model.ModeRO})
+	before, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	up := model.TaskRepo{Name: "alpha", Mode: model.ModeRW, BaseBranch: "dev", BaseCommit: "def"}
+	if err := s.UpgradeTaskRepo(ctx, task.ID, up); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same position, other repos untouched.
+	want := []model.TaskRepo{before.Repos[0], up, before.Repos[2]}
+	if !reflect.DeepEqual(got.Repos, want) {
+		t.Fatalf("repos = %+v\nwant %+v", got.Repos, want)
+	}
+	if !got.UpdatedAt.After(before.UpdatedAt) {
+		t.Error("updated_at not bumped")
+	}
+
+	for name, tc := range map[string]struct {
+		id  int64
+		r   model.TaskRepo
+		err error
+	}{
+		"already rw":   {task.ID, model.TaskRepo{Name: "zeta", Mode: model.ModeRW}, ErrNotFound},
+		"not in task":  {task.ID, model.TaskRepo{Name: "nope", Mode: model.ModeRW}, ErrNotFound},
+		"unknown task": {9999, model.TaskRepo{Name: "beta", Mode: model.ModeRW}, ErrNotFound},
+		"to ro":        {task.ID, model.TaskRepo{Name: "beta", Mode: model.ModeRO}, nil},
+	} {
+		err := s.UpgradeTaskRepo(ctx, tc.id, tc.r)
+		if err == nil || (tc.err != nil && !errors.Is(err, tc.err)) {
+			t.Errorf("%s: err = %v, want %v", name, err, tc.err)
+		}
+	}
+	if g, _ := s.GetTask(ctx, task.ID); !reflect.DeepEqual(g.Repos, want) {
+		t.Fatalf("failed upgrades changed repos: %+v", g.Repos)
+	}
+
+	if err := s.SetTaskStatus(ctx, task.ID, model.StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpgradeTaskRepo(ctx, task.ID, model.TaskRepo{Name: "beta", Mode: model.ModeRW}); !errors.Is(err, ErrTaskClosed) {
+		t.Errorf("closed task err = %v", err)
+	}
+}

@@ -125,6 +125,10 @@ func lockFile(ctx context.Context, path string, wait time.Duration, busy string)
 // the new worktree (a failure is a warning). Concurrent AddRepo calls on
 // one task (from any process) are serialised by a lock file. It returns
 // the updated task.
+//
+// Adding a repo the task has as ro again as rw upgrades it: the worktree is
+// created as above and the same repo row becomes rw. Any other repeat is an
+// error.
 func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) (*model.Task, error) {
 	name, mode, err := validRepoArg(r.Name, r.Mode)
 	if err != nil {
@@ -146,9 +150,13 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 	if !t.Status.Open() {
 		return nil, fmt.Errorf("task %s is %s; repos can only be added to open tasks", t.Slug, t.Status)
 	}
+	upgrade := false // ro → rw: same row, now with a worktree
 	for _, x := range t.Repos {
 		if x.Name == name {
-			return nil, fmt.Errorf("task %s already has repo %s (%s)", t.Slug, name, x.Mode)
+			if x.Mode != model.ModeRO || mode != model.ModeRW {
+				return nil, fmt.Errorf("task %s already has repo %s (%s)", t.Slug, name, x.Mode)
+			}
+			upgrade = true
 		}
 	}
 	repo := a.Paths.RepoPath(name)
@@ -193,13 +201,19 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 		}
 		createdBranch = !branchExisted
 	}
-	if err := a.Store.AddTaskRepo(ctx, t.ID, tr); err != nil {
+	record := a.Store.AddTaskRepo
+	if upgrade {
+		record = a.Store.UpgradeTaskRepo
+	}
+	if err := record(ctx, t.ID, tr); err != nil {
 		if mode == model.ModeRW {
 			a.undoWorktree(ctx, name, wt, t.Branch, true, createdBranch)
 		}
 		switch {
 		case errors.Is(err, store.ErrDuplicate):
 			return nil, fmt.Errorf("task %s already has repo %s", t.Slug, name)
+		case upgrade && errors.Is(err, store.ErrNotFound):
+			return nil, fmt.Errorf("task %s no longer has repo %s as ro; not upgraded", t.Slug, name)
 		case errors.Is(err, store.ErrTaskClosed):
 			return nil, fmt.Errorf("task %s was closed meanwhile; repo %s not added", t.Slug, name)
 		}
@@ -207,6 +221,12 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 	}
 	if nt, err := a.Store.GetTask(ctx, t.ID); err == nil {
 		t = nt
+	} else if upgrade {
+		for i := range t.Repos {
+			if t.Repos[i].Name == name {
+				t.Repos[i] = tr
+			}
+		}
 	} else {
 		t.Repos = append(t.Repos, tr)
 	}
@@ -219,7 +239,11 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 		if err := a.runSetup(ctx, t, func(x model.TaskRepo) bool { return x.Name == name }); err != nil {
 			a.warnf("setup for %s in task %s failed (repo kept): %v", name, t.Slug, err)
 		}
-		fmt.Fprintf(a.out(), "added %s (rw) to %s: worktree at %s; running sessions can already see it\n", name, t.Slug, wt)
+		if upgrade {
+			fmt.Fprintf(a.out(), "upgraded %s to rw in %s: worktree at %s; running sessions can already see it\n", name, t.Slug, wt)
+		} else {
+			fmt.Fprintf(a.out(), "added %s (rw) to %s: worktree at %s; running sessions can already see it\n", name, t.Slug, wt)
+		}
 	} else {
 		// ro repos reach Claude only through --add-dir at launch.
 		fmt.Fprintf(a.out(), "added %s (ro) to %s: running Claude sessions need a new session (s) to see %s\n", name, t.Slug, name)
