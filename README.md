@@ -83,7 +83,8 @@ its last hook said it ended, e.g. around `/clear`), then the past ones you can r
 the task dir can find: it still exists and is in Claude's project dir for the task dir, so
 a claude you ran in a subdirectory, or a nested `claude -p`, is not offered; a session
 with no recorded transcript is offered only if atl launched it), each group newest
-activity first. Closed (done or cancelled) tasks offer no past sessions. Each row shows
+activity first. The most recently active session is highlighted, so `enter` continues it
+(`↑` for a new one). Closed (done or cancelled) tasks offer no past sessions. Each row shows
 the state, how long ago it was last active, the conversation title, the window name and,
 if there is room, the last prompt. The title is Claude Code's own (a `/rename` title, else
 the one it generated), else the first prompt, else the window name; it is read from the
@@ -230,7 +231,7 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `XDG_CONFIG_HOME` | `~/.config` — projects in `atelier/projects/<name>.toml` (ignored with `ATL_WORKSPACE`) |
 | `ATL_TMUX_SOCKET` | unset — tmux socket name (`tmux -L`) if you don't use the default server |
 | `ATL_BIN` | the running binary — `atl` path written into hook commands |
-| `ATL_CONTEXT` | unset — extra text appended to every task session's start context |
+| `ATL_CONTEXT` | unset — extra text appended to every task session's start context (max 1000 bytes; atl refuses to start if longer) |
 
 With `ATL_WORKSPACE` set (it must be an existing directory, so a typo or a missing mount
 is an error rather than a new empty database), atelier keeps everything in it, and you can
@@ -295,7 +296,8 @@ sees current notes without any file being rewritten. If the notes don't fit, the
 `atl notes <slug>` for all)". If `ATL_CONTEXT` is set in the hook's
 environment (e.g. a devcontainer's `containerEnv`: "no language runtimes here; run tests
 inside each repo's container via docker"), its text (newlines kept, up to 1000 bytes) is added
-as an "Environment notes" section before the notes. This is the only hook output on
+as an "Environment notes" section before the notes. A longer `ATL_CONTEXT` makes `atl` (and
+`atl doctor`) fail with its size; the hook itself only cuts it, so a session never loses its context. This is the only hook output on
 stdout; if the context cannot be built the error goes to `hook.log` and nothing is printed.
 
 ## Status line

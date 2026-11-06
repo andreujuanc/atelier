@@ -546,3 +546,23 @@ func TestSessionStartContextLatency(t *testing.T) {
 		t.Errorf("unexpected errors logged: %s", log)
 	}
 }
+
+func TestCheckEnvContext(t *testing.T) {
+	for _, tc := range []struct {
+		raw string
+		ok  bool
+	}{
+		{"", true},
+		{strings.Repeat("a", contextEnvLen), true},
+		{" \n" + strings.Repeat("a", contextEnvLen) + "\r\n", true}, // trimmed like the hook does
+		{strings.Repeat("a", contextEnvLen+1), false},
+		{strings.Repeat("é", contextEnvLen/2+1), false}, // bytes, not characters
+	} {
+		if err := checkEnvContext(tc.raw); (err == nil) != tc.ok {
+			t.Errorf("len %d: err %v, want ok=%v", len(tc.raw), err, tc.ok)
+		}
+	}
+	if err := checkEnvContext(strings.Repeat("a", 1043)); err == nil || err.Error() != "$ATL_CONTEXT is 1043 bytes, max 1000" {
+		t.Errorf("message: %v", err)
+	}
+}
