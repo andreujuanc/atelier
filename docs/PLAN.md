@@ -541,7 +541,8 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
   title → nothing saved),
   `/` filter (substring on slug/title), `j/k`/arrows move, `q`/ctrl-c quit.
 - Session picker (`enter` on a task with openable sessions: live, or resumable as `App.OpenChoices` defines; closed tasks offer
-  no past sessions): row 0 "New session" (`App.OpenNew`), then `App.OpenChoices` order; row =
+  no past sessions): row 0 "New session" (`App.OpenNew`), then `App.OpenChoices` order; the cursor starts on the newest `LastEventAt` (live or
+  past; first in list order on a tie); row =
   state, age, title (transcript: newest `custom-title`, else newest `ai-title`/`summary`, else first user prompt, else window
   name; head+tail 1 MiB of a large transcript), window name and last prompt if they fit. ↑/↓ (ctrl+p/n, j/k, pgup/pgdown,
   home/end) move, enter → `App.OpenSession` / `App.OpenNew` then ExecProcess, esc cancels. Same look as the repo picker.

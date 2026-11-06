@@ -83,7 +83,8 @@ its last hook said it ended, e.g. around `/clear`), then the past ones you can r
 the task dir can find: it still exists and is in Claude's project dir for the task dir, so
 a claude you ran in a subdirectory, or a nested `claude -p`, is not offered; a session
 with no recorded transcript is offered only if atl launched it), each group newest
-activity first. Closed (done or cancelled) tasks offer no past sessions. Each row shows
+activity first. The most recently active session is highlighted, so `enter` continues it
+(`↑` for a new one). Closed (done or cancelled) tasks offer no past sessions. Each row shows
 the state, how long ago it was last active, the conversation title, the window name and,
 if there is room, the last prompt. The title is Claude Code's own (a `/rename` title, else
 the one it generated), else the first prompt, else the window name; it is read from the
