@@ -1041,23 +1041,33 @@ func TestAddRepoFlow(t *testing.T) {
 		t.Fatalf("picker not open for beta: mode %d", m.mode)
 	}
 	v := plainView(m)
-	if !strings.Contains(v, "Add repos to beta") || !strings.Contains(v, "[rw] api  (in task)") || !strings.Contains(v, "[ro] docs  (in task)") {
+	if !strings.Contains(v, "Add repos to beta") || !strings.Contains(v, "[rw] api  (in task)") || !strings.Contains(v, "[ro] docs  (in task; space: upgrade to rw)") {
 		t.Fatalf("add picker:\n%s", v)
 	}
 	// the cursor starts on the first repo not in the task
 	if cur := m.picker.current(); cur != "lib" || !strings.Contains(plainView(m), "> [  ] lib") {
 		t.Fatalf("initial cursor on %q:\n%s", cur, plainView(m))
 	}
-	key(m, "up") // docs: locked, still shows the cursor marker
-	if !strings.Contains(plainView(m), "> [ro] docs  (in task)") {
+	key(m, "up") // docs: locked ro, still shows the cursor marker
+	if !strings.Contains(plainView(m), "> [ro] docs  (in task") {
 		t.Fatalf("no cursor on locked row:\n%s", plainView(m))
 	}
+	key(m, " ") // space toggles upgrading it to rw
+	if !strings.Contains(plainView(m), "> [ro→rw] docs  (upgrade)") || !strings.Contains(plainView(m), "selected: docs(rw)") {
+		t.Fatalf("upgrade not selected:\n%s", plainView(m))
+	}
+	key(m, " ")
+	if len(m.picker.sel) != 0 || !strings.Contains(plainView(m), "> [ro] docs  (in task") {
+		t.Fatalf("upgrade not deselected: %v\n%s", m.picker.sel, plainView(m))
+	}
+	key(m, "up") // api: locked rw, not selectable
 	key(m, " ")
 	if len(m.picker.sel) != 0 {
-		t.Fatal("locked repo selected")
+		t.Fatal("locked rw repo selected")
 	}
+	key(m, "down")
 	key(m, "down") // lib: the hint stays until the selection changes
-	if !strings.Contains(plainView(m), "docs is already in the task") {
+	if !strings.Contains(plainView(m), "api is already in the task") {
 		t.Fatalf("hint cleared by a move:\n%s", plainView(m))
 	}
 	key(m, " ")

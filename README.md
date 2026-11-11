@@ -35,6 +35,7 @@ atl new "Spike" --repo api:rw --repo docs:ro -m "why" [--backlog] [--no-fetch]
 atl new "Hotfix" --project shop --base default   # branch from origin's default branch (production)
 atl add fix-login web [--no-fetch]  # add a repo to an open task (rw: worktree on atl/<slug>)
 atl add fix-login docs:ro           # ro: listed in CLAUDE.md; running sessions need a new one (s)
+atl add fix-login docs:rw           # upgrade an ro repo to rw (worktree on atl/<slug>); rw → ro is not possible
 atl repos                 # git repos in $ATL_REPOS, one per line
 atl ls [--status active,review|all] [--json]
 atl open fix-login        # ensure the tmux session (resume or start Claude), attach
@@ -71,6 +72,7 @@ and `/` are refused so no input is lost). The task list shows each task's title
 is in the details pane, with the task's notes below the details.
 Repos (in the new-task form and for `a`) are picked from a list of `$ATL_REPOS`: type to
 filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter` confirms, `esc` cancels.
+Repos already in the task are dimmed; `space` on an ro one marks it `[ro→rw]` to upgrade it.
 Choosing a project in the form preselects its repos. The form's Base field toggles
 (`space`, `←`/`→`; `enter` moves on) between "auto (dev → develop → default)" and
 "production patch (default branch)".
@@ -283,7 +285,8 @@ kept. Your global `~/.claude/settings.json` is never touched (only read, for its
 `statusLine`). They keep session state current
 (`running`, `waiting` on permission prompts, `idle`, `ended`; `stopped` comes from
 crash recovery) and record each session's transcript path, and the PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
-on paths inside read-only repos. Hook failures never block Claude (except the
+on paths inside read-only repos, and inside the original clone (`$ATL_REPOS/<name>`) of the
+task's rw repos, whose edits belong in the worktree. Hook failures never block Claude (except the
 read-only guard) and are logged to `hook.log`. The assistant's `AssistantGuard` hook
 (see above) fails closed: input it cannot inspect is refused.
 

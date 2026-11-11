@@ -324,8 +324,10 @@ Every event updates `last_event_at`. Unknown events: no-op, exit 0.
 
 ro guard: take `tool_input.file_path` (or `notebook_path`), make absolute against `cwd`, `filepath.Clean`, resolve
 symlinks of the longest existing prefix; compare (path-component-wise, also after EvalSymlinks of the ro root)
-against `Paths.RepoPath(name)` of every ro repo of the resolved task. Inside → exit 2, stderr
-`atelier: <path> is inside read-only repo <name>; edit it in a rw repo instead`. Task unresolvable or any error →
+against `Paths.RepoPath(name)` of every repo of the resolved task (rw too: a session launched while the repo was ro keeps the
+clone as `--add-dir` after an upgrade to rw). Inside → exit 2, stderr
+`atelier: <path> is inside read-only repo <name>; edit it in a rw repo instead` (ro) or
+`atelier: <path> is inside the original clone of <name>; edit the task's worktree <wt> instead` (rw). Task unresolvable or any error →
 exit 0 (fail open) and log.
 
 SessionStart output: for sessions inside a task, after the DB update, print one JSON line
@@ -478,7 +480,7 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 | `atl` | TUI |
 | `atl new <title...> [--project P] [--repo name:rw\|ro ...] [--backlog] [--no-fetch] [-m/--description D]` | create task; prints slug + task dir |
 | `atl ls [--status S[,S...]\|all] [--json]` | default: open statuses. Text columns: `ID SLUG STATUS PROJECT SESSIONS TITLE` (sessions like `2 (1 waiting)`) |
-| `atl add <task> <name>[:rw\|ro] [--no-fetch]` | add a repo to an open task; prints `slug\trepo\tmode\tpath` |
+| `atl add <task> <name>[:rw\|ro] [--no-fetch]` | add a repo to an open task; `:rw` on a repo the task has as ro upgrades it (worktree, same row via `Store.UpgradeTaskRepo`); any other repeat is refused; prints `slug\trepo\tmode\tpath` |
 | `atl repos` | list repos available under `$ATL_REPOS` |
 | `atl open <task> [--session ID \| --new]` | `App.Open` (no flags; unchanged), `App.OpenSession` (`--session`) or `App.OpenNew` (`--new`), then run attach cmd with stdio attached. The flags are mutually exclusive (usage error) |
 | `atl session <task>` | new Claude session (does not attach; prints window) |
@@ -531,7 +533,7 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
   contain either shows a hint in the status line; leaving unchanged saves nothing). `atl notes --set` keeps them. The editor is bound to its task id (the details pane
   shows that task while editing, whatever the selection/list does); resize refits it; narrow terminals show the details
   pane full width while editing.
-- Repo picker (new-task form and `a`): list of `App.AvailableRepos`, type to filter, space cycles none→rw→ro, enter confirms, esc clears filter then cancels; project repos preselected.
+- Repo picker (new-task form and `a`): list of `App.AvailableRepos`, type to filter, space cycles none→rw→ro (on a repo already in the task: only ro, toggling an upgrade to rw), enter confirms, esc clears filter then cancels; project repos preselected.
 - Keys: `n` new (form: title, project, repos via picker, description, backlog toggle), `enter` open (`App.OpenOrChoose`;
   attach cmd → tea.ExecProcess; choices → session picker), `s` new session, `r` resume, `d` done / `c` cancel (y/N confirm; if refused because dirty, offer `F`
   force), `p` pr, `D` diff (ExecProcess `$PAGER`), `1-5` set status (`AllStatuses` order, plain SetStatus), `a` add repos to the selected task (picker),

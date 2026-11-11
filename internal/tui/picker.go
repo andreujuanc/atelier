@@ -16,8 +16,8 @@ import (
 // substring), up/down (ctrl+p/ctrl+n) move, space cycles the highlighted
 // repo none → rw → ro → none, enter confirms and esc clears the filter (or
 // cancels when it is empty). Locked repos (already in the task) are shown
-// dimmed and cannot be selected; the cursor starts on the first unlocked
-// repo.
+// dimmed and cannot be selected, except that space on a locked ro repo
+// toggles upgrading it to rw; the cursor starts on the first unlocked repo.
 type picker struct {
 	title     string
 	available []string              // repos found in $ATL_REPOS
@@ -135,6 +135,17 @@ func (p *picker) cycle(name string) {
 	p.sel = append(p.sel, app.RepoArg{Name: name, Mode: model.ModeRW})
 }
 
+// toggleUpgrade selects locked ro repo name as rw (upgrade), or deselects it.
+func (p *picker) toggleUpgrade(name string) {
+	for i, r := range p.sel {
+		if r.Name == name {
+			p.sel = append(p.sel[:i:i], p.sel[i+1:]...)
+			return
+		}
+	}
+	p.sel = append(p.sel, app.RepoArg{Name: name, Mode: model.ModeRW})
+}
+
 // selection returns a copy of the selection.
 func (p *picker) selection() []app.RepoArg {
 	return append([]app.RepoArg(nil), p.sel...)
@@ -211,6 +222,9 @@ func (p *picker) update(msg tea.KeyMsg) pickResult {
 		name := p.current()
 		switch {
 		case name == "":
+		case p.locked[name] == model.ModeRO:
+			p.msg = ""
+			p.toggleUpgrade(name)
 		case p.locked[name] != "":
 			p.msg = name + " is already in the task"
 		default:
@@ -315,8 +329,19 @@ func (p *picker) lines(w, h int) []string {
 }
 
 func (p *picker) row(name string, cur bool, w int) string {
+	if m := p.locked[name]; m == model.ModeRO && p.modeOf(name) == model.ModeRW {
+		text := "  [ro→rw] " + clean(name) + "  (upgrade)"
+		if cur {
+			return selStyle.Render(fit("> "+text[2:], w))
+		}
+		return trunc("  "+markStyle.Render("[ro→rw]")+" "+clean(name)+dimStyle.Render("  (upgrade)"), w)
+	}
 	if m := p.locked[name]; m != "" {
-		text := fmt.Sprintf("  [%s] %s  (in task)", m, clean(name))
+		hint := "  (in task)"
+		if m == model.ModeRO {
+			hint = "  (in task; space: upgrade to rw)"
+		}
+		text := fmt.Sprintf("  [%s] %s%s", m, clean(name), hint)
 		if cur {
 			return selStyle.Render(fit(dimStyle.Render("> "+text[2:]), w))
 		}

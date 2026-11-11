@@ -477,6 +477,50 @@ func (s *Store) AddTaskRepo(ctx context.Context, taskID int64, r model.TaskRepo)
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	if err := touchOpenTask(ctx, tx, taskID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_repos
+		(task_id, name, mode, base_branch, base_commit, position)
+		VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(position), -1) + 1 FROM task_repos WHERE task_id = ?))`,
+		taskID, r.Name, string(r.Mode), r.BaseBranch, r.BaseCommit, taskID); err != nil {
+		return fmt.Errorf("store: insert repo %q for task %d: %w", r.Name, taskID, err)
+	}
+	return tx.Commit()
+}
+
+// UpgradeTaskRepo turns ro repo r.Name of task taskID into rw with r's base
+// branch and commit, keeping its position. Like AddTaskRepo it bumps the
+// task's updated_at and requires an open task (ErrTaskClosed); a repo the
+// task does not have as ro is ErrNotFound.
+func (s *Store) UpgradeTaskRepo(ctx context.Context, taskID int64, r model.TaskRepo) error {
+	if r.Mode != model.ModeRW {
+		return fmt.Errorf("store: upgrade repo %q to mode %q: only rw", r.Name, r.Mode)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := touchOpenTask(ctx, tx, taskID); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE task_repos SET mode = 'rw', base_branch = ?, base_commit = ?
+		WHERE task_id = ? AND name = ? AND mode = 'ro'`, r.BaseBranch, r.BaseCommit, taskID, r.Name)
+	if err != nil {
+		return fmt.Errorf("store: upgrade repo %q for task %d: %w", r.Name, taskID, err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return fmt.Errorf("store: ro repo %q of task %d: %w", r.Name, taskID, ErrNotFound)
+	}
+	return tx.Commit()
+}
+
+// touchOpenTask bumps task taskID's updated_at in tx, or returns
+// ErrTaskClosed (done/cancelled) or ErrNotFound.
+func touchOpenTask(ctx context.Context, tx *sql.Tx, taskID int64) error {
 	res, err := tx.ExecContext(ctx, `UPDATE tasks SET updated_at = ?
 		WHERE id = ? AND status IN ('backlog', 'active', 'review')`, toMS(now()), taskID)
 	if err != nil {
@@ -495,11 +539,5 @@ func (s *Store) AddTaskRepo(ctx context.Context, taskID int64, r model.TaskRepo)
 		}
 		return fmt.Errorf("store: task %d is %s: %w", taskID, st, ErrTaskClosed)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO task_repos
-		(task_id, name, mode, base_branch, base_commit, position)
-		VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(position), -1) + 1 FROM task_repos WHERE task_id = ?))`,
-		taskID, r.Name, string(r.Mode), r.BaseBranch, r.BaseCommit, taskID); err != nil {
-		return fmt.Errorf("store: insert repo %q for task %d: %w", r.Name, taskID, err)
-	}
-	return tx.Commit()
+	return nil
 }
