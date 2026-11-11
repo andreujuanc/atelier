@@ -208,6 +208,58 @@ func TestAddRepoRO(t *testing.T) {
 	}
 }
 
+func TestAddRepoUpgradeROToRW(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "docs", "main")
+	e.addRepo(t, "lib", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Upgrade", NoFetch: true, Repos: []RepoArg{
+		{"api", model.ModeRW}, {"docs", model.ModeRO}, {"lib", model.ModeRO}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.app.Out.(interface{ Reset() }).Reset()
+	got, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"docs", model.ModeRW}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := e.app.Paths.WorktreePath(task.Slug, "docs")
+	if b := git(t, wt, "symbolic-ref", "--short", "HEAD"); b != task.Branch {
+		t.Fatalf("branch %s", b)
+	}
+	head := git(t, e.canonical("docs"), "rev-parse", "refs/remotes/origin/main")
+	// Same position; the other repos are untouched.
+	want := []model.TaskRepo{task.Repos[0], {Name: "docs", Mode: model.ModeRW, BaseBranch: "main", BaseCommit: head}, task.Repos[2]}
+	if !reflect.DeepEqual(got.Repos, want) {
+		t.Fatalf("returned repos %+v\nwant %+v", got.Repos, want)
+	}
+	if stored, _ := e.app.Store.GetTask(ctx, task.ID); !reflect.DeepEqual(stored.Repos, want) {
+		t.Fatalf("stored repos %+v", stored.Repos)
+	}
+	md := readFile(t, filepath.Join(e.app.Paths.TaskDir(task.Slug), "CLAUDE.md"))
+	if !strings.Contains(md, "**docs** — `"+wt+"` — **rw**") || strings.Contains(md, "`"+e.canonical("docs")+"` (docs)") {
+		t.Fatalf("CLAUDE.md:\n%s", md)
+	}
+	if !strings.Contains(e.outString(), "upgraded docs to rw in "+task.Slug+": worktree at "+wt) {
+		t.Fatalf("output:\n%s", e.outString())
+	}
+	// Sessions launched while docs was ro still see its clone: still blocked.
+	if !guardBlocks(t, e, task.Slug, filepath.Join(e.canonical("docs"), "README")) {
+		t.Fatal("guard allows writes into the upgraded repo's clone")
+	}
+	if guardBlocks(t, e, task.Slug, filepath.Join(wt, "README")) {
+		t.Fatal("guard blocks the new worktree")
+	}
+
+	// Only ro → rw: rw → ro, rw → rw and ro → ro are refused.
+	for _, r := range []RepoArg{{"docs", model.ModeRO}, {"docs", model.ModeRW}, {"lib", model.ModeRO}} {
+		if _, err := e.app.AddRepo(ctx, task.Slug, r, true); err == nil || !strings.Contains(err.Error(), "already has repo "+r.Name) {
+			t.Errorf("%s:%s: err = %v", r.Name, r.Mode, err)
+		}
+	}
+}
+
 func TestAddRepoRefusals(t *testing.T) {
 	e := newTaskEnv(t)
 	ctx := context.Background()
@@ -450,7 +502,7 @@ func TestAddRepoLockWait(t *testing.T) {
 		t.Fatalf("err = %v, want deadline exceeded", err)
 	}
 	unlock()
-	if _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"api", model.ModeRW}, true); err == nil || !strings.Contains(err.Error(), "already has repo api") {
+	if _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"api", model.ModeRO}, true); err == nil || !strings.Contains(err.Error(), "already has repo api") {
 		t.Fatalf("after unlock: %v", err)
 	}
 }

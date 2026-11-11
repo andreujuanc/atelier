@@ -17,8 +17,11 @@ import (
 const maxSymlinks = 40
 
 // guard is the PreToolUse ro guard: it blocks (exit 2) Edit/Write tool calls
-// whose target path is inside a read-only repo of the task, and fails open
-// (exit 0, error for the log) on anything it cannot resolve.
+// whose target path is inside the canonical clone ($ATL_REPOS/<name>) of any
+// of the task's repos: an ro repo, or an rw one, whose work belongs in its
+// worktree (a session launched while the repo was ro still has the clone as
+// an --add-dir after it is upgraded to rw). It fails open (exit 0, error for
+// the log) on anything it cannot resolve.
 func guard(ctx context.Context, in Input, env func(string) string, st *store.Store, p config.Paths) (int, string, error) {
 	targets, decodeErr := guardTargets(in.ToolInput)
 	if len(targets) == 0 {
@@ -35,13 +38,7 @@ func guard(ctx context.Context, in Input, env func(string) string, st *store.Sto
 	if task == nil {
 		return 0, "", errors.New("ro guard: cannot resolve task (no ATL_TASK, session or task cwd); allowing")
 	}
-	var ro []string
-	for _, r := range task.Repos {
-		if r.Mode == model.ModeRO {
-			ro = append(ro, r.Name)
-		}
-	}
-	if len(ro) == 0 {
+	if len(task.Repos) == 0 {
 		return 0, "", nil
 	}
 
@@ -72,7 +69,8 @@ func guard(ctx context.Context, in Input, env func(string) string, st *store.Sto
 		resolveErr = decodeErr
 	}
 
-	for _, name := range ro {
+	for _, repo := range task.Repos {
+		name := repo.Name
 		root := p.RepoPath(name)
 		for _, r := range []string{root, realPath(root)} {
 			for _, c := range candidates {
@@ -81,7 +79,11 @@ func guard(ctx context.Context, in Input, env func(string) string, st *store.Sto
 					if c.landing != c.given {
 						what += " (resolves to " + c.landing + ")"
 					}
-					return 2, fmt.Sprintf("atelier: %s is inside read-only repo %s; edit it in a rw repo instead", what, name), nil
+					if repo.Mode == model.ModeRO {
+						return 2, fmt.Sprintf("atelier: %s is inside read-only repo %s; edit it in a rw repo instead", what, name), nil
+					}
+					return 2, fmt.Sprintf("atelier: %s is inside the original clone of %s; edit the task's worktree %s instead",
+						what, name, p.WorktreePath(task.Slug, name)), nil
 				}
 			}
 		}
