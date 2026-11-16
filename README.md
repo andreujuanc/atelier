@@ -234,6 +234,7 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `ATL_TMUX_SOCKET` | unset — tmux socket name (`tmux -L`) if you don't use the default server |
 | `ATL_BIN` | the running binary — `atl` path written into hook commands |
 | `ATL_CONTEXT` | unset — extra text appended to every task session's start context (max 1000 bytes; atl refuses to start if longer) |
+| `ATL_BASH_GUARD` | unset — `1` limits what task sessions may run with the Bash tool (see Hooks) |
 
 With `ATL_WORKSPACE` set (it must be an existing directory, so a typo or a missing mount
 is an error rather than a new empty database), atelier keeps everything in it, and you can
@@ -289,6 +290,28 @@ on paths inside read-only repos, and inside the original clone (`$ATL_REPOS/<nam
 task's rw repos, whose edits belong in the worktree. Hook failures never block Claude (except the
 read-only guard) and are logged to `hook.log`. The assistant's `AssistantGuard` hook
 (see above) fails closed: input it cannot inspect is refused.
+
+With `ATL_BASH_GUARD=1` (e.g. in a box's `containerEnv`), the PreToolUse hook also checks
+every Bash command, parsed with a real shell parser, and blocks (exit 2, with the reason)
+anything but:
+
+- `git`, `docker` and `atl`;
+- read-only tools: `ls cat head tail grep find wc cut tr sort uniq diff cmp comm stat jq`,
+  `sed -n '10,20p'`, `echo`, `pwd`, `cd` and the like (`find -exec/-delete`, `sort -o`,
+  `rg --pre` and other writing or command-running options are refused);
+- pipes, `&&`/`||`, `if`/`for`/`while`, reading redirections, `2>&1` and `> /dev/null`.
+
+Refused: any other command (`awk`, `mkdir`, `rm`, `tee`, `xargs`, `sh -c`, `eval`, …), writing
+files with `>`/`>>` (edit with the Edit/Write tools), command and process substitution (except
+`$(cat <<'EOF' … EOF)` for commit messages), variable assignments (`X=1 cmd`, `export`),
+functions and shell arithmetic. git may not run other programs (`-c`, `config` writes,
+`rebase --exec`, `difftool`, …), and wherever it would work in or name a path inside
+`$ATL_REPOS` (the canonical clones) only reading commands run (`log`, `show`, `diff`, `status`,
+listing branches…). docker may not use `--privileged`, host namespaces, `--cap-add`,
+`--device` or `--security-opt` (other than `label=disable`/`no-new-privileges`), mount
+`$ATL_REPOS` writable, mount credentials (`~/.ssh`, `~/.claude`, `~/.gitconfig`, `~/.config/gh`,
+…) or copy/export into `$ATL_REPOS`. It is a guardrail for agents, not a sandbox: compose files
+are not inspected, and docker itself can reach anything the daemon can.
 
 On SessionStart (startup, resume, `/clear`, compaction) inside a task, `atl hook
 SessionStart` also prints Claude Code's `hookSpecificOutput.additionalContext` JSON with

@@ -83,7 +83,7 @@ func (a *App) now() time.Time {
 // atl path current) and CLAUDE.md is written only if missing.
 func (a *App) prepareTaskDir(ctx context.Context, t *model.Task) error {
 	dir := a.Paths.TaskDir(t.Slug)
-	if err := gen.WriteSettings(dir, a.AtlBin); err != nil {
+	if err := gen.WriteSettingsBash(dir, a.AtlBin, hook.BashGuardOn(os.Getenv)); err != nil {
 		return err
 	}
 	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); errors.Is(err, os.ErrNotExist) {

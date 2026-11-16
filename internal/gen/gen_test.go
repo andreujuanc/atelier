@@ -525,3 +525,27 @@ func TestWriteSettingsGlobalStatusLine(t *testing.T) {
 		}
 	})
 }
+
+func TestWriteSettingsBashMatcher(t *testing.T) {
+	dir := t.TempDir()
+	read := func() string {
+		b, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	if err := WriteSettingsBash(dir, "/bin/atl", true); err != nil {
+		t.Fatal(err)
+	}
+	if s := read(); !strings.Contains(s, `"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash"`) {
+		t.Fatalf("guard on:\n%s", s)
+	}
+	// Turning it off again drops Bash (atelier's entry is replaced, not added).
+	if err := WriteSettingsBash(dir, "/bin/atl", false); err != nil {
+		t.Fatal(err)
+	}
+	if s := read(); strings.Contains(s, "Bash") || strings.Count(s, "hook PreToolUse") != 1 {
+		t.Fatalf("guard off:\n%s", s)
+	}
+}

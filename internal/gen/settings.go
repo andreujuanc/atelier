@@ -59,6 +59,12 @@ func StatusLineCommand(atlBin string) string {
 // is not a valid settings object is backed up to settings.json.bak and
 // replaced. The write is atomic.
 func WriteSettings(taskDir, atlBin string) error {
+	return WriteSettingsBash(taskDir, atlBin, false)
+}
+
+// WriteSettingsBash is WriteSettings; with bashGuard, atelier's PreToolUse
+// hook also matches the Bash tool (the $ATL_BASH_GUARD command check).
+func WriteSettingsBash(taskDir, atlBin string, bashGuard bool) error {
 	path, root, err := loadSettings(taskDir)
 	if err != nil {
 		return err
@@ -68,7 +74,11 @@ func WriteSettings(taskDir, atlBin string) error {
 		hooks = map[string]any{}
 	}
 	for _, ev := range hookEvents {
-		setAtelierHook(hooks, ev.Name, ev.Matcher, ev.Name, atlBin)
+		matcher := ev.Matcher
+		if bashGuard && ev.Name == "PreToolUse" {
+			matcher += "|Bash"
+		}
+		setAtelierHook(hooks, ev.Name, matcher, ev.Name, atlBin)
 	}
 	root["hooks"] = hooks
 	setStatusLine(root, atlBin, globalStatusLine(config.ClaudeUserSettings()))

@@ -14,6 +14,7 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/gen"
 	"github.com/andreujuanc/atelier/internal/gitx"
+	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/project"
 	"github.com/andreujuanc/atelier/internal/tmux"
@@ -363,7 +364,7 @@ func (a *App) populateTaskDir(ctx context.Context, t *model.Task) (err error) {
 	if err := gen.WriteClaudeMD(dir, *t, a.repoInfos(t)); err != nil {
 		return err
 	}
-	return gen.WriteSettings(dir, a.AtlBin)
+	return gen.WriteSettingsBash(dir, a.AtlBin, hook.BashGuardOn(os.Getenv))
 }
 
 // taskProject loads the task's project, or returns nil if it has none.

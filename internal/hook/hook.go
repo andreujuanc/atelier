@@ -144,6 +144,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, env func(stri
 	if !knownEvent(event) {
 		return 0
 	}
+	if event == EventPreToolUse && strings.HasPrefix(in.ToolName, "Bash") {
+		if in.ToolName != "Bash" {
+			return 0 // e.g. BashOutput, matched by the "Bash" matcher
+		}
+		return bashGuardMain(p, stderr, env, in)
+	}
 	return handleMain(p, stdout, stderr, env, event, in)
 }
 
@@ -186,6 +192,13 @@ func handleMain(p config.Paths, stdout, stderr io.Writer, env func(string) strin
 // any other undecodable input fails open.
 func guardPartial(p config.Paths, stderr io.Writer, env func(string) string, event string, data []byte, oversized bool) int {
 	in, ok := partialInput(data)
+	if strings.HasPrefix(in.ToolName, "Bash") {
+		if in.ToolName == "Bash" && BashGuardOn(env) {
+			fmt.Fprintln(stderr, "atelier: blocked: cannot read the Bash command"+bashHint)
+			return 2
+		}
+		return 0
+	}
 	if ok {
 		code := handleMain(p, nil, stderr, env, event, in)
 		if code == 2 || !oversized {
