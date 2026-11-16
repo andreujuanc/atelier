@@ -451,7 +451,7 @@ one); ≥1 repo required; every repo must be `gitx.IsRepo(Paths.RepoPath(name))`
 (also must not exist on disk); port = `NextPortOffset`; mkdir task dir; for each rw repo: `gitx.Fetch` (skipped with
 `--no-fetch`), `base_branch` from the task's base ("" auto = gitx.IntegrationBranch: origin/dev → develop → default; ":default" = DefaultBranch; else explicit branch), `base_commit = RevParse("refs/remotes/origin/"+base_branch)`,
 `AddWorktree(repo, wt, "atl/<slug>", base_commit)` → on any failure roll back created worktrees + dir; write CLAUDE.md + settings.json; `CreateTask`
-(status active, or backlog with `--backlog`); then (M7) run project setup in each rw worktree — failure is a warning,
+(status active, or backlog with `--backlog`; only a backlog task may have no repos); then (M7) run project setup in each rw worktree — failure is a warning,
 task stays. Worktrees are created even for backlog tasks.
 
 Done/Cancel flow: resolve task; if !force and any rw worktree dirty → error listing dirty repos; kill tmux session;
@@ -509,7 +509,7 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 ## 5. TUI (`internal/tui`)
 
 - Left pane: tasks grouped under status headers (backlog, active, review, done, cancelled; done/cancelled collapsed
-  to last 10). Task row = session-state dot (waiting > running > idle > stopped), the task TITLE only (the slug is in
+  to last 10; open groups: tasks with a live session first, stable otherwise). Task row = session-state dot (waiting > running > idle > stopped), the task TITLE only (the slug is in
   the right pane; blank title → slug), truncated to the pane width, then `*` if an open task has uncommitted changes
   (kept when the title is truncated).
 - Right pane: title, slug, project, branch, port offset, task dir; repos (`rw`/`ro`, dirty `*`); sessions
