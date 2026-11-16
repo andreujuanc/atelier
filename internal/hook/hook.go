@@ -193,7 +193,7 @@ func handleMain(p config.Paths, stdout, stderr io.Writer, env func(string) strin
 func guardPartial(p config.Paths, stderr io.Writer, env func(string) string, event string, data []byte, oversized bool) int {
 	in, ok := partialInput(data)
 	if strings.HasPrefix(in.ToolName, "Bash") {
-		if in.ToolName == "Bash" && BashGuardOn(env) {
+		if in.ToolName == "Bash" {
 			fmt.Fprintln(stderr, "atelier: blocked: cannot read the Bash command"+bashHint)
 			return 2
 		}

@@ -234,7 +234,6 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `ATL_TMUX_SOCKET` | unset — tmux socket name (`tmux -L`) if you don't use the default server |
 | `ATL_BIN` | the running binary — `atl` path written into hook commands |
 | `ATL_CONTEXT` | unset — extra text appended to every task session's start context (max 1000 bytes; atl refuses to start if longer) |
-| `ATL_BASH_GUARD` | unset — `1` limits what task sessions may run with the Bash tool (see Hooks) |
 
 With `ATL_WORKSPACE` set (it must be an existing directory, so a typo or a missing mount
 is an error rather than a new empty database), atelier keeps everything in it, and you can
@@ -291,9 +290,8 @@ task's rw repos, whose edits belong in the worktree. Hook failures never block C
 read-only guard) and are logged to `hook.log`. The assistant's `AssistantGuard` hook
 (see above) fails closed: input it cannot inspect is refused.
 
-With `ATL_BASH_GUARD=1` (e.g. in a box's `containerEnv`), the PreToolUse hook also checks
-every Bash command, parsed with a real shell parser, and blocks (exit 2, with the reason)
-anything but:
+The PreToolUse hook also checks every Bash command of a task session, parsed with a real
+shell parser, and blocks (exit 2, with the reason) anything but:
 
 - `git`, `docker` and `atl`;
 - read-only tools: `ls cat head tail grep find wc cut tr sort uniq diff cmp comm stat jq`,
@@ -304,7 +302,8 @@ anything but:
 Refused: any other command (`awk`, `mkdir`, `rm`, `tee`, `xargs`, `sh -c`, `eval`, …), writing
 files with `>`/`>>` (edit with the Edit/Write tools), command and process substitution (except
 `$(cat <<'EOF' … EOF)` for commit messages), variable assignments (`X=1 cmd`, `export`),
-functions and shell arithmetic. git may not run other programs (`-c`, `config` writes,
+functions and shell arithmetic (except `$((…))` on numbers and environment variables, e.g.
+`$((3000 + ATL_PORT_OFFSET))`). Each task's CLAUDE.md states these rules. git may not run other programs (`-c`, `config` writes,
 `rebase --exec`, `difftool`, …), and wherever it would work in or name a path inside
 `$ATL_REPOS` (the canonical clones) only reading commands run (`log`, `show`, `diff`, `status`,
 listing branches…). docker may not use `--privileged`, host namespaces, `--cap-add`,

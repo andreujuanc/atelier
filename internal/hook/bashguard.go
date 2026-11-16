@@ -16,28 +16,12 @@ import (
 	"github.com/andreujuanc/atelier/internal/config"
 )
 
-// envBashGuard turns the Bash guard on (any value but "", "0", "off",
-// "false"), e.g. in a devcontainer's containerEnv.
-const envBashGuard = "ATL_BASH_GUARD"
-
-// BashGuardOn reports whether $ATL_BASH_GUARD turns the Bash guard on.
-func BashGuardOn(env func(string) string) bool {
-	switch strings.ToLower(strings.TrimSpace(env(envBashGuard))) {
-	case "", "0", "off", "false", "no":
-		return false
-	}
-	return true
-}
-
 const bashHint = "\nAllowed here: git, docker, atl and read-only tools (ls, cat, head, tail, grep, find, wc, sort, diff, jq, …). " +
-	"Edit files with the Edit/Write tools; run builds and tests in the repo's containers via docker. ($" + envBashGuard + ")"
+	"Edit files with the Edit/Write tools; run builds and tests in the repo's containers via docker. (atelier Bash guard)"
 
 // bashGuardMain runs the Bash guard on a decoded PreToolUse input for the
 // Bash tool: exit 2 with the reason on stderr when it blocks, else 0.
 func bashGuardMain(p config.Paths, stderr io.Writer, env func(string) string, in Input) int {
-	if !BashGuardOn(env) {
-		return 0
-	}
 	var ti struct {
 		Command *string `json:"command"`
 	}
@@ -65,9 +49,11 @@ func checkBash(command, cwd string, env func(string) string, repos string) error
 		return fmt.Errorf("cannot parse the command (%v)", err)
 	}
 	c := &bashChecker{
-		cfg:  &expand.Config{Env: expand.FuncEnviron(env), ReadDir2: os.ReadDir},
-		home: env("HOME"),
-		cwds: []string{cwd},
+		cfg:      &expand.Config{Env: expand.FuncEnviron(env), ReadDir2: os.ReadDir},
+		env:      env,
+		home:     env("HOME"),
+		cwds:     []string{cwd},
+		loopVars: map[string]bool{},
 	}
 	c.cfg.CmdSubst = func(w io.Writer, cs *syntax.CmdSubst) error {
 		hdoc := catHeredoc(cs)
@@ -87,6 +73,12 @@ func checkBash(command, cwd string, env func(string) string, repos string) error
 			c.roots = append(c.roots, r)
 		}
 	}
+	syntax.Walk(f, func(n syntax.Node) bool {
+		if wi, ok := n.(*syntax.WordIter); ok {
+			c.loopVars[wi.Name.Value] = true
+		}
+		return true
+	})
 	if err := c.syntaxCheck(f); err != nil {
 		return err
 	}
@@ -108,9 +100,11 @@ func checkBash(command, cwd string, env func(string) string, repos string) error
 }
 
 type bashChecker struct {
-	cfg   *expand.Config
-	home  string
-	roots []string // $ATL_REPOS (and its real path)
+	cfg      *expand.Config
+	env      func(string) string
+	loopVars map[string]bool // for-loop variables set in the command
+	home     string
+	roots    []string // $ATL_REPOS (and its real path)
 	// cwds: every directory a command may run in: the shell's cwd plus each
 	// cd target in the command ("" = unknown). Using all of them is
 	// conservative: a cd that fails or runs later in a loop is covered.
@@ -144,8 +138,12 @@ func (c *bashChecker) syntaxCheck(f *syntax.File) error {
 			if n.Coprocess {
 				refuse("coprocesses")
 			}
-		case *syntax.ArithmExp, *syntax.ArithmCmd, *syntax.LetClause, *syntax.CStyleLoop:
-			refuse("shell arithmetic")
+		case *syntax.ArithmExp:
+			if !c.safeArithm(n.X) {
+				refuse("shell arithmetic other than $((...)) on numbers and environment variables")
+			}
+		case *syntax.ArithmCmd, *syntax.LetClause, *syntax.CStyleLoop:
+			refuse("shell arithmetic other than $((...)) on numbers and environment variables")
 		case *syntax.ForClause:
 			if n.Select {
 				refuse("`select`")
@@ -193,6 +191,47 @@ func catHeredoc(cs *syntax.CmdSubst) *syntax.Word {
 		return r.Hdoc
 	}
 	return nil
+}
+
+var envName = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+
+// safeArithm reports whether arithmetic x only reads numbers and
+// environment variables that are set and not assigned in the command (for
+// example $((3000 + ATL_PORT_OFFSET))). bash evaluates a variable's value as
+// arithmetic too, which can run code (a[$(cmd)]); only values the command
+// cannot choose are allowed.
+func (c *bashChecker) safeArithm(x syntax.ArithmExpr) bool {
+	okName := func(name string) bool {
+		return envName.MatchString(name) && !c.loopVars[name] && c.env(name) != ""
+	}
+	ok := true
+	syntax.Walk(x, func(n syntax.Node) bool {
+		switch n := n.(type) {
+		case *syntax.BinaryArithm:
+			switch n.Op {
+			case syntax.Assgn, syntax.AddAssgn, syntax.SubAssgn, syntax.MulAssgn, syntax.QuoAssgn,
+				syntax.RemAssgn, syntax.AndAssgn, syntax.OrAssgn, syntax.XorAssgn, syntax.ShlAssgn, syntax.ShrAssgn:
+				ok = false
+			}
+		case *syntax.UnaryArithm:
+			if n.Op == syntax.Inc || n.Op == syntax.Dec {
+				ok = false
+			}
+		case *syntax.Word:
+			if len(n.Parts) == 1 {
+				if _, isParam := n.Parts[0].(*syntax.ParamExp); isParam {
+					return true
+				}
+			}
+			lit := n.Lit()
+			ok = ok && lit != "" && (isDigits(lit) || okName(lit))
+		case *syntax.ParamExp:
+			ok = ok && n.Param != nil && okName(n.Param.Value) && n.Exp == nil && n.Index == nil &&
+				n.Slice == nil && n.Repl == nil && !n.Excl && !n.Length && !n.Width
+		}
+		return ok
+	})
+	return ok
 }
 
 // collectCds adds every cd target in f to c.cwds.

@@ -146,7 +146,7 @@ func TestWriteSettingsFresh(t *testing.T) {
 		t.Errorf("unexpected keys: %s", text)
 	}
 	if !strings.Contains(text, `"command": "'/usr/local/bin/atl' hook PreToolUse"`) ||
-		!strings.Contains(text, `"matcher": "Edit|Write|MultiEdit|NotebookEdit"`) {
+		!strings.Contains(text, `"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash"`) {
 		t.Errorf("unexpected content:\n%s", text)
 	}
 	if !strings.Contains(text, "\n  \"hooks\": {\n    \"") {
@@ -524,28 +524,4 @@ func TestWriteSettingsGlobalStatusLine(t *testing.T) {
 			t.Errorf("~/.claude/settings.json statusLine ignored without CLAUDE_CONFIG_DIR:\n%s", text)
 		}
 	})
-}
-
-func TestWriteSettingsBashMatcher(t *testing.T) {
-	dir := t.TempDir()
-	read := func() string {
-		b, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(b)
-	}
-	if err := WriteSettingsBash(dir, "/bin/atl", true); err != nil {
-		t.Fatal(err)
-	}
-	if s := read(); !strings.Contains(s, `"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash"`) {
-		t.Fatalf("guard on:\n%s", s)
-	}
-	// Turning it off again drops Bash (atelier's entry is replaced, not added).
-	if err := WriteSettingsBash(dir, "/bin/atl", false); err != nil {
-		t.Fatal(err)
-	}
-	if s := read(); strings.Contains(s, "Bash") || strings.Count(s, "hook PreToolUse") != 1 {
-		t.Fatalf("guard off:\n%s", s)
-	}
 }

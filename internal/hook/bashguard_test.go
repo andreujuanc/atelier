@@ -26,7 +26,7 @@ func TestCheckBash(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := func(k string) string {
-		return map[string]string{"HOME": home, "ATL_REPOS": repos, "ATL_TASK_DIR": task}[k]
+		return map[string]string{"HOME": home, "ATL_REPOS": repos, "ATL_TASK_DIR": task, "ATL_PORT_OFFSET": "300", "_": "x"}[k]
 	}
 
 	allow := []string{
@@ -61,6 +61,8 @@ func TestCheckBash(t *testing.T) {
 		"docker run --rm -v cache:/root/.npm --security-opt label=disable alpine true",
 		"docker run --rm -v /var/run/docker.sock:/var/run/docker.sock alpine true",
 		"docker network connect shared $ATL_TASK-api",
+		"docker run --rm -p $((3000 + ATL_PORT_OFFSET)):3000 -p $(( $ATL_PORT_OFFSET + 5432 )):5432 alpine true",
+		"echo $(( (ATL_PORT_OFFSET + 1) * 2 ))",
 	}
 
 	block := map[string]string{
@@ -85,8 +87,15 @@ func TestCheckBash(t *testing.T) {
 		"GIT_SSH_COMMAND='sh -c x' git push": "setting variables",
 		"export PATH=/tmp":                   "`export`",
 		"f() { ls; }; f":                     "defining functions",
-		"echo $((1+2))":                      "shell arithmetic",
-		"for x in 'a[$(id)]'; do echo ${!x}; done": "indirect expansion",
+		"(( x = 1 ))":                        "shell arithmetic",
+		"let x=1":                            "shell arithmetic",
+		"echo $((x + 1))":                    "shell arithmetic",
+		"echo $((_))":                        "shell arithmetic",
+		"echo $((UNSET_VAR + 1))":            "shell arithmetic",
+		"echo $((ATL_PORT_OFFSET = 1))":      "shell arithmetic",
+		"echo $((ATL_PORT_OFFSET++))":        "shell arithmetic",
+		"for ATL_PORT_OFFSET in 'a[$(id)]'; do echo $((ATL_PORT_OFFSET)); done": "shell arithmetic",
+		"for x in 'a[$(id)]'; do echo ${!x}; done":                              "indirect expansion",
 		"[[ $_ -eq 1 ]]":                                                 "numeric [[ ]]",
 		"test $x -eq 1":                                                  "-eq is not allowed",
 		"echo ${x@P}":                                                    "transformations",
@@ -158,31 +167,17 @@ func TestBashGuardMain(t *testing.T) {
 		ti, _ := json.Marshal(map[string]string{"command": cmd})
 		return Input{ToolName: "Bash", Cwd: t.TempDir(), ToolInput: ti}
 	}
-	off := func(string) string { return "" }
-	on := func(k string) string {
-		if k == envBashGuard {
-			return "1"
-		}
-		return ""
-	}
+	env := func(string) string { return "" }
 	var stderr bytes.Buffer
-	if code := bashGuardMain(p, &stderr, off, in("rm -rf /")); code != 0 || stderr.Len() != 0 {
-		t.Fatalf("guard off: %d %q", code, stderr.String())
-	}
-	if code := bashGuardMain(p, &stderr, on, in("git status")); code != 0 || stderr.Len() != 0 {
+	if code := bashGuardMain(p, &stderr, env, in("git status")); code != 0 || stderr.Len() != 0 {
 		t.Fatalf("allowed: %d %q", code, stderr.String())
 	}
-	if code := bashGuardMain(p, &stderr, on, in("awk 1 f")); code != 2 ||
+	if code := bashGuardMain(p, &stderr, env, in("awk 1 f")); code != 2 ||
 		!strings.Contains(stderr.String(), "atelier: blocked: `awk` is not allowed here") || !strings.Contains(stderr.String(), "Edit/Write") {
 		t.Fatalf("blocked: %d %q", code, stderr.String())
 	}
 	stderr.Reset()
-	if code := bashGuardMain(p, &stderr, on, Input{ToolName: "Bash", ToolInput: json.RawMessage(`{}`)}); code != 2 {
+	if code := bashGuardMain(p, &stderr, env, Input{ToolName: "Bash", ToolInput: json.RawMessage(`{}`)}); code != 2 {
 		t.Fatalf("no command: %d", code)
-	}
-	for _, v := range []string{"", "0", "off", "false", "no"} {
-		if BashGuardOn(func(string) string { return v }) {
-			t.Errorf("%q turns the guard on", v)
-		}
 	}
 }

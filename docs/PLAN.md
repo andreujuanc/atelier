@@ -318,7 +318,7 @@ State machine:
 | PostToolUse | running **only if** current state is waiting (clears waiting after a permission prompt is answered) |
 | Stop | idle |
 | SessionEnd | ended |
-| PreToolUse | ro guard (Edit/Write/…); Bash guard when `ATL_BASH_GUARD` is on (Bash, routed before the DB is opened); no state change |
+| PreToolUse | ro guard (Edit/Write/…); Bash guard (Bash, routed before the DB is opened); no state change |
 
 Every event updates `last_event_at`. Unknown events: no-op, exit 0.
 
@@ -330,9 +330,10 @@ clone as `--add-dir` after an upgrade to rw). Inside → exit 2, stderr
 `atelier: <path> is inside the original clone of <name>; edit the task's worktree <wt> instead` (rw). Task unresolvable or any error →
 exit 0 (fail open) and log.
 
-Bash guard (`internal/hook/bashguard.go`, only with `ATL_BASH_GUARD` on; settings then match `...|Bash`): parse
+Bash guard (`internal/hook/bashguard.go`, always on; the PreToolUse matcher includes `Bash`): parse
 `tool_input.command` with mvdan.cc/sh (bash); fail closed (exit 2) on parse errors or a missing command. Refuse CmdSubst
-(except `$(cat <<EOF…)`), ProcSubst, functions, Assign/DeclClause, arithmetic (ArithmExp/Cmd, let, C-style for), `${!x}`,
+(except `$(cat <<EOF…)`), ProcSubst, functions, Assign/DeclClause, arithmetic (ArithmCmd, let, C-style for; ArithmExp
+only on numbers and set, uppercase env vars that are not loop variables, no assignments), `${!x}`,
 `${x[i]}`, `${x:o}`, `${x@…}`, `[[ -v ]]` and numeric tests (bash evaluates those as arithmetic, which can run code from a
 variable). Redirections: input, heredocs, fd dups, and output only to /dev/null|stdout|stderr. Each CallExpr: literal name
 without `/`, in `bashTools` (git, docker, atl, read-only tools with per-tool option checks). cwds = hook cwd plus every cd
