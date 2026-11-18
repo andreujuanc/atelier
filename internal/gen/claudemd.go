@@ -96,6 +96,14 @@ func ClaudeMD(t model.Task, repos []RepoInfo) string {
 		w("If a change is needed in one of them, say so instead of making it (or make it in a rw repo).\n\n")
 	}
 
+	w("## Shell (Bash tool)\n\n")
+	w("An atelier hook checks every Bash command and blocks what is not allowed, with the reason.\n\n")
+	w("- Allowed: `git`, `docker`, `atl` and read-only tools (`ls`, `cat`, `grep`, `find`, `head`, `wc`, `sort`, `diff`, `jq`,\n")
+	w("  `sed -n '10,20p'`, ...), with pipes, `&&`, `if`/`for`, `2>&1` and `> /dev/null`.\n")
+	w("- Not allowed: other programs (`awk`, `mkdir`, `rm`, `xargs`, `sh -c`, ...), writing files with `>`/`>>`/`tee`,\n")
+	w("  setting variables, and `$(...)` other than `$(cat <<'EOF' ... EOF)` for commit messages.\n")
+	w("- Edit files with the Edit/Write tools. Run builds, tests and installs in the repo's own containers via `docker`.\n\n")
+
 	w("## Ports\n\n")
 	w("`ATL_PORT_OFFSET=%d`\n\n", t.PortOffset)
 	w("`ATL_PORT_OFFSET` is also exported in the environment. Offset every port you bind so this task does not\n")

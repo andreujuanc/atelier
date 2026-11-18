@@ -146,7 +146,7 @@ func TestWriteSettingsFresh(t *testing.T) {
 		t.Errorf("unexpected keys: %s", text)
 	}
 	if !strings.Contains(text, `"command": "'/usr/local/bin/atl' hook PreToolUse"`) ||
-		!strings.Contains(text, `"matcher": "Edit|Write|MultiEdit|NotebookEdit"`) {
+		!strings.Contains(text, `"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash"`) {
 		t.Errorf("unexpected content:\n%s", text)
 	}
 	if !strings.Contains(text, "\n  \"hooks\": {\n    \"") {

@@ -24,7 +24,7 @@ var hookEvents = []struct {
 	{"Notification", ""},
 	{"Stop", ""},
 	{"SessionEnd", ""},
-	{"PreToolUse", "Edit|Write|MultiEdit|NotebookEdit"},
+	{"PreToolUse", "Edit|Write|MultiEdit|NotebookEdit|Bash"},
 	{"PostToolUse", ""},
 }
 

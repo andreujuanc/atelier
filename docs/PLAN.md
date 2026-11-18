@@ -318,7 +318,7 @@ State machine:
 | PostToolUse | running **only if** current state is waiting (clears waiting after a permission prompt is answered) |
 | Stop | idle |
 | SessionEnd | ended |
-| PreToolUse | ro guard only; no state change |
+| PreToolUse | ro guard (Edit/Write/…); Bash guard (Bash, routed before the DB is opened); no state change |
 
 Every event updates `last_event_at`. Unknown events: no-op, exit 0.
 
@@ -329,6 +329,18 @@ clone as `--add-dir` after an upgrade to rw). Inside → exit 2, stderr
 `atelier: <path> is inside read-only repo <name>; edit it in a rw repo instead` (ro) or
 `atelier: <path> is inside the original clone of <name>; edit the task's worktree <wt> instead` (rw). Task unresolvable or any error →
 exit 0 (fail open) and log.
+
+Bash guard (`internal/hook/bashguard.go`, always on; the PreToolUse matcher includes `Bash`): parse
+`tool_input.command` with mvdan.cc/sh (bash); fail closed (exit 2) on parse errors or a missing command. Refuse CmdSubst
+(except `$(cat <<EOF…)`), ProcSubst, functions, Assign/DeclClause, arithmetic (ArithmCmd, let, C-style for; ArithmExp
+only on numbers and set, uppercase env vars that are not loop variables, no assignments), `${!x}`,
+`${x[i]}`, `${x:o}`, `${x@…}`, `[[ -v ]]` and numeric tests (bash evaluates those as arithmetic, which can run code from a
+variable). Redirections: input, heredocs, fd dups, and output only to /dev/null|stdout|stderr. Each CallExpr: literal name
+without `/`, in `bashTools` (git, docker, atl, read-only tools with per-tool option checks). cwds = hook cwd plus every cd
+target (conservative union). git: refuse `-c`, `--config-env`, config writes, rebase --exec, difftool/mergetool,
+filter-branch, submodule foreach, bisect run, grep -O, --upload-pack/--receive-pack/ext::; if any cwd (+ -C, --git-dir,
+--work-tree) or argument resolves inside `Paths.Repos`, only read subcommands. docker: refuse privileged/host-namespace/
+cap/device/security-opt flags, writable bind mounts of or containing `Paths.Repos`, credential mounts, cp/-o into it.
 
 SessionStart output: for sessions inside a task, after the DB update, print one JSON line
 `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":...}}` (task, repos + base, ro warning, port offset,
