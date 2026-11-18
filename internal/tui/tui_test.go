@@ -464,10 +464,36 @@ func TestGroupingAndClosedLimit(t *testing.T) {
 	}
 }
 
+func TestLiveTasksFirst(t *testing.T) {
+	live := model.Session{ID: 1, State: model.StateIdle}
+	tasks := []app.TaskView{ // in List order: most recently updated first
+		tv(1, "a-none", model.StatusActive),
+		tv(2, "b-ended", model.StatusActive, model.Session{ID: 2, State: model.StateEnded}),
+		tv(3, "c-idle", model.StatusActive, live),
+		tv(4, "d-stopped", model.StatusActive, model.Session{ID: 4, State: model.StateStopped}),
+		tv(5, "e-running", model.StatusActive, model.Session{ID: 5, State: model.StateRunning}),
+		tv(6, "f-backlog", model.StatusBacklog),
+		tv(7, "g-backlog-live", model.StatusBacklog, live),
+		tv(8, "h-done-live", model.StatusDone, live),
+		tv(9, "i-done", model.StatusDone),
+	}
+	var got []string
+	for _, r := range buildRows(tasks, "") {
+		if r.isTask() {
+			got = append(got, r.task.Task.Slug)
+		}
+	}
+	want := []string{"g-backlog-live", "f-backlog", "c-idle", "e-running", "a-none", "b-ended", "d-stopped", "i-done", "h-done-live"} // closed: newest first, sessions ignored
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("order %v\nwant  %v", got, want)
+	}
+}
+
 func TestSelectionSkipsHeadersAndSurvivesReload(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks()}
 	m, _ := newTest(t, fb)
-	want := []string{"#backlog", "beta", "#active", "alpha", "gamma", "#review", "delta"}
+	// gamma has a live session: it comes first within active.
+	want := []string{"#backlog", "beta", "#active", "gamma", "alpha", "#review", "delta"}
 	if got := rowSlugs(m); !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows %v", got)
 	}
@@ -475,7 +501,7 @@ func TestSelectionSkipsHeadersAndSurvivesReload(t *testing.T) {
 		t.Fatalf("initial selection %s", m.selected().Task.Slug)
 	}
 	key(m, "j")
-	if m.selected().Task.Slug != "alpha" {
+	if m.selected().Task.Slug != "gamma" {
 		t.Fatalf("after j: %s", m.selected().Task.Slug)
 	}
 	key(m, "down")
@@ -496,7 +522,6 @@ func TestSelectionSkipsHeadersAndSurvivesReload(t *testing.T) {
 	}
 
 	// select gamma, then it moves to review: selection follows the ID
-	key(m, "j")
 	key(m, "j")
 	fb.tasks[2].Task.Status = model.StatusReview
 	drain(m, m.listCmd())
@@ -568,8 +593,7 @@ func TestWaitingMarkerAndHighlight(t *testing.T) {
 	if strings.Contains(v, "● Title of alpha") || strings.Contains(v, "● Title of beta") {
 		t.Fatalf("marker on non-waiting task:\n%s", v)
 	}
-	key(m, "j")
-	key(m, "j") // gamma
+	key(m, "j") // gamma (live: first in active)
 	v = plainView(m)
 	if !strings.Contains(v, "claude-7") || !strings.Contains(v, "waiting") || !strings.Contains(v, "2m") {
 		t.Fatalf("session line missing:\n%s", v)
@@ -612,7 +636,8 @@ func TestDirtyRepoShown(t *testing.T) {
 func TestStatusKeys(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks()}
 	m, _ := newTest(t, fb)
-	key(m, "j") // alpha (active)
+	key(m, "j")
+	key(m, "j") // alpha (active, after the live gamma)
 	for i, st := range model.AllStatuses {
 		if st == model.StatusActive {
 			continue
@@ -1204,7 +1229,7 @@ func TestTicks(t *testing.T) {
 		t.Fatalf("no debounce scheduled: %v", *sched)
 	}
 	drain(m, func() tea.Msg { return (*sched)[0] })
-	if c := fb.last("Get"); c == nil || c.args[0] != "alpha" {
+	if c := fb.last("Get"); c == nil || c.args[0] != "gamma" {
 		t.Fatalf("Get after move: %+v", c)
 	}
 }
@@ -1641,8 +1666,7 @@ func TestRemovedRepoOfClosedTask(t *testing.T) {
 func TestFilterRestoresSelection(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks()}
 	m, _ := newTest(t, fb)
-	key(m, "j")
-	key(m, "j") // gamma
+	key(m, "j") // gamma (live: first in active)
 	key(m, "/")
 	typeText(m, "delta")
 	if m.selected().Task.Slug != "delta" {
@@ -1685,7 +1709,7 @@ func TestMultiRuneKeys(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks()}
 	m, _ := newTest(t, fb) // beta
 	key(m, "jj")
-	if s := m.selected().Task.Slug; s != "gamma" {
+	if s := m.selected().Task.Slug; s != "alpha" { // gamma (live) comes first
 		t.Fatalf("jj: %s", s)
 	}
 	key(m, "/del")

@@ -35,7 +35,9 @@ func matchFilter(t model.Task, f string) bool {
 }
 
 // buildRows groups tasks under status headers in model.AllStatuses order,
-// applying the filter; done and cancelled keep only their closedLimit most
+// applying the filter. Open groups list tasks with a live session (idle,
+// running or waiting) first, each part in the given order (most recently
+// updated first); done and cancelled keep only their closedLimit most
 // recently updated tasks. Empty groups are omitted.
 func buildRows(tasks []app.TaskView, filter string) []row {
 	groups := map[model.Status][]*app.TaskView{}
@@ -52,7 +54,11 @@ func buildRows(tasks []app.TaskView, filter string) []row {
 			continue
 		}
 		total := len(g)
-		if !st.Open() {
+		if st.Open() {
+			sort.SliceStable(g, func(i, j int) bool {
+				return model.TaskState(g[i].Sessions).Live() && !model.TaskState(g[j].Sessions).Live()
+			})
+		} else {
 			sort.SliceStable(g, func(i, j int) bool { return g[i].Task.UpdatedAt.After(g[j].Task.UpdatedAt) })
 			if len(g) > closedLimit {
 				g = g[:closedLimit]

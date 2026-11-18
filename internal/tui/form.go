@@ -185,11 +185,13 @@ func (f *newForm) opts() (app.NewTaskOpts, error) {
 	}
 	preselected := o.Project != "" && o.Project == f.preProject
 	if len(f.repos) == 0 {
-		if o.Project == "" {
-			return o, errors.New("pick at least one repo (enter on Repos) or choose a project")
-		}
-		if preselected {
-			return o, errors.New("no repos selected (enter on Repos to pick some)")
+		switch {
+		case o.Backlog: // repos can be added later (a)
+			o.ExactRepos = preselected
+		case o.Project == "":
+			return o, errors.New("pick at least one repo (enter on Repos), choose a project, or create it in the backlog")
+		case preselected:
+			return o, errors.New("no repos selected (enter on Repos to pick some, or create it in the backlog)")
 		}
 		return o, nil
 	}

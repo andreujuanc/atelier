@@ -277,6 +277,33 @@ func TestNewTaskValidation(t *testing.T) {
 	}
 }
 
+func TestNewTaskBacklogWithoutRepos(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Idea for later", Backlog: true, NoFetch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != model.StatusBacklog || len(task.Repos) != 0 {
+		t.Fatalf("task %+v", task)
+	}
+	dir := e.app.Paths.TaskDir(task.Slug)
+	for _, f := range []string{"CLAUDE.md", filepath.Join(".claude", "settings.json")} {
+		if !exists(filepath.Join(dir, f)) {
+			t.Errorf("%s not written", f)
+		}
+	}
+	// Repos come later.
+	got, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"api", model.ModeRW}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repos) != 1 || !exists(e.app.Paths.WorktreePath(task.Slug, "api")) {
+		t.Fatalf("after add: %+v", got.Repos)
+	}
+}
+
 func TestNewTaskRollback(t *testing.T) {
 	e := newTaskEnv(t)
 	ctx := context.Background()

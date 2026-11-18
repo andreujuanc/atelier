@@ -119,11 +119,12 @@ func (a *App) mergeRepos(o NewTaskOpts) ([]model.TaskRepo, error) {
 			return nil, err
 		}
 	}
-	if len(repos) == 0 {
+	// A backlog task may start without repos (add them later with atl add).
+	if len(repos) == 0 && !o.Backlog {
 		if o.Project != "" {
-			return nil, fmt.Errorf("project %s has no repos; add some with --repo name:rw|ro", o.Project)
+			return nil, fmt.Errorf("project %s has no repos; add some with --repo name:rw|ro (or use --backlog)", o.Project)
 		}
-		return nil, errors.New("no repos: pass --project or --repo name:rw|ro")
+		return nil, errors.New("no repos: pass --project or --repo name:rw|ro (only --backlog tasks may have none)")
 	}
 	return repos, nil
 }

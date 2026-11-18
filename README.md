@@ -32,6 +32,7 @@ Claude's own status line, under its prompt, shows which task you are in (see
 ```sh
 atl new "Fix login" --project shop        # task + worktrees, prints "<slug>\t<dir>"
 atl new "Spike" --repo api:rw --repo docs:ro -m "why" [--backlog] [--no-fetch]
+atl new "Idea for later" --backlog  # backlog tasks may start without repos (add them later)
 atl new "Hotfix" --project shop --base default   # branch from origin's default branch (production)
 atl add fix-login web [--no-fetch]  # add a repo to an open task (rw: worktree on atl/<slug>)
 atl add fix-login docs:ro           # ro: listed in CLAUDE.md; running sessions need a new one (s)
@@ -69,7 +70,9 @@ the selected task (an input prefilled with its title; `enter` saves, `esc` cance
 waits for them and then quits; `ctrl+c` again forces it; meanwhile `n`, `t`, `a`, `d`, `c`
 and `/` are refused so no input is lost). The task list shows each task's title
 (with its session-state dot and `*` for uncommitted changes), truncated to the pane; the slug
-is in the details pane, with the task's notes below the details.
+is in the details pane, with the task's notes below the details. Within each open status,
+tasks with an open Claude session (idle, running or waiting) come first, then the rest, each
+most recently updated first. In the new-task form, a backlog task may have no repos.
 Repos (in the new-task form and for `a`) are picked from a list of `$ATL_REPOS`: type to
 filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter` confirms, `esc` cancels.
 Repos already in the task are dimmed; `space` on an ro one marks it `[ro→rw]` to upgrade it.
