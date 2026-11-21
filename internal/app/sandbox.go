@@ -63,7 +63,7 @@ func (a *App) pathsEnv() map[string]string {
 // (a worktree keeps its objects and refs there) and each ro repo, read-only;
 // Claude Code's config dir (login, settings, transcripts); and what the atl
 // hooks need (database, hook log, project config). The run dir, with the
-// gate's socket and the atl binary, is at sandbox.RunMount. It does not see
+// gate's sockets and the atl binary, is at sandbox.RunMount. It does not see
 // the host's Docker socket, the SSH agent, other repos or other tasks.
 func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, error) {
 	home, err := os.UserHomeDir()

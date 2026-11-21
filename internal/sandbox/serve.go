@@ -38,10 +38,11 @@ func UpstreamSocket() string {
 // holds 108 bytes including the final NUL).
 const maxSocketPath = 107
 
-// Serve runs g on the socket in runDir until ctx ends, the task directory
-// (g.Root) disappears or the socket is removed or replaced. It returns nil
-// at once if another gate already serves runDir.
-func Serve(ctx context.Context, g *Gate, runDir string) error {
+// Serve runs g on the socket in runDir, and ctl (if not nil) on the control
+// socket there, until ctx ends, the task directory (g.Root) disappears or the
+// gate's socket is removed or replaced. It returns nil at once if another
+// gate already serves runDir.
+func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return err
 	}
@@ -79,6 +80,21 @@ func Serve(ctx context.Context, g *Gate, runDir string) error {
 	}
 	if g.Log != nil {
 		g.Log.Printf("gate %s on %s, mounts allowed under %s", g.ID, sock, g.Root)
+	}
+
+	if ctl != nil {
+		ctlSock := ControlSocketPath(runDir)
+		os.Remove(ctlSock) // stale, from a gate that died
+		cl, err := net.Listen("unix", ctlSock)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(ctlSock)
+		defer cl.Close()
+		if err := os.Chmod(ctlSock, 0o666); err != nil {
+			return err
+		}
+		go ctl.Serve(cl)
 	}
 
 	srv := &http.Server{Handler: g}

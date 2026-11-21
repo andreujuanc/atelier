@@ -76,7 +76,8 @@ const sandboxNote = "Sandbox: this session runs in the task's own container. Run
 	"install what you need (system packages: `docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`). " +
 	"`docker` and `docker compose` are for services (databases, localstack, ...): mounts must come from the task dir, " +
 	"privileged and host modes are refused, you see only what this task started, and services answer by their compose " +
-	"service name. `git push` and `gh` are not available here."
+	"service name. There are no git credentials here (plain `git push` and `gh` fail): to push the task branch run " +
+	"`atl push`, to update from the remote `atl fetch`."
 
 // renderContext renders the SessionStart task context: plain markdown of
 // at most contextMaxLen bytes. envText (the raw ATL_CONTEXT value) is

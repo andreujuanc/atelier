@@ -199,6 +199,7 @@ func (c *cli) rootCmd() *cobra.Command {
 	root.AddCommand(
 		c.newCmd(), c.addCmd(), c.reposCmd(), c.lsCmd(), c.openCmd(), c.sessionCmd(), c.resumeCmd(), c.statusCmd(), c.renameCmd(),
 		c.diffCmd(), c.prCmd(), c.finishCmd("done"), c.finishCmd("cancel"), c.doctorCmd(), c.hookCmd(), c.statuslineCmd(), c.gateCmd(),
+		c.remoteCmd(true), c.remoteCmd(false),
 		c.showCmd(), c.transcriptCmd(), c.noteCmd(), c.notesCmd(), c.assistantCmd(),
 	)
 	return root
