@@ -106,23 +106,50 @@ func (a *App) checkSandbox(ctx context.Context) []Check {
 			checks = append(checks, pass("task image", sb.Image))
 		}
 	}
-	if auth, err := sandboxAuth(); err != nil {
-		checks = append(checks, fail("claude token", err.Error()))
-	} else {
-		names := make([]string, 0, len(auth))
-		for _, k := range claudeAuthVars {
-			if _, ok := auth[k]; ok {
-				names = append(names, "$"+k)
-			}
-		}
-		checks = append(checks, pass("claude token", strings.Join(names, " and ")+" set (passed to task sessions by name)"))
-	}
+	checks = append(checks, a.checkClaudeToken())
 	detail := "each task has its own, in " + filepath.Dir(a.Paths.ClaudeDir("x"))
 	if user := config.ClaudeConfigDir(); user != "" {
 		detail += "; your setup is copied from " + user
 	}
 	checks = append(checks, pass("claude config", detail))
 	return checks
+}
+
+// checkClaudeToken says where the token of sandboxed sessions comes from:
+// atl's environment, or the file `atl token` stored it in, with its age. A
+// stored token warns within tokenWarnBefore of a year old and fails after.
+// It never shows the value.
+func (a *App) checkClaudeToken() Check {
+	const name = "claude token"
+	auth, err := a.claudeAuth()
+	if err != nil {
+		return fail(name, err.Error())
+	}
+	if !auth.stored {
+		names := make([]string, 0, len(auth.vars))
+		for _, k := range claudeAuthVars {
+			if _, ok := auth.vars[k]; ok {
+				names = append(names, "$"+k)
+			}
+		}
+		detail := "from the environment: " + strings.Join(names, " and ") + " set (passed to task sessions by name)"
+		if _, ok, _ := a.loadToken(); ok {
+			detail += "; the token stored by `atl token` is not used while it is set"
+		}
+		return pass(name, detail)
+	}
+	age := a.now().Sub(auth.storedAt)
+	days := int(age / (24 * time.Hour))
+	on := auth.storedAt.Local().Format(time.DateOnly)
+	switch {
+	case age >= tokenLifetime:
+		return fail(name, fmt.Sprintf("the token stored by `atl token` on %s is %d days old and has expired (they last a year): run `atl token` again", on, days))
+	case age >= tokenLifetime-tokenWarnBefore:
+		return warn(name, fmt.Sprintf("the token stored by `atl token` on %s is %d days old and expires by %s (they last a year): run `atl token` again",
+			on, days, auth.storedAt.Add(tokenLifetime).Local().Format(time.DateOnly)))
+	}
+	return pass(name, fmt.Sprintf("from %s: stored by `atl token` on %s, %d days old (passed to task sessions by name)",
+		a.Paths.ClaudeToken(), on, days))
 }
 
 // checkRepoConfigs lists, for each repo in Paths.Repos (its canonical

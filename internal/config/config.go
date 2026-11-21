@@ -155,6 +155,15 @@ func (p Paths) OriginPin(repo string) string {
 	return filepath.Join(p.runRoot(), "origins", repo+".json")
 }
 
+// ClaudeToken returns the file in which `atl token` stores the Claude Code
+// token of sandboxed sessions: claude-token.json next to the run dirs. A
+// task container gets only its own run dir and Claude dir, never their
+// parent, so no task can read it (its sessions get the token by name, see
+// app.sandboxArgv).
+func (p Paths) ClaudeToken() string {
+	return filepath.Join(p.runRoot(), "claude-token.json")
+}
+
 // HookLog returns StateDir/hook.log.
 func (p Paths) HookLog() string { return filepath.Join(p.StateDir, "hook.log") }
 

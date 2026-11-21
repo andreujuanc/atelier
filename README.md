@@ -61,6 +61,7 @@ atl assistant [fix-login] # the atelier assistant (one Claude session for all ta
 atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
 atl cancel fix-login [--force]
 atl doctor                # tools, dirs, database; repos whose config atl refuses to run git with
+atl token [--paste]       # sandbox: run claude setup-token and store its token for task sessions (see Sandbox)
 atl                       # TUI (on a terminal)
 ```
 
@@ -241,8 +242,8 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `ATL_SANDBOX` | unset (off) — `docker` runs each task's sessions in the task's own container (see [Sandbox](#sandbox)) |
 | `ATL_SANDBOX_IMAGE` | `atelier` — the task container image, unless the task's project names one |
 | `ATL_SANDBOX_CONTEXT` | unset — what sandboxed sessions get in place of `ATL_CONTEXT` (same limit) |
-| `CLAUDE_CODE_OAUTH_TOKEN` | unset — with the sandbox on, the token (`claude setup-token`) that sandboxed sessions log in with |
-| `ANTHROPIC_API_KEY` | unset — with the sandbox on, an API key for sandboxed sessions instead of a token |
+| `CLAUDE_CODE_OAUTH_TOKEN` | unset — with the sandbox on, the token (`claude setup-token`) that sandboxed sessions log in with; when set it wins over the one `atl token` stored |
+| `ANTHROPIC_API_KEY` | unset — with the sandbox on, an API key for sandboxed sessions instead of a token (also wins over the stored one) |
 
 With `ATL_WORKSPACE` set (it must be an existing directory, so a typo or a missing mount
 is an error rather than a new empty database), atelier keeps everything in it, and you can
@@ -314,21 +315,33 @@ The tmux window of a session runs `docker exec` into the container, so everythin
 **Claude Code in the container.** Your Claude Code login stays where `atl` runs. Sessions
 in a task log in with a token instead:
 
-1. Run `claude setup-token` once (it needs a Pro, Max, Ultra, Team or Enterprise plan;
-   the token lasts a year) and copy the token it prints.
-2. Put it in the environment `atl` runs in as `CLAUDE_CODE_OAUTH_TOKEN`, e.g. in
+1. Run `atl token` where `atl` runs (it needs a Pro, Max, Ultra, Team or Enterprise
+   plan). It runs `claude setup-token` in a tmux window you are attached to: open the URL
+   it shows, approve access in the browser (paste the code back if it asks), and press
+   Enter when the token is on the screen. `atl` reads the token from that screen and
+   stores it in `<workspace>/run/claude-token.json` (without a workspace,
+   `$XDG_STATE_HOME/atelier-run/claude-token.json`), mode 0600, a place no task container
+   sees; the window and its scrollback are removed. If `atl` cannot pick out exactly one
+   token of the expected shape (`sk-ant-oat01-…`) there, it asks you to paste it, without
+   echo. `atl token --paste` stores a token you already have the same way (read from the
+   terminal without echo, or from standard input).
+2. Or put a token in the environment `atl` runs in as `CLAUDE_CODE_OAUTH_TOKEN`, e.g. in
    `containerEnv` of the devcontainer, or `remoteEnv` from a variable of your host:
    `"CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}"`. An API key in
-   `ANTHROPIC_API_KEY` works too (Claude Code prefers it when both are set).
-3. `atl doctor` says whether `atl` sees it. Without either, starting a sandboxed session
-   fails and says this.
+   `ANTHROPIC_API_KEY` works too (Claude Code prefers it when both are set). Either
+   variable, when set, wins over the stored token.
+3. `atl doctor` says where the token comes from (the environment or the file) and, for a
+   stored one, when it was stored and how old it is. The token lasts a year: doctor warns
+   from 30 days before that, and fails after it; run `atl token` again then. (The age
+   counts from when `atl` stored it: a token pasted with `--paste` may be older.) Without
+   any token, starting a sandboxed session fails with one line that names `atl token`.
 
 `atl` hands the token to each session by name: the tmux server gets it from `atl`'s own
-environment (read on its standard input, not from a command line) and `docker exec -e
-CLAUDE_CODE_OAUTH_TOKEN` passes it on. So it is on no command line, not in the
-container's stored configuration, and a new token reaches the next session without a new
-container. A token-authenticated session can only make model requests: claude.ai
-connectors and Remote Control are not available in it.
+environment or the stored file (read on its standard input, not from a command line) and
+`docker exec -e CLAUDE_CODE_OAUTH_TOKEN` passes it on. So it is on no command line, not in
+the container's stored configuration, and a new token reaches the next session without a
+new container. `atl` never prints it. A token-authenticated session can only make model
+requests: claude.ai connectors and Remote Control are not available in it.
 
 Each task has its own Claude Code config dir, `<workspace>/run/claude/<hash>` (without a
 workspace, `$XDG_STATE_HOME/atelier-run/claude/<hash>`), mounted at the same path in that

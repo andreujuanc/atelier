@@ -460,6 +460,48 @@ func TestKillTaggedWindows(t *testing.T) {
 	}
 }
 
+// TestCapturePaneAfterExit: with remain-on-exit set on the window, what a
+// command printed can be read after it exited, scrollback included, with
+// lines tmux wrapped joined and lines the program broke itself kept apart.
+func TestCapturePaneAfterExit(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	script := `read -r _; i=0; while [ $i -lt 40 ]; do echo "line $i"; i=$((i+1)); done; ` +
+		`printf '%s\n' "$(printf 'x%.0s' $(seq 1 100))"; printf 'ab\ncd\n'`
+	id, err := c.NewWindow(ctx, WindowSpec{Session: "atl-s", Name: "w", Argv: []string{"sh", "-c", script}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetWindowOption(ctx, id, "remain-on-exit", "on"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.run(ctx, "send-keys", "-t", id, "Enter"); err != nil {
+		t.Fatal(err)
+	}
+	waitDead(t, c, id)
+	text, width, err := c.CapturePane(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if width != 80 {
+		t.Errorf("width = %d", width)
+	}
+	for _, want := range []string{"\nline 0\n", "\nline 39\n", "\n" + strings.Repeat("x", 100) + "\n", "\nab\ncd\n"} {
+		if !strings.Contains("\n"+text, want) {
+			t.Errorf("capture lacks %q:\n%s", want, text)
+		}
+	}
+	if err := c.SetSessionOption(ctx, "atl-s", "detach-on-destroy", "off"); err != nil {
+		t.Error(err)
+	}
+	if v, err := c.run(ctx, "show-options", "-v", "-t", "=atl-s:", "detach-on-destroy"); err != nil || v != "off" {
+		t.Errorf("detach-on-destroy = %q, %v", v, err)
+	}
+	if _, _, err := c.CapturePane(ctx, "w"); err == nil {
+		t.Error("CapturePane accepted a non-id target")
+	}
+}
+
 func TestSelectWindow(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()

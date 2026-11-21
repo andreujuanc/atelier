@@ -61,12 +61,13 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 		if err := a.ensureSandbox(ctx, t); err != nil {
 			return "", fmt.Errorf("sandbox: %w", err)
 		}
-		auth, err := sandboxAuth()
+		auth, err := a.sandboxAuth()
 		if err != nil {
 			return "", fmt.Errorf("sandbox: %w", err)
 		}
 		// The window takes the token from the tmux server's environment, set
-		// here from atl's own (current) one without a command line.
+		// here from atl's own (current) one, or the stored token, without a
+		// command line.
 		if err := a.Tmux.SetGlobalEnv(ctx, auth); err != nil {
 			return "", fmt.Errorf("sandbox: pass Claude Code's token to the session: %w", err)
 		}
