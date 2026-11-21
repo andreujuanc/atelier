@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/gen"
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/nofollow"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
 	"github.com/andreujuanc/atelier/internal/tmux"
@@ -99,7 +99,12 @@ func (a *App) prepareTaskDir(ctx context.Context, t *model.Task) error {
 	if err := gen.WriteSettings(dir, a.hookBin()); err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); errors.Is(err, os.ErrNotExist) {
+	d, err := nofollow.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if _, err := d.Lstat("CLAUDE.md"); errors.Is(err, os.ErrNotExist) {
 		return gen.WriteClaudeMD(dir, *t, a.repoInfos(t))
 	} else if err != nil {
 		return err

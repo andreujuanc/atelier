@@ -5,10 +5,10 @@ package gen
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // RepoInfo describes one repo of a task as seen from the task directory.
@@ -27,20 +27,21 @@ func WriteClaudeMD(taskDir string, t model.Task, repos []RepoInfo) error {
 	if err := os.MkdirAll(taskDir, 0o755); err != nil {
 		return fmt.Errorf("gen: create task dir: %w", err)
 	}
-	path := filepath.Join(taskDir, "CLAUDE.md")
-	if err := WriteAtomic(path, []byte(ClaudeMD(t, repos))); err != nil {
-		return fmt.Errorf("gen: write %s: %w", path, err)
-	}
-	return nil
+	return RewriteClaudeMD(taskDir, t, repos)
 }
 
 // RewriteClaudeMD replaces <taskDir>/CLAUDE.md like WriteClaudeMD but never
 // creates taskDir: if it is gone (the task was closed meanwhile) it fails
-// and nothing is written.
+// and nothing is written. The task dir is the task's to write: a symlink in
+// place of CLAUDE.md is replaced, not written through (see nofollow).
 func RewriteClaudeMD(taskDir string, t model.Task, repos []RepoInfo) error {
-	path := filepath.Join(taskDir, "CLAUDE.md")
-	if err := WriteAtomic(path, []byte(ClaudeMD(t, repos))); err != nil {
-		return fmt.Errorf("gen: write %s: %w", path, err)
+	d, err := nofollow.Open(taskDir)
+	if err != nil {
+		return fmt.Errorf("gen: %w", err)
+	}
+	defer d.Close()
+	if err := d.WriteFile("CLAUDE.md", []byte(ClaudeMD(t, repos)), 0o644); err != nil {
+		return fmt.Errorf("gen: %w", err)
 	}
 	return nil
 }

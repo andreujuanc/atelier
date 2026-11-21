@@ -847,6 +847,57 @@ func TestPrepareTaskDir(t *testing.T) {
 	}
 }
 
+// TestPrepareTaskDirSymlinks: what a task plants in its task dir (from its
+// container) before its next session launch cannot make prepareTaskDir
+// write where atl runs, nor read a file there into the task dir.
+func TestPrepareTaskDirSymlinks(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	task := &model.Task{Slug: "prep", Title: "Prep", Status: model.StatusActive, Branch: "atl/prep",
+		Repos: []model.TaskRepo{{Name: "docs", Mode: model.ModeRO}}}
+	dir := e.app.Paths.TaskDir("prep")
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "bashrc")
+	secret := filepath.Join(outside, "settings.json")
+	for p, s := range map[string]string{victim: "# the user's\n", secret: `{"env":{"TOKEN":"SECRET-OF-THE-USER"}}`} {
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for link, target := range map[string]string{
+		filepath.Join(dir, ".claude", "settings.json"):     secret,
+		filepath.Join(dir, ".claude", "settings.json.bak"): victim,
+		filepath.Join(dir, "CLAUDE.md"):                    victim,
+	} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.app.prepareTaskDir(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "# the user's\n" {
+		t.Errorf("a file outside the task dir was written: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, ".claude", "settings.json")); strings.Contains(string(b), "SECRET-OF-THE-USER") {
+		t.Errorf("settings.json got the content of the file its symlink named: %s", b)
+	}
+	// .claude itself a symlink: the launch fails rather than write there.
+	os.RemoveAll(filepath.Join(dir, ".claude"))
+	if err := os.Symlink(outside, filepath.Join(dir, ".claude")); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.app.prepareTaskDir(ctx, task); err == nil {
+		t.Error("prepareTaskDir through a symlinked .claude succeeded")
+	}
+	if b, _ := os.ReadFile(secret); !strings.Contains(string(b), "SECRET-OF-THE-USER") || strings.Contains(string(b), "hook") {
+		t.Errorf("the other dir's settings.json was rewritten: %s", b)
+	}
+}
+
 func TestDoctorMissingRepos(t *testing.T) {
 	e := newTaskEnv(t)
 	checks := e.app.Doctor(context.Background())
