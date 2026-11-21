@@ -404,10 +404,11 @@ func AddWorktree(ctx context.Context, repo, path, branch, startPoint string, ori
 	if err != nil {
 		return fmt.Errorf("add worktree %s: %w", path, err)
 	}
-	if err := checkHazards(ctx, repo, opCheckout, &origin); err != nil {
+	cfg := userTransportArgs(ctx, repo)
+	if err := checkHazards(ctx, repo, opCheckout, &origin, cfg); err != nil {
 		return err
 	}
-	args := append(userTransportArgs(ctx, repo), "worktree", "add", "-b", branch, abs, startPoint)
+	args := append(cfg, "worktree", "add", "-b", branch, abs, startPoint)
 	_, err = run(ctx, repo, args...)
 	return err
 }
@@ -631,7 +632,7 @@ func CommitsAhead(ctx context.Context, worktree, base string) (int, error) {
 // the filters the repo's config names, so it is refused while that config
 // has one of its own (see checkHazards).
 func Diff(ctx context.Context, worktree, base string, color bool, w io.Writer) error {
-	if err := checkHazards(ctx, worktree, opDiff, nil); err != nil {
+	if err := checkHazards(ctx, worktree, opDiff, nil, nil); err != nil {
 		return err
 	}
 	colorFlag := "--no-color"
