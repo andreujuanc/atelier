@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"text/template"
 	"time"
 )
 
@@ -17,8 +19,8 @@ import (
 // included, and nothing else (not session 17 for session 7). It is run
 // here with sh, as docker exec would run it in the container.
 func TestKillSessionArgs(t *testing.T) {
-	args := KillSessionArgs("t-abc", 7)
-	if !slices.Equal(args[:4], []string{"exec", "atl-t-abc", "sh", "-c"}) || args[len(args)-1] != "7" {
+	args := KillSessionArgs(oldID, 7)
+	if !slices.Equal(args[:4], []string{"exec", oldID, "sh", "-c"}) || args[len(args)-1] != "7" {
 		t.Fatalf("args = %q", args)
 	}
 	start := func(session string) *exec.Cmd {
@@ -146,6 +148,12 @@ func TestIDDiffersPerWorkspace(t *testing.T) {
 	if a == b || !strings.HasPrefix(a, "fix-login-") || ContainerName(a) != "atl-"+a {
 		t.Errorf("ids %q %q", a, b)
 	}
+	// Every task container's name is reserved (see Gate).
+	for _, slug := range []string{"fix-login", "x", "a.b_c-1"} {
+		if name := ContainerName(ID(slug, "/ws/tasks/"+slug)); !ReservedName(name) || !ReservedName("/"+strings.ToUpper(name)) {
+			t.Errorf("%s is not reserved", name)
+		}
+	}
 }
 
 func testSpec() Spec {
@@ -171,9 +179,9 @@ func TestSpecRunArgs(t *testing.T) {
 }
 
 func TestExecArgv(t *testing.T) {
-	got := ExecArgv("t-abc123", "/tasks/t", []string{"ATL_TASK", "TERM"}, []string{"claude", "--resume", "x"})
+	got := ExecArgv(oldID, "/tasks/t", []string{"ATL_TASK", "TERM"}, []string{"claude", "--resume", "x"})
 	want := []string{"docker", "exec", "-it", "--detach-keys", "ctrl-^,ctrl-^,ctrl-^", "-w", "/tasks/t", "-e", "ATL_TASK", "-e", "COLORFGBG", "-e", "COLORTERM",
-		"-e", "NO_COLOR", "-e", "TERM", "atl-t-abc123", "sh", "-c", `PATH=/run/atl/bin:$PATH exec "$@"`, "atl-exec",
+		"-e", "NO_COLOR", "-e", "TERM", oldID, "sh", "-c", `PATH=/run/atl/bin:$PATH exec "$@"`, "atl-exec",
 		"claude", "--resume", "x"}
 	if !slices.Equal(got, want) {
 		t.Errorf("ExecArgv:\n got %q\nwant %q", got, want)
@@ -222,86 +230,259 @@ func (s *script) verbs() string {
 	return strings.Join(v, " ")
 }
 
+// agentDaemon is a Runner for Ensure: a daemon with at most the one
+// container named atl-<id>.
+type agentDaemon struct {
+	t      *testing.T
+	c      *container // nil: none
+	calls  []string
+	runErr error      // what docker run fails with
+	winner *container // the container another atl made when run fails with a name conflict
+}
+
+const (
+	oldID = "0000000000000000000000000000000000000000000000000000000000000001"
+	newID = "0000000000000000000000000000000000000000000000000000000000000002"
+)
+
+func (d *agentDaemon) run(_ context.Context, args ...string) (string, error) {
+	d.calls = append(d.calls, strings.Join(args, " "))
+	switch args[0] {
+	case "inspect":
+		if d.c == nil {
+			return "", errors.New("docker inspect: Error response from daemon: No such container: atl-t-abc123")
+		}
+		return d.c.inspect(d.t, args), nil
+	case "run":
+		if d.runErr != nil {
+			d.c = d.winner
+			return "", d.runErr
+		}
+		d.c = &container{Id: newID}
+		d.c.State.Running = true
+		d.c.Config.Labels = map[string]string{}
+		for i, a := range args {
+			if a == "--label" {
+				k, v, _ := strings.Cut(args[i+1], "=")
+				d.c.Config.Labels[k] = v
+			}
+		}
+		return newID, nil
+	case "rm":
+		if d.c != nil && args[len(args)-1] == d.c.Id {
+			d.c = nil
+		}
+	case "start":
+		if d.c != nil && args[len(args)-1] == d.c.Id {
+			d.c.State.Running = true
+		}
+	}
+	return "", nil
+}
+
+func (d *agentDaemon) verbs() string {
+	var v []string
+	for _, c := range d.calls {
+		first, _, _ := strings.Cut(c, " ")
+		v = append(v, first)
+	}
+	return strings.Join(v, " ")
+}
+
+// atlsContainer is a container atl made for spec, with spec label hash.
+func atlsContainer(spec Spec, running bool, hash string) *container {
+	c := &container{Id: oldID}
+	c.State.Running = running
+	c.Config.Labels = map[string]string{LabelAgent: spec.ID, labelSpec: hash}
+	return c
+}
+
 func TestEnsure(t *testing.T) {
 	spec := testSpec()
 	ctx := context.Background()
 	busy := func() bool { return true }
 	idle := func() bool { return false }
-	missing := errors.New("docker inspect: Error response from daemon: No such container: atl-t-abc123")
 
 	for _, tc := range []struct {
 		name      string
-		inspect   string
-		err       error
+		c         *container
 		busy      func() bool
 		want      string
+		wantID    string
 		wantStale bool
 	}{
-		{"missing: create", "", missing, idle, "inspect run", false},
-		{"running, same spec: nothing", "true " + spec.Hash(), nil, busy, "inspect", false},
-		{"stopped, same spec: start", "false " + spec.Hash(), nil, idle, "inspect start", false},
-		{"other spec, idle: replace", "true old", nil, idle, "inspect rm run", false},
-		{"other spec, sessions running: keep", "true old", nil, busy, "inspect", true},
-		{"other spec but stopped: replace", "false old", nil, busy, "inspect rm run", false},
+		{"missing: create", nil, idle, "inspect run", newID, false},
+		{"running, same spec: nothing", atlsContainer(spec, true, spec.Hash()), busy, "inspect", oldID, false},
+		{"stopped, same spec: start", atlsContainer(spec, false, spec.Hash()), idle, "inspect start", oldID, false},
+		{"other spec, idle: replace", atlsContainer(spec, true, "old"), idle, "inspect rm run", newID, false},
+		{"other spec, sessions running: keep", atlsContainer(spec, true, "old"), busy, "inspect", oldID, true},
+		{"other spec but stopped: replace", atlsContainer(spec, false, "old"), busy, "inspect rm run", newID, false},
 	} {
-		s := &script{}
-		s.answer("inspect", tc.inspect, tc.err)
+		d := &agentDaemon{t: t, c: tc.c}
 		// fresh runs right before each docker run, after any docker rm.
 		fresh := func() error {
-			s.calls = append(s.calls, "fresh")
+			d.calls = append(d.calls, "fresh")
 			return nil
 		}
-		stale, err := Ensure(ctx, s.run, spec, tc.busy, fresh)
+		id, stale, err := Ensure(ctx, d.run, spec, tc.busy, fresh)
 		want := strings.ReplaceAll(tc.want, "run", "fresh run")
-		if err != nil || stale != tc.wantStale || s.verbs() != want {
-			t.Errorf("%s: calls %q stale %v err %v; want %q stale %v", tc.name, s.verbs(), stale, err, want, tc.wantStale)
+		if err != nil || stale != tc.wantStale || d.verbs() != want || id != tc.wantID {
+			t.Errorf("%s: calls %q stale %v id %.4s… err %v; want %q stale %v id %.4s…", tc.name, d.verbs(), stale, id, err, want, tc.wantStale, tc.wantID)
+		}
+		// By ID only, once checked.
+		for _, c := range d.calls {
+			if strings.HasPrefix(c, "rm ") && !strings.HasSuffix(c, " "+oldID) || strings.HasPrefix(c, "start ") && !strings.HasSuffix(c, " "+oldID) {
+				t.Errorf("%s: %q", tc.name, c)
+			}
 		}
 	}
 
-	// Two atl at once: the loser of the name race uses the winner's container.
-	s := &script{}
-	s.answer("inspect", "", missing)
-	s.answer("run", "", errors.New(`docker run: Conflict. The container name "/atl-t-abc123" is already in use`))
-	if _, err := Ensure(ctx, s.run, spec, idle, nil); err != nil || s.verbs() != "inspect run start" {
-		t.Errorf("name race: %q, %v", s.verbs(), err)
+	// Two atl at once: the loser of the name race uses the winner's
+	// container, if it is atl's.
+	conflict := errors.New(`docker run: Conflict. The container name "/atl-t-abc123" is already in use`)
+	d := &agentDaemon{t: t, runErr: conflict, winner: atlsContainer(spec, false, spec.Hash())}
+	if id, _, err := Ensure(ctx, d.run, spec, idle, nil); err != nil || d.verbs() != "inspect run inspect start" || id != oldID {
+		t.Errorf("name race: %q, %q, %v", d.verbs(), id, err)
+	}
+	d = &agentDaemon{t: t, runErr: conflict, winner: &container{Id: oldID}}
+	if id, _, err := Ensure(ctx, d.run, spec, idle, nil); !errors.Is(err, ErrNotAgent) || d.verbs() != "inspect run inspect" || id != "" {
+		t.Errorf("name race won by a container not atl's: %q, %q, %v", d.verbs(), id, err)
 	}
 	// Any other failure is reported.
-	s = &script{}
-	s.answer("inspect", "", missing)
-	s.answer("run", "", errors.New("docker run: pull access denied for img"))
-	if _, err := Ensure(ctx, s.run, spec, idle, nil); err == nil {
+	d = &agentDaemon{t: t, runErr: errors.New("docker run: pull access denied for img")}
+	if _, _, err := Ensure(ctx, d.run, spec, idle, nil); err == nil {
 		t.Error("a failed docker run was not reported")
 	}
 	// A failed fresh stops the creation.
-	s = &script{}
-	s.answer("inspect", "", missing)
-	if _, err := Ensure(ctx, s.run, spec, idle, func() error { return errors.New("no") }); err == nil || s.verbs() != "inspect" {
-		t.Errorf("failed fresh: %q, %v", s.verbs(), err)
+	d = &agentDaemon{t: t}
+	if _, _, err := Ensure(ctx, d.run, spec, idle, func() error { return errors.New("no") }); err == nil || d.verbs() != "inspect" {
+		t.Errorf("failed fresh: %q, %v", d.verbs(), err)
+	}
+}
+
+// container is a fake daemon's only container, for Runners that answer
+// docker inspect --format as Docker does.
+type container struct {
+	Id     string
+	State  struct{ Running bool }
+	Config struct{ Labels map[string]string }
+}
+
+// inspectFormat answers `docker inspect ... --format F <name>` for c.
+func (c *container) inspect(t *testing.T, args []string) string {
+	t.Helper()
+	f := ""
+	for i, a := range args {
+		if a == "--format" || a == "-f" {
+			f = args[i+1]
+		}
+	}
+	tmpl, err := template.New("f").Funcs(template.FuncMap{"json": func(v any) string {
+		b, _ := json.Marshal(v)
+		return string(b)
+	}}).Parse(f)
+	if err != nil {
+		t.Fatalf("format %q: %v", f, err)
+	}
+	var b strings.Builder
+	if err := tmpl.Execute(&b, c); err != nil {
+		t.Fatalf("format %q: %v", f, err)
+	}
+	return b.String()
+}
+
+// TestEnsureAdoptsOnlyItsOwn: a container that merely has the task
+// container's name is not adopted, replaced or removed: only one that
+// carries atelier.agent=<id> and no atelier.task label is atl's (a task
+// cannot create one through its gate, but a container takes its image's
+// labels). Ensure fails with one line that names it.
+func TestEnsureAdoptsOnlyItsOwn(t *testing.T) {
+	spec := testSpec()
+	const cid = "9999999999999999999999999999999999999999999999999999999999999999"
+	for name, labels := range map[string]map[string]string{
+		"no labels":            {},
+		"another task's agent": {LabelAgent: "t-other1", labelSpec: spec.Hash()},
+		"a task's container":   {LabelAgent: spec.ID, LabelTask: "t-other1", labelSpec: spec.Hash()},
+		"a task's, other spec": {LabelAgent: spec.ID, LabelTask: "t-other1", labelSpec: "old"},
+	} {
+		c := &container{Id: cid}
+		c.State.Running = true
+		c.Config.Labels = labels
+		var calls []string
+		run := func(_ context.Context, args ...string) (string, error) {
+			calls = append(calls, args[0])
+			if args[0] == "inspect" {
+				return c.inspect(t, args), nil
+			}
+			return "", nil
+		}
+		got, _, err := Ensure(context.Background(), run, spec, func() bool { return false }, nil)
+		if err == nil || got != "" {
+			t.Errorf("%s: adopted (%q, %v)", name, got, err)
+			continue
+		}
+		if msg := err.Error(); !strings.Contains(msg, "atl-"+spec.ID) || strings.Contains(msg, "\n") {
+			t.Errorf("%s: error %q; want one line naming the container", name, msg)
+		}
+		if !slices.Equal(calls, []string{"inspect"}) {
+			t.Errorf("%s: docker calls %q; want the inspect only (nothing removed or started)", name, calls)
+		}
+	}
+	// Its own: adopted by ID, started if stopped.
+	c := &container{Id: cid}
+	c.Config.Labels = map[string]string{LabelAgent: spec.ID, labelSpec: spec.Hash()}
+	var calls []string
+	run := func(_ context.Context, args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		if args[0] == "inspect" {
+			return c.inspect(t, args), nil
+		}
+		return "", nil
+	}
+	got, stale, err := Ensure(context.Background(), run, spec, nil, nil)
+	if err != nil || stale || got != cid || calls[len(calls)-1] != "start "+cid {
+		t.Errorf("own container: %q %v %v, calls %q", got, stale, err, calls)
 	}
 }
 
 func TestCleanup(t *testing.T) {
-	s := &script{}
-	s.answer("ps", "c1\nc2", nil)
-	s.answer("network ls", "", nil)
-	s.answer("volume ls", "v1", nil)
-	s.answer("rm -f atl-", "", errors.New("docker rm: Error: No such container: atl-t-abc123"))
-	if err := Cleanup(context.Background(), s.run, "t-abc123"); err != nil {
-		t.Fatalf("Cleanup: %v", err)
-	}
-	want := []string{
-		"rm -f atl-t-abc123",
+	inspect := "inspect --type container --format {{.Id}} {{.State.Running}} {{json .Config.Labels}} atl-t-abc123"
+	rest := []string{
 		"ps -aq --filter label=atelier.task=t-abc123",
 		"rm -f -v c1 c2",
 		"network ls -q --filter label=atelier.task=t-abc123",
 		"volume ls -q --filter label=atelier.task=t-abc123",
 		"volume rm -f v1",
 	}
-	if !slices.Equal(s.calls, want) {
-		t.Errorf("calls:\n got %q\nwant %q", s.calls, want)
+	for _, tc := range []struct {
+		name, out string
+		err       error
+		want      []string
+		wantErr   bool
+	}{
+		{"atl's container", oldID + ` true {"atelier.agent":"t-abc123","atelier.spec":"x"}`, nil,
+			append([]string{inspect, "rm -f " + oldID}, rest...), false},
+		{"none", "", errors.New("docker inspect: Error: No such container: atl-t-abc123"), append([]string{inspect}, rest...), false},
+		// One that merely has the name is not atl's to remove: left, and reported.
+		{"another's of that name", oldID + ` true {"atelier.agent":"t-abc123","atelier.task":"t-other1"}`, nil,
+			append([]string{inspect}, rest...), true},
+	} {
+		s := &script{}
+		s.answer("inspect", tc.out, tc.err)
+		s.answer("ps", "c1\nc2", nil)
+		s.answer("network ls", "", nil)
+		s.answer("volume ls", "v1", nil)
+		err := Cleanup(context.Background(), s.run, "t-abc123")
+		if (err != nil) != tc.wantErr || tc.wantErr && !errors.Is(err, ErrNotAgent) {
+			t.Errorf("%s: Cleanup: %v", tc.name, err)
+		}
+		if !slices.Equal(s.calls, tc.want) {
+			t.Errorf("%s: calls:\n got %q\nwant %q", tc.name, s.calls, tc.want)
+		}
 	}
 	// A failure does not stop the rest, and is reported.
-	s = &script{}
+	s := &script{}
+	s.answer("inspect", "", errors.New("docker inspect: Error: No such container: atl-t-abc123"))
 	s.answer("ps", "", errors.New("docker ps: daemon down"))
 	s.answer("volume ls", "v1", nil)
 	if err := Cleanup(context.Background(), s.run, "t-abc123"); err == nil || !slices.Contains(s.calls, "volume rm -f v1") {

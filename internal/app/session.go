@@ -60,10 +60,12 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 		// The window runs a docker client attached to Claude in the task's
 		// container. Should the window die first, what it started there is
 		// ended when that is noticed (Recover, resumeClaimed).
-		if err := a.ensureSandbox(ctx, t); err != nil {
+		// It names the container by the ID ensureSandbox checked to be atl's
+		// own: the token goes there.
+		container, err := a.ensureSandbox(ctx, t)
+		if err != nil {
 			return "", fmt.Errorf("sandbox: %w", err)
 		}
-		var err error
 		if auth, err = a.sandboxAuth(); err != nil {
 			return "", fmt.Errorf("sandbox: %w", err)
 		}
@@ -71,7 +73,7 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 		// environment: set from atl's own (current) one, or the stored
 		// token, on tmux's standard input, in the same tmux call that
 		// creates the window, and the server if none runs yet.
-		argv = a.sandboxArgv(t, dir, env, auth, argv)
+		argv = a.sandboxArgv(container, dir, env, auth, argv)
 	}
 	return a.Tmux.NewWindow(ctx, tmux.WindowSpec{
 		Session:   tmux.SessionName(t.Slug),

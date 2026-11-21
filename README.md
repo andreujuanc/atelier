@@ -471,6 +471,18 @@ log in `gate-<slug>.log` next to `hook.log`) forwards only what a task may do:
   host's credentials: build from a local context;
 - the task's own container is joined to every network the task creates, so services
   answer by their compose service name; the task cannot stop or remove that container.
+  Names in its pattern (`atl-<slug>-<hash>`, in any case, with or without Docker's leading
+  slash) are atl's: a task can neither create a container under one nor rename one to it.
+  A request whose body is a form is refused (Docker would read its values ahead of the
+  query, which is what the gate checks: a new name, a build's remote, a pull's source).
+
+`atl` itself uses, replaces and removes a task's container only if it carries the label
+`atelier.agent=<id>` that `atl` gave it and no `atelier.task` label (a container a task
+creates always has that one; it can get `atelier.agent` from its image). Should a
+container of that name be something else, starting a session fails with one line that
+names it, and `atl` leaves it alone (also at `atl done`): remove or rename it yourself.
+Once checked, `atl` addresses the container by its full ID (the session's `docker exec`
+included), not by its name.
 
 `atl done`/`atl cancel` remove what the task left on the daemon (containers, networks,
 volumes).
