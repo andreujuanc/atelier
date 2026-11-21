@@ -19,6 +19,25 @@ docker build -t atelier \
   --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 ```
 
+With the [sandbox](#sandbox) on, task containers use a second image from the same file,
+the `task` target, built for your user the same way:
+
+```bash
+docker build --target task -t atelier-task \
+  --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+```
+
+It has Claude Code, git, the Docker CLI with the compose plugin, a C toolchain
+(`build-essential`, `pkg-config`), Node.js (the current LTS line, 26, from NodeSource) with
+npm and corepack, Python 3 with pip and venv (`python` is `python3`), Go (from go.dev), and
+curl, jq, ripgrep, unzip, zip, xz, less, procps, openssh-client and ca-certificates, with a
+UTF-8 locale (`C.UTF-8`); not `atl` (it is mounted into task containers), tmux or gh. As
+the ordinary user, `npm install -g` installs into `~/.local` and `pip install` (`--user`)
+too (`PIP_BREAK_SYSTEM_PACKAGES=1` lifts Debian's refusal; a venv needs no override), `go
+install` into `~/go/bin`, all on `PATH`. `--build-arg NODE_MAJOR=…` and `GO_VERSION=…`
+pick other versions. With Docker's legacy builder, building the box builds this stage
+too (every stage before the target is built; cached afterwards).
+
 Run it with `docker run -it atelier` (plus your mounts). The container starts a plain
 shell, not tmux: run `atl` there, press Enter on a task to open Claude full screen, and
 press **Ctrl-q** to go back to the TUI (Claude keeps running in tmux). Don't start `atl`
@@ -240,7 +259,7 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `ATL_BIN` | the running binary — `atl` path written into hook commands |
 | `ATL_CONTEXT` | unset — extra text appended to every task session's start context (max 1000 bytes; atl refuses to start if longer) |
 | `ATL_SANDBOX` | unset (off) — `docker` runs each task's sessions in the task's own container (see [Sandbox](#sandbox)) |
-| `ATL_SANDBOX_IMAGE` | `atelier` — the task container image, unless the task's project names one |
+| `ATL_SANDBOX_IMAGE` | `atelier-task` — the task container image, unless the task's project names one (see [Docker image](#docker-image)) |
 | `ATL_SANDBOX_CONTEXT` | unset — what sandboxed sessions get in place of `ATL_CONTEXT` (same limit) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | unset — with the sandbox on, the token (`claude setup-token`) that sandboxed sessions log in with; when set it wins over the one `atl token` stored |
 | `ANTHROPIC_API_KEY` | unset — with the sandbox on, an API key for sandboxed sessions instead of a token (also wins over the stored one) |
@@ -369,13 +388,22 @@ closed tasks; delete the dir yourself when you no longer need them. Sessions sta
 before this change kept their transcripts in your own config dir, which the container does
 not see: they cannot be resumed in it.
 
-**Tools.** Sessions can run whatever the image has and install more. As the image's
-ordinary user that is `npm`, `pip --user`, `go install` and the like; for system packages
+**Tools.** The image of a task's container is the project's `image = "..."` (in its
+toml), else `ATL_SANDBOX_IMAGE`, else `atelier-task`, the default task image (see
+[Docker image](#docker-image) for how to build it and what it has). When the default image
+is not on the Docker daemon, starting a session fails, and `atl doctor` fails, with one
+line that gives the command to build it; another image that is missing is left to docker
+to pull, and if that fails the launch says so in one line. An image needs `claude` and
+`sh`, and should have the user that runs `atl` (same name, uid and home directory, as
+atelier's images have), so that what the task writes in the task dir and its Claude dir
+stays yours.
+
+Sessions can run whatever the image has and install more: as the image's ordinary user
+`npm install -g`, `pip install --user`, `go install` and the like; for system packages
 the task may be root in its own container: `docker exec -u 0 $ATL_CONTAINER apt-get
-install -y <pkg>`. The image is `ATL_SANDBOX_IMAGE`, or per project `image = "..."` in
-its toml. It needs `claude` and `sh`, and should have the user that runs `atl` (same
-name, uid and home directory, as the atelier image has), so that what the task writes
-in the task dir and its Claude dir stays yours.
+install -y <pkg>`. But what is installed by hand lives in the container only, and is gone
+when the task's container is replaced (after a change of the task's repos or image): what a project keeps needing belongs in its own `image`,
+e.g. one built `FROM atelier-task`. The session's start context says so too.
 
 **Docker.** `docker` and `docker compose` in a task talk to the task's *gate*, not to the
 daemon. The gate (`atl gate <slug>`, started by `atl` and stopped when the task closes;

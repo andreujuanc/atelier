@@ -40,6 +40,40 @@ func TestFromEnv(t *testing.T) {
 	}
 }
 
+// TestDefaultImage: the default task image is the Dockerfile's task target,
+// not the box image, and its build command builds that target for the user.
+func TestDefaultImage(t *testing.T) {
+	if DefaultImage != "atelier-task" {
+		t.Errorf("DefaultImage = %q", DefaultImage)
+	}
+	for _, want := range []string{"docker build --target task -t atelier-task ", "--build-arg USERNAME=$(whoami)",
+		"--build-arg UID=$(id -u)", "--build-arg GID=$(id -g)"} {
+		if !strings.Contains(BuildDefaultImage, want) {
+			t.Errorf("BuildDefaultImage lacks %q: %s", want, BuildDefaultImage)
+		}
+	}
+	if !strings.HasSuffix(BuildDefaultImage, " .") || strings.Contains(BuildDefaultImage, "\n") {
+		t.Errorf("BuildDefaultImage: %q", BuildDefaultImage)
+	}
+	run := func(_ context.Context, args ...string) (string, error) {
+		if args[len(args)-1] == "gone" {
+			return "", errors.New("docker image: Error response from daemon: No such image: gone:latest")
+		}
+		if args[len(args)-1] == "broken" {
+			return "", errors.New("docker image: Cannot connect to the Docker daemon")
+		}
+		return "sha256:x", nil
+	}
+	for image, want := range map[string]bool{"here": false, "gone": true} {
+		if missing, err := ImageMissing(context.Background(), run, image); missing != want || err != nil {
+			t.Errorf("ImageMissing(%s) = %v, %v", image, missing, err)
+		}
+	}
+	if missing, err := ImageMissing(context.Background(), run, "broken"); missing || err == nil {
+		t.Errorf("ImageMissing without a daemon = %v, %v", missing, err)
+	}
+}
+
 func TestIDDiffersPerWorkspace(t *testing.T) {
 	a, b := ID("fix-login", "/ws/a/tasks/fix-login"), ID("fix-login", "/ws/b/tasks/fix-login")
 	if a == b || !strings.HasPrefix(a, "fix-login-") || ContainerName(a) != "atl-"+a {

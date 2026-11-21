@@ -22,9 +22,10 @@ import (
 // fakeDocker records docker CLI calls. No container exists until one is
 // "run"; then inspect reports it running with the spec label it was given.
 type fakeDocker struct {
-	mu    sync.Mutex
-	calls [][]string
-	label string // atelier.spec of the existing container; "" → none exists
+	mu      sync.Mutex
+	calls   [][]string
+	label   string          // atelier.spec of the existing container; "" → none exists
+	missing map[string]bool // images not on the daemon, which docker run cannot pull either
 }
 
 func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
@@ -37,7 +38,16 @@ func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 			return "", errors.New("docker inspect: Error: No such container: x")
 		}
 		return "true " + f.label, nil
+	case "image":
+		if image := args[len(args)-1]; f.missing[image] {
+			return "", errors.New("docker image: Error response from daemon: No such image: " + image + ":latest")
+		}
+		return "sha256:0123", nil
 	case "run":
+		if image := args[len(args)-3]; f.missing[image] { // image sleep infinity
+			return "", errors.New("docker run: Unable to find image '" + image + ":latest' locally\n" +
+				"docker: Error response from daemon: pull access denied for " + image + ", repository does not exist")
+		}
 		for i, a := range args {
 			if a == "--label" && strings.HasPrefix(args[i+1], "atelier.spec=") {
 				f.label = strings.TrimPrefix(args[i+1], "atelier.spec=")
@@ -437,6 +447,103 @@ func TestSandboxClaudeToken(t *testing.T) {
 		if strings.Contains(all.String(), secret) {
 			t.Errorf("a secret is in docker's arguments, the spec or the output:\n%s", all.String())
 		}
+	}
+}
+
+// TestSandboxTaskImage: the project's image wins over $ATL_SANDBOX_IMAGE,
+// which wins over the default. A missing default image stops the launch
+// before anything is created, in one line with the command that builds it;
+// another missing image is left to docker (it may pull it) and, when that
+// fails, said in one line too.
+func TestSandboxTaskImage(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	task := e.task(t, "boxed", model.StatusActive, true)
+
+	e.app.Sandbox = &sandbox.Config{Image: sandbox.DefaultImage}
+	if img, from := e.app.taskImage(task); img != "atelier-task" || from != "default" {
+		t.Errorf("default: %s from %s", img, from)
+	}
+	e.app.Sandbox = &sandbox.Config{Image: "mine:1"}
+	if img, from := e.app.taskImage(task); img != "mine:1" || from != "$ATL_SANDBOX_IMAGE" {
+		t.Errorf("setting: %s from %s", img, from)
+	}
+	pf := e.app.Paths.ProjectFile("shop")
+	if err := os.MkdirAll(filepath.Dir(pf), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pf, []byte("image = \"shop-image:2\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task.Project = "shop"
+	if img, from := e.app.taskImage(task); img != "shop-image:2" || from != "project shop" {
+		t.Errorf("project: %s from %s", img, from)
+	}
+	if spec, err := e.app.sandboxSpec(ctx, task); err != nil || spec.Image != "shop-image:2" {
+		t.Errorf("spec image: %s, %v", spec.Image, err)
+	}
+	task.Project = ""
+
+	// The default image is missing: one line with the build command.
+	e.app.Sandbox = &sandbox.Config{Image: sandbox.DefaultImage}
+	fd.missing = map[string]bool{sandbox.DefaultImage: true}
+	_, err := e.app.NewSession(ctx, "boxed")
+	if err == nil || strings.Contains(err.Error(), "\n") || !strings.Contains(err.Error(), "task image atelier-task is not on the Docker daemon") ||
+		!strings.Contains(err.Error(), sandbox.BuildDefaultImage) {
+		t.Fatalf("NewSession without the default image: %v", err)
+	}
+	if n := len(fd.find("run")); n != 0 {
+		t.Errorf("docker run without the default image: %d calls", n)
+	}
+
+	// Another image docker cannot pull either.
+	e.app.Sandbox = &sandbox.Config{Image: "mine:1"}
+	fd.missing = map[string]bool{"mine:1": true}
+	err = e.app.ensureSandbox(ctx, task)
+	if err == nil || strings.Contains(err.Error(), "\n") ||
+		!strings.Contains(err.Error(), "task image mine:1 (from $ATL_SANDBOX_IMAGE) is not on the Docker daemon and could not be pulled") {
+		t.Fatalf("ensureSandbox without the image: %v", err)
+	}
+	if n := len(fd.find("run")); n != 1 {
+		t.Errorf("docker run calls = %d, want 1 (docker may pull)", n)
+	}
+
+	// Once it is there, the container starts.
+	fd.missing = nil
+	if err := e.app.ensureSandbox(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDoctorTaskImage: doctor fails on a missing default image with the
+// build command, warns on another missing one, passes when it is there.
+func TestDoctorTaskImage(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	t.Setenv("ATL_SANDBOX", "docker")
+	check := func() Check {
+		t.Helper()
+		for _, c := range e.app.checkSandbox(ctx) {
+			if c.Name == "task image" {
+				return c
+			}
+		}
+		t.Fatal("no task image check")
+		return Check{}
+	}
+	t.Setenv("ATL_SANDBOX_IMAGE", "")
+	fd.missing = map[string]bool{sandbox.DefaultImage: true}
+	if c := check(); c.Level() != "FAIL" || !strings.Contains(c.Detail, sandbox.BuildDefaultImage) || strings.Contains(c.Detail, "\n") {
+		t.Errorf("missing default: %s %q", c.Level(), c.Detail)
+	}
+	fd.missing = nil
+	if c := check(); c.Level() != "ok" || c.Detail != sandbox.DefaultImage {
+		t.Errorf("default there: %s %q", c.Level(), c.Detail)
+	}
+	t.Setenv("ATL_SANDBOX_IMAGE", "mine:1")
+	fd.missing = map[string]bool{"mine:1": true}
+	if c := check(); c.Level() != "warn" || !strings.Contains(c.Detail, "mine:1") {
+		t.Errorf("missing other: %s %q", c.Level(), c.Detail)
 	}
 }
 

@@ -64,12 +64,7 @@ func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, err
 	}
 	dir := a.Paths.TaskDir(t.Slug)
 	id := a.sandboxID(t)
-	image := a.Sandbox.Image
-	if pr, err := a.taskProject(t); err != nil {
-		a.warnf("%v; using the default task image", err)
-	} else if pr != nil && pr.Image != "" {
-		image = pr.Image
-	}
+	image, _ := a.taskImage(t)
 	spec := sandbox.Spec{
 		ID:      id,
 		Image:   image,
@@ -137,6 +132,34 @@ func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, err
 	return spec, nil
 }
 
+// taskImage returns the image of the task's container and where its name
+// comes from: the task's project, else the sandbox setting
+// ($ATL_SANDBOX_IMAGE or sandbox.DefaultImage).
+func (a *App) taskImage(t *model.Task) (image, from string) {
+	if pr, err := a.taskProject(t); err != nil {
+		a.warnf("%v; using the default task image", err)
+	} else if pr != nil && pr.Image != "" {
+		return pr.Image, "project " + t.Project
+	}
+	if a.Sandbox.Image == sandbox.DefaultImage {
+		return a.Sandbox.Image, "default"
+	}
+	return a.Sandbox.Image, "$ATL_SANDBOX_IMAGE"
+}
+
+// missingImage is the one line that says image is not on the Docker
+// daemon: with the command that builds it if it is sandbox.DefaultImage.
+func missingImage(image, from string) error {
+	return errors.New("task image " + missingImageDetail(image, from))
+}
+
+func missingImageDetail(image, from string) string {
+	if image == sandbox.DefaultImage {
+		return image + " is not on the Docker daemon; build it in a checkout of atelier with: " + sandbox.BuildDefaultImage
+	}
+	return image + " (from " + from + ") is not on the Docker daemon and could not be pulled; build or pull it"
+}
+
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
@@ -181,8 +204,22 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) error {
 		live, err := a.hasLiveWindow(ctx, t, tmux.SessionName(t.Slug))
 		return err != nil || live
 	}
-	stale, err := sandbox.Ensure(ctx, a.docker(), spec, busy, func() error { return a.seedClaudeDir(t) })
+	// A new container needs its image: the default one is never pulled (it
+	// is built for the user), others docker may pull.
+	fresh := func() error {
+		if spec.Image == sandbox.DefaultImage {
+			if missing, err := sandbox.ImageMissing(ctx, a.docker(), spec.Image); err == nil && missing {
+				return missingImage(spec.Image, "default")
+			}
+		}
+		return a.seedClaudeDir(t)
+	}
+	stale, err := sandbox.Ensure(ctx, a.docker(), spec, busy, fresh)
 	if err != nil {
+		if missing, ierr := sandbox.ImageMissing(ctx, a.docker(), spec.Image); ierr == nil && missing {
+			_, from := a.taskImage(t)
+			return missingImage(spec.Image, from)
+		}
 		return fmt.Errorf("task container (image %s): %w", spec.Image, err)
 	}
 	if stale {
