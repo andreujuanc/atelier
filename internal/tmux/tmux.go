@@ -91,8 +91,16 @@ func (c *Client) args(args ...string) []string {
 
 // run executes tmux and returns trimmed stdout.
 func (c *Client) run(ctx context.Context, args ...string) (string, error) {
+	return c.runIn(ctx, "", args...)
+}
+
+// runIn is run with stdin as tmux's standard input.
+func (c *Client) runIn(ctx context.Context, stdin string, args ...string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "tmux", c.args(args...)...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	// A freshly started server daemonizes; never hang on inherited pipes.
@@ -154,6 +162,46 @@ func gone(err error) bool {
 		return false
 	}
 	return noServer(err) || strings.Contains(te.Stderr, "can't find window") || strings.Contains(te.Stderr, "no such window")
+}
+
+// SetGlobalEnv sets env in the server's global environment, which windows
+// created afterwards inherit. The commands reach tmux on its standard input
+// (source-file -), so no value appears on a command line, nor in the error.
+// A value may not contain a single quote or a control character. Without a
+// running server it does nothing: a server started later by this process
+// takes its environment anyway.
+func (c *Client) SetGlobalEnv(ctx context.Context, env map[string]string) error {
+	if len(env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var script strings.Builder
+	for _, k := range keys {
+		v := env[k]
+		if k == "" || strings.ContainsFunc(k+v, func(r rune) bool { return r == '\'' || r < 0x20 || r == 0x7f }) {
+			return fmt.Errorf("tmux: $%s has a character atl cannot pass to tmux (a quote or a control character)", k)
+		}
+		fmt.Fprintf(&script, "set-environment -g '%s' '%s'\n", k, v)
+	}
+	_, err := c.runIn(ctx, script.String(), "source-file", "-")
+	if err == nil || noServer(err) {
+		return nil
+	}
+	var te *Error
+	if errors.As(err, &te) {
+		msg := te.Stderr
+		for _, v := range env {
+			if v != "" {
+				msg = strings.ReplaceAll(msg, v, "…")
+			}
+		}
+		return &Error{Args: te.Args, Stderr: msg, Err: te.Err}
+	}
+	return err
 }
 
 // HasSession reports whether a session with exactly this name exists.

@@ -77,7 +77,7 @@ func (a *App) sessionChoices(ctx context.Context, t *model.Task) ([]SessionChoic
 		} else if s.State.Live() {
 			continue // not launched by atl, or its window is being launched
 		} else if !resumableState(s.State) || s.ClaudeSessionID == "" || !t.Status.Open() ||
-			resumableHere(dir, s) != nil {
+			resumableHere(a.claudeConfigDirFor(t), dir, s) != nil {
 			continue
 		}
 		var info transcriptInfo
@@ -114,24 +114,26 @@ func resumableState(st model.SessionState) bool {
 	return st == model.StateEnded || st == model.StateStopped
 }
 
-// resumableHere returns nil if `claude --resume` run in the task dir dir can
-// find the past session s's conversation, else why not. Claude Code looks
-// for it only in its project dir for the cwd (claudeProjectDirs), so a
+// resumableHere returns nil if `claude --resume` run in the task dir dir
+// with the Claude config dir cfg (the task's own when sandboxed, see
+// claudeConfigDirFor) can find the past session s's conversation, else why
+// not. Claude Code looks for it only in its project dir for the cwd
+// (claudeProjectDirs), so a
 // session the hooks recorded for a claude run elsewhere (a task subdir, a
 // nested `claude -p` with ATL_TASK set) cannot be resumed from there: its
 // recorded transcript must sit directly in that dir. A row with no recorded
 // transcript path (older rows) is trusted only if atl launched it (it has a
 // window name), since atl always launches claude in the task dir.
-func resumableHere(dir string, s model.Session) error {
+func resumableHere(cfg, dir string, s model.Session) error {
 	if s.TranscriptPath == "" {
 		if s.Name == "" {
 			return errors.New("it was not started by atl and has no recorded transcript, so claude --resume in the task dir may not find it")
 		}
 		return nil
 	}
-	if !inClaudeProject(dir, s.TranscriptPath) {
-		return fmt.Errorf("its transcript %s is not in Claude's project dir for the task dir %s (claude ran in another directory), so claude --resume there cannot find it",
-			s.TranscriptPath, dir)
+	if !inClaudeProject(cfg, dir, s.TranscriptPath) {
+		return fmt.Errorf("its transcript %s is not in Claude's project dir for the task dir %s under %s (claude ran in another directory, or with another config dir), so claude --resume there cannot find it",
+			s.TranscriptPath, dir, cfg)
 	}
 	return nil
 }
@@ -237,7 +239,7 @@ func (a *App) OpenSession(ctx context.Context, ref string, sessionID int64) (*ex
 		return nil, fmt.Errorf("session %d of task %s is %s and has no Claude session id; it cannot be resumed (use --new for a new session)",
 			s.ID, t.Slug, s.State)
 	}
-	if err := resumableHere(a.Paths.TaskDir(t.Slug), *s); err != nil {
+	if err := resumableHere(a.claudeConfigDirFor(t), a.Paths.TaskDir(t.Slug), *s); err != nil {
 		return nil, fmt.Errorf("session %d of task %s cannot be resumed: %w (use --new for a new session)", s.ID, t.Slug, err)
 	}
 	if s.TranscriptPath != "" {

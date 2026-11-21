@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -60,6 +61,9 @@ func (f *fakeDocker) find(verb string) [][]string {
 	return out
 }
 
+// testToken is the made-up Claude Code token of sandboxEnv.
+const testToken = "sk-ant-oat01-test-token-made-up-1234567890"
+
 // sandboxEnv is newEnv with the sandbox on: a fake docker daemon for atl's
 // own calls, no gate process, and a stub `docker` on PATH whose `exec` runs
 // the command after "atl-exec" locally, so the stub claude still records.
@@ -75,7 +79,9 @@ func sandboxEnv(t *testing.T) (*env, *fakeDocker) {
 	if err := os.WriteFile(atl, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, ".claude"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, ".claude")) // the user's, never a task's
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", testToken)
+	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv(sandbox.InEnv, "")
 	t.Setenv("ATL_CONTEXT", "rules of the shared box")
 	t.Setenv("ATL_SANDBOX_CONTEXT", "rules of a task container")
@@ -126,7 +132,9 @@ func TestSandboxSessionRunsInTaskContainer(t *testing.T) {
 		"type=bind,src=" + dir + ",dst=" + dir + " ",
 		"type=bind,src=" + filepath.Join(p.RepoPath("api"), ".git") + ",dst=" + filepath.Join(p.RepoPath("api"), ".git") + " ",
 		"type=bind,src=" + p.RepoPath("docs") + ",dst=" + p.RepoPath("docs") + ",readonly",
-		"type=bind,src=" + os.Getenv("CLAUDE_CONFIG_DIR") + ",",
+		// The task's own Claude dir, at the same path, and none other.
+		"type=bind,src=" + p.ClaudeDir("boxed") + ",dst=" + p.ClaudeDir("boxed") + " ",
+		"--env CLAUDE_CONFIG_DIR=" + p.ClaudeDir("boxed") + " ",
 		"type=bind,src=" + p.RunDir("boxed") + ",dst=/run/atl,readonly",
 		"--env DOCKER_HOST=unix:///run/atl/docker.sock",
 		"--env ATL_SANDBOX_ID=" + id,
@@ -140,7 +148,8 @@ func TestSandboxSessionRunsInTaskContainer(t *testing.T) {
 			t.Errorf("docker run lacks %q:\n%s", want, run)
 		}
 	}
-	for _, never := range []string{"docker.sock,dst=/var/run", "--privileged", "ssh", "shared box", ".gitconfig", "credential"} {
+	for _, never := range []string{"docker.sock,dst=/var/run", "--privileged", "ssh", "shared box", ".gitconfig", "credential",
+		os.Getenv("CLAUDE_CONFIG_DIR"), "CLAUDE_CODE_OAUTH_TOKEN", testToken} {
 		if strings.Contains(run, never) {
 			t.Errorf("docker run has %q:\n%s", never, run)
 		}
@@ -148,6 +157,16 @@ func TestSandboxSessionRunsInTaskContainer(t *testing.T) {
 	// Only the canonical clone's git database is mounted, not its files.
 	if strings.Contains(run, "src="+p.RepoPath("api")+",") {
 		t.Errorf("docker run mounts the whole rw clone:\n%s", run)
+	}
+
+	// The token reaches Claude by name: from the window's environment
+	// (set in tmux without a command line), never in the window's command.
+	if env := readFile(t, filepath.Join(e.out, "env-"+strconv.FormatInt(s.ID, 10))); !strings.Contains(env, "CLAUDE_CODE_OAUTH_TOKEN="+testToken+"\n") {
+		t.Errorf("claude did not get the token:\n%s", env)
+	}
+	if cmd := e.tmux(t, "display-message", "-p", "-t", s.TmuxTarget, "#{pane_start_command}"); !strings.Contains(cmd, "-e CLAUDE_CODE_OAUTH_TOKEN ") ||
+		strings.Contains(cmd, testToken) {
+		t.Errorf("window command: %s", cmd)
 	}
 
 	// Hooks call the atl inside the container, and its copy is in the run dir.
@@ -185,9 +204,31 @@ func TestSandboxSessionRunsInTaskContainer(t *testing.T) {
 		t.Errorf("no warning about the stale container: %q", out)
 	}
 
-	// Closing the task removes the container, what the task created, and the run dir.
+	// Closing the task removes the container, what the task created, and the
+	// run dir; of the Claude dir only the transcripts stay (atl show and atl
+	// transcript read them for closed tasks).
+	claude := p.ClaudeDir("boxed")
+	transcript := filepath.Join(claude, "projects", "k", "t.jsonl")
+	for _, f := range []string{transcript, filepath.Join(claude, "todos", "x.json")} {
+		if err := os.MkdirAll(filepath.Dir(f), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evil := filepath.Join(claude, "projects", "k", "evil.jsonl") // planted by the task
+	if err := os.Symlink("/etc/passwd", evil); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := e.app.Done(ctx, "boxed", true); err != nil {
 		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(claude); err != nil || len(entries) != 1 || entries[0].Name() != "projects" || !exists(transcript) {
+		t.Errorf("Claude dir after done: %v, %v", entries, err)
+	}
+	if _, err := os.Lstat(evil); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a symlink in projects/ survived done: %v", err)
 	}
 	var cleanup []string
 	for _, c := range fd.calls {
@@ -309,7 +350,7 @@ func TestSandboxSpecHidesAtelierDirs(t *testing.T) {
 				}
 			}
 			if paths.Workspace != "" && inside(paths.Workspace, m.Src) &&
-				m.Src != paths.TaskDir("boxed") && m.Src != paths.RunDir("boxed") {
+				m.Src != paths.TaskDir("boxed") && m.Src != paths.RunDir("boxed") && m.Src != paths.ClaudeDir("boxed") {
 				t.Errorf("mount %s is in the workspace", m.Src)
 			}
 		}
@@ -321,15 +362,298 @@ func TestSandboxSpecHidesAtelierDirs(t *testing.T) {
 	}
 }
 
-func TestSandboxNeedsClaudeConfigDir(t *testing.T) {
+// TestSandboxClaudeToken: without a token nothing starts and the error says
+// how to get one; an API key alone does; either goes by name only, and the
+// value is in no docker argument, spec (nor its hash) or output.
+func TestSandboxClaudeToken(t *testing.T) {
 	e, fd := sandboxEnv(t)
-	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	e.task(t, "boxed", model.StatusActive, true)
-	if _, err := e.app.NewSession(context.Background(), "boxed"); err == nil || !strings.Contains(err.Error(), "CLAUDE_CONFIG_DIR") {
-		t.Fatalf("NewSession error = %v, want one naming $CLAUDE_CONFIG_DIR", err)
+	ctx := context.Background()
+	task := e.task(t, "boxed", model.StatusActive, true)
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	_, err := e.app.NewSession(ctx, "boxed")
+	if err == nil || !strings.Contains(err.Error(), "claude setup-token") || !strings.Contains(err.Error(), "CLAUDE_CODE_OAUTH_TOKEN") {
+		t.Fatalf("NewSession without a token: %v", err)
 	}
-	if len(fd.find("run")) != 0 {
-		t.Error("a container was created without a Claude config dir")
+	if len(fd.calls) != 0 || exists(e.app.Paths.RunDir("boxed")) {
+		t.Errorf("started something without a token: %q", fd.calls)
+	}
+
+	const key = "sk-ant-api03-made-up-key-0123456789abcdefghij"
+	t.Setenv("ANTHROPIC_API_KEY", key)
+	s, err := e.app.NewSession(ctx, "boxed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s.ID)
+	if env := readFile(t, filepath.Join(e.out, "env-"+strconv.FormatInt(s.ID, 10))); !strings.Contains(env, "ANTHROPIC_API_KEY="+key+"\n") {
+		t.Errorf("claude did not get the API key:\n%s", env)
+	}
+	// Claude Code asks once whether to use an API key (default no): it is
+	// approved in the task's state file, by its last 20 characters.
+	var st struct {
+		Responses struct{ Approved []string } `json:"customApiKeyResponses"`
+	}
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(e.app.Paths.ClaudeDir("boxed"), ".claude.json"))), &st); err != nil ||
+		!slices.Equal(st.Responses.Approved, []string{key[len(key)-20:]}) {
+		t.Errorf("API key approval = %+v, %v", st, err)
+	}
+
+	spec, err := e.app.sandboxSpec(ctx, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", testToken+"-rotated")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	spec2, err := e.app.sandboxSpec(ctx, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Hash() != spec2.Hash() {
+		t.Error("the spec hash depends on the token")
+	}
+	// A new token reaches the next session without a new container.
+	s2, err := e.app.NewSession(ctx, "boxed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s2.ID)
+	if env := readFile(t, filepath.Join(e.out, "env-"+strconv.FormatInt(s2.ID, 10))); !strings.Contains(env, "CLAUDE_CODE_OAUTH_TOKEN="+testToken+"-rotated\n") {
+		t.Errorf("claude did not get the new token:\n%s", env)
+	}
+	if n := len(fd.find("run")); n != 1 {
+		t.Errorf("docker run calls = %d, want 1", n)
+	}
+	var all strings.Builder
+	for _, c := range fd.calls {
+		all.WriteString(strings.Join(c, " ") + "\n")
+	}
+	for _, sp := range []sandbox.Spec{spec, spec2} {
+		all.WriteString(strings.Join(sp.RunArgs(), " ") + "\n")
+	}
+	all.WriteString(e.app.Out.(*bytes.Buffer).String())
+	for _, secret := range []string{testToken, key} {
+		if strings.Contains(all.String(), secret) {
+			t.Errorf("a secret is in docker's arguments, the spec or the output:\n%s", all.String())
+		}
+	}
+}
+
+// userClaudeDir makes a Claude config dir for the user at
+// $CLAUDE_CONFIG_DIR with their setup, their secrets and a transcript.
+func userClaudeDir(t *testing.T) string {
+	t.Helper()
+	user := os.Getenv("CLAUDE_CONFIG_DIR")
+	for name, content := range map[string]string{
+		"settings.json":           `{"theme":"x","apiKeyHelper":"/home/u/bin/key","statusLine":{"type":"command","command":"mine"}}`,
+		"CLAUDE.md":               "# my rules\n",
+		"keybindings.json":        `{"bindings":[]}`,
+		"skills/review/SKILL.md":  "---\nname: review\n---\n",
+		"agents/helper.md":        "an agent\n",
+		"commands/go.md":          "a command\n",
+		".credentials.json":       `{"claudeAiOauth":{"accessToken":"SECRET-LOGIN"}}`,
+		".claude.json":            `{"theme":"light","oauthAccount":{"emailAddress":"me@example.com"},"mcpServers":{"x":{"env":{"K":"SECRET-MCP"}}}}`,
+		"projects/-other/o.jsonl": `{"type":"user","message":{"content":"SECRET-TRANSCRIPT"}}`,
+		"todos/t.json":            "[]",
+	} {
+		path := filepath.Join(user, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A symlink in a copied dir does not carry the credentials over either.
+	if err := os.Symlink(filepath.Join(user, ".credentials.json"), filepath.Join(user, "skills", "creds.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(user, "projects"), filepath.Join(user, "agents", "old")); err != nil {
+		t.Fatal(err)
+	}
+	return user
+}
+
+// TestSandboxSeedsClaudeDir: a new container's Claude dir gets copies of the
+// user's setup and a state file that skips the first-start screens, nothing
+// secret; the copies are refreshed only for a new container, never written
+// through what the task left there, and Claude Code's own state is kept.
+func TestSandboxSeedsClaudeDir(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	user := userClaudeDir(t)
+	task := e.task(t, "boxed", model.StatusActive, true)
+	dir := e.app.Paths.ClaudeDir("boxed")
+	if err := e.app.ensureSandbox(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"CLAUDE.md", "keybindings.json", "skills/review/SKILL.md", "agents/helper.md", "commands/go.md"} {
+		if got, want := readFile(t, filepath.Join(dir, name)), readFile(t, filepath.Join(user, name)); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(dir, "settings.json"))), &settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := settings["apiKeyHelper"]; ok || settings["statusLine"] == nil || settings["theme"] != "x" {
+		t.Errorf("settings.json copy: %v", settings)
+	}
+	for _, never := range []string{".credentials.json", "projects", "todos", "skills/creds.md", "agents/old"} {
+		if _, err := os.Lstat(filepath.Join(dir, never)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s was carried over: %v", never, err)
+		}
+	}
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			if b := readFile(t, path); strings.Contains(b, "SECRET") || strings.Contains(b, "me@example.com") {
+				t.Errorf("%s holds a secret of the user:\n%s", path, b)
+			}
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st struct {
+		Onboarded bool   `json:"hasCompletedOnboarding"`
+		Theme     string `json:"theme"`
+		Projects  map[string]struct {
+			Trusted bool `json:"hasTrustDialogAccepted"`
+		} `json:"projects"`
+	}
+	state := filepath.Join(dir, ".claude.json")
+	if err := json.Unmarshal([]byte(readFile(t, state)), &st); err != nil {
+		t.Fatal(err)
+	}
+	if !st.Onboarded || st.Theme != "light" || !st.Projects[e.app.Paths.TaskDir("boxed")].Trusted {
+		t.Errorf("state file: %+v", st)
+	}
+
+	// Claude Code writes its state; the task changes its copies and plants a
+	// symlink to the user's settings. Sessions in the same container see
+	// all that as it is.
+	if err := os.WriteFile(state, []byte(`{"numStartups":3,"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("changed by the task\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "settings.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(user, "settings.json"), filepath.Join(dir, "settings.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(user, "CLAUDE.md"), []byte("# my new rules\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	userSettings := readFile(t, filepath.Join(user, "settings.json"))
+	if err := e.app.ensureSandbox(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dir, "CLAUDE.md")); got != "changed by the task\n" {
+		t.Errorf("copies refreshed without a new container: %q", got)
+	}
+
+	// A new container: the copies are the user's again, the symlink is
+	// replaced (the user's file untouched), Claude Code's state is kept.
+	fd.label = "" // the container is gone
+	if err := e.app.ensureSandbox(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dir, "CLAUDE.md")); got != "# my new rules\n" {
+		t.Errorf("CLAUDE.md not refreshed: %q", got)
+	}
+	if fi, err := os.Lstat(filepath.Join(dir, "settings.json")); err != nil || !fi.Mode().IsRegular() {
+		t.Errorf("settings.json: %v, %v", fi, err)
+	}
+	if got := readFile(t, filepath.Join(user, "settings.json")); got != userSettings {
+		t.Errorf("the user's settings were written through: %s", got)
+	}
+	var st2 map[string]any
+	if err := json.Unmarshal([]byte(readFile(t, state)), &st2); err != nil {
+		t.Fatal(err)
+	}
+	if st2["numStartups"] != float64(3) || st2["theme"] != "dark" || st2["hasCompletedOnboarding"] != true {
+		t.Errorf("state after refresh: %v", st2)
+	}
+
+	// Closing the task with no transcripts removes the dir altogether.
+	e.app.removeSandbox(ctx, task)
+	if exists(dir) {
+		t.Errorf("Claude dir left: %s", dir)
+	}
+}
+
+// TestSandboxClaudeDirsApart: two tasks get different Claude dirs, and no
+// mount of either reaches the other's or the user's, with or without a
+// workspace.
+func TestSandboxClaudeDirsApart(t *testing.T) {
+	e, _ := sandboxEnv(t)
+	ctx := context.Background()
+	p := e.app.Paths
+	root := filepath.Dir(e.out)
+	a := e.task(t, "alpha", model.StatusActive, true)
+	b := e.task(t, "beta", model.StatusActive, true)
+	inside := func(dir, p string) bool {
+		rel, err := filepath.Rel(dir, p)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+	}
+	for _, paths := range []config.Paths{p, {
+		Workspace: filepath.Join(root, "ws"), Repos: p.Repos, Tasks: filepath.Join(root, "ws", "tasks"),
+		DB: filepath.Join(root, "ws", "data", "atelier.db"), StateDir: filepath.Join(root, "ws", "state"),
+		ConfigDir: filepath.Join(root, "ws", "config"),
+	}} {
+		e.app.Paths = paths
+		for _, d := range []string{paths.TaskDir("alpha"), paths.TaskDir("beta")} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if paths.ClaudeDir("alpha") == paths.ClaudeDir("beta") {
+			t.Fatal("two tasks share a Claude dir")
+		}
+		for _, c := range []struct {
+			task  *model.Task
+			other string
+		}{{a, "beta"}, {b, "alpha"}} {
+			spec, err := e.app.sandboxSpec(ctx, c.task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if spec.Env["CLAUDE_CONFIG_DIR"] != paths.ClaudeDir(c.task.Slug) {
+				t.Errorf("%s: CLAUDE_CONFIG_DIR = %s", c.task.Slug, spec.Env["CLAUDE_CONFIG_DIR"])
+			}
+			for _, m := range spec.Mounts {
+				for _, h := range []string{paths.ClaudeDir(c.other), os.Getenv("CLAUDE_CONFIG_DIR")} {
+					if inside(m.Src, h) || inside(h, m.Src) {
+						t.Errorf("%s: mount %s reaches %s", c.task.Slug, m.Src, h)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestSandboxResumesFromTaskClaudeDir: with the sandbox on, a past session
+// can be resumed when its transcript is in the task's Claude dir (where
+// claude --resume in the container looks), not in the user's.
+func TestSandboxResumesFromTaskClaudeDir(t *testing.T) {
+	e, _ := sandboxEnv(t)
+	task := e.task(t, "boxed", model.StatusActive, true)
+	dir := e.app.Paths.TaskDir("boxed")
+	cfg := e.app.claudeConfigDirFor(task)
+	if cfg != e.app.Paths.ClaudeDir("boxed") {
+		t.Fatalf("config dir for a sandboxed task: %s", cfg)
+	}
+	key := claudeProjectKey(dir)
+	own := model.Session{Name: "claude-1", TranscriptPath: filepath.Join(cfg, "projects", key, "a.jsonl")}
+	users := model.Session{Name: "claude-2", TranscriptPath: filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "projects", key, "b.jsonl")}
+	if err := resumableHere(cfg, dir, own); err != nil {
+		t.Errorf("own transcript: %v", err)
+	}
+	if err := resumableHere(cfg, dir, users); err == nil {
+		t.Error("a transcript in the user's dir counts as resumable in the task container")
 	}
 }
 

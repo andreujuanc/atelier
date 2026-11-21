@@ -165,7 +165,9 @@ func containerLandings(data []byte) []sandbox.Landing {
 // and writes the rows of its own task only, which it knows by database id:
 // a request names no task, and the session ids, Claude session ids,
 // working directories and ATL_TASK it carries can only select among that
-// task's sessions, never reach another task's (see db.scope).
+// task's sessions, never reach another task's (see db.scope). A transcript
+// path an event reports is recorded only if it lies in the task's own
+// Claude config dir (see transcriptIn).
 type TaskServer struct {
 	d    db
 	slug string
@@ -181,7 +183,7 @@ func OpenTaskServer(p config.Paths, id int64, slug string) (*TaskServer, error) 
 	if err != nil {
 		return nil, err
 	}
-	s := &TaskServer{d: db{st: st, p: p, scope: id}, slug: slug}
+	s := &TaskServer{d: db{st: st, p: p, scope: id, claudeDir: p.ClaudeDir(slug)}, slug: slug}
 	if gone, err := s.Gone(context.Background()); err != nil || gone {
 		st.Close()
 		if err == nil {

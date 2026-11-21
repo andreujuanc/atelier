@@ -240,6 +240,8 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `ATL_SANDBOX` | unset (off) — `docker` runs each task's sessions in the task's own container (see [Sandbox](#sandbox)) |
 | `ATL_SANDBOX_IMAGE` | `atelier` — the task container image, unless the task's project names one |
 | `ATL_SANDBOX_CONTEXT` | unset — what sandboxed sessions get in place of `ATL_CONTEXT` (same limit) |
+| `CLAUDE_CODE_OAUTH_TOKEN` | unset — with the sandbox on, the token (`claude setup-token`) that sandboxed sessions log in with |
+| `ANTHROPIC_API_KEY` | unset — with the sandbox on, an API key for sandboxed sessions instead of a token |
 
 With `ATL_WORKSPACE` set (it must be an existing directory, so a typo or a missing mount
 is an error rather than a new empty database), atelier keeps everything in it, and you can
@@ -280,9 +282,10 @@ atl (box)  ── docker exec ──▶  task container atl-<slug>-<hash>   one 
 
 A task container sees, at the same paths as `atl`: the task dir; the git database
 (`.git`) of each rw repo's clone, which the worktree needs; each ro repo, read-only;
-and Claude Code's config dir. It does not see the Docker socket, the SSH agent, other
-repos, other tasks, nor atelier's database, state dir (hook log, gate logs) or config dir
-(projects). It is created on the task's first session, reused by later ones (so what a
+and the task's own Claude Code config dir (see below). It does not see the Docker socket,
+the SSH agent, other repos, other tasks, your Claude Code config dir (login, settings,
+other sessions' transcripts), nor atelier's database, state dir (hook log, gate logs) or
+config dir (projects). It is created on the task's first session, reused by later ones (so what a
 session installs is there for the next), restarted after a reboot and removed by `atl
 done`/`atl cancel`. When the task's repos change (`atl add`), it is replaced the next time
 a session starts while no other session runs in it; `atl add` says so when sessions are
@@ -307,13 +310,58 @@ since, is replaced the next time `atl` starts a session in the task.
 The tmux window of a session runs `docker exec` into the container, so everything else
 (session states, crash recovery, resume, the picker) works as before.
 
+**Claude Code in the container.** Your Claude Code login stays where `atl` runs. Sessions
+in a task log in with a token instead:
+
+1. Run `claude setup-token` once (it needs a Pro, Max, Ultra, Team or Enterprise plan;
+   the token lasts a year) and copy the token it prints.
+2. Put it in the environment `atl` runs in as `CLAUDE_CODE_OAUTH_TOKEN`, e.g. in
+   `containerEnv` of the devcontainer, or `remoteEnv` from a variable of your host:
+   `"CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}"`. An API key in
+   `ANTHROPIC_API_KEY` works too (Claude Code prefers it when both are set).
+3. `atl doctor` says whether `atl` sees it. Without either, starting a sandboxed session
+   fails and says this.
+
+`atl` hands the token to each session by name: the tmux server gets it from `atl`'s own
+environment (read on its standard input, not from a command line) and `docker exec -e
+CLAUDE_CODE_OAUTH_TOKEN` passes it on. So it is on no command line, not in the
+container's stored configuration, and a new token reaches the next session without a new
+container. A token-authenticated session can only make model requests: claude.ai
+connectors and Remote Control are not available in it.
+
+Each task has its own Claude Code config dir, `<workspace>/run/claude/<hash>` (without a
+workspace, `$XDG_STATE_HOME/atelier-run/claude/<hash>`), mounted at the same path in that
+task's container only and set as `CLAUDE_CONFIG_DIR` there. It holds what Claude Code
+keeps: its state file, the task's transcripts (so `claude --resume` works across a new
+container), history. When a new container is created for the task, `atl` refreshes in it
+copies of your own setup from your config dir (`$CLAUDE_CONFIG_DIR`, else `~/.claude`),
+whichever of these exist: `settings.json` (without `apiKeyHelper` and the other settings
+that run a program for credentials), `CLAUDE.md`, `keybindings.json`, `skills/`,
+`agents/` and `commands/`. They are copies: a task can change its own, never yours, and a
+change of yours reaches a task with its next new container. `atl` also sets in the task's
+state file (`.claude.json`) that onboarding is done (with your theme), that the task dir is
+trusted and, with an API key, that the key is approved, so no first-start screen
+shows. Not carried over: your login (`.credentials.json`), your state file (account, your
+own MCP servers and their settings, project trust), transcripts and `projects/`, plugins,
+other files your settings may point to (hook or status line scripts in `~/.claude`), and
+claude.ai connectors. Add MCP servers a task needs to the repo's `.mcp.json` or install
+them in the session.
+
+A hook's `transcript_path` comes from the task: the gate records it only if it lies in the
+task's own Claude dir (symlinks resolved), and logs and ignores any other. `atl done` and
+`atl cancel` empty the task's Claude dir except its transcripts (`projects/`, symlinks and
+other special files in it removed), which `atl show` and `atl transcript` still read for
+closed tasks; delete the dir yourself when you no longer need them. Sessions started
+before this change kept their transcripts in your own config dir, which the container does
+not see: they cannot be resumed in it.
+
 **Tools.** Sessions can run whatever the image has and install more. As the image's
 ordinary user that is `npm`, `pip --user`, `go install` and the like; for system packages
 the task may be root in its own container: `docker exec -u 0 $ATL_CONTAINER apt-get
 install -y <pkg>`. The image is `ATL_SANDBOX_IMAGE`, or per project `image = "..."` in
 its toml. It needs `claude` and `sh`, and should have the user that runs `atl` (same
-name, uid and home directory, as the atelier image has), since Claude Code's config dir
-is used at its usual path.
+name, uid and home directory, as the atelier image has), so that what the task writes
+in the task dir and its Claude dir stays yours.
 
 **Docker.** `docker` and `docker compose` in a task talk to the task's *gate*, not to the
 daemon. The gate (`atl gate <slug>`, started by `atl` and stopped when the task closes;
@@ -336,8 +384,9 @@ volumes).
 
 What the sandbox does not do yet:
 
-- Claude Code's config dir is shared, so a task can read your login and other tasks'
-  transcripts.
+- The task can read Claude Code's token (or API key), which its sessions need to work:
+  what runs in the task can use it to make model requests on your account, also from
+  elsewhere, until you revoke it.
 - The git database of a task's rw repos is writable from the task (other branches, hooks
   and config of that clone included).
 - A task can swap a checked mount path for a symlink before the daemon mounts it.
@@ -349,10 +398,10 @@ What the sandbox does not do yet:
   fetching go through `atl push`/`atl fetch` (see Git below), and `atl pr` runs where
   `atl` runs.
 
-It needs `CLAUDE_CONFIG_DIR` to be set (the atelier image sets it), the workspace, repos
-and Claude config dir at the same paths for `atl` and the Docker daemon, and a workspace
-path short enough for the gate's socket (`<workspace>/run/<12 chars>/docker.sock`, at most
-107 bytes). `atl doctor` checks the setting, the daemon and the image.
+It needs a token for Claude Code (above), the workspace and repos at the same paths for
+`atl` and the Docker daemon, and a workspace path short enough for the gate's socket
+(`<workspace>/run/<12 chars>/docker.sock`, at most 107 bytes). `atl doctor` checks the
+setting, the daemon, the image and the token.
 
 **Session context.** A sandboxed session's start context has a built-in note on the
 sandbox (tools run here, what Docker allows, `atl push`/`atl fetch` for git).
@@ -480,7 +529,9 @@ not add its entry to task settings, and removes it on the next launch if an earl
 wrote it; your global status line shows instead. To see atelier's anyway, remove your
 global `statusLine`, or call `atl statusline` from your own status line script (pass it
 the same JSON on stdin; it prints one line, or nothing). A global file that is missing or
-can't be parsed counts as having no `statusLine`.
+can't be parsed counts as having no `statusLine`. In a sandboxed task your status line
+runs in the task's container, from the copy of your settings there (see
+[Sandbox](#sandbox)): a script it calls must exist in the container too.
 
 `atl statusline` only reads the database: it never creates or migrates it, and prints
 nothing while the database is at another schema version than the binary (the next `atl`
