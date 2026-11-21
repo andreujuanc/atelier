@@ -392,7 +392,10 @@ claude.ai connectors. Add MCP servers a task needs to the repo's `.mcp.json` or 
 them in the session.
 
 A hook's `transcript_path` comes from the task: the gate records it only if it lies in the
-task's own Claude dir (symlinks resolved), and logs and ignores any other. `atl done` and
+task's own Claude dir (symlinks resolved), and logs and ignores any other. Since the task
+can change what is there afterwards, `atl show`, `atl transcript` and the picker read a
+transcript only from the task's Claude dir or yours (where sessions with the sandbox off
+keep theirs), as described under **Files a task can write** below. `atl done` and
 `atl cancel` empty the task's Claude dir except its transcripts (`projects/`, symlinks and
 other special files in it removed), which `atl show` and `atl transcript` still read for
 closed tasks; delete the dir yourself when you no longer need them. Sessions started with
@@ -401,9 +404,10 @@ transcripts in your own config dir, which the container does not see: they canno
 resumed in it.
 
 **Files a task can write.** Where `atl` itself reads or writes files the task can write
-too (the task dir's `CLAUDE.md` and `.claude/`, the task's Claude dir), it follows no
-symlink, neither on the way nor at the end, reads only regular files and never waits on a
-pipe: what a task plants there cannot make `atl` read or write anything else. A
+too (the task dir's `CLAUDE.md` and `.claude/`, the task's Claude dir and transcripts, the
+files of a worktree the dirty check hashes), it follows no symlink, neither on the way nor
+at the end, reads only regular files and never waits on a pipe: what a task plants there
+cannot make `atl` read or write anything else. A
 `.claude/settings.json` that is a symlink or not a regular file is replaced without being
 read, and a `.claude` that is a symlink makes the session launch fail.
 

@@ -86,7 +86,7 @@ func (a *App) Show(ctx context.Context, ref string) (*TaskDetail, error) {
 		if s.TranscriptPath == "" {
 			continue
 		}
-		if info, err := readTranscriptInfo(s.TranscriptPath); err == nil {
+		if info, err := a.transcriptInfo(t, s.TranscriptPath); err == nil {
 			if title := info.Title; title != "" {
 				d.SessionTitles[s.ID] = title
 			} else if info.FirstPrompt != "" {

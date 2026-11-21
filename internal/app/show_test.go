@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
@@ -225,11 +226,20 @@ func TestTranscript(t *testing.T) {
 	if _, err := e.app.Transcript(ctx, "tr", 0, 0); err == nil || !strings.Contains(err.Error(), "no session with a recorded transcript") {
 		t.Fatalf("no sessions: %v", err)
 	}
-	fixture, err := filepath.Abs(filepath.Join("testdata", "transcript.jsonl"))
+	// Transcripts are read from a Claude config dir: the user's here.
+	proj := filepath.Join(config.ClaudeConfigDir(), "projects", "tr")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join("testdata", "transcript.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	short := filepath.Join(e.root, "short.jsonl")
+	fixture := filepath.Join(proj, "fixture.jsonl")
+	if err := os.WriteFile(fixture, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	short := filepath.Join(proj, "short.jsonl")
 	if err := os.WriteFile(short, []byte(`{"type":"user","message":{"content":"hi"}}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +254,7 @@ func TestTranscript(t *testing.T) {
 	s1 := mk(fixture, 0)
 	s2 := mk(short, time.Minute)
 	none := mk("", 2*time.Minute) // most recent, but no transcript: skipped by default
-	gone := mk("/nonexistent/x.jsonl", -time.Minute)
+	gone := mk(filepath.Join(proj, "gone.jsonl"), -time.Minute)
 
 	turns, err := e.app.Transcript(ctx, "tr", 0, 0)
 	if err != nil || len(turns) != 1 || turns[0].Text != "hi" {

@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // Turn is one condensed conversation turn of a Claude Code transcript.
@@ -51,7 +54,7 @@ func (a *App) Transcript(ctx context.Context, ref string, sessionID int64, tail 
 	case sess.TranscriptPath == "":
 		return nil, fmt.Errorf("session %d of task %s has no recorded transcript", sess.ID, t.Slug)
 	}
-	f, err := os.Open(sess.TranscriptPath)
+	f, err := a.openTranscript(t, sess.TranscriptPath)
 	if err != nil {
 		return nil, fmt.Errorf("session %d transcript: %w", sess.ID, err)
 	}
@@ -64,6 +67,54 @@ func (a *App) Transcript(ctx context.Context, ref string, sessionID int64, tail 
 		turns = turns[len(turns)-tail:]
 	}
 	return turns, nil
+}
+
+// openTranscript opens a session's recorded transcript for reading. The
+// path came from a hook, so from the task, and the gate's check of it when
+// it was recorded says nothing about what is there now: the task can swap
+// the file, or a directory on the way, for a symlink or a FIFO since. So it
+// is opened only in the task's own Claude dir or the user's (where sessions
+// run with the sandbox off keep theirs), through package nofollow: no
+// symlink is followed, only a regular file is read, and nothing blocks. A
+// path elsewhere is not read at all.
+func (a *App) openTranscript(t *model.Task, path string) (*os.File, error) {
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("%q is not an absolute path; not read", path)
+	}
+	path = filepath.Clean(path)
+	for _, root := range []string{a.Paths.ClaudeDir(t.Slug), config.ClaudeConfigDir()} {
+		if root == "" {
+			continue
+		}
+		real, err := filepath.EvalSymlinks(root) // the dir itself is not the task's to swap
+		if err != nil {
+			real = root
+		}
+		for _, form := range []string{root, real} {
+			rel, err := filepath.Rel(form, path)
+			if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				continue
+			}
+			d, err := nofollow.Open(real)
+			if err != nil {
+				return nil, err
+			}
+			defer d.Close()
+			return d.OpenFile(rel)
+		}
+	}
+	return nil, fmt.Errorf("%s is neither in the task's Claude dir nor in yours; not read", path)
+}
+
+// transcriptInfo is readTranscriptInfo of a session's transcript, opened
+// with openTranscript.
+func (a *App) transcriptInfo(t *model.Task, path string) (transcriptInfo, error) {
+	f, err := a.openTranscript(t, path)
+	if err != nil {
+		return transcriptInfo{}, err
+	}
+	defer f.Close()
+	return readTranscriptInfo(f)
 }
 
 // transcriptEntry is the part of a Claude Code transcript JSONL line used.
@@ -300,17 +351,12 @@ const (
 )
 
 // readTranscriptInfo reads a session's title and first/last user prompts
-// from its Claude Code transcript (see transcriptInfo). Large files are
+// from its Claude Code transcript f (see transcriptInfo). Large files are
 // scanned only in their first and last transcriptWindow bytes (the first
 // prompt is at the head, the last prompt and the newest titles near the
 // tail), so a title or prompt in the middle of a huge file may be missed.
-func readTranscriptInfo(path string) (transcriptInfo, error) {
+func readTranscriptInfo(f *os.File) (transcriptInfo, error) {
 	var info transcriptInfo
-	f, err := os.Open(path)
-	if err != nil {
-		return info, err
-	}
-	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
 		return info, err
