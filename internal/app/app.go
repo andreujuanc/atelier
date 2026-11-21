@@ -35,7 +35,7 @@ type App struct {
 	Sandbox *sandbox.Config
 	Docker  sandbox.Runner // nil → the docker CLI
 	// StartGate starts a task's gate if none runs; nil → sandbox.Start.
-	StartGate func(atlBin, slug, runDir, logPath string) error
+	StartGate func(atlBin, slug string, taskID int64, runDir, logPath string) error
 }
 
 // New resolves paths from the environment, opens the store and returns an

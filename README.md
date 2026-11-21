@@ -271,19 +271,38 @@ and is the only thing that talks to the Docker daemon directly.
 atl (box)  ── docker exec ──▶  task container atl-<slug>-<hash>   one per task
    │                              claude, your tools, the task dir
    └─ atl gate <slug>  ◀── /run/atl/docker.sock ── docker / docker compose in the task
-          │            ◀── /run/atl/atl.sock ───── atl push / atl fetch in the task
+          │  │         ◀── /run/atl/atl.sock ───── atl hook / statusline / note / notes /
+          │  │                                     push / fetch in the task
+          │  └──▶ atelier's database, hook log     (this task's rows only)
           ▼
      Docker daemon
 ```
 
 A task container sees, at the same paths as `atl`: the task dir; the git database
 (`.git`) of each rw repo's clone, which the worktree needs; each ro repo, read-only;
-Claude Code's config dir; and atelier's database, hook log and project config, which the
-hooks, the status line and `atl note` use. It does not see the Docker socket, the SSH
-agent, other repos or other tasks. It is created on the task's first session, reused by
-later ones (so what a session installs is there for the next), restarted after a reboot
-and removed by `atl done`/`atl cancel`. When the task's repos change (`atl add`), it is
-replaced the next time a session starts while no other session runs in it.
+and Claude Code's config dir. It does not see the Docker socket, the SSH agent, other
+repos, other tasks, nor atelier's database, state dir (hook log, gate logs) or config dir
+(projects). It is created on the task's first session, reused by later ones (so what a
+session installs is there for the next), restarted after a reboot and removed by `atl
+done`/`atl cancel`. When the task's repos change (`atl add`), it is replaced the next time
+a session starts while no other session runs in it; `atl add` says so when sessions are
+running in it now, since those do not see the new repo (a running container cannot get
+another mount): close them, then start or resume a session.
+
+**atl in the container.** The hooks, the status line, `atl note` and `atl notes` work in a
+task container without the database: they send their input to the task's gate on
+`/run/atl/atl.sock`, and the gate answers them itself, from the database where `atl` runs,
+with the same code as outside (same session states, read-only guard, start context and
+output). The gate knows its task by database id, set when it starts, and reads and writes
+that task's rows only: the session ids, Claude session ids, working directory and
+`ATL_TASK` a hook brings can only pick among this task's sessions, a Claude session id
+that another task's session has is refused, and the start context and status line are
+always this task's. Hook errors go to `hook.log` where `atl` runs, as before. A hook whose
+gate cannot be reached fails open with the error on stderr (an oversized `PreToolUse`
+input is still refused). For `atl notes` and `atl note` the task must be the container's
+own (`$ATL_TASK`); every other `atl` command says in one line that it does not work in a
+task container. A gate started by an older `atl` binary, or for a task that was deleted
+since, is replaced the next time `atl` starts a session in the task.
 
 The tmux window of a session runs `docker exec` into the container, so everything else
 (session states, crash recovery, resume, the picker) works as before.
@@ -318,7 +337,7 @@ volumes).
 What the sandbox does not do yet:
 
 - Claude Code's config dir is shared, so a task can read your login and other tasks'
-  transcripts, and atelier's database is writable from a task.
+  transcripts.
 - The git database of a task's rw repos is writable from the task (other branches, hooks
   and config of that clone included).
 - A task can swap a checked mount path for a symlink before the daemon mounts it.
@@ -351,12 +370,17 @@ There are no push or fetch credentials in a task (no SSH agent, no `~/.ssh`), so
 `git push`, `git fetch` and `gh` fail there. Instead a session runs `atl push` (when you
 tell it to push) and `atl fetch` (to rebase on fresh remote branches). In the container
 these open nothing: they send a request to the task's gate on `/run/atl/atl.sock`, and the
-gate runs `atl push <slug>` or `atl fetch <slug>` where `atl` runs, with your SSH agent,
+gate runs `atl push` or `atl fetch` for its task where `atl` runs (naming the task by
+database id and exact slug, so no other task can be taken for it), with your SSH agent,
 `~/.ssh/config` and git credentials, and passes the output and exit status back. The
 request can only name the operation, one of the task's repos and `--force`; the task is
 always the gate's own. So an agent can push its own branch, and cannot push `main`, tags
 or another task's branch. Requests and refusals are in the gate log; a push may take its
 time (up to 10 minutes), e.g. while your SSH key waits for a touch.
+
+A push asked from a task runs without a terminal, so an SSH key that needs a PIN or a
+passphrase typed at a prompt fails there (push from your own shell then); a key that only
+needs a touch works, though this has not been tried with a hardware key yet.
 
 The push and fetch run git in a repo whose config and hooks the task can write, so git
 runs with hooks off and the settings that make it run programs (fsmonitor, credential
@@ -418,7 +442,8 @@ kept. Your global `~/.claude/settings.json` is never touched (only read, for its
 crash recovery) and record each session's transcript path, and the PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
 on paths inside read-only repos, and inside the original clone (`$ATL_REPOS/<name>`) of the
 task's rw repos, whose edits belong in the worktree. Hook failures never block Claude (except the
-read-only guard) and are logged to `hook.log`. The assistant's `AssistantGuard` hook
+read-only guard) and are logged to `hook.log` (in a sandboxed task the gate runs them, see
+[Sandbox](#sandbox)). The assistant's `AssistantGuard` hook
 (see above) fails closed: input it cannot inspect is refused.
 
 On SessionStart (startup, resume, `/clear`, compaction) inside a task, `atl hook
@@ -459,7 +484,8 @@ can't be parsed counts as having no `statusLine`.
 
 `atl statusline` only reads the database: it never creates or migrates it, and prints
 nothing while the database is at another schema version than the binary (the next `atl`
-command or hook migrates it).
+command or hook migrates it). In a sandboxed task it asks the task's gate, which shows
+that task only.
 
 ## Tests
 

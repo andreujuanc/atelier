@@ -242,6 +242,23 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 		if err := a.runSetup(ctx, t, func(x model.TaskRepo) bool { return x.Name == name }); err != nil {
 			a.warnf("setup for %s in task %s failed (repo kept): %v", name, t.Slug, err)
 		}
+	}
+	if a.sandboxedSessionsRun(ctx, t) {
+		// A running container cannot get a new mount: neither the repo (ro)
+		// nor its clone's git database (rw) is in there.
+		msg := fmt.Sprintf("added %s (%s) to %s", name, mode, t.Slug)
+		if upgrade {
+			msg = fmt.Sprintf("upgraded %s to rw in %s", name, t.Slug)
+		}
+		if mode == model.ModeRW {
+			msg += ": worktree at " + wt
+		}
+		fmt.Fprintln(a.out(), msg)
+		a.warnf("the sessions running now in %s do not see %s: their container was made before; close them, then start or resume a session to get a container that does",
+			t.Slug, name)
+		return t, nil
+	}
+	if mode == model.ModeRW {
 		if upgrade {
 			fmt.Fprintf(a.out(), "upgraded %s to rw in %s: worktree at %s; running sessions can already see it\n", name, t.Slug, wt)
 		} else {

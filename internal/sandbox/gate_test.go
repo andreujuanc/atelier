@@ -387,7 +387,7 @@ func TestServeOneGatePerRunDir(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Serve(ctx, g, &Control{Slug: "t1", Atl: "/bin/false"}, runDir) }()
+	go func() { done <- Serve(ctx, g, &Control{Slug: "t1", TaskID: 1, Atl: "/bin/false"}, runDir) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for !Alive(runDir) {
 		if time.Now().After(deadline) {

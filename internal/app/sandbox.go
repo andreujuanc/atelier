@@ -44,27 +44,15 @@ func outsideSandbox(what string) error {
 	return nil
 }
 
-// pathsEnv is the environment that makes atl in the task container resolve
-// the same paths as this one.
-func (a *App) pathsEnv() map[string]string {
-	env := map[string]string{"ATL_REPOS": a.Paths.Repos, "ATL_TASKS": a.Paths.Tasks}
-	if a.Paths.Workspace != "" {
-		env["ATL_WORKSPACE"] = a.Paths.Workspace
-		return env
-	}
-	env["XDG_DATA_HOME"] = filepath.Dir(filepath.Dir(a.Paths.DB))
-	env["XDG_STATE_HOME"] = filepath.Dir(a.Paths.StateDir)
-	env["XDG_CONFIG_HOME"] = filepath.Dir(a.Paths.ConfigDir)
-	return env
-}
-
 // sandboxSpec describes the task's container. It sees, at the same paths as
 // here: the task dir; the git database of each rw repo's canonical clone
 // (a worktree keeps its objects and refs there) and each ro repo, read-only;
-// Claude Code's config dir (login, settings, transcripts); and what the atl
-// hooks need (database, hook log, project config). The run dir, with the
-// gate's sockets and the atl binary, is at sandbox.RunMount. It does not see
-// the host's Docker socket, the SSH agent, other repos or other tasks.
+// and Claude Code's config dir (login, settings, transcripts). The run dir,
+// with the gate's sockets and the atl binary, is at sandbox.RunMount. It
+// does not see the host's Docker socket, the SSH agent, other repos, other
+// tasks, nor atelier's database, state or config dirs: atl in there (hooks,
+// status line, notes, push, fetch) asks the task's gate, which answers for
+// this task only (see hook.TaskServer).
 func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -90,9 +78,6 @@ func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, err
 			sandbox.InEnv:     id,
 			"ATL_CONTAINER":   sandbox.ContainerName(id),
 		},
-	}
-	for k, v := range a.pathsEnv() {
-		spec.Env[k] = v
 	}
 	for _, k := range []string{"LANG", "LC_ALL", "TZ"} {
 		if v := os.Getenv(k); v != "" {
@@ -145,14 +130,6 @@ func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, err
 	}
 	same(claude, false)
 	spec.Env["CLAUDE_CONFIG_DIR"] = claude
-	if err := os.MkdirAll(a.Paths.StateDir, 0o755); err != nil {
-		return sandbox.Spec{}, err
-	}
-	same(filepath.Dir(a.Paths.DB), false)
-	same(a.Paths.StateDir, false)
-	if fileExists(a.Paths.ConfigDir) {
-		same(a.Paths.ConfigDir, true)
-	}
 	spec.Mounts = append(spec.Mounts, sandbox.Mount{Src: a.Paths.RunDir(t.Slug), Dst: sandbox.RunMount, RO: true})
 	return spec, nil
 }
@@ -197,7 +174,7 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) error {
 	if startGate == nil {
 		startGate = sandbox.Start
 	}
-	if err := startGate(a.AtlBin, t.Slug, runDir, a.gateLog(t)); err != nil {
+	if err := startGate(a.AtlBin, t.Slug, t.ID, runDir, a.gateLog(t)); err != nil {
 		return err
 	}
 	spec, err := a.sandboxSpec(ctx, t)
@@ -216,6 +193,21 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) error {
 		a.warnf("task %s: its container predates a change (repos, image or atl paths); it is replaced once the task has no running sessions", t.Slug)
 	}
 	return nil
+}
+
+// sandboxedSessionsRun reports whether the sandbox is on and the task's
+// container exists with live sessions in it: a change to the task's repos
+// does not reach them (mounts cannot be added to a running container).
+func (a *App) sandboxedSessionsRun(ctx context.Context, t *model.Task) bool {
+	if a.Sandbox == nil {
+		return false
+	}
+	if live, err := a.hasLiveWindow(ctx, t, tmux.SessionName(t.Slug)); err != nil || !live {
+		return false
+	}
+	_, err := a.docker()(ctx, "inspect", "--type", "container", "--format", "{{.State.Running}}",
+		sandbox.ContainerName(a.sandboxID(t)))
+	return err == nil
 }
 
 func (a *App) gateLog(t *model.Task) string {

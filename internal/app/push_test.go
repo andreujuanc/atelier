@@ -243,7 +243,7 @@ func TestFetch(t *testing.T) {
 	apiTip := e.pushOrigin(t, "api", "new-api")
 	docsTip := e.pushOrigin(t, "docs", "new-docs")
 
-	res, err := e.app.Fetch(ctx, task.Slug, "docs", nil)
+	res, err := e.app.Fetch(ctx, task.Slug, FetchOpts{Repo: "docs"}, nil)
 	if err != nil || len(res) != 1 || res[0].Repo != "docs" || res[0].Err != nil {
 		t.Fatalf("fetch --repo docs: %+v, %v", res, err)
 	}
@@ -254,7 +254,7 @@ func TestFetch(t *testing.T) {
 		t.Error("api was fetched with --repo docs")
 	}
 
-	res, err = e.app.Fetch(ctx, task.Slug, "", nil)
+	res, err = e.app.Fetch(ctx, task.Slug, FetchOpts{}, nil)
 	if err != nil || len(res) != 2 || res[0].Err != nil || res[1].Err != nil {
 		t.Fatalf("fetch: %+v, %v", res, err)
 	}
@@ -281,7 +281,7 @@ func TestFetch(t *testing.T) {
 	git(t, e.canonical("docs"), "remote", "set-url", "origin", decoy)
 	docsTip = e.pushOrigin(t, "docs", "newer-docs")
 	var out bytes.Buffer
-	res, err = e.app.Fetch(ctx, task.Slug, "docs", &out)
+	res, err = e.app.Fetch(ctx, task.Slug, FetchOpts{Repo: "docs"}, &out)
 	if err != nil || len(res) != 1 || res[0].Err != nil {
 		t.Fatalf("fetch after set-url: %+v, %v\n%s", res, err, out.String())
 	}
@@ -292,7 +292,7 @@ func TestFetch(t *testing.T) {
 		t.Errorf("no warning:\n%s", out.String())
 	}
 	git(t, e.canonical("docs"), "config", "url."+decoy+".insteadOf", e.origin("docs"))
-	res, err = e.app.Fetch(ctx, task.Slug, "docs", &out)
+	res, err = e.app.Fetch(ctx, task.Slug, FetchOpts{Repo: "docs"}, &out)
 	if err != nil || len(res) != 1 || res[0].Err == nil || !strings.Contains(res[0].Err.Error(), "url."+decoy+".insteadof") {
 		t.Errorf("fetch with an insteadOf rule in the repo: %+v, %v", res, err)
 	}

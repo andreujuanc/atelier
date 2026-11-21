@@ -45,6 +45,7 @@ type Gate struct {
 	Upstream   string      // host daemon socket
 	Log        *log.Logger // refusals (and every call if Verbose); nil: discarded
 	Verbose    bool
+	Ident      string // which task and atl binary this gate serves (see Ident); Serve writes it to the run dir
 
 	once   sync.Once
 	client *http.Client

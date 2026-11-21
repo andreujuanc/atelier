@@ -89,6 +89,31 @@ func (s *Store) GetSessionByClaudeID(ctx context.Context, cid string) (*model.Se
 		"claude_session_id = ? ORDER BY id DESC LIMIT 1", cid)
 }
 
+// GetSessionByClaudeIDInTask is GetSessionByClaudeID among task taskID's
+// sessions only: rows of other tasks never match.
+func (s *Store) GetSessionByClaudeIDInTask(ctx context.Context, cid string, taskID int64) (*model.Session, error) {
+	if cid == "" {
+		return nil, fmt.Errorf("session with empty claude id: %w", ErrNotFound)
+	}
+	return s.getSession(ctx, fmt.Sprintf("claude id %q in task %d", cid, taskID),
+		"claude_session_id = ? AND task_id = ? ORDER BY id DESC LIMIT 1", cid, taskID)
+}
+
+// ClaudeIDInOtherTask reports whether a session of a task other than taskID
+// has Claude session id cid ("" never matches).
+func (s *Store) ClaudeIDInOtherTask(ctx context.Context, cid string, taskID int64) (bool, error) {
+	if cid == "" {
+		return false, nil
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM sessions WHERE claude_session_id = ? AND task_id != ? LIMIT 1`,
+		cid, taskID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // ListSessions returns a task's sessions ordered by created_at asc.
 func (s *Store) ListSessions(ctx context.Context, taskID int64) ([]model.Session, error) {
 	return s.querySessions(ctx, `SELECT `+sessionCols+` FROM sessions WHERE task_id = ?

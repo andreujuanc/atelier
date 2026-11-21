@@ -9,6 +9,7 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/store"
 )
 
 // RemoteResult is the outcome of Push or Fetch for one repo of a task.
@@ -19,8 +20,15 @@ type RemoteResult struct {
 
 // PushOpts selects what Push does.
 type PushOpts struct {
-	Repo  string // only this repo of the task; "" → every rw repo
-	Force bool   // --force-with-lease
+	Repo   string // only this repo of the task; "" → every rw repo
+	Force  bool   // --force-with-lease
+	TaskID int64  // if not 0: the task is the one with this id, and ref must be its exact slug
+}
+
+// FetchOpts selects what Fetch does.
+type FetchOpts struct {
+	Repo   string // only this repo of the task; "" → every repo
+	TaskID int64  // as in PushOpts
 }
 
 // Push pushes the task's branch of each rw repo (or only o.Repo) to the
@@ -28,7 +36,7 @@ type PushOpts struct {
 // any other branch (see gitx.PushBranch). git's output goes to out. A
 // failure in one repo does not stop the others; it is in that repo's result.
 func (a *App) Push(ctx context.Context, ref string, o PushOpts, out io.Writer) ([]RemoteResult, error) {
-	t, repos, err := a.remoteRepos(ctx, ref, o.Repo)
+	t, repos, err := a.remoteRepos(ctx, ref, o.TaskID, o.Repo)
 	if err != nil {
 		return nil, err
 	}
@@ -67,10 +75,10 @@ func (a *App) Push(ctx context.Context, ref string, o PushOpts, out io.Writer) (
 }
 
 // Fetch runs `git fetch origin` from the pinned origin (see
-// gitx.FetchOrigin) for each repo of the task, rw and ro, or only for repo.
-// git's output goes to out.
-func (a *App) Fetch(ctx context.Context, ref, repo string, out io.Writer) ([]RemoteResult, error) {
-	t, repos, err := a.remoteRepos(ctx, ref, repo)
+// gitx.FetchOrigin) for each repo of the task, rw and ro, or only for
+// o.Repo. git's output goes to out.
+func (a *App) Fetch(ctx context.Context, ref string, o FetchOpts, out io.Writer) ([]RemoteResult, error) {
+	t, repos, err := a.remoteRepos(ctx, ref, o.TaskID, o.Repo)
 	if err != nil {
 		return nil, err
 	}
@@ -94,8 +102,20 @@ func (a *App) Fetch(ctx context.Context, ref, repo string, out io.Writer) ([]Rem
 }
 
 // remoteRepos resolves the task and its repos, or only repo if it is not "".
-func (a *App) remoteRepos(ctx context.Context, ref, repo string) (*model.Task, []model.TaskRepo, error) {
-	t, err := a.Store.ResolveTask(ctx, ref)
+// With an id, the task is that one and ref must be its slug exactly (a
+// task's gate names its task so: no prefix or id-as-slug matching, and a
+// deleted task never turns into another).
+func (a *App) remoteRepos(ctx context.Context, ref string, id int64, repo string) (*model.Task, []model.TaskRepo, error) {
+	var t *model.Task
+	var err error
+	if id != 0 {
+		t, err = a.Store.GetTask(ctx, id)
+		if errors.Is(err, store.ErrNotFound) || (err == nil && t.Slug != ref) {
+			return nil, nil, fmt.Errorf("task %d is not %s (any more)", id, ref)
+		}
+	} else {
+		t, err = a.Store.ResolveTask(ctx, ref)
+	}
 	if err != nil {
 		return nil, nil, err
 	}

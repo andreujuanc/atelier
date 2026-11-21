@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"encoding/json"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -62,7 +64,7 @@ func TestPushInsideTaskContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	go (&sandbox.Control{Slug: "boxed", Atl: stand}).Serve(l)
+	go (&sandbox.Control{Slug: "boxed", TaskID: 4, Atl: stand}).Serve(l)
 	t.Setenv(sandbox.InEnv, "boxed-abc123")
 	t.Setenv("ATL_TASK", "boxed")
 	t.Setenv("ATL_CONTROL_SOCK", sock)
@@ -84,7 +86,7 @@ func TestPushInsideTaskContainer(t *testing.T) {
 		t.Errorf("push --repo ../x: %d %q", code, out)
 	}
 	argv, _ := os.ReadFile(filepath.Join(dir, "argv"))
-	if want := "push boxed --repo api --force\npush boxed\nfetch boxed\n"; string(argv) != want {
+	if want := "push --task-id 4 boxed --repo api --force\npush --task-id 4 boxed\nfetch --task-id 4 boxed\n"; string(argv) != want {
 		t.Errorf("the gate ran:\n%s\nwant:\n%s", argv, want)
 	}
 	if _, err := os.Stat(filepath.Join(root, "data")); !os.IsNotExist(err) {
@@ -95,5 +97,53 @@ func TestPushInsideTaskContainer(t *testing.T) {
 	t.Setenv("ATL_CONTROL_SOCK", filepath.Join(dir, "none.sock"))
 	if code, _, errs := atl(t, "push"); code != 1 || !strings.Contains(errs, "gate") {
 		t.Errorf("push without a gate: %d %s", code, errs)
+	}
+}
+
+// TestPushByTaskID: with --task-id (how the gate names its task) push and
+// fetch act only on the task with that id and that exact slug: not on a
+// prefix, a slug made of digits or another task.
+func TestPushByTaskID(t *testing.T) {
+	root := setup(t)
+	t.Setenv("ATL_TASK", "")
+	for _, title := range []string{"ship it", "ship it too", "7"} {
+		if code, _, errs := atl(t, "new", title, "--repo", "api", "--no-fetch"); code != 0 {
+			t.Fatalf("new %s: %d %s", title, code, errs)
+		}
+	}
+	ids := map[string]string{}
+	_, out, _ := atl(t, "ls", "--json")
+	var tasks []struct {
+		ID   int64  `json:"id"`
+		Slug string `json:"slug"`
+	}
+	if err := json.Unmarshal([]byte(out), &tasks); err != nil {
+		t.Fatal(err)
+	}
+	for _, tk := range tasks {
+		ids[tk.Slug] = strconv.FormatInt(tk.ID, 10)
+	}
+	git(t, filepath.Join(root, "tasks", "ship-it", "api"), "commit", "-q", "--allow-empty", "-m", "work")
+
+	if code, out, errs := atl(t, "push", "--task-id", ids["ship-it"], "ship-it"); code != 0 || out != "api\tpushed\n" {
+		t.Fatalf("push by id: %d %q %s", code, out, errs)
+	}
+	if code, out, errs := atl(t, "fetch", "--task-id", ids["ship-it"], "ship-it"); code != 0 || out != "api\tfetched\n" {
+		t.Fatalf("fetch by id: %d %q %s", code, out, errs)
+	}
+	for _, c := range [][]string{
+		{ids["ship-it"], "ship"},         // a prefix of its slug
+		{ids["ship-it"], "ship-it-too"},  // another task's slug
+		{ids["ship-it-too"], "ship-it"},  // another task's id
+		{ids["ship-it"], ids["ship-it"]}, // the id as the slug
+		{"999", "ship-it"},               // no such id
+		{ids["7"], ids["ship-it"]},       // a slug that is the other's id
+	} {
+		if code, out, errs := atl(t, "push", "--task-id", c[0], c[1]); code != 1 || out != "" || !strings.Contains(errs, "any more") {
+			t.Errorf("push --task-id %s %s: %d %q %s", c[0], c[1], code, out, errs)
+		}
+	}
+	if _, ok := ids["7"]; !ok {
+		t.Fatalf("no task with slug 7: %v", ids)
 	}
 }
