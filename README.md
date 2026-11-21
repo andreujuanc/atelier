@@ -514,15 +514,21 @@ mode), and it is done three ways:
   touched without a change reads as clean; one whose content is converted on checkout
   (a filter, `eol`, `text`, `working-tree-encoding`) and whose stat data changed reads as
   dirty, which is the safe answer.
-- What cannot be avoided is checked right before and refused: `atl diff` (it reads changed
+- What cannot be avoided is checked right before, reading the config with the same
+  command-line settings as the command, and refused: `atl diff` (it reads changed
   files through the filters) and the checkout of `atl new`/`atl add` refuse while the repo's
-  own config (its `.git/config`, a worktree's `config.worktree`, or a file they include)
-  defines a filter program; the exact filter commands `git lfs install` writes are let
-  through. With git-lfs on, the checkout may download, so it is also refused while the
+  own config (its `.git/config` or a worktree's `config.worktree`) defines a filter
+  program; the exact filter commands `git lfs install` writes are let through. With
+  git-lfs on, the checkout may download, so it is also refused while the
   repo's own config has git-lfs settings (other than `lfs.repositoryformatversion` and
   `lfs.<url>.access`/`locksverify`), `http.*` settings or URL rewrite rules, or its origin
   is not the pinned one. Push, fetch and the remote check are refused while it has
   `url.<base>.insteadOf`/`pushInsteadOf` rules, or `http.*` settings for an https origin.
+  All of these (`atl diff`, the checkout, push, fetch and the remote check) are also
+  refused while the repo's own config includes another file (`include.path`, or
+  `includeIf.<condition>.path` whatever its condition): what a conditional include brings
+  in can depend on what differs between the check and the command (the remote the
+  command defines, the branch, the git dir).
 
 A refusal names the repo, the setting and its value, prints a warning, and is logged in
 `refused.log` in the state dir (next to `hook.log`, which no task container sees). `atl

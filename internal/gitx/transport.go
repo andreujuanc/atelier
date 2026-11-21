@@ -190,15 +190,13 @@ func (t *transport) lsRemote(flags ...string) []string {
 //
 // -c cannot remove url.<base>.insteadOf or pushInsteadOf rules, which apply
 // to these URLs as to any, nor http.<url>.* settings; so it is refused while
-// the repo's own config has a rule, or http.* settings and origin is http(s)
-// (see Hazards). The user's own rules (system, global) stay and apply once:
-// the pin is what the config said, before them.
+// the repo's own config has a rule, or http.* settings and origin is http(s),
+// or an include (see Hazards). The check reads the config with the same -c
+// options as the command. The user's own rules (system, global) stay and
+// apply once: the pin is what the config said, before them.
 func newTransport(ctx context.Context, dir string, origin Origin, push bool) (*transport, error) {
 	if !origin.Valid() {
 		return nil, errors.New("no origin URL")
-	}
-	if err := checkHazards(ctx, dir, opTransport, &origin); err != nil {
-		return nil, err
 	}
 	user := userConfig(ctx, dir)
 	t := &transport{}
@@ -231,6 +229,9 @@ func newTransport(ctx context.Context, dir string, origin Origin, push bool) (*t
 	t.args = transportArgs(push, t.local, user)
 	for _, s := range kv {
 		t.args = append(t.args, "-c", "remote."+t.name+"."+s)
+	}
+	if err := checkHazards(ctx, dir, opTransport, &origin, t.args); err != nil {
+		return nil, err
 	}
 	return t, nil
 }
