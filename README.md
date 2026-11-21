@@ -541,6 +541,16 @@ mode), and it is done three ways:
   in can depend on what differs between the check and the command (the remote the
   command defines, the branch, the git dir).
 
+The task can also replace its worktree, `<task dir>/<repo>`, with a symlink or point the
+worktree's `.git` file into another repo. So before `atl` runs git or a project script in
+a worktree (`atl push`, `atl fetch`, `atl pr`, `atl diff`, `atl show`, the dirty marks, the
+teardown and worktree removal of `atl done`/`atl cancel`), it checks that the path is a
+directory, not a symlink, and a worktree of that repo's canonical clone; if not, the
+command fails for that repo naming the path (the dirty marks skip it), and `atl
+done`/`atl cancel` refuse, or with `--force` close the task and leave the path alone. Push,
+fetch and the remote check of `atl pr` then run in the canonical clone itself, which the
+task cannot swap.
+
 A refusal names the repo, the setting and its value, prints a warning, and is logged in
 `refused.log` in the state dir (next to `hook.log`, which no task container sees). `atl
 doctor` lists, per repo, the settings it would refuse on now. Settings `atl` overrides

@@ -112,11 +112,17 @@ func (a *App) repoDetail(ctx context.Context, t *model.Task, r model.TaskRepo) R
 		rd.Pushed = pushed
 		note(err)
 	}
-	if _, err := os.Stat(rd.Path); errors.Is(err, os.ErrNotExist) {
+	_, err := a.repoDir(ctx, t, r)
+	if err == nil && r.Mode == model.ModeRO {
+		_, err = os.Stat(rd.Path)
+	}
+	if errors.Is(err, os.ErrNotExist) {
 		rd.Err = "missing"
 		return rd
+	} else if err != nil {
+		rd.Err = firstLineOf(err.Error())
+		return rd
 	}
-	var err error
 	rd.Dirty, err = gitx.IsDirty(ctx, rd.Path)
 	note(err)
 	if sha, subject, when, err := gitx.LastCommit(ctx, rd.Path); err == nil {

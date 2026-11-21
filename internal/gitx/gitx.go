@@ -302,6 +302,39 @@ func IsRepo(path string) bool {
 	return err == nil && top != "" && samePath(top, path)
 }
 
+// CheckWorktree returns nil if path is a worktree of the canonical clone
+// repo: a directory (not a symlink to one) that is the top of a work tree
+// whose common git dir is repo's .git. A sandboxed task can replace its
+// worktree with a symlink, or point the worktree's .git file at another
+// repo's git dir, to make git that atl runs there (with the user's
+// credentials, for a push or fetch) act on another repo. A missing path is
+// an error that satisfies errors.Is(err, fs.ErrNotExist).
+func CheckWorktree(ctx context.Context, path, repo string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		what := "not a directory"
+		if fi.Mode()&os.ModeSymlink != 0 {
+			what = "a symlink"
+		}
+		return fmt.Errorf("%s is %s, not a worktree of %s", path, what, repo)
+	}
+	out, err := run(ctx, path, "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel")
+	if err != nil {
+		return fmt.Errorf("%s is not a worktree of %s: %w", path, repo, err)
+	}
+	common, top, _ := strings.Cut(out, "\n")
+	if !samePath(common, filepath.Join(repo, ".git")) {
+		return fmt.Errorf("%s is not a worktree of %s: its git dir is in %s", path, repo, common)
+	}
+	if !samePath(top, path) {
+		return fmt.Errorf("%s is not a worktree of %s: its work tree is %s", path, repo, top)
+	}
+	return nil
+}
+
 // CurrentBranch returns the checked-out branch name, or "" if HEAD is detached.
 func CurrentBranch(ctx context.Context, repo string) (string, error) {
 	args := []string{"symbolic-ref", "--quiet", "--short", "HEAD"}

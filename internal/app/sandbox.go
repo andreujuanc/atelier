@@ -93,7 +93,10 @@ func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, err
 	// who they are goes in, so that commits made in the task are theirs.
 	gitDir := dir
 	for _, r := range t.Repos {
-		if wt := a.Paths.WorktreePath(t.Slug, r.Name); r.Mode == model.ModeRW && fileExists(wt) {
+		if r.Mode != model.ModeRW {
+			continue
+		}
+		if wt, err := a.checkWorktree(ctx, t, r); err == nil {
 			gitDir = wt // a repo may set its own identity
 			break
 		}
