@@ -51,6 +51,21 @@ type Gate struct {
 	client *http.Client
 	proxy  *httputil.ReverseProxy
 	execs  sync.Map // exec IDs created through this gate
+
+	// volumes orders the task's requests that name volumes. A volume is
+	// the one object the gate forwards by name (its name is its ID), and
+	// the name stays free for anyone once it is deleted: the daemon
+	// creates a volume a container create names if none exists, without
+	// the task's label, and another task may create one of that name. So
+	// a request that checks a volume holds the read lock from its check
+	// until the daemon has answered it (a container create, a volume
+	// inspect), and a volume delete holds the write lock for its own
+	// check and forward: no delete runs in between. Containers and
+	// networks are forwarded by full IDs, which are never reused, so a
+	// delete between their check and their forward only makes the
+	// forward fail, and the requests that stream (attach, exec start,
+	// logs, events, builds, pulls) hold nothing.
+	volumes sync.RWMutex
 }
 
 type gateHandler func(g *Gate, w http.ResponseWriter, r *http.Request, m []string)
@@ -455,7 +470,16 @@ func gateNetwork(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
 	g.reply(w, r, status, out)
 }
 
+// gateVolume inspects or deletes a volume of the task's: a delete holds
+// the volumes lock exclusively (see Gate.volumes).
 func gateVolume(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
+	if r.Method == "DELETE" {
+		g.volumes.Lock()
+		defer g.volumes.Unlock()
+	} else {
+		g.volumes.RLock()
+		defer g.volumes.RUnlock()
+	}
 	if name, ok := g.checkOwned(w, r, "volumes", m[1]); ok {
 		setPath(r, "/volumes/"+name)
 		g.forward(w, r, nil)
@@ -635,12 +659,18 @@ func gateNetworkConnect(g *Gate, w http.ResponseWriter, r *http.Request, m []str
 	g.forward(w, r, body)
 }
 
+// gateContainerCreate checks and labels a container create. From the
+// check of the volumes it names (or its creation of a missing one) until
+// the daemon has created the container, no volume delete of the task's
+// runs (see Gate.volumes); the body is read before that.
 func gateContainerCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 	body, err := decodeBody(r)
 	if err != nil {
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	g.volumes.RLock()
+	defer g.volumes.RUnlock()
 	if err := g.checkCreate(body); err != nil {
 		g.deny(w, r, http.StatusForbidden, err.Error())
 		return

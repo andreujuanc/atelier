@@ -454,7 +454,11 @@ log in `gate-<slug>.log` next to `hook.log`) forwards only what a task may do:
   the path or in the request: a network mode, volumes from, endpoint settings, network
   connect) is checked and forwarded by the full ID the check found, so a name that comes
   to mean something else by the time Docker reads it (Docker also takes a unique ID
-  prefix for a name) never reaches another object; volumes are named exactly;
+  prefix for a name) never reaches another object; volumes are named exactly, and a volume
+  delete of the task waits while another of its requests that names a volume (a container
+  create, an inspect) is between its check and Docker's answer, so Docker never makes the
+  container a fresh volume of that name without the label, and a delete never reaches
+  another task's volume that took the name in between;
 - bind mounts must come from the task dir (symlinks resolved); a mount of
   `/var/run/docker.sock` becomes a mount of the gate's socket, so tools that drive Docker
   themselves (localstack, testcontainers) stay inside the same rules;
