@@ -409,7 +409,9 @@ A hook's `transcript_path` comes from the task: the gate records it only if it l
 task's own Claude dir (symlinks resolved), and logs and ignores any other. Since the task
 can change what is there afterwards, `atl show`, `atl transcript` and the picker read a
 transcript only from the task's Claude dir or yours (where sessions with the sandbox off
-keep theirs), as described under **Files a task can write** below. `atl done` and
+keep theirs), as described under **Files a task can write** below. They read it as a
+stream, holding one line at a time (a line over 32 MiB is skipped) and the turns they
+show, so its size does not decide how much memory `atl` takes. `atl done` and
 `atl cancel` empty the task's Claude dir except its transcripts (`projects/`, symlinks and
 other special files in it removed), which `atl show` and `atl transcript` still read for
 closed tasks; delete the dir yourself when you no longer need them. Sessions started with
