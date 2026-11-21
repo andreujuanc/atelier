@@ -32,8 +32,9 @@ type FetchOpts struct {
 }
 
 // Push pushes the task's branch of each rw repo (or only o.Repo) to the
-// repo's pinned origin (see pinOrigin), from the repo's worktree, and never
-// any other branch (see gitx.PushBranch). git's output goes to out. A
+// repo's pinned origin (see pinOrigin), from the repo's canonical clone once
+// the task's worktree checks out (checkWorktree), and never any other
+// branch (see gitx.PushBranch). git's output goes to out. A
 // failure in one repo does not stop the others; it is in that repo's result.
 func (a *App) Push(ctx context.Context, ref string, o PushOpts, out io.Writer) ([]RemoteResult, error) {
 	t, repos, err := a.remoteRepos(ctx, ref, o.TaskID, o.Repo)
@@ -60,14 +61,21 @@ func (a *App) Push(ctx context.Context, ref string, o PushOpts, out io.Writer) (
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
-		wt := a.Paths.WorktreePath(t.Slug, r.Name)
-		if _, err := os.Stat(wt); errors.Is(err, os.ErrNotExist) {
-			res = append(res, RemoteResult{Repo: r.Name, Err: errors.New("worktree missing")})
+		_, err := a.checkWorktree(ctx, t, r)
+		if errors.Is(err, os.ErrNotExist) {
+			err = errors.New("worktree missing")
+		}
+		if err != nil {
+			res = append(res, RemoteResult{Repo: r.Name, Err: err})
 			continue
 		}
-		origin, err := a.remoteOrigin(ctx, r.Name, wt, out)
+		// git runs in the canonical clone, which has the branch (refs are
+		// shared by its worktrees): the task can rewrite its worktree's
+		// .git file, or swap the worktree, after the check above.
+		repo := a.Paths.RepoPath(r.Name)
+		origin, err := a.remoteOrigin(ctx, r.Name, repo, out)
 		if err == nil {
-			err = a.noteRefusal(r.Name, "git push", gitx.PushBranch(ctx, wt, origin, branch, o.Force, out))
+			err = a.noteRefusal(r.Name, "git push", gitx.PushBranch(ctx, repo, origin, branch, o.Force, out))
 		}
 		res = append(res, RemoteResult{Repo: r.Name, Err: err})
 	}
@@ -75,8 +83,9 @@ func (a *App) Push(ctx context.Context, ref string, o PushOpts, out io.Writer) (
 }
 
 // Fetch runs `git fetch origin` from the pinned origin (see
-// gitx.FetchOrigin) for each repo of the task, rw and ro, or only for
-// o.Repo. git's output goes to out.
+// gitx.FetchOrigin) in the canonical clone of each repo of the task, rw
+// (once its worktree checks out) and ro, or only for o.Repo. git's output
+// goes to out.
 func (a *App) Fetch(ctx context.Context, ref string, o FetchOpts, out io.Writer) ([]RemoteResult, error) {
 	t, repos, err := a.remoteRepos(ctx, ref, o.TaskID, o.Repo)
 	if err != nil {
@@ -87,11 +96,20 @@ func (a *App) Fetch(ctx context.Context, ref string, o FetchOpts, out io.Writer)
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
-		dir := a.RepoPathFor(t, r)
-		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-			res = append(res, RemoteResult{Repo: r.Name, Err: fmt.Errorf("%s missing", dir)})
+		dir, err := a.repoDir(ctx, t, r)
+		if err == nil {
+			_, err = os.Stat(dir)
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			err = fmt.Errorf("%s missing", dir)
+		}
+		if err != nil {
+			res = append(res, RemoteResult{Repo: r.Name, Err: err})
 			continue
 		}
+		// In the canonical clone, as for Push: a fetch updates the refs its
+		// worktrees share.
+		dir = a.Paths.RepoPath(r.Name)
 		origin, err := a.remoteOrigin(ctx, r.Name, dir, out)
 		if err == nil {
 			err = a.noteRefusal(r.Name, "git fetch", gitx.FetchOrigin(ctx, dir, origin, out))

@@ -288,6 +288,7 @@ var gitxCalls = []struct {
 		}
 		return nil
 	}},
+	{"CheckWorktree", func(ctx context.Context, p *poisoned) error { return CheckWorktree(ctx, p.wt, p.repo) }},
 	{"CurrentBranch", func(ctx context.Context, p *poisoned) error { return strErr(CurrentBranch(ctx, p.wt)) }},
 	{"HeadCommit", func(ctx context.Context, p *poisoned) error { return strErr(HeadCommit(ctx, p.wt)) }},
 	{"DefaultBranch", func(ctx context.Context, p *poisoned) error { return strErr(DefaultBranch(ctx, p.repo)) }},

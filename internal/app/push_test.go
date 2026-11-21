@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -329,6 +330,81 @@ func TestFetch(t *testing.T) {
 	res, err = e.app.Fetch(ctx, task.Slug, FetchOpts{Repo: "docs"}, &out)
 	if err != nil || len(res) != 1 || res[0].Err == nil || !strings.Contains(res[0].Err.Error(), "url."+decoy+".insteadof") {
 		t.Errorf("fetch with an insteadOf rule in the repo: %+v, %v", res, err)
+	}
+}
+
+// TestWorktreeSwappedForAnotherRepo: a task replaces its worktree with a
+// symlink to a repo it does not have, or keeps a directory there whose .git
+// file points into that repo. atl push, atl fetch, atl pr, atl diff and atl
+// done (where atl runs, with the user's credentials) must not act on that
+// repo: they refuse, or leave the path alone.
+func TestWorktreeSwappedForAnotherRepo(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "secret", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "swap", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.pushOrigin(t, "api", "only-in-api") // api's origin has a commit secret's lacks
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	refs := func() string { return git(t, e.canonical("secret"), "for-each-ref") }
+	before := refs()
+
+	for _, swap := range []struct {
+		name string
+		do   func()
+	}{
+		{"a symlink to another repo", func() {
+			os.RemoveAll(wt)
+			if err := os.Symlink(e.canonical("secret"), wt); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a .git file pointing into another repo", func() {
+			os.Remove(wt)
+			if err := os.MkdirAll(wt, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			gd := filepath.Join(e.canonical("secret"), ".git")
+			if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+gd+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		swap.do()
+		res, err := e.app.Fetch(ctx, task.Slug, FetchOpts{}, nil)
+		if err != nil || len(res) != 1 || res[0].Err == nil || !strings.Contains(res[0].Err.Error(), "not a worktree of") {
+			t.Errorf("%s: fetch = %+v, %v; want a refusal", swap.name, res, err)
+		}
+		res, err = e.app.Push(ctx, task.Slug, PushOpts{}, nil)
+		if err != nil || len(res) != 1 || res[0].Err == nil || !strings.Contains(res[0].Err.Error(), "not a worktree of") {
+			t.Errorf("%s: push = %+v, %v; want a refusal", swap.name, res, err)
+		}
+		if got := refs(); got != before {
+			t.Errorf("%s: secret's refs changed:\n%s", swap.name, got)
+		}
+		if prs, _ := e.app.PR(ctx, task.Slug); len(prs) != 1 || !prs[0].Skipped || !strings.Contains(prs[0].Reason, "not a worktree of") {
+			t.Errorf("%s: pr = %+v", swap.name, prs)
+		}
+		if err := e.app.Diff(ctx, task.Slug, io.Discard, false); err == nil || !strings.Contains(err.Error(), "not a worktree of") {
+			t.Errorf("%s: diff = %v", swap.name, err)
+		}
+		if _, err := e.app.Done(ctx, task.Slug, false); err == nil || !strings.Contains(err.Error(), "not a worktree of") {
+			t.Errorf("%s: done = %v; want a refusal", swap.name, err)
+		}
+	}
+	// With --force the task closes and the path is left alone: secret's
+	// main worktree is not removed.
+	if _, err := e.app.Done(ctx, task.Slug, true); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(filepath.Join(e.canonical("secret"), "README")) {
+		t.Error("secret's checkout was removed")
+	}
+	if got := refs(); got != before {
+		t.Errorf("secret's refs changed:\n%s", got)
 	}
 }
 

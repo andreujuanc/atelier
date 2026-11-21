@@ -70,6 +70,26 @@ func (a *App) RepoPathFor(t *model.Task, r model.TaskRepo) string {
 	return a.Paths.WorktreePath(t.Slug, r.Name)
 }
 
+// checkWorktree returns the worktree path of rw repo r of task t, and nil
+// if it is still a worktree of r's canonical clone (gitx.CheckWorktree).
+// The task can write its task dir: before atl runs git or a script in the
+// path, it makes sure the task has not put a symlink or another repo's
+// worktree there. A missing worktree is an error satisfying
+// errors.Is(err, os.ErrNotExist).
+func (a *App) checkWorktree(ctx context.Context, t *model.Task, r model.TaskRepo) (string, error) {
+	wt := a.Paths.WorktreePath(t.Slug, r.Name)
+	return wt, gitx.CheckWorktree(ctx, wt, a.Paths.RepoPath(r.Name))
+}
+
+// repoDir is RepoPathFor, with an rw repo's worktree checked
+// (checkWorktree); an ro repo's canonical clone is not the task's to write.
+func (a *App) repoDir(ctx context.Context, t *model.Task, r model.TaskRepo) (string, error) {
+	if r.Mode == model.ModeRO {
+		return a.Paths.RepoPath(r.Name), nil
+	}
+	return a.checkWorktree(ctx, t, r)
+}
+
 func (a *App) repoInfos(t *model.Task) []gen.RepoInfo {
 	out := make([]gen.RepoInfo, 0, len(t.Repos))
 	for _, r := range t.Repos {
@@ -387,6 +407,9 @@ func (a *App) scriptEnv(t *model.Task, r model.TaskRepo) project.ScriptEnv {
 // output to Out as "<kind> <repo>: <line>".
 func (a *App) runScript(ctx context.Context, pr *project.Project, kind, script string, t *model.Task, r model.TaskRepo) error {
 	se := a.scriptEnv(t, r)
+	if _, err := a.checkWorktree(ctx, t, r); err != nil {
+		return err
+	}
 	fmt.Fprintf(a.out(), "%s %s: $ %s\n", kind, r.Name, strings.TrimSpace(script))
 	pw := &prefixWriter{w: a.out(), prefix: kind + " " + r.Name + ": "}
 	err := project.RunScript(ctx, script, se.Worktree, pr.EnvFor(se), pw)
@@ -432,10 +455,10 @@ func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error 
 		if r.Mode != model.ModeRW {
 			continue
 		}
-		if _, err := os.Stat(a.Paths.WorktreePath(t.Slug, r.Name)); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(a.Paths.WorktreePath(t.Slug, r.Name)); errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if err := a.runScript(ctx, pr, "teardown", pr.Teardown, t, r); err != nil {
+		if err := a.runScript(ctx, pr, "teardown", pr.Teardown, t, r); err != nil { // checks the worktree
 			if !force {
 				return fmt.Errorf("repo %s: %w", r.Name, err)
 			}
@@ -519,8 +542,10 @@ func (a *App) Get(ctx context.Context, ref string) (*TaskView, error) {
 	for _, r := range t.Repos {
 		rs := RepoStatus{Name: r.Name, Mode: r.Mode, Path: a.RepoPathFor(t, r), BaseBranch: r.BaseBranch}
 		if r.Mode == model.ModeRW {
-			if _, err := os.Stat(rs.Path); errors.Is(err, os.ErrNotExist) {
+			if _, err := a.checkWorktree(ctx, t, r); errors.Is(err, os.ErrNotExist) {
 				rs.Err = "missing"
+			} else if err != nil {
+				rs.Err = err.Error()
 			} else if rs.Dirty, err = gitx.IsDirty(ctx, rs.Path); err != nil {
 				rs.Err = err.Error()
 			}
@@ -675,9 +700,19 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		if r.Mode != model.ModeRW {
 			continue
 		}
-		p := a.Paths.WorktreePath(t.Slug, r.Name)
-		_, serr := os.Stat(p)
-		wts = append(wts, wt{r.Name, a.Paths.RepoPath(r.Name), p, errors.Is(serr, os.ErrNotExist)})
+		// What is not a worktree of the repo's clone any more (a symlink
+		// the task put there, say) is left alone: git would act on
+		// whatever it names.
+		p, cerr := a.checkWorktree(ctx, t, r)
+		missing := errors.Is(cerr, os.ErrNotExist)
+		if cerr != nil && !missing {
+			if !force {
+				return fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, r.Name, cerr)
+			}
+			a.warnf("repo %s: %v; left alone", r.Name, cerr)
+			continue
+		}
+		wts = append(wts, wt{r.Name, a.Paths.RepoPath(r.Name), p, missing})
 	}
 	// Commits only HEAD reaches (detached HEAD, stopped rebase) would be
 	// lost with the worktree; --force never discards commits.
@@ -750,6 +785,15 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 	a.removeSandbox(ctx, t)
 	var removed []wt
 	for _, w := range wts {
+		// Again, now that nothing of the task runs any more: what it left
+		// there last is what git would remove.
+		if err := gitx.CheckWorktree(ctx, w.path, w.repo); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if !force {
+				return fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, w.name, err)
+			}
+			a.warnf("repo %s: %v; left alone", w.name, err)
+			continue
+		}
 		if err := gitx.RemoveWorktree(ctx, w.repo, w.path, force); err != nil {
 			if !force {
 				// It was clean before teardown, so teardown left changes.

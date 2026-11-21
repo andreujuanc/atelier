@@ -67,9 +67,11 @@ func (a *App) PR(ctx context.Context, ref string) ([]PRResult, error) {
 
 func (a *App) prRepo(ctx context.Context, t *model.Task, r model.TaskRepo, body string) PRResult {
 	skip := func(reason string) PRResult { return PRResult{Repo: r.Name, Skipped: true, Reason: reason} }
-	wt := a.Paths.WorktreePath(t.Slug, r.Name)
-	if _, err := os.Stat(wt); errors.Is(err, os.ErrNotExist) {
+	wt, err := a.checkWorktree(ctx, t, r)
+	if errors.Is(err, os.ErrNotExist) {
 		return skip("worktree missing")
+	} else if err != nil {
+		return skip(err.Error())
 	}
 	n, err := gitx.CommitsAhead(ctx, wt, r.BaseCommit)
 	if err != nil {
@@ -78,18 +80,20 @@ func (a *App) prRepo(ctx context.Context, t *model.Task, r model.TaskRepo, body 
 	if n == 0 {
 		return skip("no commits")
 	}
-	origin, err := a.remoteOrigin(ctx, r.Name, wt, a.out())
+	// The remote check runs in the canonical clone, as push and fetch do.
+	clone := a.Paths.RepoPath(r.Name)
+	origin, err := a.remoteOrigin(ctx, r.Name, clone, a.out())
 	if err != nil {
 		return skip(err.Error())
 	}
-	pushed, err := gitx.RemoteBranchExists(ctx, wt, origin, t.Branch)
+	pushed, err := gitx.RemoteBranchExists(ctx, clone, origin, t.Branch)
 	if err != nil {
 		return skip(a.noteRefusal(r.Name, "git ls-remote", err).Error())
 	}
 	if !pushed {
 		return skip("push " + t.Branch + " first")
 	}
-	repo, ok := gitx.GitHubRepo(ctx, wt, origin)
+	repo, ok := gitx.GitHubRepo(ctx, clone, origin)
 	if !ok {
 		return skip(fmt.Sprintf("origin %s is not a GitHub repository URL", origin))
 	}

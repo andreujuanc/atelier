@@ -2,8 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
-	"os"
 	"sync"
 
 	"github.com/andreujuanc/atelier/internal/gitx"
@@ -23,15 +21,16 @@ func (a *App) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
 		return nil, err
 	}
 	type job struct {
-		id   int64
-		path string
+		id int64
+		t  *model.Task
+		r  model.TaskRepo
 	}
 	var jobs []job
 	for i := range tasks {
 		t := &tasks[i]
 		for _, r := range t.Repos {
 			if r.Mode == model.ModeRW {
-				jobs = append(jobs, job{t.ID, a.RepoPathFor(t, r)})
+				jobs = append(jobs, job{t.ID, t, r})
 			}
 		}
 	}
@@ -54,10 +53,11 @@ func (a *App) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
 				if done || ctx.Err() != nil {
 					continue
 				}
-				if _, err := os.Stat(j.path); errors.Is(err, os.ErrNotExist) {
-					continue
+				path, err := a.checkWorktree(ctx, j.t, j.r)
+				if err != nil {
+					continue // missing, or not a worktree any more
 				}
-				if dirty, err := gitx.IsDirty(ctx, j.path); err == nil && dirty {
+				if dirty, err := gitx.IsDirty(ctx, path); err == nil && dirty {
 					mu.Lock()
 					out[j.id] = true
 					mu.Unlock()
