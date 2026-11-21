@@ -47,12 +47,15 @@ func outsideSandbox(what string) error {
 // sandboxSpec describes the task's container. It sees, at the same paths as
 // here: the task dir; the git database of each rw repo's canonical clone
 // (a worktree keeps its objects and refs there) and each ro repo, read-only;
-// and Claude Code's config dir (login, settings, transcripts). The run dir,
-// with the gate's sockets and the atl binary, is at sandbox.RunMount. It
-// does not see the host's Docker socket, the SSH agent, other repos, other
-// tasks, nor atelier's database, state or config dirs: atl in there (hooks,
-// status line, notes, push, fetch) asks the task's gate, which answers for
-// this task only (see hook.TaskServer).
+// and the task's own Claude config dir (Paths.ClaudeDir, see
+// seedClaudeDir), as $CLAUDE_CONFIG_DIR. The run dir, with the gate's
+// sockets and the atl binary, is at sandbox.RunMount. It does not see the
+// host's Docker socket, the SSH agent, other repos, other tasks, the user's
+// Claude config dir (login, other sessions' transcripts), nor atelier's
+// database, state or config dirs: atl in there (hooks, status line, notes,
+// push, fetch) asks the task's gate, which answers for this task only (see
+// hook.TaskServer). Claude Code's token is not part of the spec: it is
+// passed to each session by name (see sandboxArgv).
 func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -121,10 +124,9 @@ func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, err
 		}
 		same(git, false)
 	}
-	claude, err := sandboxClaudeDir()
-	if err != nil {
-		return sandbox.Spec{}, err
-	}
+	// With $CLAUDE_CONFIG_DIR set, Claude Code keeps its state file
+	// (.claude.json) in that dir too, not in the home directory.
+	claude := a.Paths.ClaudeDir(t.Slug)
 	if err := os.MkdirAll(claude, 0o700); err != nil {
 		return sandbox.Spec{}, err
 	}
@@ -132,18 +134,6 @@ func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, err
 	spec.Env["CLAUDE_CONFIG_DIR"] = claude
 	spec.Mounts = append(spec.Mounts, sandbox.Mount{Src: a.Paths.RunDir(t.Slug), Dst: sandbox.RunMount, RO: true})
 	return spec, nil
-}
-
-// sandboxClaudeDir returns Claude Code's config dir for task containers. It
-// must come from $CLAUDE_CONFIG_DIR: only then does Claude Code keep its
-// state file (.claude.json) inside the dir, where the container sees it;
-// without the variable that file lives in the home directory.
-func sandboxClaudeDir() (string, error) {
-	dir := os.Getenv("CLAUDE_CONFIG_DIR")
-	if dir == "" {
-		return "", errors.New("the sandbox needs $CLAUDE_CONFIG_DIR (e.g. ~/.claude), so that Claude Code keeps all its state in one directory the task container can be given")
-	}
-	return filepath.Abs(dir)
 }
 
 func fileExists(path string) bool {
@@ -154,7 +144,12 @@ func fileExists(path string) bool {
 // ensureSandbox makes the task's gate and container run, creating them if
 // needed. A container that predates a change to the task's repos is replaced
 // when no session runs in it; otherwise it is kept and a warning says so.
+// A new container gets its Claude dir seeded first (seedClaudeDir). Without
+// a token for Claude Code (sandboxAuth) nothing is started.
 func (a *App) ensureSandbox(ctx context.Context, t *model.Task) error {
+	if _, err := sandboxAuth(); err != nil {
+		return err
+	}
 	runDir := a.Paths.RunDir(t.Slug)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return err
@@ -185,7 +180,7 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) error {
 		live, err := a.hasLiveWindow(ctx, t, tmux.SessionName(t.Slug))
 		return err != nil || live
 	}
-	stale, err := sandbox.Ensure(ctx, a.docker(), spec, busy)
+	stale, err := sandbox.Ensure(ctx, a.docker(), spec, busy, func() error { return a.seedClaudeDir(t) })
 	if err != nil {
 		return fmt.Errorf("task container (image %s): %w", spec.Image, err)
 	}
@@ -215,14 +210,18 @@ func (a *App) gateLog(t *model.Task) string {
 }
 
 // removeSandbox removes the task's container, everything the task created
-// through its gate, the gate and the run dir. It runs for any task that has
-// a run dir, so a task started while the sandbox was on is cleaned up after
-// it was switched off. Failures are warnings: they never keep a task open.
+// through its gate, the gate and the run dir, and empties the task's Claude
+// dir but for its transcripts (pruneClaudeDir). It runs for any task that
+// has a run dir, so a task started while the sandbox was on is cleaned up
+// after it was switched off. Failures are warnings: they never keep a task
+// open.
 func (a *App) removeSandbox(ctx context.Context, t *model.Task) {
 	runDir := a.Paths.RunDir(t.Slug)
-	if a.Sandbox == nil && !fileExists(runDir) {
+	if a.Sandbox == nil && !fileExists(runDir) && !fileExists(a.Paths.ClaudeDir(t.Slug)) {
 		return
 	}
+	// The container goes first: then nothing writes to the Claude dir.
+	defer a.pruneClaudeDir(t)
 	if err := sandbox.Cleanup(ctx, a.docker(), a.sandboxID(t)); err != nil {
 		a.warnf("task %s: clean up its containers: %v", t.Slug, err)
 	}
@@ -236,10 +235,17 @@ func (a *App) removeSandbox(ctx context.Context, t *model.Task) {
 }
 
 // sandboxArgv wraps a Claude command line so that it runs in the task's
-// container, passing on the window's environment (env's keys).
-func (a *App) sandboxArgv(t *model.Task, dir string, env map[string]string, argv []string) []string {
-	keys := make([]string, 0, len(env))
+// container, passing on the window's environment (env's keys) and the
+// variables named in auth (see sandboxAuth). All go by name only: docker
+// exec takes their values from the window's environment, so a token is on
+// no command line and not in the container's stored config, and a new one
+// reaches the next session without a new container.
+func (a *App) sandboxArgv(t *model.Task, dir string, env, auth map[string]string, argv []string) []string {
+	keys := make([]string, 0, len(env)+len(auth))
 	for k := range env {
+		keys = append(keys, k)
+	}
+	for k := range auth {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)

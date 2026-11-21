@@ -125,8 +125,20 @@ func (p Paths) WorktreePath(slug, repo string) string { return filepath.Join(p.T
 // must fit in 107 bytes. It is outside StateDir and the data dir, which a
 // task container gets to see, so one task never sees another's socket.
 func (p Paths) RunDir(slug string) string {
+	return filepath.Join(p.runRoot(), p.taskHash(slug))
+}
+
+func (p Paths) taskHash(slug string) string {
 	sum := sha256.Sum256([]byte(p.TaskDir(slug)))
-	return filepath.Join(p.runRoot(), hex.EncodeToString(sum[:])[:12])
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// ClaudeDir returns the Claude Code config dir of task slug's container
+// (its $CLAUDE_CONFIG_DIR: state file, settings, transcripts): claude/<hash>
+// next to the run dirs, the hash as in RunDir. A task container mounts its
+// own, never the parent, so no task reaches another's dir or the user's.
+func (p Paths) ClaudeDir(slug string) string {
+	return filepath.Join(p.runRoot(), "claude", p.taskHash(slug))
 }
 
 func (p Paths) runRoot() string {

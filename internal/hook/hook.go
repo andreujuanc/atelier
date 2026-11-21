@@ -59,6 +59,10 @@ type db struct {
 	// its environment say, only that task and its sessions are read or
 	// written (see TaskServer).
 	scope int64
+	// claudeDir is, with scope, the task's own Claude config dir: the only
+	// place a transcript path from the task may point into (see
+	// transcriptIn), since atl reads that file later where it runs.
+	claudeDir string
 }
 
 // Hook event names handled by atelier.
@@ -418,6 +422,12 @@ func (d db) transition(ctx context.Context, event string, in Input, env func(str
 			return 0, fmt.Errorf("claude session id %q belongs to another task's session; ignored", in.SessionID)
 		}
 	}
+	if d.scope != 0 && in.TranscriptPath != "" {
+		if err := transcriptIn(d.claudeDir, in.TranscriptPath); err != nil {
+			logError(d.p, io.Discard, event, in.SessionID, fmt.Errorf("transcript path ignored: %w", err))
+			in.TranscriptPath = ""
+		}
+	}
 	sess, err := d.findSession(ctx, event, in, env)
 	if err != nil {
 		return 0, err
@@ -454,6 +464,30 @@ func recordTranscript(ctx context.Context, event string, in Input, sess *model.S
 		return nil
 	}
 	return st.SetTranscriptPathIfEmpty(ctx, sess.ID, in.TranscriptPath)
+}
+
+// transcriptIn returns nil if path, with its symlinks resolved here (where
+// the gate runs, at the same paths as in the task container), lies inside
+// dir (resolved too); else why not. A task reports its transcript path
+// itself, and atl reads that file later (atl show, atl transcript, the
+// picker), so a path elsewhere could make it read another task's or the
+// user's files.
+func transcriptIn(dir, path string) error {
+	if dir == "" {
+		return errors.New("the task has no Claude config dir")
+	}
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return fmt.Errorf("the task's Claude config dir: %w", err)
+	}
+	real, err := resolvePath(path)
+	if err != nil {
+		return fmt.Errorf("%q: %w", path, err)
+	}
+	if rel, ok := within(root, real); !ok || rel == "" {
+		return fmt.Errorf("%q is not inside the task's Claude config dir %s", path, dir)
+	}
+	return nil
 }
 
 // transitionState applies event's state change to session id.

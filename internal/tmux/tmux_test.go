@@ -102,6 +102,34 @@ func TestSessionName(t *testing.T) {
 	}
 }
 
+// TestSetGlobalEnv: variables reach windows created afterwards; values a
+// tmux command line cannot carry are refused without being repeated; no
+// server is no error.
+func TestSetGlobalEnv(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	secret := "sk-ant-oat01-Abc_def-123$HOME~#{x}"
+	if err := c.SetGlobalEnv(ctx, map[string]string{"ATL_T_TOKEN": secret}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := c.run(ctx, "show-environment", "-g", "ATL_T_TOKEN")
+	if err != nil || out != "ATL_T_TOKEN="+secret {
+		t.Fatalf("global env = %q, %v", out, err)
+	}
+	for _, bad := range []string{"a'b", "a\nb", "a\x1bb"} {
+		err := c.SetGlobalEnv(ctx, map[string]string{"ATL_T_TOKEN": bad})
+		if err == nil || strings.Contains(err.Error(), bad) {
+			t.Errorf("value %q: %v", bad, err)
+		}
+	}
+	if _, err := c.run(ctx, "kill-server"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetGlobalEnv(ctx, map[string]string{"ATL_T_TOKEN": secret}); err != nil {
+		t.Errorf("without a server: %v", err)
+	}
+}
+
 func TestNewWindowAndTags(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()

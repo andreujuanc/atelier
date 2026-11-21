@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,9 @@ import (
 // container sees it, and returns the socket.
 func gated(t *testing.T, f *fixture) string {
 	t.Helper()
+	if err := os.MkdirAll(f.p.ClaudeDir("fix"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	ts, err := OpenTaskServer(f.p, f.task.ID, "fix")
 	if err != nil {
 		t.Fatal(err)
@@ -122,9 +126,14 @@ func TestHookThroughGate(t *testing.T) {
 			return hookInput(Input{SessionID: "c1", Cwd: f.p.TaskDir("fix"), HookEventName: EventPreToolUse, ToolName: "Write", ToolInput: ti})
 		}
 	}
+	// A transcript path "CLAUDE/x" is x in the task's Claude config dir.
 	simple := func(event string, in Input) func(f *fixture) string {
 		return func(f *fixture) string {
+			in := in
 			in.Cwd, in.HookEventName = f.p.TaskDir("fix"), event
+			if rest, ok := strings.CutPrefix(in.TranscriptPath, "CLAUDE/"); ok {
+				in.TranscriptPath = filepath.Join(f.p.ClaudeDir("fix"), rest)
+			}
 			return hookInput(in)
 		}
 	}
@@ -136,12 +145,12 @@ func TestHookThroughGate(t *testing.T) {
 		steps []step
 	}{
 		{"a session's life", []int{0, 0, 0, 0, 0, 0, 0, 0}, []step{
-			{EventSessionStart, simple(EventSessionStart, Input{SessionID: "c1", Source: "startup", TranscriptPath: "/t/c1.jsonl"}), session},
+			{EventSessionStart, simple(EventSessionStart, Input{SessionID: "c1", Source: "startup", TranscriptPath: "CLAUDE/projects/k/c1.jsonl"}), session},
 			{EventUserPromptSubmit, simple(EventUserPromptSubmit, Input{SessionID: "c1"}), session},
 			{EventNotification, simple(EventNotification, Input{SessionID: "c1", NotificationType: "permission_prompt"}), session},
 			{EventPostToolUse, simple(EventPostToolUse, Input{SessionID: "c1", ToolName: "Bash"}), session},
 			{EventStop, simple(EventStop, Input{SessionID: "c1"}), session},
-			{EventSessionStart, simple(EventSessionStart, Input{SessionID: "c2", Source: "clear", TranscriptPath: "/t/c2.jsonl"}), session},
+			{EventSessionStart, simple(EventSessionStart, Input{SessionID: "c2", Source: "clear", TranscriptPath: "CLAUDE/projects/k/c2.jsonl"}), session},
 			{EventSessionStart, simple(EventSessionStart, Input{SessionID: "c3", Source: "compact"}), session},
 			{EventSessionEnd, simple(EventSessionEnd, Input{SessionID: "c3"}), session},
 		}},
@@ -197,7 +206,8 @@ func TestHookThroughGate(t *testing.T) {
 				if c.name == "oversized and broken input" && i == 2 && !strings.Contains(want.stderr, "read-only repo docs") {
 					t.Errorf("step %d: an oversized write whose target comes first is not blocked by the guard: %s", i, want.stderr)
 				}
-				if r, w := rows(t, gate), rows(t, direct); r != w {
+				r := strings.ReplaceAll(rows(t, gate), gate.p.ClaudeDir("fix"), direct.p.ClaudeDir("fix"))
+				if w := rows(t, direct); r != w {
 					t.Errorf("step %d %s: rows\n%s\nwant\n%s", i, s.event, r, w)
 				}
 			}
@@ -493,6 +503,58 @@ func TestLogErrorOneLine(t *testing.T) {
 
 // TestGateLatency: a hook round trip through the gate (client and gate in
 // one process here) stays in the low milliseconds.
+// TestGateTranscriptPath: the gate records a transcript path only inside
+// the task's own Claude config dir, symlinks resolved; any other is
+// ignored (the event still counts) and logged.
+func TestGateTranscriptPath(t *testing.T) {
+	f := setup(t)
+	sock := gated(t, f)
+	own := f.p.ClaudeDir("fix")
+	project := filepath.Join(own, "projects", "k")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	userDir := filepath.Join(f.root, ".claude", "projects", "k")
+	if err := os.MkdirAll(userDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(userDir, filepath.Join(own, "projects", "out")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(f.root, ".claude", ".credentials.json"), filepath.Join(project, "creds.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name, path string
+		ok         bool
+	}{
+		{"own, not written yet", filepath.Join(project, "a.jsonl"), true},
+		{"the user's dir", filepath.Join(userDir, "b.jsonl"), false},
+		{"another task's dir", filepath.Join(f.p.ClaudeDir("other"), "projects", "k", "c.jsonl"), false},
+		{"dot-dot out of it", filepath.Join(own, "..", "x.jsonl"), false},
+		{"own dir itself", own, false},
+		{"a symlinked dir out of it", filepath.Join(own, "projects", "out", "d.jsonl"), false},
+		{"a symlink out of it", filepath.Join(project, "creds.jsonl"), false},
+		{"relative", "projects/k/e.jsonl", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := f.session(t, model.StateIdle, "")
+			in := hookInput(Input{SessionID: "cid-" + itoa(s.ID), Cwd: f.p.TaskDir("fix"), Source: "startup", TranscriptPath: c.path})
+			r := hookVia(t, f, sock, EventSessionStart, in, map[string]string{"ATL_SESSION": itoa(s.ID)})
+			got := f.get(t, s.ID)
+			if r.code != 0 || got.ClaudeSessionID != "cid-"+itoa(s.ID) {
+				t.Fatalf("event not applied: %+v, row %+v", r, got)
+			}
+			if want := map[bool]string{true: c.path, false: ""}[c.ok]; got.TranscriptPath != want {
+				t.Errorf("transcript path recorded %q, want %q", got.TranscriptPath, want)
+			}
+			if logged := strings.Contains(readLog(t, f.p), "transcript path ignored: "+strconv.Quote(c.path)); logged == c.ok {
+				t.Errorf("logged = %v:\n%s", logged, readLog(t, f.p))
+			}
+		})
+	}
+}
+
 func TestGateLatency(t *testing.T) {
 	if raceEnabled {
 		t.Skip("race-instrumented code is too slow to measure")

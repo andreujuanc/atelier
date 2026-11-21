@@ -133,11 +133,10 @@ func claudeProjectKey(dir string) string {
 	return b.String()
 }
 
-// claudeProjectDirs returns Claude Code's transcript dirs for dir:
-// <config>/projects/<key> for dir's absolute path and, if different, its
-// symlink-resolved path (nil if the config dir is unknown).
-func claudeProjectDirs(dir string) []string {
-	cfg := config.ClaudeConfigDir()
+// claudeProjectDirs returns Claude Code's transcript dirs for dir in the
+// Claude config dir cfg: <cfg>/projects/<key> for dir's absolute path and,
+// if different, its symlink-resolved path (nil if cfg is "").
+func claudeProjectDirs(cfg, dir string) []string {
 	if cfg == "" {
 		return nil
 	}
@@ -158,9 +157,9 @@ func claudeProjectDirs(dir string) []string {
 
 // hasClaudeConversation reports whether Claude Code has a recorded
 // conversation (a *.jsonl transcript) for dir, under its absolute or
-// symlink-resolved path.
+// symlink-resolved path, in the user's Claude config dir.
 func hasClaudeConversation(dir string) bool {
-	for _, d := range claudeProjectDirs(dir) {
+	for _, d := range claudeProjectDirs(config.ClaudeConfigDir(), dir) {
 		entries, _ := os.ReadDir(d)
 		for _, e := range entries {
 			if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
@@ -172,16 +171,17 @@ func hasClaudeConversation(dir string) bool {
 }
 
 // inClaudeProject reports whether transcript sits directly in one of
-// Claude Code's transcript dirs for dir (claudeProjectDirs), comparing
-// symlink-resolved paths too: only then can `claude --resume <id>` run in
-// dir find that conversation.
-func inClaudeProject(dir, transcript string) bool {
+// Claude Code's transcript dirs for dir in the Claude config dir cfg
+// (claudeProjectDirs), comparing symlink-resolved paths too: only then can
+// `claude --resume <id>` run in dir with that config dir find that
+// conversation.
+func inClaudeProject(cfg, dir, transcript string) bool {
 	if !filepath.IsAbs(transcript) {
 		return false
 	}
 	td := filepath.Dir(filepath.Clean(transcript))
 	rtd, rerr := filepath.EvalSymlinks(td)
-	for _, p := range claudeProjectDirs(dir) {
+	for _, p := range claudeProjectDirs(cfg, dir) {
 		if td == p {
 			return true
 		}

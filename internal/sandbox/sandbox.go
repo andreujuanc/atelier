@@ -181,13 +181,27 @@ func noSuch(err error) bool {
 // another spec (the task's repos or the atl paths changed since) is replaced
 // unless busy reports that sessions are running in it; then it is kept and
 // stale is true.
-func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool) (stale bool, err error) {
+//
+// fresh, if not nil, runs right before a container is created, when no
+// container of the task exists (any old one was removed): what it prepares
+// for the container cannot be touched by the task meanwhile. Its error stops
+// the creation.
+func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh func() error) (stale bool, err error) {
 	name := ContainerName(spec.ID)
+	create := func() error {
+		if fresh != nil {
+			if err := fresh(); err != nil {
+				return err
+			}
+		}
+		_, err := run(ctx, spec.RunArgs()...)
+		return err
+	}
 	out, err := run(ctx, "inspect", "--type", "container", "--format",
 		`{{.State.Running}} {{index .Config.Labels "`+labelSpec+`"}}`, name)
 	switch {
 	case noSuch(err):
-		if _, err = run(ctx, spec.RunArgs()...); err != nil && strings.Contains(err.Error(), "already in use") {
+		if err = create(); err != nil && strings.Contains(err.Error(), "already in use") {
 			// Lost a race with another atl creating it: take theirs.
 			_, err = run(ctx, "start", name)
 		}
@@ -203,8 +217,7 @@ func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool) (stale
 		if _, err := run(ctx, "rm", "-f", name); err != nil && !noSuch(err) {
 			return false, err
 		}
-		_, err = run(ctx, spec.RunArgs()...)
-		return false, err
+		return false, create()
 	}
 	if state != "true" {
 		_, err = run(ctx, "start", name)

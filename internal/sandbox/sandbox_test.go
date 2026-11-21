@@ -145,9 +145,15 @@ func TestEnsure(t *testing.T) {
 	} {
 		s := &script{}
 		s.answer("inspect", tc.inspect, tc.err)
-		stale, err := Ensure(ctx, s.run, spec, tc.busy)
-		if err != nil || stale != tc.wantStale || s.verbs() != tc.want {
-			t.Errorf("%s: calls %q stale %v err %v; want %q stale %v", tc.name, s.verbs(), stale, err, tc.want, tc.wantStale)
+		// fresh runs right before each docker run, after any docker rm.
+		fresh := func() error {
+			s.calls = append(s.calls, "fresh")
+			return nil
+		}
+		stale, err := Ensure(ctx, s.run, spec, tc.busy, fresh)
+		want := strings.ReplaceAll(tc.want, "run", "fresh run")
+		if err != nil || stale != tc.wantStale || s.verbs() != want {
+			t.Errorf("%s: calls %q stale %v err %v; want %q stale %v", tc.name, s.verbs(), stale, err, want, tc.wantStale)
 		}
 	}
 
@@ -155,15 +161,21 @@ func TestEnsure(t *testing.T) {
 	s := &script{}
 	s.answer("inspect", "", missing)
 	s.answer("run", "", errors.New(`docker run: Conflict. The container name "/atl-t-abc123" is already in use`))
-	if _, err := Ensure(ctx, s.run, spec, idle); err != nil || s.verbs() != "inspect run start" {
+	if _, err := Ensure(ctx, s.run, spec, idle, nil); err != nil || s.verbs() != "inspect run start" {
 		t.Errorf("name race: %q, %v", s.verbs(), err)
 	}
 	// Any other failure is reported.
 	s = &script{}
 	s.answer("inspect", "", missing)
 	s.answer("run", "", errors.New("docker run: pull access denied for img"))
-	if _, err := Ensure(ctx, s.run, spec, idle); err == nil {
+	if _, err := Ensure(ctx, s.run, spec, idle, nil); err == nil {
 		t.Error("a failed docker run was not reported")
+	}
+	// A failed fresh stops the creation.
+	s = &script{}
+	s.answer("inspect", "", missing)
+	if _, err := Ensure(ctx, s.run, spec, idle, func() error { return errors.New("no") }); err == nil || s.verbs() != "inspect" {
+		t.Errorf("failed fresh: %q, %v", s.verbs(), err)
 	}
 }
 

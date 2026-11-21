@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
@@ -75,8 +77,8 @@ func (a *App) Doctor(ctx context.Context) []Check {
 }
 
 // checkSandbox reports the sandbox setting and, when it is on, whether the
-// Docker daemon, the default task image and Claude Code's config dir are
-// usable.
+// Docker daemon and the default task image are usable and Claude Code has a
+// token for task sessions.
 func (a *App) checkSandbox(ctx context.Context) []Check {
 	const name = "sandbox"
 	if sandbox.Inside() {
@@ -102,11 +104,22 @@ func (a *App) checkSandbox(ctx context.Context) []Check {
 			checks = append(checks, pass("task image", sb.Image))
 		}
 	}
-	if dir, err := sandboxClaudeDir(); err != nil {
-		checks = append(checks, fail("claude config", err.Error()))
+	if auth, err := sandboxAuth(); err != nil {
+		checks = append(checks, fail("claude token", err.Error()))
 	} else {
-		checks = append(checks, pass("claude config", dir+" (shared with task containers)"))
+		names := make([]string, 0, len(auth))
+		for _, k := range claudeAuthVars {
+			if _, ok := auth[k]; ok {
+				names = append(names, "$"+k)
+			}
+		}
+		checks = append(checks, pass("claude token", strings.Join(names, " and ")+" set (passed to task sessions by name)"))
 	}
+	detail := "each task has its own, in " + filepath.Dir(a.Paths.ClaudeDir("x"))
+	if user := config.ClaudeConfigDir(); user != "" {
+		detail += "; your setup is copied from " + user
+	}
+	checks = append(checks, pass("claude config", detail))
 	return checks
 }
 
