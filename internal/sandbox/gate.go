@@ -282,57 +282,92 @@ var errNotFound = errors.New("not found")
 // owner returns who a container, network or volume belongs to: "task" if it
 // carries this task's label, "agent" if it is the task's own container. Any
 // other object is an error; errNotFound if it does not exist.
-func (g *Gate) owner(kind, id string) (string, error) {
-	uri := "/" + kind + "/" + url.PathEscape(id)
+//
+// It also returns the object's full ID (a volume's name), from the same
+// inspect that showed the label. What the gate forwards must name the
+// object by that ID, never by ref: the daemon resolves a reference by full
+// ID, then by name, then by unique ID prefix, so the object a name or a
+// prefix stands for can change between this check and the call (a task
+// renames its own container to a prefix of another container's ID, or
+// removes its network whose name is a prefix of another's). A volume is
+// looked up by its exact name only: its name is its ID.
+func (g *Gate) owner(kind, ref string) (who, id string, err error) {
+	uri := "/" + kind + "/" + url.PathEscape(ref)
 	if kind == "containers" {
 		uri += "/json"
 	}
 	status, out, err := g.call("GET", uri, nil)
 	switch {
 	case err != nil:
-		return "", err
+		return "", "", err
 	case status == http.StatusNotFound:
-		return "", errNotFound
+		return "", "", errNotFound
 	case status != http.StatusOK:
-		return "", fmt.Errorf("cannot inspect %s", id)
+		return "", "", fmt.Errorf("cannot inspect %s", ref)
 	}
 	var obj struct {
-		Labels map[string]string
-		Config struct{ Labels map[string]string }
+		Id, Name string
+		Labels   map[string]string
+		Config   struct{ Labels map[string]string }
 	}
 	if err := json.Unmarshal(out, &obj); err != nil {
-		return "", err
+		return "", "", err
 	}
-	labels := obj.Labels
-	if kind == "containers" {
+	labels, id := obj.Labels, obj.Id
+	switch kind {
+	case "containers":
 		labels = obj.Config.Labels
+	case "volumes":
+		id = obj.Name
+	}
+	if id == "" || strings.ContainsAny(id, "/?#%") {
+		return "", "", fmt.Errorf("cannot inspect %s", ref)
 	}
 	switch {
 	case labels[LabelTask] == g.ID:
-		return "task", nil
+		return "task", id, nil
 	case kind == "containers" && labels[LabelAgent] == g.ID:
-		return "agent", nil
+		return "agent", id, nil
 	}
-	return "", fmt.Errorf("%s %q does not belong to this task", strings.TrimSuffix(kind, "s"), id)
+	return "", "", fmt.Errorf("%s %q does not belong to this task", strings.TrimSuffix(kind, "s"), ref)
 }
 
-// owned reports whether the object carries this task's label.
-func (g *Gate) owned(kind, id string) error {
-	who, err := g.owner(kind, id)
+// owned returns the full ID of an object that carries this task's label.
+func (g *Gate) owned(kind, ref string) (string, error) {
+	who, id, err := g.owner(kind, ref)
 	if err == nil && who != "task" {
-		return fmt.Errorf("%q is the task's own container", id)
+		return "", fmt.Errorf("%q is the task's own container", ref)
 	}
-	return err
+	return id, err
 }
 
-// checkOwned answers the request itself when the object is not the task's.
-// An object that does not exist is left to the daemon's own "no such ..." reply.
-func (g *Gate) checkOwned(w http.ResponseWriter, r *http.Request, kind, id string) bool {
-	if err := g.owned(kind, id); err != nil && err != errNotFound {
-		g.deny(w, r, http.StatusForbidden, err.Error())
-		return false
+// checkOwned returns the full ID of an object of the task's, or answers the
+// request itself: forbidden for another's, the daemon's own "no such"
+// status for one that does not exist (the gate never forwards a reference
+// it could not pin to an ID).
+func (g *Gate) checkOwned(w http.ResponseWriter, r *http.Request, kind, ref string) (string, bool) {
+	id, err := g.owned(kind, ref)
+	if err != nil {
+		g.refuseRef(w, r, kind, ref, err)
+		return "", false
 	}
-	return true
+	return id, true
+}
+
+// refuseRef answers a request whose object reference did not check out.
+func (g *Gate) refuseRef(w http.ResponseWriter, r *http.Request, kind, ref string, err error) {
+	if err == errNotFound {
+		g.deny(w, r, http.StatusNotFound, "No such "+strings.TrimSuffix(kind, "s")+": "+ref)
+		return
+	}
+	g.deny(w, r, http.StatusForbidden, err.Error())
+}
+
+// setPath replaces the request's path (after the API version prefix, which
+// is kept) with p, built from checked full IDs.
+func setPath(r *http.Request, p string) {
+	r.URL.Path = versionPrefix.FindString(r.URL.Path) + p
+	r.URL.RawPath = ""
 }
 
 func gatePass(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) { g.forward(w, r, nil) }
@@ -372,15 +407,19 @@ func gateContainer(g *Gate, w http.ResponseWriter, r *http.Request, m []string) 
 	if len(m) > 2 {
 		action = m[2]
 	}
-	who, err := g.owner("containers", m[1])
+	who, id, err := g.owner("containers", m[1])
 	switch {
-	case err == errNotFound: // the daemon says so itself
 	case err != nil:
-		g.deny(w, r, http.StatusForbidden, err.Error())
+		g.refuseRef(w, r, "containers", m[1], err)
 		return
 	case who == "agent" && !agentActions[action]:
 		g.deny(w, r, http.StatusForbidden, "this is the task's own container: it cannot be stopped, removed or renamed from inside")
 		return
+	}
+	if action == "" {
+		setPath(r, "/containers/"+id)
+	} else {
+		setPath(r, "/containers/"+id+"/"+action)
 	}
 	if action == "attach" {
 		g.stream(w, r)
@@ -393,9 +432,11 @@ func gateContainer(g *Gate, w http.ResponseWriter, r *http.Request, m []string) 
 // in it: the gate attached that one, and compose leaves a network alone when
 // it sees a container it does not know.
 func gateNetwork(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
-	if !g.checkOwned(w, r, "networks", m[1]) {
+	id, ok := g.checkOwned(w, r, "networks", m[1])
+	if !ok {
 		return
 	}
+	setPath(r, "/networks/"+id)
 	status, out, err := g.call("GET", r.URL.RequestURI(), nil)
 	if err != nil {
 		g.deny(w, r, http.StatusBadGateway, err.Error())
@@ -415,7 +456,8 @@ func gateNetwork(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
 }
 
 func gateVolume(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
-	if g.checkOwned(w, r, "volumes", m[1]) {
+	if name, ok := g.checkOwned(w, r, "volumes", m[1]); ok {
+		setPath(r, "/volumes/"+name)
 		g.forward(w, r, nil)
 	}
 }
@@ -434,11 +476,9 @@ func gateExec(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
 
 // gateExecCreate allows commands in the task's containers and in its own
 // container (as any user: root in there is how a task installs packages).
+// The body is read before the container is looked up, and the exec is
+// created in the container by the ID that lookup found (see owner).
 func gateExecCreate(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
-	if _, err := g.owner("containers", m[1]); err != nil && err != errNotFound {
-		g.deny(w, r, http.StatusForbidden, err.Error())
-		return
-	}
 	body, err := decodeBody(r)
 	if err != nil {
 		g.deny(w, r, http.StatusBadRequest, err.Error())
@@ -448,6 +488,12 @@ func gateExecCreate(g *Gate, w http.ResponseWriter, r *http.Request, m []string)
 		g.deny(w, r, http.StatusForbidden, "privileged exec is not allowed")
 		return
 	}
+	_, id, err := g.owner("containers", m[1])
+	if err != nil {
+		g.refuseRef(w, r, "containers", m[1], err)
+		return
+	}
+	setPath(r, "/containers/"+id+"/exec")
 	if status, out := g.relay(w, r, body); status == http.StatusCreated {
 		var created struct{ Id string }
 		if json.Unmarshal(out, &created) == nil && created.Id != "" {
@@ -474,6 +520,10 @@ func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 		g.deny(w, r, http.StatusForbidden, "build network mode "+q.Get("networkmode")+" is not allowed")
 	case q.Get("cgroupparent") != "":
 		g.deny(w, r, http.StatusForbidden, "build cgroup parent is not allowed")
+	case q.Get("remote") != "":
+		// The daemon would fetch it itself, with the credentials of the
+		// host it runs on.
+		g.deny(w, r, http.StatusForbidden, "building from a remote URL is not allowed; build from a local context")
 	default:
 		g.forward(w, r, nil)
 	}
@@ -539,29 +589,49 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 }
 
 func gateNetworkDelete(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
-	if !g.checkOwned(w, r, "networks", m[1]) {
+	id, ok := g.checkOwned(w, r, "networks", m[1])
+	if !ok {
 		return
 	}
 	if g.Agent != "" {
-		g.call("POST", "/networks/"+url.PathEscape(m[1])+"/disconnect", map[string]any{"Container": g.Agent, "Force": true})
+		g.call("POST", "/networks/"+id+"/disconnect", map[string]any{"Container": g.Agent, "Force": true})
 	}
+	setPath(r, "/networks/"+id)
 	g.forward(w, r, nil)
 }
 
+// gateNetworkConnect connects (or disconnects) a container of the task, or
+// its own, to a network of the task. Both go to the daemon by the full IDs
+// the checks found, and so does the endpoint's NetworkID, which the daemon
+// would otherwise prefer to the network in the path.
 func gateNetworkConnect(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
-	if !g.checkOwned(w, r, "networks", m[1]) {
-		return
-	}
 	body, err := decodeBody(r)
 	if err != nil {
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	container, _ := body["Container"].(string)
-	if _, err := g.owner("containers", container); err != nil {
-		g.deny(w, r, http.StatusForbidden, err.Error())
+	nid, ok := g.checkOwned(w, r, "networks", m[1])
+	if !ok {
 		return
 	}
+	container, _ := body["Container"].(string)
+	if container == "" {
+		g.deny(w, r, http.StatusForbidden, "no container named")
+		return
+	}
+	_, cid, err := g.owner("containers", container)
+	if err != nil {
+		g.refuseRef(w, r, "containers", container, err)
+		return
+	}
+	body["Container"] = cid
+	if ep, ok := body["EndpointConfig"].(map[string]any); ok {
+		ep["NetworkID"] = nid
+	} else if !isZero(body["EndpointConfig"]) {
+		g.deny(w, r, http.StatusBadRequest, "unreadable endpoint settings")
+		return
+	}
+	setPath(r, "/networks/"+nid+"/"+m[2])
 	g.forward(w, r, body)
 }
 
@@ -584,7 +654,7 @@ func gateContainerCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []st
 // setting this list does not know is refused.
 var hostAllowed = map[string]bool{
 	"PortBindings": true, "PublishAllPorts": true, "RestartPolicy": true, "AutoRemove": true,
-	"LogConfig": true, "ConsoleSize": true, "Init": true, "ReadonlyRootfs": true, "GroupAdd": true,
+	"ConsoleSize": true, "Init": true, "ReadonlyRootfs": true, "GroupAdd": true,
 	"Memory": true, "MemorySwap": true, "MemoryReservation": true, "MemorySwappiness": true,
 	"NanoCpus": true, "CpuShares": true, "CpuPeriod": true, "CpuQuota": true, "CpusetCpus": true,
 	"PidsLimit": true, "Ulimits": true, "OomKillDisable": true, "ShmSize": true, "Tmpfs": true,
@@ -602,14 +672,26 @@ func (g *Gate) checkCreate(body map[string]any) error {
 			err = g.mounts(v)
 		case "NetworkMode":
 			s, _ := v.(string)
-			err = g.network(s)
+			hc[k], err = g.network(s)
 		case "VolumesFrom":
 			list, _ := v.([]any)
-			for _, c := range list {
+			for i, c := range list {
 				name, _ := c.(string)
-				if e := g.owned("containers", strings.SplitN(name, ":", 2)[0]); e != nil {
-					err = e
+				ref, mode, hasMode := strings.Cut(name, ":")
+				id, e := g.owned("containers", ref)
+				if e != nil {
+					err = fmt.Errorf("volumes from %q: %v", ref, e)
+					break
 				}
+				if hasMode {
+					id += ":" + mode
+				}
+				list[i] = id
+			}
+		case "LogConfig":
+			lc, _ := v.(map[string]any)
+			if t, _ := lc["Type"].(string); !oneOf(t, "", "json-file", "local", "none") {
+				err = fmt.Errorf("log driver %s is not allowed (json-file, local and none are)", t)
 			}
 		case "IpcMode":
 			if s, _ := v.(string); !oneOf(s, "", "private", "shareable", "none") {
@@ -634,28 +716,64 @@ func (g *Gate) checkCreate(body map[string]any) error {
 	}
 	nc, _ := body["NetworkingConfig"].(map[string]any)
 	endpoints, _ := nc["EndpointsConfig"].(map[string]any)
-	for name := range endpoints {
-		if err := g.network(name); err != nil {
+	if nc != nil && endpoints == nil && !isZero(nc["EndpointsConfig"]) {
+		return errors.New("unreadable endpoint settings")
+	}
+	fixed := map[string]any{}
+	for name, v := range endpoints {
+		ep, ok := v.(map[string]any)
+		if !ok && v != nil {
+			return errors.New("unreadable endpoint settings")
+		}
+		id, err := g.network(name)
+		if err != nil {
 			return err
 		}
+		if id != name {
+			// A network of the task's: by its ID, also in the endpoint's
+			// NetworkID, which the daemon prefers to the key.
+			if ep == nil {
+				ep = map[string]any{}
+			}
+			ep["NetworkID"] = id
+		} else if ep != nil {
+			delete(ep, "NetworkID") // default, bridge, none: by name only
+		}
+		if ep != nil {
+			fixed[id] = ep
+		} else {
+			fixed[id] = v
+		}
+	}
+	if endpoints != nil {
+		nc["EndpointsConfig"] = fixed
 	}
 	return nil
 }
 
-func (g *Gate) network(mode string) error {
+// network checks a network mode (or a network named in the endpoint
+// settings) and returns what to forward instead: a network of the task's,
+// or "container:" with a container of the task's (or its own), by full ID;
+// the daemon's built-in modes as they are.
+func (g *Gate) network(mode string) (string, error) {
 	switch {
 	case oneOf(mode, "", "default", "bridge", "none"):
-		return nil
+		return mode, nil
 	case mode == "host":
-		return errors.New("host networking is not allowed")
+		return "", errors.New("host networking is not allowed")
 	case strings.HasPrefix(mode, "container:"):
-		_, err := g.owner("containers", strings.TrimPrefix(mode, "container:"))
-		return err
+		ref := strings.TrimPrefix(mode, "container:")
+		_, id, err := g.owner("containers", ref)
+		if err != nil {
+			return "", fmt.Errorf("network of container %q: %v", ref, err)
+		}
+		return "container:" + id, nil
 	}
-	if err := g.owned("networks", mode); err != nil {
-		return fmt.Errorf("network %q: %v", mode, err)
+	id, err := g.owned("networks", mode)
+	if err != nil {
+		return "", fmt.Errorf("network %q: %v", mode, err)
 	}
-	return nil
+	return id, nil
 }
 
 func (g *Gate) binds(v any) error {
@@ -726,7 +844,8 @@ func (g *Gate) mounts(v any) error {
 // with its symlinks resolved.
 func (g *Gate) source(src string) (string, error) {
 	if !strings.HasPrefix(src, "/") {
-		err := g.owned("volumes", src)
+		// By name, as the daemon looks it up: exactly, no prefix.
+		_, err := g.owned("volumes", src)
 		if err == errNotFound { // created on the fly by the daemon otherwise, without the label
 			status, out, cerr := g.call("POST", "/volumes/create", map[string]any{"Name": src, "Labels": map[string]string{LabelTask: g.ID}})
 			if cerr != nil || status != http.StatusCreated {
