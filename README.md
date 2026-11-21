@@ -177,7 +177,11 @@ the rename only warns.
 
 `<task>` is a slug, numeric id, or unique slug prefix. atelier pushes only when asked:
 push `atl/<slug>` (yourself, or with `atl push`) before `atl pr`. `atl push` pushes
-nothing but the task branch of the task's rw repos, to `origin`.
+nothing but the task branch of the task's rw repos, to `origin`. `atl pr` opens each PR
+in origin's repository (the pinned origin's, see **Origin pin**): with a fork as `origin`,
+the PR is opened in the fork, not upstream. An ssh host alias in origin's URL
+(`git@github-work:org/api.git`) counts as github.com when `ssh -G` says its host name is
+github.com.
 
 `atl done`/`atl cancel` remove each worktree and then delete its `atl/<slug>` branch
 only if no commits on the branch would be lost (the branch's reflog is not kept): every

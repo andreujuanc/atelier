@@ -403,6 +403,55 @@ func TestGitHubRepo(t *testing.T) {
 	}
 }
 
+// TestGitHubRepoSSHAlias: an ssh host alias (a second GitHub account's,
+// say) whose real host name in the user's ssh config is github.com names a
+// github.com repository; ssh is asked with nothing but the host, and only
+// for an ssh URL whose host looks like one.
+func TestGitHubRepoSSHAlias(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	bin := t.TempDir()
+	log := filepath.Join(bin, "log")
+	writeFile(t, filepath.Join(bin, "ssh"), `#!/bin/sh
+printf '%s\n' "$*" >> `+log+`
+[ "$1" = -G ] && [ "$2" = -- ] || exit 2
+case "$3" in
+github-work) echo "user git"; echo "hostname github.com" ;;
+*) echo "hostname $3" ;;
+esac
+`)
+	if err := os.Chmod(filepath.Join(bin, "ssh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for url, want := range map[string]string{
+		"git@github-work:o/r.git":         "o/r",
+		"ssh://git@github-work:22/o/r":    "o/r",
+		"git@ghe.example.com:o/r.git":     "ghe.example.com/o/r",
+		"https://github-work/o/r.git":     "github-work/o/r", // not ssh: no alias
+		"git@-oProxyCommand=x:o/r.git":    "-oProxyCommand=x/o/r",
+		"git@github.com:o/r.git":          "o/r",
+		"ssh://git@github.com:22/o/r.git": "o/r",
+	} {
+		got, ok := GitHubRepo(ctx, f.repo, to(url))
+		if got != want || !ok {
+			t.Errorf("GitHubRepo(%s) = %q, %v; want %q", url, got, ok, want)
+		}
+	}
+	calls, _ := os.ReadFile(log)
+	if got, want := string(calls), "-G -- github-work\n-G -- github-work\n-G -- ghe.example.com\n"; !sameLines(got, want) {
+		t.Errorf("ssh was run with:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// sameLines reports whether a and b have the same lines, in any order.
+func sameLines(a, b string) bool {
+	x, y := strings.Split(a, "\n"), strings.Split(b, "\n")
+	slices.Sort(x)
+	slices.Sort(y)
+	return slices.Equal(x, y)
+}
+
 // decoy makes a bare repo that looks like f's origin with one more commit
 // on main, so that a fetch from it would show.
 func (f fixture) decoy(t *testing.T) string {
