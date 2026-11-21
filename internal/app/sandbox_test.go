@@ -373,7 +373,7 @@ func TestSandboxClaudeToken(t *testing.T) {
 	task := e.task(t, "boxed", model.StatusActive, true)
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
 	_, err := e.app.NewSession(ctx, "boxed")
-	if err == nil || !strings.Contains(err.Error(), "claude setup-token") || !strings.Contains(err.Error(), "CLAUDE_CODE_OAUTH_TOKEN") {
+	if err == nil || !strings.Contains(err.Error(), "atl token") || !strings.Contains(err.Error(), "CLAUDE_CODE_OAUTH_TOKEN") {
 		t.Fatalf("NewSession without a token: %v", err)
 	}
 	if len(fd.calls) != 0 || exists(e.app.Paths.RunDir("boxed")) {

@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -395,6 +396,49 @@ func (c *Client) SelectWindow(ctx context.Context, window string) error {
 		return fmt.Errorf("tmux: select window %s: %w", window, err)
 	}
 	return nil
+}
+
+// SetWindowOption sets option opt of window (an id, "@N") to value.
+func (c *Client) SetWindowOption(ctx context.Context, window, opt, value string) error {
+	if !strings.HasPrefix(window, "@") {
+		return fmt.Errorf("tmux: set window option: bad window id %q", window)
+	}
+	if _, err := c.run(ctx, "set-option", "-w", "-t", window, opt, value); err != nil {
+		return fmt.Errorf("tmux: set %s of window %s: %w", opt, window, err)
+	}
+	return nil
+}
+
+// SetSessionOption sets option opt of the named session (exact name) to
+// value.
+func (c *Client) SetSessionOption(ctx context.Context, session, opt, value string) error {
+	if _, err := c.run(ctx, "set-option", "-t", "="+session+":", opt, value); err != nil {
+		return fmt.Errorf("tmux: set %s of session %s: %w", opt, session, err)
+	}
+	return nil
+}
+
+// CapturePane returns the text of the first pane of window (an id, "@N"),
+// its scrollback included, with lines tmux wrapped joined (capture-pane -J),
+// and the pane's width in columns. The text stays in this process: it is on
+// no command line and in no error.
+func (c *Client) CapturePane(ctx context.Context, window string) (text string, width int, err error) {
+	if !strings.HasPrefix(window, "@") {
+		return "", 0, fmt.Errorf("tmux: capture pane: bad window id %q", window)
+	}
+	w, err := c.run(ctx, "display-message", "-p", "-t", window, "#{pane_width}")
+	if err != nil {
+		return "", 0, fmt.Errorf("tmux: capture pane of window %s: %w", window, err)
+	}
+	width, _ = strconv.Atoi(strings.TrimSpace(w))
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "tmux", c.args("capture-pane", "-p", "-J", "-S", "-", "-E", "-", "-t", window)...)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.WaitDelay = 2 * time.Second
+	if err := cmd.Run(); err != nil {
+		return "", 0, fmt.Errorf("tmux: capture pane of window %s: %s", window, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), width, nil
 }
 
 // SetBuffer puts text in a new automatic paste buffer, the one tmux's

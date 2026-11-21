@@ -55,7 +55,8 @@ func outsideSandbox(what string) error {
 // database, state or config dirs: atl in there (hooks, status line, notes,
 // push, fetch) asks the task's gate, which answers for this task only (see
 // hook.TaskServer). Claude Code's token is not part of the spec: it is
-// passed to each session by name (see sandboxArgv).
+// passed to each session by name (see sandboxArgv), and the file `atl
+// token` stores it in (Paths.ClaudeToken) is in no mount.
 func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -145,9 +146,9 @@ func fileExists(path string) bool {
 // needed. A container that predates a change to the task's repos is replaced
 // when no session runs in it; otherwise it is kept and a warning says so.
 // A new container gets its Claude dir seeded first (seedClaudeDir). Without
-// a token for Claude Code (sandboxAuth) nothing is started.
+// a token for Claude Code (claudeAuth) nothing is started.
 func (a *App) ensureSandbox(ctx context.Context, t *model.Task) error {
-	if _, err := sandboxAuth(); err != nil {
+	if _, err := a.claudeAuth(); err != nil {
 		return err
 	}
 	runDir := a.Paths.RunDir(t.Slug)

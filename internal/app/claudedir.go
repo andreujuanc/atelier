@@ -19,32 +19,8 @@ import (
 // A sandboxed task's Claude Code runs with its own config dir
 // (Paths.ClaudeDir), never the user's: that one holds the login and every
 // other session's transcripts. Claude Code in the task is authenticated by a
-// token from atl's environment instead (claudeAuthVars), handed to each
-// session by name at docker exec time.
-
-// claudeAuthVars are the variables that authenticate Claude Code in a task
-// container: a token from `claude setup-token`, or an API key.
-var claudeAuthVars = []string{"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
-
-// errNoClaudeAuth is what starting a sandboxed session without a token says.
-var errNoClaudeAuth = errors.New("sandboxed sessions need a Claude Code token in atl's environment: run `claude setup-token` once " +
-	"and set CLAUDE_CODE_OAUTH_TOKEN to the token it prints where atl runs (e.g. containerEnv of the devcontainer), " +
-	"or set ANTHROPIC_API_KEY")
-
-// sandboxAuth returns the claudeAuthVars set in atl's environment, or
-// errNoClaudeAuth if none is.
-func sandboxAuth() (map[string]string, error) {
-	auth := map[string]string{}
-	for _, k := range claudeAuthVars {
-		if v := os.Getenv(k); v != "" {
-			auth[k] = v
-		}
-	}
-	if len(auth) == 0 {
-		return nil, errNoClaudeAuth
-	}
-	return auth, nil
-}
+// token instead (see token.go: from atl's environment, else the one `atl
+// token` stored), handed to each session by name at docker exec time.
 
 // claudeConfigDirFor is the Claude config dir the task's sessions use: the
 // task's own with the sandbox on, else the user's.
