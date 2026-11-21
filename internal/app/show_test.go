@@ -3,8 +3,11 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -214,6 +217,171 @@ func TestParseTranscriptCapsTurns(t *testing.T) {
 	if turns[2].Text != strings.Repeat("x", maxTurnRunes) {
 		t.Error("turn of exactly the cap was truncated")
 	}
+}
+
+// lineReader yields n lines of what line returns for each index, without
+// holding more than one at a time: a transcript the size of n lines.
+type lineReader struct {
+	n, i int
+	line func(i int) []byte
+	cur  []byte
+}
+
+func (r *lineReader) Read(p []byte) (int, error) {
+	for len(r.cur) == 0 {
+		if r.i >= r.n {
+			return 0, io.EOF
+		}
+		r.cur = r.line(r.i)
+		r.i++
+	}
+	n := copy(p, r.cur)
+	r.cur = r.cur[n:]
+	return n, nil
+}
+
+// repeatReader is s repeated n times, then end.
+type repeatReader struct {
+	s   []byte
+	n   int
+	off int
+}
+
+func (r *repeatReader) Read(p []byte) (int, error) {
+	if r.n == 0 {
+		return 0, io.EOF
+	}
+	k := copy(p, r.s[r.off:])
+	r.off += k
+	if r.off == len(r.s) {
+		r.off, r.n = 0, r.n-1
+	}
+	return k, nil
+}
+
+// allocated returns how many bytes f allocates.
+func allocated(f func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// TestParseTranscriptBoundsMemory: the task writes its transcripts, so
+// reading one must not take memory in proportion to it. A line over the
+// line bound is skipped (it is read past, not held), the lines around it
+// still count; and a turn collapsed from many entries is not built whole
+// before it is capped.
+func TestParseTranscriptBoundsMemory(t *testing.T) {
+	defer func(n int) { maxTranscriptLine = n }(maxTranscriptLine)
+	maxTranscriptLine = 1 << 20
+
+	// One 64 MiB line (an image, say) between two user turns.
+	huge := io.MultiReader(
+		strings.NewReader(`{"type":"user","message":{"content":"before"}}`+"\n"),
+		strings.NewReader(`{"type":"assistant","message":{"content":[{"type":"text","text":"`),
+		&repeatReader{s: []byte(strings.Repeat("A", 4096)), n: 64 << 8},
+		strings.NewReader(`"}]}}`+"\n"+`{"type":"user","message":{"content":"after"}}`+"\n"))
+	var turns []Turn
+	var err error
+	if n := allocated(func() { turns, err = ParseTranscript(huge) }); n > 16<<20 {
+		t.Errorf("a 64 MiB line took %d MiB", n>>20)
+	}
+	if err != nil || len(turns) != 1 || turns[0].Text != "before\nafter" {
+		var texts []string
+		for _, tr := range turns {
+			texts = append(texts, firstChars(tr.Text, 20))
+		}
+		t.Errorf("turns around the long line: %q, %v; want the two user lines as one turn", texts, err)
+	}
+
+	// 3000 assistant entries of 1000 chars: one turn of 3 MB before the cap.
+	text := strings.Repeat("b", 1000)
+	many := &lineReader{n: 3000, line: func(int) []byte {
+		return []byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"` + text + `"}]}}` + "\n")
+	}}
+	if n := allocated(func() { turns, err = ParseTranscript(many) }); n > 64<<20 {
+		t.Errorf("3000 entries of one turn took %d MiB", n>>20)
+	}
+	if want := 3000*1001 - 1 - maxTurnRunes; err != nil || len(turns) != 1 || !strings.HasSuffix(turns[0].Text, fmt.Sprintf("… (%d more chars)", want)) {
+		t.Errorf("collapsed turn: %d turns, %v", len(turns), err)
+	}
+}
+
+// TestParseTranscriptSameAsWhole: the streaming parse gives what parsing
+// the transcript whole gave (wholeTranscript, the former ParseTranscript),
+// for the sample transcript and for collapsed, capped turns of several
+// byte widths; and keeping only the last turns gives the same last turns.
+func TestParseTranscriptSameAsWhole(t *testing.T) {
+	sample, err := os.ReadFile(filepath.Join("testdata", "transcript.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	b.Write(sample)
+	for i := 0; i < 40; i++ {
+		role := []string{"user", "assistant"}[i/7%2]
+		text := strings.Repeat([]string{"x", "é", "語", "🙂"}[i%4], 400+i*37)
+		if role == "user" {
+			fmt.Fprintf(&b, `{"type":"user","timestamp":"2026-05-01T10:0%d:00Z","message":{"content":%q}}`+"\n", i%10, text)
+		} else {
+			fmt.Fprintf(&b, `{"type":"assistant","message":{"content":[{"type":"text","text":%q},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`+"\n", text)
+		}
+		if i%9 == 0 {
+			b.WriteString("not json\n\n")
+		}
+	}
+	b.WriteString(`{"type":"user","message":{"content":"no newline at the end"}}`)
+	in := b.String()
+	want := wholeTranscript(t, in)
+	got, err := ParseTranscript(strings.NewReader(in))
+	if err != nil || len(got) != len(want) || len(want) < 10 {
+		t.Fatalf("got %d turns (%v), want %d", len(got), err, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("turn %d = %+v\nwant %+v", i, got[i], want[i])
+		}
+	}
+	for _, keep := range []int{1, 3, len(want), len(want) + 5} {
+		tail, err := parseTranscript(strings.NewReader(in), keep)
+		w := want[max(0, len(want)-keep):]
+		if err != nil || len(tail) != len(w) {
+			t.Fatalf("keep %d: %d turns, %v", keep, len(tail), err)
+		}
+		for i := range w {
+			if tail[i] != w[i] {
+				t.Errorf("keep %d: turn %d = %+v\nwant %+v", keep, i, tail[i], w[i])
+			}
+		}
+	}
+}
+
+// wholeTranscript is ParseTranscript as it was: every line read whole,
+// turns collapsed whole, then capped.
+func wholeTranscript(t *testing.T, in string) []Turn {
+	t.Helper()
+	var turns []Turn
+	for _, line := range strings.SplitAfter(in, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if role, text, at, ok := parseEntry([]byte(line)); ok {
+			if n := len(turns); n > 0 && turns[n-1].Role == role {
+				turns[n-1].Text += "\n" + text
+			} else {
+				turns = append(turns, Turn{Role: role, Text: text, Time: at})
+			}
+		}
+	}
+	for i := range turns {
+		if r := []rune(turns[i].Text); len(r) > maxTurnRunes {
+			turns[i].Text = string(r[:maxTurnRunes]) + fmt.Sprintf("… (%d more chars)", len(r)-maxTurnRunes)
+		}
+	}
+	return turns
 }
 
 func TestTranscript(t *testing.T) {

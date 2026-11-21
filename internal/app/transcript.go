@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
@@ -59,12 +60,9 @@ func (a *App) Transcript(ctx context.Context, ref string, sessionID int64, tail 
 		return nil, fmt.Errorf("session %d transcript: %w", sess.ID, err)
 	}
 	defer f.Close()
-	turns, err := ParseTranscript(f)
+	turns, err := parseTranscript(f, tail)
 	if err != nil {
 		return nil, fmt.Errorf("session %d transcript %s: %w", sess.ID, sess.TranscriptPath, err)
-	}
-	if tail > 0 && len(turns) > tail {
-		turns = turns[len(turns)-tail:]
 	}
 	return turns, nil
 }
@@ -154,28 +152,74 @@ type transcriptBlock struct {
 //     <bash-stdout>/<bash-stderr> output is dropped;
 //   - consecutive entries of the same role are collapsed into one turn;
 //   - each turn's text is capped at maxTurnRunes runes;
-//   - malformed lines are ignored.
+//   - malformed lines are ignored, and so are lines longer than
+//     maxTranscriptLine.
 //
-// Only read errors are returned.
-func ParseTranscript(r io.Reader) ([]Turn, error) {
+// The task writes its transcripts, so the file is read as a stream: it
+// holds one line (at most maxTranscriptLine bytes) and the turns, each
+// kept to its cap as it is collapsed. Only read errors are returned.
+func ParseTranscript(r io.Reader) ([]Turn, error) { return parseTranscript(r, 0) }
+
+// maxTranscriptLine bounds one line of a transcript that is parsed: far
+// above Claude Code's longest entries (a pasted image, a large tool result
+// run to several MB). A longer line is read past and skipped like a
+// malformed one. A var so tests can lower it.
+var maxTranscriptLine = 32 << 20
+
+// parseTranscript is ParseTranscript keeping only the last keep turns
+// (all if keep <= 0) as it goes.
+func parseTranscript(r io.Reader, keep int) ([]Turn, error) {
 	br := bufio.NewReaderSize(r, 64<<10)
-	var turns []Turn
+	var turns []turnText
+	var buf []byte
 	for {
-		line, err := br.ReadBytes('\n')
-		if len(bytes.TrimSpace(line)) > 0 {
+		line, tooLong, err := readLine(br, buf[:0], maxTranscriptLine)
+		buf = line
+		if !tooLong && len(bytes.TrimSpace(line)) > 0 {
 			if role, text, at, ok := parseEntry(line); ok {
 				if n := len(turns); n > 0 && turns[n-1].Role == role {
-					turns[n-1].Text += "\n" + text
+					turns[n-1].add("\n")
+					turns[n-1].add(text)
 				} else {
-					turns = append(turns, Turn{Role: role, Text: text, Time: at})
+					if keep > 0 && len(turns) >= 2*keep {
+						turns = append(turns[:0], turns[len(turns)-keep+1:]...)
+					}
+					turns = append(turns, turnText{Turn: Turn{Role: role, Time: at}})
+					turns[len(turns)-1].add(text)
 				}
 			}
 		}
-		if errors.Is(err, io.EOF) {
-			return capTurns(turns), nil
-		}
 		if err != nil {
-			return capTurns(turns), err
+			if keep > 0 && len(turns) > keep {
+				turns = turns[len(turns)-keep:]
+			}
+			out := make([]Turn, len(turns))
+			for i, t := range turns {
+				out[i] = t.turn()
+			}
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			return out, err
+		}
+	}
+}
+
+// readLine reads the next line from br into buf, its newline included (the
+// last line may have none, with io.EOF). A line longer than max is read to
+// its end but not kept: tooLong, and line empty.
+func readLine(br *bufio.Reader, buf []byte, max int) (line []byte, tooLong bool, err error) {
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if !tooLong {
+			if len(buf)+len(chunk) > max {
+				tooLong, buf = true, buf[:0]
+			} else {
+				buf = append(buf, chunk...)
+			}
+		}
+		if err != bufio.ErrBufferFull {
+			return buf, tooLong, err
 		}
 	}
 }
@@ -183,15 +227,40 @@ func ParseTranscript(r io.Reader) ([]Turn, error) {
 // maxTurnRunes caps the text of one condensed turn.
 const maxTurnRunes = 3000
 
-// capTurns truncates each turn's text to maxTurnRunes runes, appending
-// "… (N more chars)".
-func capTurns(turns []Turn) []Turn {
-	for i := range turns {
-		if r := []rune(turns[i].Text); len(r) > maxTurnRunes {
-			turns[i].Text = string(r[:maxTurnRunes]) + fmt.Sprintf("… (%d more chars)", len(r)-maxTurnRunes)
+// turnText is a turn being collapsed: Text holds at most its first
+// maxTurnRunes runes, runes counts them all.
+type turnText struct {
+	Turn
+	runes int
+}
+
+func (t *turnText) add(s string) {
+	n := utf8.RuneCountInString(s)
+	if room := maxTurnRunes - t.runes; room > 0 {
+		if n <= room {
+			t.Text += s
+		} else {
+			cut := 0
+			for i := range s {
+				if room == 0 {
+					cut = i
+					break
+				}
+				room--
+			}
+			t.Text += s[:cut]
 		}
 	}
-	return turns
+	t.runes += n
+}
+
+// turn is the turn with its text capped at maxTurnRunes runes and
+// "… (N more chars)" appended if it was longer.
+func (t turnText) turn() Turn {
+	if t.runes > maxTurnRunes {
+		t.Text += fmt.Sprintf("… (%d more chars)", t.runes-maxTurnRunes)
+	}
+	return t.Turn
 }
 
 func parseEntry(line []byte) (role, text string, at time.Time, ok bool) {
