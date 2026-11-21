@@ -3,40 +3,171 @@ package gitx
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 )
 
+// Origin is where a repo's origin points: its fetch URL and push URLs as git
+// resolves them (insteadOf rules applied). atl pins it once per repo and
+// pushes and fetches there, whatever the repo's config says later.
+type Origin struct {
+	URL      string   `json:"url"`
+	PushURLs []string `json:"push_urls"`
+}
+
+// Equal reports whether o and p have the same URLs, in the same order.
+func (o Origin) Equal(p Origin) bool {
+	return o.URL == p.URL && slices.Equal(o.PushURLs, p.PushURLs)
+}
+
+// String is the fetch URL, followed by the push URLs if they differ.
+func (o Origin) String() string {
+	if len(o.PushURLs) == 1 && o.PushURLs[0] == o.URL {
+		return o.URL
+	}
+	return o.URL + " (push: " + strings.Join(o.PushURLs, ", ") + ")"
+}
+
+// CurrentOrigin returns origin's URLs as the repo at dir resolves them now;
+// ok is false when the repo has no origin.
+func CurrentOrigin(ctx context.Context, dir string) (o Origin, ok bool, err error) {
+	if o.URL, err = run(ctx, dir, "remote", "get-url", "origin"); err != nil {
+		var ge *Error
+		if errors.As(err, &ge) && ge.ExitCode == 2 { // no such remote
+			return Origin{}, false, nil
+		}
+		return Origin{}, false, err
+	}
+	push, err := run(ctx, dir, "remote", "get-url", "--push", "--all", "origin")
+	if err != nil {
+		return Origin{}, false, err
+	}
+	o.PushURLs = strings.Split(push, "\n")
+	return o, true, nil
+}
+
 // PushBranch pushes the local branch of the repo at dir to the same branch
-// on origin, and nothing else (no tags, no submodules); force means
-// --force-with-lease. git's output goes to out as it comes.
+// at origin's push URLs, and nothing else (no tags, no submodules); force
+// means --force-with-lease. git's output goes to out as it comes.
 //
 // It runs git in a repo whose config and hooks may have been written by a
 // sandboxed task, with the credentials of the place atl runs in, so it keeps
-// git from running anything that config names (see transportArgs). The
-// remote URL itself is still read from the repo's config (remote.origin.url
-// and pushurl, url.*.insteadOf): the branch goes wherever origin points.
-func PushBranch(ctx context.Context, dir, branch string, force bool, out io.Writer) error {
+// git from running anything that config names (see transportArgs), and the
+// branch goes to origin's URLs, never to what the repo's config says (see
+// remoteArgs).
+func PushBranch(ctx context.Context, dir string, origin Origin, branch string, force bool, out io.Writer) error {
 	ref := "refs/heads/" + branch
-	local := allLocal(remoteURLs(ctx, dir, true))
-	args := transportArgs(ctx, dir, true, local)
+	local := allLocal(origin.PushURLs)
+	name, remote, err := remoteArgs(ctx, dir, origin, true)
+	if err != nil {
+		return err
+	}
+	args := append(transportArgs(ctx, dir, true, local), remote...)
 	args = append(args, "push", "--no-follow-tags", "--recurse-submodules=no")
 	if force {
 		args = append(args, "--force-with-lease")
 	}
-	args = append(args, "--receive-pack="+packProgram(true, local), "origin", ref+":"+ref)
+	args = append(args, "--receive-pack="+packProgram(true, local), name, ref+":"+ref)
 	return runTransport(ctx, dir, out, args)
 }
 
-// FetchOrigin is `git fetch origin` in the repo at dir with the same guards
-// as PushBranch. git's output goes to out.
-func FetchOrigin(ctx context.Context, dir string, out io.Writer) error {
-	local := allLocal(remoteURLs(ctx, dir, false))
-	args := transportArgs(ctx, dir, false, local)
+// FetchOrigin is `git fetch origin` in the repo at dir, from origin's URL,
+// with the same guards as PushBranch. git's output goes to out.
+func FetchOrigin(ctx context.Context, dir string, origin Origin, out io.Writer) error {
+	local := isLocalURL(origin.URL)
+	name, remote, err := remoteArgs(ctx, dir, origin, false)
+	if err != nil {
+		return err
+	}
+	args := append(transportArgs(ctx, dir, false, local), remote...)
 	args = append(args, "fetch", "--no-recurse-submodules", "--no-auto-gc",
-		"--upload-pack="+packProgram(false, local), "origin")
+		"--upload-pack="+packProgram(false, local), name)
 	return runTransport(ctx, dir, out, args)
+}
+
+// remoteArgs defines, with -c options only, a remote that stands in for
+// origin and returns its name and the options. Its URLs are origin's (not
+// the repo's remote.origin.*), and its fetch refspecs are the repo's own
+// remote.origin.fetch, so that a push still updates refs/remotes/origin/<b>
+// and --force-with-lease leases against it, and a single-branch clone
+// fetches what it did. A refspec the task wrote can only touch local refs,
+// which the task can write anyway.
+//
+// The name is random: remote.<name>.url and pushurl are lists, so a remote
+// the repo's config could name in advance would get its URLs too.
+//
+// -c cannot remove url.<base>.insteadOf or pushInsteadOf rules, which apply
+// to these URLs as to any; so a push or fetch is refused while the repo's
+// own config has one (see repoRewrites). The user's own rules (system,
+// global) stay: origin's URLs were resolved with them, and the usual ones
+// (https://host/ → git@host:) leave a rewritten URL as it is. The check and
+// git's own read of the config are two moments, so a task rewriting its
+// config in a loop could slip a rule in between; that is part of the task
+// being able to write the clone's .git at all (see README, Sandbox).
+func remoteArgs(ctx context.Context, dir string, origin Origin, push bool) (string, []string, error) {
+	if origin.URL == "" || len(origin.PushURLs) == 0 {
+		return "", nil, errors.New("no origin URL")
+	}
+	if err := repoRewrites(ctx, dir); err != nil {
+		return "", nil, err
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", nil, err
+	}
+	name := "atl-" + hex.EncodeToString(b[:])
+	kv := []string{"url=" + origin.URL, "followRemoteHEAD=never"}
+	if push {
+		for _, u := range origin.PushURLs {
+			kv = append(kv, "pushurl="+u)
+		}
+	}
+	refspecs, _ := run(ctx, dir, "config", "--get-all", "remote.origin.fetch")
+	n := len(kv)
+	for _, r := range strings.Split(refspecs, "\n") {
+		if r != "" {
+			kv = append(kv, "fetch="+r)
+		}
+	}
+	if len(kv) == n {
+		kv = append(kv, "fetch=+refs/heads/*:refs/remotes/origin/*")
+	}
+	args := make([]string, 0, 2*len(kv))
+	for _, s := range kv {
+		args = append(args, "-c", "remote."+name+"."+s)
+	}
+	return name, args, nil
+}
+
+// repoRewrites refuses when the config of the repo at dir itself (scopes
+// local and worktree, includes followed) has a url.<base>.insteadOf or
+// pushInsteadOf rule.
+func repoRewrites(ctx context.Context, dir string) error {
+	data, err := run(ctx, dir, "config", "--show-scope", "--includes", "--null",
+		"--get-regexp", `^url\..*\.(insteadof|pushinsteadof)$`)
+	if err != nil {
+		var ge *Error
+		if errors.As(err, &ge) && ge.ExitCode == 1 && ge.Stderr == "" {
+			return nil // none
+		}
+		return err
+	}
+	// Records are scope NUL key LF value NUL.
+	f := strings.Split(data, "\x00")
+	for i := 0; i+1 < len(f); i += 2 {
+		if scope := f[i]; scope == "local" || scope == "worktree" {
+			key, value, _ := strings.Cut(f[i+1], "\n")
+			return fmt.Errorf("refused: the repo's own config (%s) has %s = %s, which would rewrite origin's URL; remove it and try again",
+				scope, key, value)
+		}
+	}
+	return nil
 }
 
 // transportArgs are the -c options of a push or fetch in dir. Options given
@@ -49,8 +180,8 @@ func FetchOrigin(ctx context.Context, dir string, out io.Writer) error {
 //     no askpass program but the user's, and ssh as the user runs it
 //     ($GIT_SSH_COMMAND, else their core.sshCommand, else $GIT_SSH or ssh);
 //   - no ext:: transport (it runs a command), and no file transport unless
-//     origin is a local path (local; see packProgram);
-//   - for a push: no signing, no push options, no mirror mode.
+//     origin's URLs are local paths (local; see packProgram);
+//   - for a push: no signing, no push options.
 //
 // core.gitProxy cannot be undone with -c (git takes its first value), so
 // runTransport sets $GIT_PROXY_COMMAND, which comes before it.
@@ -84,7 +215,7 @@ func transportArgs(ctx context.Context, dir string, push, local bool) []string {
 		kv = append(kv, "protocol.file.allow=never")
 	}
 	if push {
-		kv = append(kv, "push.gpgSign=false", "push.pushOption=", "remote.origin.mirror=false")
+		kv = append(kv, "push.gpgSign=false", "push.pushOption=")
 	}
 	args := make([]string, 0, 2*len(kv))
 	for _, s := range kv {
@@ -108,20 +239,6 @@ func packProgram(push, local bool) string {
 		return "git-" + name
 	}
 	return "git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.alternateRefsCommand=true -c receive.autogc=false " + name
-}
-
-// remoteURLs returns origin's URLs (push URLs for a push) as git resolves
-// them, insteadOf rules applied.
-func remoteURLs(ctx context.Context, dir string, push bool) []string {
-	args := []string{"remote", "get-url", "--all"}
-	if push {
-		args = append(args, "--push")
-	}
-	out, err := run(ctx, dir, append(args, "origin")...)
-	if err != nil || out == "" {
-		return nil
-	}
-	return strings.Split(out, "\n")
 }
 
 func allLocal(urls []string) bool {

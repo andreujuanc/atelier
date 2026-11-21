@@ -172,7 +172,7 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 	if mode == model.ModeRW {
 		if !noFetch {
 			fmt.Fprintf(a.out(), "fetching %s...\n", name)
-			if err := gitx.Fetch(ctx, repo); err != nil {
+			if err := a.fetchOrigin(ctx, name, repo); err != nil {
 				return nil, fmt.Errorf("repo %s: %w", name, err)
 			}
 		}

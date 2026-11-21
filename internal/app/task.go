@@ -208,7 +208,7 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 		path := a.Paths.RepoPath(r.Name)
 		if !o.NoFetch {
 			fmt.Fprintf(a.out(), "fetching %s...\n", r.Name)
-			if err := gitx.Fetch(ctx, path); err != nil {
+			if err := a.fetchOrigin(ctx, r.Name, path); err != nil {
 				return nil, fmt.Errorf("repo %s: %w", r.Name, err)
 			}
 		}

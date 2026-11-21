@@ -191,7 +191,7 @@ func saveSettings(path string, root map[string]any) error {
 	if err := enc.Encode(root); err != nil {
 		return fmt.Errorf("gen: encode settings: %w", err)
 	}
-	if err := writeAtomic(path, buf.Bytes()); err != nil {
+	if err := WriteAtomic(path, buf.Bytes()); err != nil {
 		return fmt.Errorf("gen: write %s: %w", path, err)
 	}
 	return nil
@@ -337,9 +337,9 @@ loop:
 	return s[:i], b.String()
 }
 
-// writeAtomic writes data to path via a temp file in the same directory,
+// WriteAtomic writes data to path via a temp file in the same directory,
 // synced to disk before the rename so a crash never leaves an empty file.
-func writeAtomic(path string, data []byte) error {
+func WriteAtomic(path string, data []byte) error {
 	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
 	if err != nil {
 		return err

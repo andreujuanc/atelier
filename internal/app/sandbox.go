@@ -189,6 +189,10 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) error {
 	if err := sandbox.InstallBin(a.AtlBin, runDir); err != nil {
 		return fmt.Errorf("install atl for the task container: %w", err)
 	}
+	// Before the container can reach the repos' config (see pinOrigin).
+	if err := a.pinOrigins(ctx, t); err != nil {
+		return err
+	}
 	startGate := a.StartGate
 	if startGate == nil {
 		startGate = sandbox.Start

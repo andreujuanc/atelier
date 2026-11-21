@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 )
@@ -204,6 +207,68 @@ func TestSandboxSessionRunsInTaskContainer(t *testing.T) {
 	}
 	if _, err := os.Stat(p.RunDir("boxed")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("run dir left behind: %v", err)
+	}
+}
+
+// TestSandboxPinsOrigins: the task's repos get their origin pinned before
+// its container starts, in a place none of the container's mounts reaches;
+// a repo without origin gets no pin and does not stop the sandbox.
+func TestSandboxPinsOrigins(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	p := e.app.Paths
+	root := filepath.Dir(e.out)
+	for _, name := range []string{"api", "docs"} {
+		origin := filepath.Join(root, "origins", name+".git")
+		git(t, root, "init", "-q", "--bare", origin)
+		git(t, root, "clone", "-q", origin, p.RepoPath(name))
+	}
+	git(t, root, "init", "-q", p.RepoPath("local"))
+	task := e.task(t, "boxed", model.StatusActive, true, model.TaskRepo{Name: "api", Mode: model.ModeRW},
+		model.TaskRepo{Name: "local", Mode: model.ModeRW}, model.TaskRepo{Name: "docs", Mode: model.ModeRO})
+	pinnedAtRun := false
+	e.app.Docker = func(ctx context.Context, args ...string) (string, error) {
+		if args[0] == "run" {
+			pinnedAtRun = exists(p.OriginPin("api")) && exists(p.OriginPin("docs"))
+		}
+		return fd.run(ctx, args...)
+	}
+	if err := e.app.ensureSandbox(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if len(fd.find("run")) != 1 || !pinnedAtRun {
+		t.Errorf("container started %d times, origins pinned before: %v", len(fd.find("run")), pinnedAtRun)
+	}
+	for _, name := range []string{"api", "docs"} {
+		var o gitx.Origin
+		if err := json.Unmarshal([]byte(readFile(t, p.OriginPin(name))), &o); err != nil {
+			t.Fatal(err)
+		}
+		if want := filepath.Join(root, "origins", name+".git"); o.URL != want || len(o.PushURLs) != 1 || o.PushURLs[0] != want {
+			t.Errorf("%s pin = %+v, want %s", name, o, want)
+		}
+	}
+	if exists(p.OriginPin("local")) {
+		t.Error("a repo without origin was pinned")
+	}
+
+	// No mount of the container reaches the pins, with or without a workspace.
+	for _, paths := range []config.Paths{p, {
+		Workspace: filepath.Join(root, "ws"), Repos: p.Repos, Tasks: filepath.Join(root, "ws", "tasks"),
+		DB: filepath.Join(root, "ws", "data", "atelier.db"), StateDir: filepath.Join(root, "ws", "state"),
+		ConfigDir: filepath.Join(root, "ws", "config"),
+	}} {
+		e.app.Paths = paths
+		spec, err := e.app.sandboxSpec(ctx, task)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pin := paths.OriginPin("api")
+		for _, m := range spec.Mounts {
+			if rel, err := filepath.Rel(m.Src, pin); err == nil && !strings.HasPrefix(rel, "..") {
+				t.Errorf("mount %s reaches the pin %s", m.Src, pin)
+			}
+		}
 	}
 }
 

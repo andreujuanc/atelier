@@ -71,7 +71,7 @@ func WriteAssistantFiles(dir, atlBin string) error {
 		return fmt.Errorf("gen: create assistant dir: %w", err)
 	}
 	path := filepath.Join(dir, "CLAUDE.md")
-	if err := writeAtomic(path, []byte(AssistantClaudeMD())); err != nil {
+	if err := WriteAtomic(path, []byte(AssistantClaudeMD())); err != nil {
 		return fmt.Errorf("gen: write %s: %w", path, err)
 	}
 	return writeAssistantSettings(dir, atlBin)

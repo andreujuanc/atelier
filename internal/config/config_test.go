@@ -127,12 +127,17 @@ func TestResolveWorkspaceMissing(t *testing.T) {
 
 func TestHelpers(t *testing.T) {
 	p := Paths{Repos: "/r", Tasks: "/t", StateDir: "/s", ConfigDir: "/c"}
+	w := Paths{Workspace: "/w", Tasks: "/w/tasks", StateDir: "/w/state"}
 	cases := []struct{ got, want string }{
 		{p.TaskDir("fix-bug"), "/t/fix-bug"},
 		{p.RepoPath("api"), "/r/api"},
 		{p.WorktreePath("fix-bug", "api"), "/t/fix-bug/api"},
 		{p.HookLog(), "/s/hook.log"},
 		{p.ProjectFile("acme"), "/c/projects/acme.toml"},
+		{filepath.Dir(p.RunDir("fix-bug")), "/s-run"},
+		{p.OriginPin("api"), "/s-run/origins/api.json"},
+		{filepath.Dir(w.RunDir("fix-bug")), "/w/run"},
+		{w.OriginPin("api"), "/w/run/origins/api.json"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
