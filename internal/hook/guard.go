@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/store"
 )
@@ -22,7 +21,13 @@ const maxSymlinks = 40
 // worktree (a session launched while the repo was ro still has the clone as
 // an --add-dir after it is upgraded to rw). It fails open (exit 0, error for
 // the log) on anything it cannot resolve.
-func guard(ctx context.Context, in Input, env func(string) string, st *store.Store, p config.Paths) (int, string, error) {
+//
+// Paths are resolved where the hook runs. Through a sandboxed task's gate
+// that is next to atl, not in the task container, so the container's own
+// resolution of the targets (in.landings, see viaGate) is checked too: it
+// can only add blocks.
+func (d db) guard(ctx context.Context, in Input, env func(string) string) (int, string, error) {
+	p := d.p
 	targets, decodeErr := guardTargets(in.ToolInput)
 	if len(targets) == 0 {
 		if decodeErr != nil {
@@ -31,7 +36,7 @@ func guard(ctx context.Context, in Input, env func(string) string, st *store.Sto
 		return 0, "", fmt.Errorf("ro guard: no file_path or notebook_path in %s tool_input", orDash(in.ToolName))
 	}
 
-	task, err := guardTask(ctx, in, env, st, p)
+	task, err := d.guardTask(ctx, in, env)
 	if err != nil {
 		return 0, "", fmt.Errorf("ro guard: resolve task: %w", err)
 	}
@@ -42,7 +47,6 @@ func guard(ctx context.Context, in Input, env func(string) string, st *store.Sto
 		return 0, "", nil
 	}
 
-	type candidate struct{ given, landing string }
 	var candidates []candidate
 	var resolveErr error
 	for _, target := range targets {
@@ -68,6 +72,7 @@ func guard(ctx context.Context, in Input, env func(string) string, st *store.Sto
 	if resolveErr == nil {
 		resolveErr = decodeErr
 	}
+	candidates = append(candidates, in.landings...)
 
 	for _, repo := range task.Repos {
 		name := repo.Name
@@ -147,16 +152,25 @@ func targetForms(target, cwd string) (forms []string, err error) {
 	return forms, err
 }
 
+// candidate is a form of a tool target (given) and where a write to it
+// lands.
+type candidate struct{ given, landing string }
+
 // guardTask resolves the task for the ro guard: ATL_TASK env → the
-// session's task → task dir from cwd. nil, nil if none matches.
-func guardTask(ctx context.Context, in Input, env func(string) string, st *store.Store, p config.Paths) (*model.Task, error) {
+// session's task → task dir from cwd. nil, nil if none matches. With a
+// scope it is the scope's task.
+func (d db) guardTask(ctx context.Context, in Input, env func(string) string) (*model.Task, error) {
+	st := d.st
+	if d.scope != 0 {
+		return d.scopeTask(ctx)
+	}
 	if slug := env("ATL_TASK"); slug != "" {
 		task, err := st.GetTaskBySlug(ctx, slug)
 		if err == nil || !errors.Is(err, store.ErrNotFound) {
 			return task, err
 		}
 	}
-	sess, err := findSession(ctx, EventPreToolUse, in, env, st)
+	sess, err := d.findSession(ctx, EventPreToolUse, in, env)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +180,7 @@ func guardTask(ctx context.Context, in Input, env func(string) string, st *store
 			return task, err
 		}
 	}
-	return findTask(ctx, in, func(string) string { return "" }, st, p)
+	return d.findTask(ctx, in, func(string) string { return "" })
 }
 
 // resolvePath returns where a write to the absolute path would land,

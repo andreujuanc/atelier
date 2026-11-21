@@ -7,6 +7,9 @@
 // carrying fresh task context (see context.go). Errors go to hook.log.
 //
 // This path must stay fast (<50ms): no cobra, one DB open, no tmux calls.
+// In a sandboxed task's container it opens nothing: the input goes to the
+// task's gate, which handles it with an open database, limited to that task
+// (see gate.go).
 package hook
 
 import (
@@ -40,6 +43,22 @@ type Input struct {
 	ToolName         string          `json:"tool_name"`
 	ToolInput        json.RawMessage `json:"tool_input"`      // file_path / notebook_path
 	TranscriptPath   string          `json:"transcript_path"` // every event: the session's transcript JSONL
+
+	// landings are where the tool targets land as the task container
+	// resolves them (PreToolUse through a sandboxed task's gate): the ro
+	// guard checks them besides its own resolution.
+	landings []candidate
+}
+
+// db is the database a hook works on, and how much of it it may touch.
+type db struct {
+	st *store.Store // nil: opened per event from p.DB
+	p  config.Paths
+	// scope is 0 for atl running next to the sessions: any task's rows. A
+	// sandboxed task's gate sets it to the task's id: whatever the event or
+	// its environment say, only that task and its sessions are read or
+	// written (see TaskServer).
+	scope int64
 }
 
 // Hook event names handled by atelier.
@@ -82,6 +101,9 @@ const (
 // ro guard blocks a tool call, 0 otherwise. Errors are appended to
 // Paths.HookLog(). The only stdout output is the SessionStart task context
 // JSON (one object, only for a session resolved to a task).
+//
+// In a task container (sandbox.InEnv set) it opens nothing: the task's gate
+// handles the event (see viaGate and TaskServer).
 func Main(args []string) int {
 	return run(args, os.Stdin, os.Stdout, os.Stderr, os.Getenv)
 }
@@ -91,11 +113,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, env func(stri
 	if len(args) > 0 {
 		event = args[0]
 	}
+	if event != EventAssistantGuard && env(sandbox.InEnv) != "" {
+		return viaGate(event, stdin, stdout, stderr, env)
+	}
 	var p config.Paths
-	var sid string
 	defer func() {
 		if r := recover(); r != nil {
-			logError(p, stderr, event, sid, fmt.Errorf("panic: %v\n%s", r, debug.Stack()))
+			logError(p, stderr, event, "", fmt.Errorf("panic: %v\n%s", r, debug.Stack()))
 			code = 0
 			if event == EventAssistantGuard {
 				code = assistantRefuse(stderr, "", "internal error")
@@ -105,7 +129,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, env func(stri
 
 	p, err := config.Resolve()
 	if err != nil {
-		logError(p, stderr, event, sid, err)
+		logError(p, stderr, event, "", err)
 		if event == EventAssistantGuard {
 			return assistantRefuse(stderr, "", "cannot resolve atelier paths")
 		}
@@ -115,61 +139,75 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, env func(stri
 		return assistantGuardMain(p, stdin, stderr)
 	}
 	if event == "" {
-		logError(p, stderr, event, sid, errors.New("missing event name (usage: atl hook <event>)"))
-		return 0
+		return db{p: p}.serve(event, nil, nil, nil, stdout, stderr, env)
 	}
 	data, err := io.ReadAll(io.LimitReader(stdin, int64(maxInput)+1))
-	if err != nil {
-		logError(p, stderr, event, sid, fmt.Errorf("read stdin: %w", err))
+	return db{p: p}.serve(event, data, err, nil, stdout, stderr, env)
+}
+
+// serve handles one hook event whose input is data; readErr says reading it
+// failed after those bytes. landings come from a task container (see
+// Input.landings). It returns the exit code.
+func (d db) serve(event string, data []byte, readErr error, landings []candidate, stdout, stderr io.Writer, env func(string) string) int {
+	if event == "" {
+		logError(d.p, stderr, event, "", errors.New("missing event name (usage: atl hook <event>)"))
+		return 0
+	}
+	if readErr != nil {
+		logError(d.p, stderr, event, "", fmt.Errorf("read stdin: %w", readErr))
 		if event == EventPreToolUse && len(data) > 0 {
-			return guardPartial(p, stderr, env, event, data, false)
+			return d.guardPartial(stderr, env, event, data, false, landings)
 		}
 		return 0
 	}
 	if len(data) > maxInput {
-		logError(p, stderr, event, sid, fmt.Errorf("hook input exceeds %d bytes", maxInput))
+		logError(d.p, stderr, event, "", fmt.Errorf("hook input exceeds %d bytes", maxInput))
 		if event == EventPreToolUse {
-			return guardPartial(p, stderr, env, event, data, true)
+			return d.guardPartial(stderr, env, event, data, true, landings)
 		}
 		return 0
 	}
 	var in Input
 	if err := json.Unmarshal(data, &in); err != nil {
-		logError(p, stderr, event, sid, fmt.Errorf("decode hook input: %w", err))
+		logError(d.p, stderr, event, "", fmt.Errorf("decode hook input: %w", err))
 		if event == EventPreToolUse {
-			return guardPartial(p, stderr, env, event, data, false)
+			return d.guardPartial(stderr, env, event, data, false, landings)
 		}
 		return 0
 	}
-	sid = in.SessionID
 	if !knownEvent(event) {
 		return 0
 	}
-	return handleMain(p, stdout, stderr, env, event, in)
+	in.landings = landings
+	return d.handleMain(stdout, stderr, env, event, in)
 }
 
-// handleMain opens the store and runs Handle, mapping its result to the
-// process exit code. For a SessionStart resolved to a task it then writes
-// the task context JSON to stdout (stdout is nil for callers that must
-// never print it).
-func handleMain(p config.Paths, stdout, stderr io.Writer, env func(string) string, event string, in Input) int {
-	st, err := store.OpenWithTimeout(p.DB, dbBusyTimeout)
-	if err != nil {
-		logError(p, stderr, event, in.SessionID, err)
-		return 0
+// handleMain opens the store (unless d has one) and runs Handle, mapping its
+// result to the process exit code. For a SessionStart resolved to a task it
+// then writes the task context JSON to stdout (stdout is nil for callers
+// that must never print it).
+func (d db) handleMain(stdout, stderr io.Writer, env func(string) string, event string, in Input) int {
+	if d.st == nil {
+		st, err := store.OpenWithTimeout(d.p.DB, dbBusyTimeout)
+		if err != nil {
+			logError(d.p, stderr, event, in.SessionID, err)
+			return 0
+		}
+		defer st.Close()
+		d.st = st
 	}
-	defer st.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 	defer cancel()
 
 	now := time.Now()
-	exit, msg, taskID, err := handle(ctx, event, in, env, st, p, now)
+	exit, msg, taskID, err := d.handle(ctx, event, in, env, now)
 	if err != nil {
-		logError(p, stderr, event, in.SessionID, err)
+		logError(d.p, stderr, event, in.SessionID, err)
 	}
 	if event == EventSessionStart && taskID != 0 && stdout != nil {
-		if err := writeSessionContext(ctx, stdout, st, p, taskID, env(envContextVar), env(sandbox.InEnv) != "", now); err != nil {
-			logError(p, stderr, event, in.SessionID, fmt.Errorf("session context: %w", err))
+		sandboxed := d.scope != 0 || env(sandbox.InEnv) != ""
+		if err := writeSessionContext(ctx, stdout, d.st, d.p, taskID, env(envContextVar), sandboxed, now); err != nil {
+			logError(d.p, stderr, event, in.SessionID, fmt.Errorf("session context: %w", err))
 		}
 	}
 	if exit == 2 {
@@ -185,18 +223,25 @@ func handleMain(p config.Paths, stdout, stderr io.Writer, env func(string) strin
 // path is recovered the guard decides as usual; otherwise an oversized
 // input is refused (exit 2: the guard cannot see where the write goes) and
 // any other undecodable input fails open.
-func guardPartial(p config.Paths, stderr io.Writer, env func(string) string, event string, data []byte, oversized bool) int {
+func (d db) guardPartial(stderr io.Writer, env func(string) string, event string, data []byte, oversized bool, landings []candidate) int {
 	in, ok := partialInput(data)
 	if ok {
-		code := handleMain(p, nil, stderr, env, event, in)
+		in.landings = landings
+		code := d.handleMain(nil, stderr, env, event, in)
 		if code == 2 || !oversized {
 			return code
 		}
 	} else if !oversized {
 		return 0
 	}
+	return refuseOversized(stderr, in.ToolName)
+}
+
+// refuseOversized prints the refusal of a PreToolUse whose input is too
+// large for the ro guard and returns exit code 2.
+func refuseOversized(stderr io.Writer, tool string) int {
 	fmt.Fprintf(stderr, "atelier: hook input exceeds %d bytes; refusing the %s tool call because the read-only repo guard cannot inspect it\n",
-		maxInput, orDash(in.ToolName))
+		maxInput, orDash(tool))
 	return 2
 }
 
@@ -298,8 +343,18 @@ func skipValue(dec *json.Decoder) error {
 // logError appends one line to the hook log. If the log cannot be written
 // the error goes to stderr instead (never stdout).
 func logError(p config.Paths, stderr io.Writer, event, sid string, err error) {
+	// One line per error: the event name and session id come from the hook
+	// input (in a sandboxed task, from the task), so they cannot add lines.
+	oneLineField := func(s string) string {
+		return strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f {
+				return '?'
+			}
+			return r
+		}, s)
+	}
 	line := fmt.Sprintf("%s event=%s session_id=%s error=%s\n", time.Now().Format(time.RFC3339),
-		orDash(event), orDash(sid), strings.ReplaceAll(err.Error(), "\n", "\\n"))
+		oneLineField(orDash(event)), oneLineField(orDash(sid)), strings.ReplaceAll(err.Error(), "\n", "\\n"))
 	if p.StateDir != "" {
 		if mkErr := os.MkdirAll(p.StateDir, 0o755); mkErr == nil {
 			f, ferr := os.OpenFile(p.HookLog(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -326,22 +381,21 @@ func orDash(s string) string {
 // to log (which never changes the exit code from 0).
 func Handle(ctx context.Context, event string, in Input, env func(string) string, st *store.Store,
 	p config.Paths, now time.Time) (exit int, msg string, err error) {
-	exit, msg, _, err = handle(ctx, event, in, env, st, p, now)
+	exit, msg, _, err = db{st: st, p: p}.handle(ctx, event, in, env, now)
 	return exit, msg, err
 }
 
 // handle is Handle that also returns the id of the task the event's
 // session was resolved to (0 if none, or for events that do not resolve a
 // session).
-func handle(ctx context.Context, event string, in Input, env func(string) string, st *store.Store,
-	p config.Paths, now time.Time) (exit int, msg string, taskID int64, err error) {
+func (d db) handle(ctx context.Context, event string, in Input, env func(string) string, now time.Time) (exit int, msg string, taskID int64, err error) {
 	switch event {
 	case EventPreToolUse:
-		exit, msg, err = guard(ctx, in, env, st, p)
+		exit, msg, err = d.guard(ctx, in, env)
 		return exit, msg, 0, err
 	case EventSessionStart, EventUserPromptSubmit, EventNotification, EventStop,
 		EventSessionEnd, EventPostToolUse:
-		taskID, err = transition(ctx, event, in, env, st, p, now)
+		taskID, err = d.transition(ctx, event, in, env, now)
 		return 0, "", taskID, err
 	default:
 		return 0, "", 0, nil
@@ -350,9 +404,21 @@ func handle(ctx context.Context, event string, in Input, env func(string) string
 
 // transition applies event to its session's row and returns the session's
 // task id (0 if the event matched no session or task).
-func transition(ctx context.Context, event string, in Input, env func(string) string, st *store.Store,
-	p config.Paths, now time.Time) (int64, error) {
-	sess, err := findSession(ctx, event, in, env, st)
+func (d db) transition(ctx context.Context, event string, in Input, env func(string) string, now time.Time) (int64, error) {
+	st := d.st
+	if event == EventSessionStart && d.scope != 0 {
+		// A Claude session id is how the hooks and the status line of every
+		// task find a session row (GetSessionByClaudeID): a sandboxed task
+		// must not put another task's id on a row of its own.
+		taken, err := st.ClaudeIDInOtherTask(ctx, in.SessionID, d.scope)
+		if err != nil {
+			return 0, err
+		}
+		if taken {
+			return 0, fmt.Errorf("claude session id %q belongs to another task's session; ignored", in.SessionID)
+		}
+	}
+	sess, err := d.findSession(ctx, event, in, env)
 	if err != nil {
 		return 0, err
 	}
@@ -360,7 +426,7 @@ func transition(ctx context.Context, event string, in Input, env func(string) st
 		if event != EventSessionStart {
 			return 0, nil // not a session atelier knows about
 		}
-		task, err := findTask(ctx, in, env, st, p)
+		task, err := d.findTask(ctx, in, env)
 		if err != nil || task == nil {
 			return 0, err
 		}
@@ -452,8 +518,10 @@ func isPermissionPrompt(in Input) bool {
 // the parent row is never touched (a nested SessionStart then creates its
 // own row). The ATL_SESSION row with an empty claude id is also only a
 // fallback for non-SessionStart events when no row has the event's id.
-func findSession(ctx context.Context, event string, in Input, env func(string) string, st *store.Store) (*model.Session, error) {
-	envSess, err := envSession(ctx, env, st)
+//
+// With a scope, both lookups only ever return a row of the scope's task.
+func (d db) findSession(ctx context.Context, event string, in Input, env func(string) string) (*model.Session, error) {
+	envSess, err := d.envSession(ctx, env)
 	if err != nil {
 		return nil, err
 	}
@@ -472,11 +540,19 @@ func findSession(ctx context.Context, event string, in Input, env func(string) s
 			envSess = nil // another (nested) Claude process: not this row
 		}
 	}
-	sess, err := st.GetSessionByClaudeID(ctx, in.SessionID)
+	sess, err := d.sessionByClaudeID(ctx, in.SessionID)
 	if errors.Is(err, store.ErrNotFound) {
 		return envSess, nil
 	}
 	return sess, err
+}
+
+// sessionByClaudeID is Store.GetSessionByClaudeID within d's scope.
+func (d db) sessionByClaudeID(ctx context.Context, cid string) (*model.Session, error) {
+	if d.scope != 0 {
+		return d.st.GetSessionByClaudeIDInTask(ctx, cid, d.scope)
+	}
+	return d.st.GetSessionByClaudeID(ctx, cid)
 }
 
 // midTurn reports whether a session in state s is in the middle of a turn.
@@ -495,8 +571,9 @@ func idChangingSource(source string) bool {
 }
 
 // envSession returns the ATL_SESSION row if it is set, parses, exists and
-// belongs to the ATL_TASK task (when set); nil, nil otherwise.
-func envSession(ctx context.Context, env func(string) string, st *store.Store) (*model.Session, error) {
+// belongs to the ATL_TASK task (when set; with a scope, to the scope's task
+// whatever ATL_TASK says); nil, nil otherwise.
+func (d db) envSession(ctx context.Context, env func(string) string) (*model.Session, error) {
 	v := env("ATL_SESSION")
 	if v == "" {
 		return nil, nil
@@ -505,14 +582,20 @@ func envSession(ctx context.Context, env func(string) string, st *store.Store) (
 	if perr != nil {
 		return nil, nil
 	}
-	sess, err := st.GetSession(ctx, id)
+	sess, err := d.st.GetSession(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if belongs, err := sessionInEnvTask(ctx, sess, env, st); err != nil || !belongs {
+	if d.scope != 0 {
+		if sess.TaskID != d.scope {
+			return nil, nil
+		}
+		return sess, nil
+	}
+	if belongs, err := sessionInEnvTask(ctx, sess, env, d.st); err != nil || !belongs {
 		return nil, err
 	}
 	return sess, nil
@@ -534,9 +617,22 @@ func sessionInEnvTask(ctx context.Context, sess *model.Session, env func(string)
 }
 
 // findTask resolves the task from ATL_TASK, else from cwd being inside
-// Paths.Tasks/<slug>. It returns nil, nil if neither matches.
-func findTask(ctx context.Context, in Input, env func(string) string, st *store.Store, p config.Paths) (*model.Task, error) {
-	return resolveTask(in.Cwd, env, p, func(slug string) (*model.Task, error) { return st.GetTaskBySlug(ctx, slug) })
+// Paths.Tasks/<slug>. It returns nil, nil if neither matches. With a scope
+// it is always the scope's task (nil if that is gone).
+func (d db) findTask(ctx context.Context, in Input, env func(string) string) (*model.Task, error) {
+	if d.scope != 0 {
+		return d.scopeTask(ctx)
+	}
+	return resolveTask(in.Cwd, env, d.p, func(slug string) (*model.Task, error) { return d.st.GetTaskBySlug(ctx, slug) })
+}
+
+// scopeTask returns the scope's task, or nil, nil if it is gone.
+func (d db) scopeTask(ctx context.Context) (*model.Task, error) {
+	t, err := d.st.GetTask(ctx, d.scope)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	return t, err
 }
 
 // resolveTask is the task resolution order shared by the hook and `atl

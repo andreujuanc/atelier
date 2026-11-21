@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -662,13 +663,16 @@ func (c *cli) statuslineCmd() *cobra.Command {
 	}
 }
 
-// gateCmd serves a task's gated Docker socket (see sandbox.Gate). atl starts
-// it itself, detached, when it launches a session in a sandboxed task; it
-// needs the paths only, never the database.
+// gateCmd serves a task's gated Docker socket (see sandbox.Gate) and its
+// control socket (sandbox.Control): push and fetch, and the hooks, status
+// line and notes of the task's container, which it answers itself from the
+// database (hook.TaskServer) for this one task only. atl starts it itself,
+// detached, when it launches a session in a sandboxed task.
 func (c *cli) gateCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:    "gate <slug>",
-		Short:  "Serve a sandboxed task's Docker socket (internal)",
+	var taskID int64
+	cmd := &cobra.Command{
+		Use:    "gate <slug> --task-id ID",
+		Short:  "Serve a sandboxed task's Docker socket and atl requests (internal)",
 		Hidden: true,
 		Args:   args(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
@@ -680,6 +684,9 @@ func (c *cli) gateCmd() *cobra.Command {
 			if slug == "" || strings.ContainsAny(slug, `/\`) || slug == "." || slug == ".." {
 				return usagef("invalid task slug %q", slug)
 			}
+			if taskID <= 0 {
+				return usagef("--task-id is required")
+			}
 			dir := p.TaskDir(slug)
 			root, err := filepath.EvalSymlinks(dir)
 			if err != nil {
@@ -687,6 +694,19 @@ func (c *cli) gateCmd() *cobra.Command {
 			}
 			runDir := p.RunDir(slug)
 			id := sandbox.ID(slug, dir)
+			bin := os.Getenv("ATL_BIN")
+			if bin == "" {
+				if bin, err = os.Executable(); err != nil {
+					return fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
+				}
+			}
+			// The task by database id, checked against the slug once: a
+			// request never names a task.
+			ts, err := hook.OpenTaskServer(p, taskID, slug)
+			if err != nil {
+				return err
+			}
+			defer ts.Close()
 			g := &sandbox.Gate{
 				ID:         id,
 				Root:       root,
@@ -695,17 +715,32 @@ func (c *cli) gateCmd() *cobra.Command {
 				Upstream:   sandbox.UpstreamSocket(),
 				Log:        sandbox.NewLogger(),
 				Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
+				Ident:      sandbox.Ident(taskID, bin),
 			}
-			bin := os.Getenv("ATL_BIN")
-			if bin == "" {
-				if bin, err = os.Executable(); err != nil {
-					return fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
+			go func() { // a gate outliving its task stops
+				tick := time.NewTicker(10 * time.Second)
+				defer tick.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-tick.C:
+						if gone, _ := ts.Gone(ctx); gone {
+							g.Log.Printf("task %d (%s) is gone; stopping", taskID, slug)
+							cancel()
+							return
+						}
+					}
 				}
-			}
-			ctl := &sandbox.Control{Slug: slug, Atl: bin, Log: g.Log}
-			return sandbox.Serve(cmd.Context(), g, ctl, runDir)
+			}()
+			ctl := &sandbox.Control{Slug: slug, TaskID: taskID, Atl: bin, Task: ts, Log: g.Log}
+			return sandbox.Serve(ctx, g, ctl, runDir)
 		},
 	}
+	cmd.Flags().Int64Var(&taskID, "task-id", 0, "the task's database id (must still have this slug)")
+	return cmd
 }
 
 // remoteCmd is `atl push` (push true) or `atl fetch`. Inside a task
@@ -714,6 +749,7 @@ func (c *cli) gateCmd() *cobra.Command {
 func (c *cli) remoteCmd(push bool) *cobra.Command {
 	var repo string
 	var force bool
+	var taskID int64
 	op, short := sandbox.OpFetch, "git fetch origin in each repo of the task (rw and ro), or only --repo"
 	use := "fetch [task] [--repo NAME]"
 	if push {
@@ -737,7 +773,10 @@ func (c *cli) remoteCmd(push bool) *cobra.Command {
 			}
 			repo = strings.TrimSpace(repo)
 			if sandbox.Inside() {
-				return c.remoteViaGate(sandbox.ControlRequest{Op: op, Repo: repo, Force: force}, ref)
+				if taskID != 0 {
+					return usagef("--task-id is for the task's gate, not for a task container")
+				}
+				return c.viaGate(sandbox.ControlRequest{Op: op, Repo: repo, Force: force}, ref, nil, 0)
 			}
 			ap, err := c.App()
 			if err != nil {
@@ -745,9 +784,9 @@ func (c *cli) remoteCmd(push bool) *cobra.Command {
 			}
 			var res []app.RemoteResult
 			if push {
-				res, err = ap.Push(cmd.Context(), ref, app.PushOpts{Repo: repo, Force: force}, c.stderr)
+				res, err = ap.Push(cmd.Context(), ref, app.PushOpts{Repo: repo, Force: force, TaskID: taskID}, c.stderr)
 			} else {
-				res, err = ap.Fetch(cmd.Context(), ref, repo, c.stderr)
+				res, err = ap.Fetch(cmd.Context(), ref, app.FetchOpts{Repo: repo, TaskID: taskID}, c.stderr)
 			}
 			failed := false
 			for _, r := range res {
@@ -770,20 +809,44 @@ func (c *cli) remoteCmd(push bool) *cobra.Command {
 	if push {
 		cmd.Flags().BoolVar(&force, "force", false, "push with --force-with-lease (after a rebase)")
 	}
+	// The gate names its task by id and slug, so that nothing else (a
+	// prefix, a slug that is all digits, a task created after its own was
+	// deleted) can be taken for it.
+	cmd.Flags().Int64Var(&taskID, "task-id", 0, "only the task with this id, which must have the exact slug given (internal)")
+	cmd.Flags().MarkHidden("task-id")
 	return cmd
 }
 
-// remoteViaGate sends req to the task's gate from inside its container and
-// relays the output and exit status. The gate acts on its own task only, so
-// a task named on the command line must be this one.
-func (c *cli) remoteViaGate(req sandbox.ControlRequest, ref string) error {
+// ownTask checks, in a task container, that ref is the container's own task
+// ($ATL_TASK): the only one atl op can work on there.
+func ownTask(op, ref string) error {
 	switch self := os.Getenv("ATL_TASK"); {
 	case self == "":
-		return fmt.Errorf("inside a task container atl %s needs $ATL_TASK (it works on the container's own task only)", req.Op)
+		return fmt.Errorf("inside a task container atl %s needs $ATL_TASK (it works on the container's own task only)", op)
 	case ref != self:
-		return usagef("inside a task container atl %s works on this task (%s) only", req.Op, self)
+		return usagef("inside a task container atl %s works on this task (%s) only", op, self)
 	}
-	code, err := sandbox.ControlClient(os.Getenv("ATL_CONTROL_SOCK"), req, c.stdout)
+	return nil
+}
+
+// viaGateTimeout bounds note and notes through the gate (push and fetch
+// may wait for the user: they have the gate's own limit).
+const viaGateTimeout = 30 * time.Second
+
+// viaGate sends req (with body) to the task's gate from inside its container
+// and relays the output and exit status; timeout 0 waits as long as the gate
+// does. The gate acts on its own task only, so a task named on the command
+// line must be this one. push and fetch get all output on stdout, as before;
+// note and notes keep stdout and stderr apart.
+func (c *cli) viaGate(req sandbox.ControlRequest, ref string, body []byte, timeout time.Duration) error {
+	if err := ownTask(req.Op, ref); err != nil {
+		return err
+	}
+	stderr := c.stderr
+	if req.Op == sandbox.OpPush || req.Op == sandbox.OpFetch {
+		stderr = c.stdout
+	}
+	code, _, err := sandbox.Ask(os.Getenv("ATL_CONTROL_SOCK"), req, body, c.stdout, stderr, timeout)
 	if err != nil {
 		return err
 	}

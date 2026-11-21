@@ -88,7 +88,7 @@ func sandboxEnv(t *testing.T) (*env, *fakeDocker) {
 	e.app.AtlBin = atl
 	e.app.Sandbox = &sandbox.Config{Image: "task-image"}
 	e.app.Docker = fd.run
-	e.app.StartGate = func(string, string, string, string) error { return nil }
+	e.app.StartGate = func(string, string, int64, string, string) error { return nil }
 	return e, fd
 }
 
@@ -130,7 +130,6 @@ func TestSandboxSessionRunsInTaskContainer(t *testing.T) {
 		"type=bind,src=" + p.RunDir("boxed") + ",dst=/run/atl,readonly",
 		"--env DOCKER_HOST=unix:///run/atl/docker.sock",
 		"--env ATL_SANDBOX_ID=" + id,
-		"--env ATL_TASKS=" + p.Tasks,
 		// The container's own rules, not the shared box's; who commits, not the git config.
 		"--env ATL_CONTEXT=rules of a task container",
 		"--env GIT_AUTHOR_NAME=Lab User",
@@ -267,6 +266,56 @@ func TestSandboxPinsOrigins(t *testing.T) {
 		for _, m := range spec.Mounts {
 			if rel, err := filepath.Rel(m.Src, pin); err == nil && !strings.HasPrefix(rel, "..") {
 				t.Errorf("mount %s reaches the pin %s", m.Src, pin)
+			}
+		}
+	}
+}
+
+// TestSandboxSpecHidesAtelierDirs: a task container mounts none of
+// atelier's database, state and config dirs (atl in it asks the gate), and
+// gets no variable that only told atl in there where they are; with or
+// without a workspace.
+func TestSandboxSpecHidesAtelierDirs(t *testing.T) {
+	e, _ := sandboxEnv(t)
+	ctx := context.Background()
+	p := e.app.Paths
+	root := filepath.Dir(e.out)
+	task := e.task(t, "boxed", model.StatusActive, true)
+	ws := filepath.Join(root, "ws")
+	for _, paths := range []config.Paths{p, {
+		Workspace: ws, Repos: p.Repos, Tasks: filepath.Join(ws, "tasks"),
+		DB: filepath.Join(ws, "data", "atelier.db"), StateDir: filepath.Join(ws, "state"),
+		ConfigDir: filepath.Join(ws, "config"),
+	}} {
+		for _, d := range []string{filepath.Dir(paths.DB), paths.StateDir, filepath.Join(paths.ConfigDir, "projects"), paths.TaskDir("boxed")} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		e.app.Paths = paths
+		spec, err := e.app.sandboxSpec(ctx, task)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// inside reports whether p is dir or below it.
+		inside := func(dir, p string) bool {
+			rel, err := filepath.Rel(dir, p)
+			return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+		}
+		for _, m := range spec.Mounts {
+			for _, h := range []string{filepath.Dir(paths.DB), paths.StateDir, paths.ConfigDir} {
+				if inside(m.Src, h) || inside(h, m.Src) {
+					t.Errorf("mount %s reaches or is in %s", m.Src, h)
+				}
+			}
+			if paths.Workspace != "" && inside(paths.Workspace, m.Src) &&
+				m.Src != paths.TaskDir("boxed") && m.Src != paths.RunDir("boxed") {
+				t.Errorf("mount %s is in the workspace", m.Src)
+			}
+		}
+		for _, k := range []string{"ATL_WORKSPACE", "ATL_REPOS", "ATL_TASKS", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME"} {
+			if v, ok := spec.Env[k]; ok {
+				t.Errorf("container env has %s=%s", k, v)
 			}
 		}
 	}

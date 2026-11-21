@@ -21,6 +21,19 @@ import (
 func socketPath(runDir string) string { return filepath.Join(runDir, "docker.sock") }
 func pidPath(runDir string) string    { return filepath.Join(runDir, "gate.pid") }
 func lockPath(runDir string) string   { return filepath.Join(runDir, "gate.lock") }
+func identPath(runDir string) string  { return filepath.Join(runDir, "gate.ident") }
+
+// Ident names what a gate serves: the task (database id) and the atl binary
+// it runs (size and modification time of bin). A gate that answers with
+// another ident is replaced by Start: it serves a task that was deleted
+// meanwhile, or runs code older than the atl in the task container.
+func Ident(taskID int64, bin string) string {
+	s := fmt.Sprintf("task %d", taskID)
+	if fi, err := os.Stat(bin); err == nil {
+		s += fmt.Sprintf(", atl %d bytes %d", fi.Size(), fi.ModTime().UnixNano())
+	}
+	return s
+}
 
 // SocketPath is the gate's socket in runDir.
 func SocketPath(runDir string) string { return socketPath(runDir) }
@@ -61,27 +74,15 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 		}
 		return err
 	}
-	os.Remove(sock) // stale, from a gate that died
-	l, err := net.Listen("unix", sock)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(sock)
-	if err := os.Chmod(sock, 0o666); err != nil { // the dir decides who gets to it
-		return err
-	}
 	if err := os.WriteFile(pidPath(runDir), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
 		return err
 	}
 	defer os.Remove(pidPath(runDir))
-	mine, err := os.Stat(sock)
-	if err != nil {
+	if err := os.WriteFile(identPath(runDir), []byte(g.Ident+"\n"), 0o644); err != nil {
 		return err
 	}
-	if g.Log != nil {
-		g.Log.Printf("gate %s on %s, mounts allowed under %s", g.ID, sock, g.Root)
-	}
-
+	defer os.Remove(identPath(runDir))
+	// The control socket first: once the Docker socket answers (Alive), both do.
 	if ctl != nil {
 		ctlSock := ControlSocketPath(runDir)
 		os.Remove(ctlSock) // stale, from a gate that died
@@ -95,6 +96,22 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 			return err
 		}
 		go ctl.Serve(cl)
+	}
+	os.Remove(sock) // stale, from a gate that died
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(sock)
+	if err := os.Chmod(sock, 0o666); err != nil { // the dir decides who gets to it
+		return err
+	}
+	mine, err := os.Stat(sock)
+	if err != nil {
+		return err
+	}
+	if g.Log != nil {
+		g.Log.Printf("gate %s on %s, mounts allowed under %s", g.ID, sock, g.Root)
 	}
 
 	srv := &http.Server{Handler: g}
@@ -133,12 +150,22 @@ func Alive(runDir string) bool {
 	return true
 }
 
-// Start makes sure a gate serves runDir: if none answers, it starts
-// `<atlBin> gate <slug>` as a detached process (it outlives this atl, like
-// the tmux server) logging to logPath, and waits until it answers.
-func Start(atlBin, slug, runDir, logPath string) error {
+// Start makes sure a gate for task taskID serves runDir: if none answers, it
+// starts `<atlBin> gate <slug> --task-id <taskID>` as a detached process (it
+// outlives this atl, like the tmux server) logging to logPath, and waits
+// until it answers. A gate that answers for another task or from another
+// atl binary (see Ident) is stopped and replaced first.
+func Start(atlBin, slug string, taskID int64, runDir, logPath string) error {
 	if Alive(runDir) {
-		return nil
+		cur, _ := os.ReadFile(identPath(runDir))
+		if strings.TrimSpace(string(cur)) == Ident(taskID, atlBin) {
+			return nil
+		}
+		Stop(runDir)
+		// One that missed the signal notices its socket is gone within 10s.
+		if err := awaitUnlocked(runDir, 15*time.Second); err != nil {
+			return fmt.Errorf("replace the gate for %s: %w", slug, err)
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		return err
@@ -148,7 +175,7 @@ func Start(atlBin, slug, runDir, logPath string) error {
 		return err
 	}
 	defer logFile.Close()
-	cmd := exec.Command(atlBin, "gate", slug)
+	cmd := exec.Command(atlBin, "gate", slug, "--task-id", strconv.FormatInt(taskID, 10))
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -172,6 +199,30 @@ func Start(atlBin, slug, runDir, logPath string) error {
 			return fmt.Errorf("gate for %s did not come up; see %s", slug, logPath)
 		case <-time.After(50 * time.Millisecond):
 		}
+	}
+}
+
+// awaitUnlocked waits until no gate holds runDir's lock (a stopped gate
+// holds it until it has removed its files).
+func awaitUnlocked(runDir string, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
+	for {
+		f, err := os.OpenFile(lockPath(runDir), os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			return err
+		}
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		f.Close() // releases the lock too
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return errors.New("the old gate did not stop")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

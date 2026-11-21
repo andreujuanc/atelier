@@ -32,7 +32,8 @@ const (
 	InSocket = RunMount + "/docker.sock" // the gate
 	InBin    = RunMount + "/bin/atl"     // the atl binary that created the container
 	// InEnv is set (to the sandbox ID) in every task container. atl running
-	// in there only serves hooks, the status line and notes.
+	// in there opens no database: hooks, the status line, note, notes, push
+	// and fetch ask the task's gate (see Control), everything else is refused.
 	InEnv = "ATL_SANDBOX_ID"
 )
 

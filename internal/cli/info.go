@@ -14,6 +14,7 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 // wrapWidth is the column at which transcript and note text is wrapped.
@@ -342,6 +343,9 @@ func (c *cli) noteCmd() *cobra.Command {
 			if body == "" {
 				return usagef("note text is empty")
 			}
+			if sandbox.Inside() {
+				return c.viaGate(sandbox.ControlRequest{Op: sandbox.OpNote, Author: author}, a[0], []byte(body), viaGateTimeout)
+			}
 			ap, err := c.App()
 			if err != nil {
 				return err
@@ -364,6 +368,9 @@ func (c *cli) notesCmd() *cobra.Command {
 		Short: "Print a task's notes; --set replaces them with stdin, --clear clears them",
 		Args:  args(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
+			if sandbox.Inside() {
+				return c.notesViaGate(cmd, a[0], set, clearNotes)
+			}
 			ap, err := c.App()
 			if err != nil {
 				return err
@@ -404,6 +411,29 @@ func (c *cli) notesCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&set, "set", false, "replace the notes with the text read from stdin (empty stdin is an error unless --clear is given too)")
 	cmd.Flags().BoolVar(&clearNotes, "clear", false, "clear the notes (alone: stdin is not read; with --set: allow an empty stdin)")
 	return cmd
+}
+
+// notesViaGate is `atl notes` in a task container: the gate prints, replaces
+// or clears the notes of its own task. As outside, a task that is not this
+// one fails before stdin is read, and an empty --set without --clear never
+// reaches the gate.
+func (c *cli) notesViaGate(cmd *cobra.Command, ref string, set, clearNotes bool) error {
+	if err := ownTask(sandbox.OpNotes, ref); err != nil {
+		return err
+	}
+	req := sandbox.ControlRequest{Op: sandbox.OpNotes, Set: set, Clear: clearNotes}
+	var body []byte
+	if set {
+		data, err := c.readNotesStdin(cmd)
+		if err != nil {
+			return err
+		}
+		if !clearNotes && model.SanitizeNotes(data) == "" {
+			return errors.New("stdin is empty: nothing to set (use --clear to clear the notes)")
+		}
+		body = []byte(data)
+	}
+	return c.viaGate(req, ref, body, viaGateTimeout)
 }
 
 // readNotesStdin reads the new notes text for `atl notes --set`, with a
