@@ -5,7 +5,7 @@
 // It is switched on per workspace with $ATL_SANDBOX=docker. The image comes
 // from the task's project (`image = "..."`), else $ATL_SANDBOX_IMAGE, else
 // DefaultImage; it needs `claude` and a shell, and should have the same user
-// as the one running atl (the atelier image does).
+// as the one running atl (atelier's images do).
 package sandbox
 
 import (
@@ -23,8 +23,22 @@ import (
 )
 
 // DefaultImage is the task image when neither the project nor
-// $ATL_SANDBOX_IMAGE names one: the image atl itself ships in.
-const DefaultImage = "atelier"
+// $ATL_SANDBOX_IMAGE names one: the target "task" of atelier's Dockerfile.
+const DefaultImage = "atelier-task"
+
+// BuildDefaultImage is the command that builds DefaultImage for the user
+// running it, in a checkout of atelier.
+const BuildDefaultImage = "docker build --target task -t " + DefaultImage +
+	" --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) ."
+
+// ImageMissing reports whether image is not on the Docker daemon.
+func ImageMissing(ctx context.Context, run Runner, image string) (bool, error) {
+	_, err := run(ctx, "image", "inspect", "--format", "{{.Id}}", image)
+	if noSuch(err) {
+		return true, nil
+	}
+	return false, err
+}
 
 // Where a task container finds what atl gives it.
 const (

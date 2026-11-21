@@ -72,8 +72,10 @@ func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID
 
 // sandboxNote tells a session that runs in the task's own container (see
 // package sandbox) what that changes.
-const sandboxNote = "Sandbox: this session runs in the task's own container. Run builds, tests and tools here directly and " +
-	"install what you need (system packages: `docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`). " +
+const sandboxNote = "Sandbox: this session runs in the task's own container. Run builds, tests and tools here directly. " +
+	"You can install what is missing (system packages: `docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`), " +
+	"but installs last only until the task's container is replaced; tell the user what the task keeps needing, " +
+	"for the project's image. " +
 	"`docker` and `docker compose` are for services (databases, localstack, ...): mounts must come from the task dir, " +
 	"privileged and host modes are refused, you see only what this task started, and services answer by their compose " +
 	"service name. There are no git credentials here (plain `git push` and `gh` fail): to push the task branch run " +

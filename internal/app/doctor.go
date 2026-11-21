@@ -100,9 +100,14 @@ func (a *App) checkSandbox(ctx context.Context) []Check {
 		checks = append(checks, fail("docker", err.Error()))
 	} else {
 		checks = append(checks, pass("docker", "daemon "+ver+" via "+sandbox.UpstreamSocket()))
-		if _, err := a.docker()(ctx, "image", "inspect", "--format", "{{.Id}}", sb.Image); err != nil {
-			checks = append(checks, warn("task image", sb.Image+" is not on the daemon (docker will try to pull it); build it or set $ATL_SANDBOX_IMAGE"))
-		} else {
+		switch missing, err := sandbox.ImageMissing(ctx, a.docker(), sb.Image); {
+		case err != nil:
+			checks = append(checks, warn("task image", err.Error()))
+		case missing && sb.Image == sandbox.DefaultImage:
+			checks = append(checks, fail("task image", missingImageDetail(sb.Image, "default")))
+		case missing:
+			checks = append(checks, warn("task image", sb.Image+" (from $ATL_SANDBOX_IMAGE) is not on the Docker daemon (docker will try to pull it); build or pull it"))
+		default:
 			checks = append(checks, pass("task image", sb.Image))
 		}
 	}
