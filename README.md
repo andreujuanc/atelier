@@ -346,7 +346,12 @@ task container. A gate started by an older `atl` binary, or for a task that was 
 since, is replaced the next time `atl` starts a session in the task.
 
 The tmux window of a session runs `docker exec` into the container, so everything else
-(session states, crash recovery, resume, the picker) works as before.
+(session states, crash recovery, resume, the picker) works as before. When the window dies
+before Claude does (it is closed, or tmux or the box restarts while the task containers
+keep running), Docker leaves what it started running in the container; `atl` ends it (every
+process there with the session's `ATL_SESSION`, Claude's children included) when it
+notices the window gone, which it checks when it starts, and again right before it resumes
+the session.
 
 **Claude Code in the container.** Your Claude Code login stays where `atl` runs. Sessions
 in a task log in with a token instead:
