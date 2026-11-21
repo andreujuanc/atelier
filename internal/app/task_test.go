@@ -40,6 +40,10 @@ func TestMain(m *testing.M) {
 		// No global Claude Code settings (a global statusLine would keep
 		// atelier's out of task settings, see gen.WriteSettings).
 		"CLAUDE_CONFIG_DIR": filepath.Join(dir, "claude"),
+		// The sandbox is on by default. These tests build Apps without it
+		// (sessions run next to atl) and doctor must say the same, as with
+		// ATL_SANDBOX=off; the sandbox tests set what they need.
+		"ATL_SANDBOX": "off",
 	} {
 		os.Setenv(k, v)
 	}

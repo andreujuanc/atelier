@@ -61,6 +61,9 @@ export ATL_TMUX_SOCKET="$SOCK"
 export GIT_CONFIG_GLOBAL="$W/gitconfig"
 export GIT_CONFIG_NOSYSTEM=1
 export SHELL=/bin/sh
+# The sandbox is on by default; this test runs sessions next to atl (the
+# stub claude records what it gets there), so it switches the sandbox off.
+export ATL_SANDBOX=off
 export E2E_OUT="$W/out"
 export E2E_LOG="$W/out/claude.log"
 export E2E_GH_LOG="$W/out/gh.log"

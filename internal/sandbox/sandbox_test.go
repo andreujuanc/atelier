@@ -13,24 +13,37 @@ import (
 func TestFromEnv(t *testing.T) {
 	t.Setenv(InEnv, "")
 	t.Setenv("ATL_SANDBOX_IMAGE", "")
-	for _, off := range []string{"", "off", "0", "none", " OFF "} {
+	// On by default: unset, empty and docker.
+	t.Setenv("ATL_SANDBOX", "") // restores the old value after the test
+	os.Unsetenv("ATL_SANDBOX")
+	if c, err := FromEnv(); err != nil || c == nil || c.Image != DefaultImage {
+		t.Errorf("unset: %+v, %v; want on", c, err)
+	}
+	for _, on := range []string{"", "  ", "docker", " Docker "} {
+		t.Setenv("ATL_SANDBOX", on)
+		if c, err := FromEnv(); err != nil || c == nil || c.Image != DefaultImage {
+			t.Errorf("ATL_SANDBOX=%q: %+v, %v; want on", on, c, err)
+		}
+	}
+	for _, off := range []string{"off", " OFF "} {
 		t.Setenv("ATL_SANDBOX", off)
 		if c, err := FromEnv(); c != nil || err != nil {
 			t.Errorf("ATL_SANDBOX=%q: %v, %v; want off", off, c, err)
 		}
 	}
-	t.Setenv("ATL_SANDBOX", "docker")
-	if c, err := FromEnv(); err != nil || c == nil || c.Image != DefaultImage {
-		t.Errorf("docker: %+v, %v", c, err)
-	}
+	t.Setenv("ATL_SANDBOX", "")
 	t.Setenv("ATL_SANDBOX_IMAGE", "dev:1")
 	if c, _ := FromEnv(); c == nil || c.Image != "dev:1" {
 		t.Errorf("image: %+v", c)
 	}
-	// A typo must not silently run tasks unsandboxed.
-	t.Setenv("ATL_SANDBOX", "dokcer")
-	if _, err := FromEnv(); err == nil {
-		t.Error("unknown value accepted")
+	// A typo, or an old spelling of off, picks no mode: the error names
+	// the two values there are.
+	for _, bad := range []string{"dokcer", "0", "none", "on"} {
+		t.Setenv("ATL_SANDBOX", bad)
+		if c, err := FromEnv(); err == nil || c != nil || !strings.Contains(err.Error(), "want docker") ||
+			!strings.Contains(err.Error(), "or off") {
+			t.Errorf("ATL_SANDBOX=%q: %+v, %v; want an error", bad, c, err)
+		}
 	}
 	// In a task container there is nothing to sandbox.
 	t.Setenv("ATL_SANDBOX", "docker")

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/hook"
@@ -155,9 +156,30 @@ func missingImage(image, from string) error {
 
 func missingImageDetail(image, from string) string {
 	if image == sandbox.DefaultImage {
-		return image + " is not on the Docker daemon; build it in a checkout of atelier with: " + sandbox.BuildDefaultImage
+		return image + " is not on the Docker daemon (each task's sessions run in a container made from it); " +
+			"build it in a checkout of atelier with: " + sandbox.BuildDefaultImage
 	}
 	return image + " (from " + from + ") is not on the Docker daemon and could not be pulled; build or pull it"
+}
+
+// checkDocker returns the Docker daemon's version, or, when it does not
+// answer, the one line that says what to do (dockerUnreachable).
+func (a *App) checkDocker(ctx context.Context) (version string, err error) {
+	version, err = a.docker()(ctx, "version", "--format", "{{.Server.Version}}")
+	if err != nil {
+		return "", dockerUnreachable(err)
+	}
+	return version, nil
+}
+
+// dockerUnreachable is the one line that says the sandbox cannot reach the
+// Docker daemon, with docker's reason, and what to do. The sandbox is on
+// without the user asking for it, so it says why Docker is needed, and it is
+// the one place that names the way out, $ATL_SANDBOX=off.
+func dockerUnreachable(err error) error {
+	return fmt.Errorf("cannot reach Docker, which runs each task's sessions in the task's own container (%s): "+
+		"start Docker or give atl access to it, or set ATL_SANDBOX=off to run sessions without a container",
+		strings.Join(strings.Fields(err.Error()), " "))
 }
 
 func fileExists(path string) bool {
@@ -169,8 +191,12 @@ func fileExists(path string) bool {
 // needed. A container that predates a change to the task's repos is replaced
 // when no session runs in it; otherwise it is kept and a warning says so.
 // A new container gets its Claude dir seeded first (seedClaudeDir). Without
-// a token for Claude Code (claudeAuth) nothing is started.
+// a Docker daemon (checked first: without one, `atl token` would not help)
+// or a token for Claude Code (claudeAuth) nothing is started.
 func (a *App) ensureSandbox(ctx context.Context, t *model.Task) error {
+	if _, err := a.checkDocker(ctx); err != nil {
+		return err
+	}
 	if _, err := a.claudeAuth(); err != nil {
 		return err
 	}

@@ -173,7 +173,7 @@ func TestSandboxStoredToken(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "run `atl token`") || strings.Contains(err.Error(), "\n") {
 		t.Fatalf("NewSession without any token: %v", err)
 	}
-	if len(fd.calls) != 0 {
+	if len(fd.changes()) != 0 {
 		t.Errorf("started something without a token: %q", fd.calls)
 	}
 

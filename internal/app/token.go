@@ -26,7 +26,7 @@ import (
 var claudeAuthVars = []string{"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
 
 // errNoClaudeAuth is what starting a sandboxed session without a token says.
-var errNoClaudeAuth = errors.New("sandboxed sessions need a Claude Code token: run `atl token` " +
+var errNoClaudeAuth = errors.New("task sessions run in the task's own container and need a Claude Code token there: run `atl token` " +
 	"(or set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY where atl runs)")
 
 // A token from `claude setup-token` lasts a year; doctor warns a month

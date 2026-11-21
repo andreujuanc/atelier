@@ -2,7 +2,8 @@
 // container instead of next to atl, and gives that container a gated Docker
 // socket (see Gate) in place of the host's.
 //
-// It is switched on per workspace with $ATL_SANDBOX=docker. The image comes
+// It is on by default; $ATL_SANDBOX=off switches it off for a workspace
+// (a way out while it is new, going away). The image comes
 // from the task's project (`image = "..."`), else $ATL_SANDBOX_IMAGE, else
 // DefaultImage; it needs `claude` and a shell, and should have the same user
 // as the one running atl (atelier's images do).
@@ -58,16 +59,18 @@ type Config struct {
 	Image string // default task image
 }
 
-// FromEnv reads $ATL_SANDBOX and $ATL_SANDBOX_IMAGE. It returns nil when the
-// sandbox is off (unset, "", "0", "off", "none"), and also inside a task
-// container, where there is nothing to launch.
+// FromEnv reads $ATL_SANDBOX and $ATL_SANDBOX_IMAGE. The sandbox is on
+// unless $ATL_SANDBOX is "off" (a way out while the sandbox is new; it is
+// going away): unset, empty and "docker" all mean on, and any other value is
+// an error (a typo must not pick a mode). It returns nil when the sandbox is
+// off, and also inside a task container, where there is nothing to launch.
 func FromEnv() (*Config, error) {
 	switch v := strings.ToLower(strings.TrimSpace(os.Getenv("ATL_SANDBOX"))); v {
-	case "", "0", "off", "none":
+	case "off":
 		return nil, nil
-	case "docker":
+	case "", "docker":
 	default:
-		return nil, fmt.Errorf("$ATL_SANDBOX=%q: want docker or off", v)
+		return nil, fmt.Errorf("$ATL_SANDBOX=%q: want docker (the default, also when unset) or off", v)
 	}
 	if Inside() {
 		return nil, nil
