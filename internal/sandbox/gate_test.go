@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,6 +28,12 @@ type daemon struct {
 	bodies   map[string]string // last body per "METHOD path"
 	objects  []*object
 	execIn   []string // IDs of the containers execs were created in
+	// onInspect, if set, runs before an inspect of an object is answered.
+	onInspect func(kind, ref string)
+	// volumesMissing are the volumes a container create named by name that
+	// did not exist when the create reached the daemon (which would create
+	// them itself, without the task's label).
+	volumesMissing []string
 }
 
 type object struct {
@@ -92,6 +99,15 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	inspect := r.Method == "GET" && (len(parts) == 2 && parts[0] != "containers" || len(parts) == 3 && parts[0] == "containers" && parts[2] == "json")
+	d.mu.Lock()
+	onInspect := d.onInspect
+	d.mu.Unlock()
+	if inspect && obj != nil && onInspect != nil {
+		onInspect(parts[0], parts[1])
+	}
+	if r.Method == "POST" && len(parts) == 2 && parts[0] == "containers" && parts[1] == "create" {
+		d.noteMissingVolumes(body)
+	}
 	switch {
 	case inspect && obj != nil:
 		out := map[string]any{"Labels": obj.labels, "Config": map[string]any{"Labels": obj.labels}, "Name": obj.name}
@@ -131,6 +147,38 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"Id":"new1"}`)
 	default:
 		io.WriteString(w, `{}`)
+	}
+}
+
+// noteMissingVolumes records the volumes a container create names (in
+// Binds or Mounts) that do not exist.
+func (d *daemon) noteMissingVolumes(body []byte) {
+	var create struct {
+		HostConfig struct {
+			Binds  []string
+			Mounts []struct{ Type, Source string }
+		}
+	}
+	if json.Unmarshal(body, &create) != nil {
+		return
+	}
+	var names []string
+	for _, b := range create.HostConfig.Binds {
+		if src, _, _ := strings.Cut(b, ":"); !strings.HasPrefix(src, "/") {
+			names = append(names, src)
+		}
+	}
+	for _, m := range create.HostConfig.Mounts {
+		if m.Type == "volume" && m.Source != "" {
+			names = append(names, m.Source)
+		}
+	}
+	for _, name := range names {
+		if d.find("volumes", name) == nil {
+			d.mu.Lock()
+			d.volumesMissing = append(d.volumesMissing, name)
+			d.mu.Unlock()
+		}
 	}
 }
 
@@ -502,6 +550,57 @@ func TestGateChecksWhatItForwards(t *testing.T) {
 	}
 	if got := c.d.saw("POST /v1.45/networks/abcd/"); got != "" {
 		t.Errorf("the connect was forwarded by name: %s (answer %d %s)", got, status, out)
+	}
+}
+
+// TestGateVolumeDeleteWaitsForCreate: a container create that names a volume
+// of the task's reaches the daemon while that volume still exists. The task
+// deletes the volume through the gate right after the gate checked it for
+// the create; were the delete let through first, the daemon would create a
+// fresh volume of that name for the container, without the task's label,
+// and atl done would never remove it. The delete waits for the create
+// instead, and still happens.
+func TestGateVolumeDeleteWaitsForCreate(t *testing.T) {
+	c := newGate(t)
+	deleted := make(chan int, 1)
+	deleteVolume := func() {
+		req, _ := http.NewRequest("DELETE", "http://gate/v1.45/volumes/myvol", nil)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			deleted <- 0
+			return
+		}
+		resp.Body.Close()
+		deleted <- resp.StatusCode
+	}
+	var first atomic.Bool
+	c.d.mu.Lock()
+	c.d.onInspect = func(kind, ref string) {
+		if kind != "volumes" || ref != "myvol" || first.Swap(true) {
+			return
+		}
+		// The create's check: the task deletes the volume now.
+		go deleteVolume()
+		time.Sleep(500 * time.Millisecond) // time enough for an unhindered delete
+	}
+	c.d.mu.Unlock()
+	status, out := c.do("POST", "/v1.45/containers/create", `{"Image":"x","HostConfig":{"Binds":["myvol:/data"]}}`)
+	if status != http.StatusCreated {
+		t.Fatalf("create: %d %s", status, out)
+	}
+	select {
+	case s := <-deleted:
+		if s != http.StatusNoContent {
+			t.Errorf("the delete after the create: status %d", s)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the volume delete never finished")
+	}
+	c.d.mu.Lock()
+	missing := slices.Clone(c.d.volumesMissing)
+	c.d.mu.Unlock()
+	if len(missing) > 0 {
+		t.Errorf("the create reached the daemon after volume %v was deleted: the daemon makes it again, unlabelled", missing)
 	}
 }
 
