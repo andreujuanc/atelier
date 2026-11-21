@@ -46,7 +46,7 @@ func (a *App) Diff(ctx context.Context, ref string, w io.Writer, color bool) err
 			continue
 		}
 		if err := gitx.Diff(ctx, wt, r.BaseCommit, color, w); err != nil {
-			errs = append(errs, fmt.Errorf("repo %s: %w", r.Name, err))
+			errs = append(errs, fmt.Errorf("repo %s: %w", r.Name, a.noteRefusal(r.Name, "git diff", err)))
 			continue
 		}
 		untracked, err := gitx.Untracked(ctx, wt)

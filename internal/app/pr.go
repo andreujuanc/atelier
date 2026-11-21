@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,10 +25,10 @@ type PRResult struct {
 // prFooter ends every PR body.
 const prFooter = "Created by atelier"
 
-// PR opens a pull request (`gh pr create`, run in the worktree) for each rw
-// repo of the task that has commits on its branch and whose branch is on
-// origin; if any PR was created (or already existed) the task moves to
-// review. atelier never pushes: a repo whose branch is not on origin is
+// PR opens a pull request (`gh pr create --repo <the pinned origin's>`) for
+// each rw repo of the task that has commits on its branch and whose branch
+// is on origin; if any PR was created (or already existed) the task moves
+// to review. atelier never pushes: a repo whose branch is not on origin is
 // skipped with reason "push <branch> first". Per-repo failures (including
 // gh's) are reported as skipped results, never abort the other repos.
 func (a *App) PR(ctx context.Context, ref string) ([]PRResult, error) {
@@ -77,19 +78,35 @@ func (a *App) prRepo(ctx context.Context, t *model.Task, r model.TaskRepo, body 
 	if n == 0 {
 		return skip("no commits")
 	}
-	pushed, err := gitx.RemoteBranchExists(ctx, wt, t.Branch)
+	origin, err := a.remoteOrigin(ctx, r.Name, wt, a.out())
 	if err != nil {
 		return skip(err.Error())
+	}
+	pushed, err := gitx.RemoteBranchExists(ctx, wt, origin, t.Branch)
+	if err != nil {
+		return skip(a.noteRefusal(r.Name, "git ls-remote", err).Error())
 	}
 	if !pushed {
 		return skip("push " + t.Branch + " first")
 	}
+	repo, ok := gitx.GitHubRepo(ctx, wt, origin)
+	if !ok {
+		return skip(fmt.Sprintf("origin %s is not a GitHub repository URL", origin))
+	}
 
+	// gh is told the repository (the pinned origin's) and runs in an empty
+	// directory: it picks the repository from the remotes of the repo it
+	// runs in, and runs git there (whose config is the task's), otherwise.
+	tmp, err := os.MkdirTemp("", "atl-gh-")
+	if err != nil {
+		return skip(err.Error())
+	}
+	defer os.RemoveAll(tmp)
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "gh", "pr", "create",
+	cmd := exec.CommandContext(ctx, "gh", "pr", "create", "--repo", repo,
 		"--head", t.Branch, "--base", r.BaseBranch, "--title", t.Title, "--body", body)
-	cmd.Dir = wt
-	cmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+	cmd.Dir = tmp
+	cmd.Env = append(gitx.GuardedEnv(), "GH_PROMPT_DISABLED=1", "GIT_CEILING_DIRECTORIES="+filepath.Dir(tmp))
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Run(); err != nil {

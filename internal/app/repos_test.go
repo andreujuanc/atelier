@@ -342,22 +342,14 @@ func TestAddRepoRollback(t *testing.T) {
 		}
 	}
 
-	// A failing post-checkout hook: git creates branch + worktree, then fails.
-	hookPath := filepath.Join(web, ".git", "hooks", "post-checkout")
-	if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// A failed checkout: git creates the branch, then fails.
+	restore := breakCheckout(t, web, "origin/main:README")
 	if _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"web", model.ModeRW}, true); err == nil {
-		t.Fatal("AddRepo succeeded despite failing hook")
+		t.Fatal("AddRepo succeeded despite the failed checkout")
 	}
-	check("hook")
+	check("checkout")
 	noBranch(t, web, task.Branch)
-	if err := os.Remove(hookPath); err != nil {
-		t.Fatal(err)
-	}
+	restore()
 
 	// The branch already exists: AddWorktree fails, the branch is kept.
 	git(t, web, "branch", task.Branch)
@@ -522,37 +514,13 @@ func TestAddRepoTaskClosedMeanwhile(t *testing.T) {
 		t.Fatal(err)
 	}
 	web := e.canonical("web")
-	sig := filepath.Join(e.root, "sig")
-	if err := os.MkdirAll(sig, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	hookPath := filepath.Join(web, ".git", "hooks", "post-checkout")
-	if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	script := "#!/bin/sh\ntouch '" + sig + "/started'\nwhile [ ! -f '" + sig + "/go' ]; do sleep 0.02; done\n"
-	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"web", model.ModeRW}, true)
-		done <- err
-	}()
-	deadline := time.Now().Add(20 * time.Second)
-	for !exists(filepath.Join(sig, "started")) {
-		if time.Now().After(deadline) {
-			t.Fatal("hook never started")
+	afterWorktreeAdd = func(string) {
+		if err := e.app.Store.SetTaskStatus(ctx, task.ID, model.StatusDone); err != nil {
+			t.Error(err)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	if err := e.app.Store.SetTaskStatus(ctx, task.ID, model.StatusDone); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sig, "go"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	err = <-done
+	t.Cleanup(func() { afterWorktreeAdd = nil })
+	_, err = e.app.AddRepo(ctx, task.Slug, RepoArg{"web", model.ModeRW}, true)
 	if err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("err = %v, want task closed", err)
 	}

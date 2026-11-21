@@ -347,10 +347,10 @@ func (a *App) populateTaskDir(ctx context.Context, t *model.Task) (err error) {
 		repo := a.Paths.RepoPath(r.Name)
 		_, berr := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
 		branchExisted := berr == nil
-		if err := gitx.AddWorktree(ctx, repo, wt, t.Branch, r.BaseCommit); err != nil {
+		if err := a.addWorktree(ctx, r.Name, repo, wt, t.Branch, r.BaseCommit); err != nil {
 			if !branchExisted {
 				// git may have created the branch (and worktree) before
-				// failing, e.g. in a post-checkout hook: undo them too.
+				// failing, e.g. when the checkout fails: undo them too.
 				bg := context.WithoutCancel(ctx)
 				_ = gitx.RemoveWorktree(bg, repo, wt, true)
 				if _, rerr := gitx.RevParse(bg, repo, "refs/heads/"+t.Branch); rerr == nil {

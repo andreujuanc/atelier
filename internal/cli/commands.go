@@ -145,7 +145,7 @@ func (c *cli) addCmd() *cobra.Command {
 }
 
 func (c *cli) reposCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "repos",
 		Short: "List the git repos in $ATL_REPOS, one per line",
 		Args:  args(cobra.NoArgs),
@@ -164,6 +164,33 @@ func (c *cli) reposCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "pin <repo>...",
+		Short: "Pin each repo's origin anew from its config (accept a changed origin URL for atl push/fetch)",
+		Args:  args(cobra.MinimumNArgs(1)),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			ap, err := c.App()
+			if err != nil {
+				return err
+			}
+			for _, name := range a {
+				old, had, now, err := ap.RepinOrigin(cmd.Context(), name)
+				if err != nil {
+					return err
+				}
+				switch {
+				case !had:
+					fmt.Fprintf(c.stdout, "%s: pinned %s\n", name, now)
+				case old.Equal(now):
+					fmt.Fprintf(c.stdout, "%s: pinned %s (unchanged)\n", name, now)
+				default:
+					fmt.Fprintf(c.stdout, "%s: pinned %s (was %s)\n", name, now, old)
+				}
+			}
+			return nil
+		},
+	})
+	return cmd
 }
 
 // parseStatuses parses --status: "" → open statuses, "all" → nil (every

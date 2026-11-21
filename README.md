@@ -37,6 +37,7 @@ atl add fix-login web [--no-fetch]  # add a repo to an open task (rw: worktree o
 atl add fix-login docs:ro           # ro: listed in CLAUDE.md; running sessions need a new one (s)
 atl add fix-login docs:rw           # upgrade an ro repo to rw (worktree on atl/<slug>); rw → ro is not possible
 atl repos                 # git repos in $ATL_REPOS, one per line
+atl repos pin api         # pin api's origin anew from its config (accept a changed origin URL)
 atl ls [--status active,review|all] [--json]
 atl open fix-login        # ensure the tmux session (resume or start Claude), attach
 atl open fix-login --session 3   # open that session: select it if live, else claude --resume it; attach
@@ -48,7 +49,7 @@ atl rename fix-login Fix the login page   # title only: slug, branch atl/<slug>,
 atl diff fix-login        # git diff of each rw repo vs its base commit (paged on a TTY)
 atl push [fix-login] [--repo api] [--force]  # push atl/<slug> of each rw repo to origin (--force: with lease); task defaults to $ATL_TASK
 atl fetch [fix-login] [--repo api]           # git fetch origin in each repo of the task (rw and ro)
-atl pr fix-login          # gh pr create (--base = the repo's base branch) per rw repo with pushed commits; status → review
+atl pr fix-login          # gh pr create (--repo = origin's, --base = the repo's base branch) per rw repo with pushed commits; status → review
 atl show fix-login [--json]     # task, repos (dirty, commits ahead, last commit, pushed), sessions, notes
 atl show fix-login --notes      # only the notes text (same as atl notes; read-only spelling)
 atl transcript fix-login [--session ID] [--tail N]  # last N (20; 0 = all) turns of a Claude session
@@ -59,7 +60,7 @@ atl notes fix-login --clear            # clear the notes
 atl assistant [fix-login] # the atelier assistant (one Claude session for all tasks); attach
 atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
 atl cancel fix-login [--force]
-atl doctor
+atl doctor                # tools, dirs, database; repos whose config atl refuses to run git with
 atl                       # TUI (on a terminal)
 ```
 
@@ -388,7 +389,9 @@ What the sandbox does not do yet:
   what runs in the task can use it to make model requests on your account, also from
   elsewhere, until you revoke it.
 - The git database of a task's rw repos is writable from the task (other branches, hooks
-  and config of that clone included).
+  and config of that clone included). `atl` runs git in those repos where it runs (see
+  **Git where atl runs** below), and keeps that config from making git run a program or
+  contact a server; one limit remains there.
 - A task can swap a checked mount path for a symlink before the daemon mounts it.
 - Only the classic image builder goes through the gate (`DOCKER_BUILDKIT=0` is set in the
   task); BuildKit sessions are refused.
@@ -431,30 +434,66 @@ A push asked from a task runs without a terminal, so an SSH key that needs a PIN
 passphrase typed at a prompt fails there (push from your own shell then); a key that only
 needs a touch works, though this has not been tried with a hardware key yet.
 
-The push and fetch run git in a repo whose config and hooks the task can write, so git
-runs with hooks off and the settings that make it run programs (fsmonitor, credential
-helpers and askpass, ssh and proxy commands, `ext::` remotes) pinned to your own config on
-the command line.
+**Git where atl runs.** `atl` itself runs git in the task's repos where it runs, next to
+your SSH agent and the Docker socket: `git status` for the dirty marks and `atl show`/`atl
+done`, `git diff` for `atl diff`, `worktree add`/`remove`, branch cleanup, the remote
+check of `atl pr`, push and fetch. A repo's config can name programs git then runs
+(`core.fsmonitor`, hooks, an ssh command, filters, ...), and that config is the task's to
+write. This holds whether the sandbox is on or not (the plan is for it to be the only
+mode), and it is done three ways:
 
-Nor do they go wherever the repo's `origin` points now. `atl` pins each repo's origin
-URLs (fetch and push, as git resolves them) in `<workspace>/run/origins/<repo>.json`
-(without a workspace, `$XDG_STATE_HOME/atelier-run/origins/`), a place no task container
-sees, and pushes and fetches there, through a remote defined on the command line under a
-random name. `refs/remotes/origin/*` and `--force-with-lease` work as before. With the
-sandbox on, `atl new` and `atl add` fetch the pinned origin the same way before branching.
-The pin is written once per repo (clones are shared between tasks), the first time `atl`
-needs it: at the fetch of `atl new`/`atl add`, before the container of a task using the
-repo starts, or at the first `atl push`/`atl fetch`, whichever comes first. That is trust on first use: the URL is whatever
-the clone said at that moment, and `atl` never rewrites it. When the repo's config says
-something else later, `atl` uses the pin and prints a warning naming both; to accept the
-new URL, delete the pin file.
+- Every git `atl` runs is told not to: `--no-pager`, no fsmonitor, no hooks (the hooks
+  directory and every hook configured in git config), no submodule recursion, no
+  automatic gc, no editor, no lazy fetch from a partial clone's promisor remote, and no
+  transport at all except for push, fetch and the remote check, which use your own
+  credential helpers, askpass and ssh command, never the repo's (`ext::` remotes and
+  bundle URIs off). `atl diff` runs no external diff or textconv program and shows a
+  submodule as its commit only. `gh pr create` (for `atl pr`) runs outside the worktree
+  with `--repo` set to the pinned origin's GitHub repository, so it neither reads the
+  repo's remotes nor runs git in it.
+- Where git would read a file through a filter (a `filter.<name>.clean` program the
+  config names), `atl` gets its answer without git doing so: the dirty check compares the
+  worktree with the index itself (stat data, and the file's hash where that is not
+  conclusive); `atl done` and `worktree remove` use that check instead of git's. A file
+  touched without a change reads as clean; one whose content is converted on checkout
+  (a filter, `eol`, `text`, `working-tree-encoding`) and whose stat data changed reads as
+  dirty, which is the safe answer.
+- What cannot be avoided is checked right before and refused: `atl diff` (it reads changed
+  files through the filters) and the checkout of `atl new`/`atl add` refuse while the repo's
+  own config (its `.git/config`, a worktree's `config.worktree`, or a file they include)
+  defines a filter program; the exact filter commands `git lfs install` writes are let
+  through. With git-lfs on, the checkout may download, so it is also refused while the
+  repo's own config has git-lfs settings (other than `lfs.repositoryformatversion` and
+  `lfs.<url>.access`/`locksverify`), `http.*` settings or URL rewrite rules, or its origin
+  is not the pinned one. Push, fetch and the remote check are refused while it has
+  `url.<base>.insteadOf`/`pushInsteadOf` rules, or `http.*` settings for an https origin.
 
-`url.<base>.insteadOf` and `pushInsteadOf` rules would rewrite the pinned URL too, so a
-push or fetch is refused while the repo's own config (or a file it includes) has one;
-yours in `~/.gitconfig` stay. Two limits: the check and git's own reading of the config
-are two moments, so a task rewriting its config in a tight loop could slip a rule in
-between (part of the task being able to write the clone's `.git`, above); and the repo's
-own `http.*` settings (proxy, `sslVerify`) still apply to an https origin.
+A refusal names the repo, the setting and its value, prints a warning, and is logged in
+`refused.log` in the state dir (next to `hook.log`, which no task container sees). `atl
+doctor` lists, per repo, the settings it would refuse on now. Settings `atl` overrides
+anyway (a husky `core.hooksPath`, `core.fsmonitor=true`, your own `core.sshCommand` in a
+repo) are not listed. Remove the setting and run the command again.
+
+The limit: a check and git's own reading of the config are two moments, so a task
+rewriting its config in a tight loop could slip a setting in between. Also, git cannot
+fetch a missing object for `atl` (the promisor remote is the config's to choose), so a
+partial clone (`clone --filter`) cannot be an rw repo: the checkout of `atl new` fails.
+
+**Origin pin.** Push and fetch do not go wherever the repo's `origin` points now. `atl`
+pins each repo's origin URLs (fetch and push, as the config says them, before any
+`insteadOf` rule) in `<workspace>/run/origins/<repo>.json` (without a workspace,
+`$XDG_STATE_HOME/atelier-run/origins/`), a place no task container sees, and pushes and
+fetches there, through a remote defined on the command line under a random name; your own
+`insteadOf`/`pushInsteadOf` rules (in `~/.gitconfig`) apply to it then, once.
+`refs/remotes/origin/*`, `refs/remotes/origin/HEAD` (created when missing, as `git
+fetch` does since git 2.48) and `--force-with-lease` work as before. `atl new` and `atl
+add` fetch the pinned origin the same way before branching. The pin is written once per
+repo (clones are shared between tasks), the first time `atl` needs it: at `atl new`/`atl
+add`, before the container of a task using the repo starts, or at the first `atl
+push`/`atl fetch`, whichever comes first. That is trust on first use: the URL is whatever
+the clone said at that moment, and `atl` never rewrites it on its own. When the repo's
+config says something else later, `atl` uses the pin and prints a warning naming both; to
+accept the new URL, run `atl repos pin <repo>` (where `atl` runs; not from a task).
 
 ## Projects
 

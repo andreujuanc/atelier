@@ -1,0 +1,362 @@
+package gitx
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+)
+
+// IsDirty reports whether the worktree has uncommitted changes, counting
+// untracked files (as `git status --porcelain` does, whatever
+// status.showUntrackedFiles says) and changes inside checked-out
+// submodules. It takes no locks and writes nothing, so it is safe to poll
+// while other git commands run.
+//
+// It does not run `git status`: status reads a file whose stat data no
+// longer matches the index through the clean filter the repo's config
+// names, which is the task's to choose. Here git only lists what it has
+// recorded (index against HEAD, the index's entries with their stat data,
+// the untracked files), and the worktree's files are compared with the
+// index here, by stat data and, where that is not conclusive, by hashing
+// the file as it is, with no filter or line-ending conversion. Where a
+// conversion applies (a filter, eol, text, working-tree-encoding), a file
+// whose stat data changed but whose content did not reads as dirty: a
+// conservative answer.
+func IsDirty(ctx context.Context, worktree string) (bool, error) {
+	return isDirty(ctx, worktree, 0)
+}
+
+// maxSubmoduleDepth bounds the recursion into nested submodules.
+const maxSubmoduleDepth = 8
+
+func isDirty(ctx context.Context, worktree string, depth int) (bool, error) {
+	// The index against HEAD: staged changes.
+	unborn := false
+	if _, err := run(ctx, worktree, "diff-index", "--cached", "--quiet", "--ignore-submodules=none", "HEAD", "--"); err != nil {
+		var ge *Error
+		if errors.As(err, &ge) && ge.ExitCode == 1 && ge.Stderr == "" {
+			return true, nil
+		}
+		if _, herr := run(ctx, worktree, "rev-parse", "--verify", "--quiet", "HEAD"); herr == nil {
+			return false, err
+		}
+		unborn = true // no commit yet: anything in the index is staged
+	}
+	// Untracked files (directories as one entry).
+	out, err := run(ctx, worktree, "ls-files", "-z", "--others", "--exclude-standard", "--directory", "--no-empty-directory")
+	if err != nil {
+		return false, err
+	}
+	if out != "" {
+		return true, nil
+	}
+	ix, err := readIndex(ctx, worktree)
+	if err != nil {
+		return false, err
+	}
+	if unborn && len(ix.entries) > 0 {
+		return true, nil
+	}
+	fileMode := true
+	if v, err := run(ctx, worktree, "config", "--type=bool", "--get", "core.filemode"); err == nil {
+		fileMode = v != "false"
+	}
+	for i := range ix.entries {
+		e := &ix.entries[i]
+		if e.stage != 0 || e.flags&ceIntentToAdd != 0 {
+			return true, nil // unmerged, or added with -N
+		}
+		if e.flags&(ceValid|ceSkipWorktree) != 0 {
+			continue // assume-unchanged or outside the sparse checkout: git does not look either
+		}
+		path := filepath.Join(worktree, filepath.FromSlash(e.path))
+		if e.mode == modeGitlink {
+			dirty, err := submoduleDirty(ctx, path, e.oid, depth)
+			if err != nil || dirty {
+				return dirty, err
+			}
+			continue
+		}
+		changed, err := ix.changed(e, path, fileMode)
+		if err != nil || changed {
+			return changed, err
+		}
+	}
+	return false, nil
+}
+
+// submoduleDirty compares a submodule's checkout at path with the commit
+// oid its superproject records: dirty if it is gone, is at another commit
+// or has changes of its own. An empty directory is a submodule that is not
+// checked out, which is not a change.
+func submoduleDirty(ctx context.Context, path, oid string, depth int) (bool, error) {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !fi.IsDir() {
+		return true, nil
+	}
+	if !populated(path) {
+		return false, nil
+	}
+	head, err := run(ctx, path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+	if err != nil || head != oid {
+		return true, nil
+	}
+	if depth >= maxSubmoduleDepth {
+		return true, nil // conservative
+	}
+	return isDirty(ctx, path, depth+1)
+}
+
+// populated reports whether the submodule directory path is checked out
+// (has a .git).
+func populated(path string) bool {
+	_, err := os.Lstat(filepath.Join(path, ".git"))
+	return err == nil
+}
+
+const (
+	modeTypeMask = 0o170000
+	modeRegular  = 0o100000
+	modeSymlink  = 0o120000
+	modeGitlink  = 0o160000
+
+	// In-memory index entry flags, as `ls-files --debug` prints them.
+	ceValid        = 0x8000  // assume-unchanged
+	ceIntentToAdd  = 1 << 29 // git add -N
+	ceSkipWorktree = 1 << 30
+)
+
+type statTime struct{ sec, nsec uint32 }
+
+type indexEntry struct {
+	mode, flags         uint32
+	oid, path           string
+	stage               int
+	ctime, mtime        statTime
+	ino, uid, gid, size uint32
+}
+
+type gitIndex struct {
+	entries []indexEntry
+	mtime   time.Time // of the index file; zero if there is none
+}
+
+// readIndex lists the index of the worktree with each entry's stat data
+// (`git ls-files --stage --debug`), and the index file's mtime.
+func readIndex(ctx context.Context, worktree string) (*gitIndex, error) {
+	var stdout, stderr bytes.Buffer
+	args := []string{"ls-files", "-z", "--stage", "--debug"}
+	cmd := command(ctx, worktree, args...)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, wrap(ctx, args, stderr.String(), err)
+	}
+	ix := &gitIndex{}
+	r := bufio.NewReader(&stdout)
+	for {
+		head, err := r.ReadString(0)
+		if err == io.EOF && head == "" {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("git ls-files: truncated output")
+		}
+		e, err := parseIndexEntry(strings.TrimSuffix(head, "\x00"), r)
+		if err != nil {
+			return nil, err
+		}
+		ix.entries = append(ix.entries, e)
+	}
+	path, err := run(ctx, worktree, "rev-parse", "--git-path", "index")
+	if err != nil {
+		return nil, err
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(worktree, path)
+	}
+	if fi, err := os.Stat(path); err == nil {
+		ix.mtime = fi.ModTime()
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	return ix, nil
+}
+
+// parseIndexEntry parses "<mode> <oid> <stage>\t<path>" and the five lines
+// of stat data that follow it in r:
+//
+//	ctime: <sec>:<nsec>
+//	mtime: <sec>:<nsec>
+//	dev: <n>	ino: <n>
+//	uid: <n>	gid: <n>
+//	size: <n>	flags: <hex>
+func parseIndexEntry(head string, r *bufio.Reader) (indexEntry, error) {
+	var e indexEntry
+	bad := func() (indexEntry, error) { return e, fmt.Errorf("git ls-files: unexpected output %q", head) }
+	meta, path, ok := strings.Cut(head, "\t")
+	f := strings.Fields(meta)
+	if !ok || len(f) != 3 {
+		return bad()
+	}
+	mode, err1 := strconv.ParseUint(f[0], 8, 32)
+	stage, err2 := strconv.Atoi(f[2])
+	if err1 != nil || err2 != nil {
+		return bad()
+	}
+	e.mode, e.oid, e.stage, e.path = uint32(mode), f[1], stage, path
+	vals := map[string]string{}
+	for i := 0; i < 5; i++ {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return bad()
+		}
+		for _, kv := range strings.Split(strings.TrimSpace(line), "\t") {
+			k, v, ok := strings.Cut(kv, ": ")
+			if !ok {
+				return bad()
+			}
+			vals[k] = v
+		}
+	}
+	u := func(k string, base int) uint32 {
+		n, err := strconv.ParseUint(vals[k], base, 32)
+		if err != nil {
+			ok = false
+		}
+		return uint32(n)
+	}
+	t := func(k string) statTime {
+		s, ns, found := strings.Cut(vals[k], ":")
+		a, err1 := strconv.ParseUint(s, 10, 32)
+		b, err2 := strconv.ParseUint(ns, 10, 32)
+		if !found || err1 != nil || err2 != nil {
+			ok = false
+		}
+		return statTime{uint32(a), uint32(b)}
+	}
+	e.ctime, e.mtime = t("ctime"), t("mtime")
+	e.ino, e.uid, e.gid, e.size = u("ino", 10), u("uid", 10), u("gid", 10), u("size", 10)
+	e.flags = u("flags", 16)
+	if !ok {
+		return bad()
+	}
+	return e, nil
+}
+
+// changed reports whether the file at path differs from index entry e.
+// Matching stat data is enough unless the file may have changed within the
+// second the index was written (git's "racily clean" case); otherwise the
+// file is hashed as a blob, as is, and compared with the entry's object.
+func (ix *gitIndex) changed(e *indexEntry, path string, fileMode bool) (bool, error) {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	switch e.mode & modeTypeMask {
+	case modeRegular:
+		if !fi.Mode().IsRegular() {
+			return true, nil
+		}
+		if fileMode && (e.mode&0o100 != 0) != (fi.Mode().Perm()&0o100 != 0) {
+			return true, nil
+		}
+	case modeSymlink:
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			return true, nil
+		}
+	default:
+		return true, nil
+	}
+	if uint32(fi.Size()) != e.size {
+		return true, nil
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, fmt.Errorf("stat %s: no stat data", path)
+	}
+	if sameStat(e, st) && !ix.racy(e) {
+		return false, nil
+	}
+	sum, err := blobHash(path, fi, len(e.oid))
+	if err != nil {
+		return false, err
+	}
+	return sum != e.oid, nil
+}
+
+func sameStat(e *indexEntry, st *syscall.Stat_t) bool {
+	same := func(t statTime, ts syscall.Timespec) bool {
+		// An index written without nanoseconds has 0 there.
+		return t.sec == uint32(ts.Sec) && (t.nsec == 0 || t.nsec == uint32(ts.Nsec))
+	}
+	mtime, ctime := statTimes(st)
+	return same(e.mtime, mtime) && same(e.ctime, ctime) &&
+		e.ino == uint32(st.Ino) && e.uid == st.Uid && e.gid == st.Gid
+}
+
+// racy: the entry's file was modified no earlier than the second its stat
+// data was recorded in the index, so a change within that second does not
+// show in it.
+func (ix *gitIndex) racy(e *indexEntry) bool {
+	return ix.mtime.IsZero() || uint32(ix.mtime.Unix()) <= e.mtime.sec
+}
+
+// blobHash returns the object id the file at path would have as a blob, as
+// it is (its target, for a symlink), in the object format whose ids are
+// hexLen long. A file that changes size while it is read hashes to "".
+func blobHash(path string, fi fs.FileInfo, hexLen int) (string, error) {
+	var h hash.Hash
+	switch hexLen {
+	case 40:
+		h = sha1.New()
+	case 64:
+		h = sha256.New()
+	default:
+		return "", fmt.Errorf("unknown object id length %d", hexLen)
+	}
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(h, "blob %d\x00%s", len(target), target)
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	fmt.Fprintf(h, "blob %d\x00", fi.Size())
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return "", err
+	}
+	if n != fi.Size() {
+		return "", nil
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}

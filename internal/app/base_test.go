@@ -262,6 +262,7 @@ func TestPRTargetsBaseBranch(t *testing.T) {
 	gh := installGH(t)
 	e.addRepo(t, "api", "main")
 	e.pushBranch(t, "api", "main", "dev", "dev-only")
+	e.githubOrigins(t, "api")
 	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Feature", Repos: []RepoArg{{"api", model.ModeRW}}})
 	if err != nil {
 		t.Fatal(err)

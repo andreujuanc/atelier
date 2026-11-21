@@ -187,9 +187,9 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 		}
 		_, berr := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
 		branchExisted := berr == nil
-		if err := gitx.AddWorktree(ctx, repo, wt, t.Branch, tr.BaseCommit); err != nil {
+		if err := a.addWorktree(ctx, name, repo, wt, t.Branch, tr.BaseCommit); err != nil {
 			// git may have created the branch (and worktree) before
-			// failing, e.g. in a post-checkout hook: undo only what this
+			// failing, e.g. when the checkout fails: undo only what this
 			// call verifiably created. "already exists" means git refused
 			// up front and whatever is there belongs to someone else.
 			if !strings.Contains(err.Error(), "already exists") {
@@ -203,6 +203,9 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 			return nil, fmt.Errorf("repo %s: %w", name, err)
 		}
 		createdBranch = !branchExisted
+		if afterWorktreeAdd != nil {
+			afterWorktreeAdd(wt)
+		}
 	}
 	record := a.Store.AddTaskRepo
 	if upgrade {
@@ -270,6 +273,10 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 	}
 	return t, nil
 }
+
+// afterWorktreeAdd, if set (tests only), runs in AddRepo between the
+// worktree's creation and the repo's insert.
+var afterWorktreeAdd func(wt string)
 
 // undoWorktree removes (if removeWT) worktree wt of repo name and, if
 // deleteBranch and the branch exists, deletes it; failures are warnings.
