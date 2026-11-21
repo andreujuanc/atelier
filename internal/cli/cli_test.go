@@ -283,6 +283,13 @@ func TestPRExitCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// An origin gh can name, which the user's own rule maps to the local one.
+	global := filepath.Join(root, "gitconfig")
+	if err := os.WriteFile(global, []byte("[url \""+filepath.Join(root, "origin.git")+"\"]\n\tinsteadOf = https://github.com/o/api.git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	git(t, filepath.Join(root, "repos", "api"), "remote", "set-url", "origin", "https://github.com/o/api.git")
 
 	if code, _, errs := atl(t, "new", "ship", "--repo", "api", "--no-fetch"); code != 0 {
 		t.Fatalf("new: %d %s", code, errs)
@@ -302,6 +309,24 @@ func TestPRExitCode(t *testing.T) {
 	git(t, wt, "push", "-q", "origin", "atl/ship")
 	if code, out, errs := atl(t, "pr", "ship"); code != 1 || out != "api\tskipped: gh: boom\n" || errs != "" {
 		t.Fatalf("pr (gh fails): %d %q %q", code, out, errs)
+	}
+}
+
+func TestReposPin(t *testing.T) {
+	root := setup(t)
+	origin := filepath.Join(root, "origin.git")
+	if code, out, errs := atl(t, "repos", "pin", "api"); code != 0 || out != "api: pinned "+origin+"\n" {
+		t.Fatalf("repos pin: %d %q %s", code, out, errs)
+	}
+	git(t, filepath.Join(root, "repos", "api"), "remote", "set-url", "origin", "/elsewhere.git")
+	if code, out, errs := atl(t, "repos", "pin", "api"); code != 0 || out != "api: pinned /elsewhere.git (was "+origin+")\n" {
+		t.Fatalf("repos pin after set-url: %d %q %s", code, out, errs)
+	}
+	if code, _, errs := atl(t, "repos", "pin", "nope"); code != 1 || !strings.Contains(errs, "does not exist") {
+		t.Fatalf("repos pin nope: %d %s", code, errs)
+	}
+	if code, _, _ := atl(t, "repos", "pin"); code != 2 {
+		t.Fatalf("repos pin without a repo: %d", code)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
@@ -67,6 +68,7 @@ func (a *App) Doctor(ctx context.Context) []Check {
 		a.checkDB(ctx),
 		a.checkStateDir(),
 	)
+	checks = append(checks, a.checkRepoConfigs(ctx)...)
 	if os.Getenv("ATL_CONTEXT") != "" || os.Getenv(hook.SandboxContextVar) != "" {
 		checks = append(checks, checkEnvContext())
 	}
@@ -120,6 +122,63 @@ func (a *App) checkSandbox(ctx context.Context) []Check {
 		detail += "; your setup is copied from " + user
 	}
 	checks = append(checks, pass("claude config", detail))
+	return checks
+}
+
+// checkRepoConfigs lists, for each repo in Paths.Repos (its canonical
+// clone and its worktrees), the settings of its own config that make atl
+// refuse a git command now (see gitx.Hazards): one warning per repo that
+// has any. Settings atl overrides on every git it runs (hooks, fsmonitor,
+// ssh command, ...) are not listed: they do nothing there.
+func (a *App) checkRepoConfigs(ctx context.Context) []Check {
+	const name = "repo configs"
+	ctx, cancel := context.WithTimeout(ctx, 4*checkTimeout)
+	defer cancel()
+	repos, err := a.AvailableRepos(ctx)
+	if err != nil {
+		return []Check{warn(name, err.Error())}
+	}
+	var checks []Check
+	for _, r := range repos {
+		dir := a.Paths.RepoPath(r)
+		var origin *gitx.Origin
+		if o, ok, err := a.loadPin(r); err == nil && ok {
+			origin = &o
+		} else if o, ok, err := gitx.CurrentOrigin(ctx, dir); err == nil && ok {
+			origin = &o
+		}
+		dirs := []string{dir}
+		if wts, err := gitx.Worktrees(ctx, dir); err == nil {
+			dirs = append(dirs, wts...)
+		}
+		seen := map[string]bool{}
+		var found []string
+		for _, d := range dirs {
+			hs, err := gitx.Hazards(ctx, d, origin)
+			if err != nil {
+				if d == dir {
+					found = append(found, err.Error())
+				}
+				continue
+			}
+			for _, h := range hs {
+				s := fmt.Sprintf("%s = %s (%s; blocks %s)", h.Key, h.Value, h.Scope, h.Blocks())
+				if h.Scope == "worktree" {
+					s = fmt.Sprintf("%s = %s (worktree %s; blocks %s)", h.Key, h.Value, d, h.Blocks())
+				}
+				if !seen[s] {
+					seen[s] = true
+					found = append(found, s)
+				}
+			}
+		}
+		if len(found) > 0 {
+			checks = append(checks, warn("repo "+r, "its own config has what atl refuses to run git with: "+strings.Join(found, "; ")))
+		}
+	}
+	if len(checks) == 0 {
+		return []Check{pass(name, fmt.Sprintf("%d repos: nothing atl refuses to run git with", len(repos)))}
+	}
 	return checks
 }
 

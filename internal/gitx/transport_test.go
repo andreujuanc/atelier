@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -107,7 +108,7 @@ func plantRepoConfig(t *testing.T, m markers, repo, origin string) {
 }
 
 // to is an Origin with one URL for fetch and push.
-func to(url string) Origin { return Origin{URL: url, PushURLs: []string{url}} }
+func to(url string) Origin { return Origin{URLs: []string{url}} }
 
 func TestPushBranchPushesOnlyTheBranchAndRunsNothing(t *testing.T) {
 	ctx := context.Background()
@@ -174,27 +175,228 @@ func TestCurrentOrigin(t *testing.T) {
 	if o, ok, err := CurrentOrigin(ctx, f.repo); err != nil || !ok || !o.Equal(to(f.origin)) {
 		t.Errorf("CurrentOrigin = %+v, %v, %v; want %s", o, ok, err, f.origin)
 	}
-	// The user's rules are applied, and the usual https → ssh rule leaves
-	// the URL it made as it is when git applies it again.
+	// What the config says, before the user's rules.
 	global := filepath.Join(t.TempDir(), "gitconfig")
 	writeFile(t, global, "[url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n")
 	t.Setenv("GIT_CONFIG_GLOBAL", global)
 	git(t, f.repo, "remote", "set-url", "origin", "https://github.com/o/r.git")
 	git(t, f.repo, "remote", "set-url", "--add", "--push", "origin", "/srv/a.git")
 	git(t, f.repo, "remote", "set-url", "--add", "--push", "origin", "/srv/b.git")
-	want := Origin{URL: "git@github.com:o/r.git", PushURLs: []string{"/srv/a.git", "/srv/b.git"}}
+	want := Origin{URLs: []string{"https://github.com/o/r.git"}, PushURLs: []string{"/srv/a.git", "/srv/b.git"}}
 	if o, ok, err := CurrentOrigin(ctx, f.repo); err != nil || !ok || !o.Equal(want) {
 		t.Errorf("CurrentOrigin = %+v, %v, %v; want %+v", o, ok, err, want)
 	}
-	if got := git(t, f.repo, "ls-remote", "--get-url", want.URL); got != want.URL {
-		t.Errorf("the rule applied again: %s → %s", want.URL, got)
+	if got := want.String(); got != "https://github.com/o/r.git (push: /srv/a.git, /srv/b.git)" {
+		t.Errorf("String = %q", got)
+	}
+	// An empty value clears the list, as for git.
+	git(t, f.repo, "config", "--add", "remote.origin.pushurl", "")
+	git(t, f.repo, "config", "--add", "remote.origin.pushurl", "/srv/c.git")
+	if o, _, _ := CurrentOrigin(ctx, f.repo); !slices.Equal(o.PushURLs, []string{"/srv/c.git"}) {
+		t.Errorf("push URLs after an empty value = %q", o.PushURLs)
 	}
 	git(t, f.repo, "remote", "remove", "origin")
 	if o, ok, err := CurrentOrigin(ctx, f.repo); err != nil || ok {
 		t.Errorf("CurrentOrigin without origin = %+v, %v, %v", o, ok, err)
 	}
-	if _, _, err := CurrentOrigin(ctx, t.TempDir()); err == nil {
-		t.Error("CurrentOrigin outside a repo: no error")
+	if o, ok, _ := CurrentOrigin(ctx, t.TempDir()); ok {
+		t.Errorf("CurrentOrigin outside a repo = %+v", o)
+	}
+}
+
+// TestUserRulesApplyOnce: the pin is the config's URL, and the user's own
+// insteadOf rules apply to it once, even one whose replacement starts with
+// what it replaces (applied twice, it would grow the URL again).
+func TestUserRulesApplyOnce(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	decoy := f.decoy(t)
+	tip := f.pushFromOtherClone(t, "new")
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	// "short:" → the origin's path; and a rule whose replacement starts with
+	// its own prefix: <root>/ → <root>/x/ would make <root>/x/x/... if
+	// applied to its own result.
+	writeFile(t, global, "[url \""+f.origin+"\"]\n\tinsteadOf = short:\n"+
+		"[url \""+f.root+"/x/\"]\n\tinsteadOf = "+f.root+"/\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	git(t, f.repo, "remote", "set-url", "origin", "short:")
+	o, ok, err := CurrentOrigin(ctx, f.repo)
+	if err != nil || !ok || !o.Equal(Origin{URLs: []string{"short:"}}) {
+		t.Fatalf("CurrentOrigin = %+v, %v, %v", o, ok, err)
+	}
+	var out bytes.Buffer
+	if err := FetchOrigin(ctx, f.repo, o, &out); err != nil {
+		t.Fatalf("fetch: %v\n%s", err, out.String())
+	}
+	if got := git(t, f.repo, "rev-parse", "origin/main"); got != tip {
+		t.Errorf("origin/main = %s, want %s", got, tip)
+	}
+	// The double rewrite: a path under the root, pinned as it is.
+	if err := os.MkdirAll(filepath.Join(f.root, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(decoy, filepath.Join(f.root, "x", "decoy.git")); err != nil {
+		t.Fatal(err)
+	}
+	p := Origin{URLs: []string{filepath.Join(f.root, "decoy.git")}}
+	if got := p.fetchURLs(userConfig(ctx, f.repo)); len(got) != 1 || got[0] != filepath.Join(f.root, "x", "decoy.git") {
+		t.Errorf("fetch URL with the user's rules = %q", got)
+	}
+	if err := FetchOrigin(ctx, f.repo, p, &out); err != nil {
+		t.Errorf("fetch through a rule applied once: %v\n%s", err, out.String())
+	}
+}
+
+// TestFetchCreatesOriginHead: like `git fetch` since git 2.48, a fetch
+// creates a missing origin/HEAD (the stand-in remote cannot), and leaves an
+// existing one alone.
+func TestFetchCreatesOriginHead(t *testing.T) {
+	ctx := context.Background()
+	f := newFixtureBranch(t, "trunk")
+	head := func() string {
+		t.Helper()
+		out, err := run(ctx, f.repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+		if err != nil {
+			return ""
+		}
+		return out
+	}
+	git(t, f.repo, "remote", "set-head", "origin", "-d")
+	if err := FetchOrigin(ctx, f.repo, to(f.origin), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := head(); got != "refs/remotes/origin/trunk" {
+		t.Errorf("origin/HEAD = %q after the fetch", got)
+	}
+	if got, err := DefaultBranch(ctx, f.repo); err != nil || got != "trunk" {
+		t.Errorf("DefaultBranch = %q, %v", got, err)
+	}
+	f.pushFromOtherCloneBranch(t, "other")
+	git(t, f.repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	if err := FetchOrigin(ctx, f.repo, to(f.origin), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := head(); got != "refs/remotes/origin/main" {
+		t.Errorf("an existing origin/HEAD changed to %q", got)
+	}
+	git(t, f.repo, "remote", "set-head", "origin", "-d")
+	git(t, f.repo, "config", "remote.origin.followRemoteHEAD", "never")
+	if err := FetchOrigin(ctx, f.repo, to(f.origin), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := head(); got != "" {
+		t.Errorf("origin/HEAD = %q with followRemoteHEAD=never", got)
+	}
+}
+
+// pushFromOtherCloneBranch pushes a commit on a new branch main to origin
+// (whose default branch is not main).
+func (f fixture) pushFromOtherCloneBranch(t *testing.T, name string) {
+	t.Helper()
+	other := filepath.Join(f.root, "other-"+name)
+	git(t, f.root, "clone", "-q", f.origin, other)
+	git(t, other, "checkout", "-q", "-b", "main")
+	commitFile(t, other, name, name+"\n", "add "+name)
+	git(t, other, "push", "-q", "origin", "main")
+}
+
+// TestAddWorktreeWithLFS: with git-lfs's filter on, the checkout may
+// download; the repo's own git-lfs settings and an origin that is not the
+// pinned one are refused, and the user's credential helpers are the only
+// ones git-lfs could reach.
+func TestAddWorktreeWithLFS(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	writeFile(t, global, "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	git(t, f.repo, "config", "lfs.repositoryformatversion", "0")
+	base := git(t, f.repo, "rev-parse", "origin/main")
+	n := 0
+	add := func() error {
+		n++
+		return AddWorktree(ctx, f.repo, filepath.Join(f.root, fmt.Sprintf("wt%d", n)), fmt.Sprintf("atl/%d", n), base, to(f.origin))
+	}
+	if err := add(); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ key, value string }{
+		{"lfs.customtransfer.x.path", "/bin/x"},
+		{"lfs.url", "https://elsewhere/"},
+		{"http.proxy", "http://elsewhere:1"},
+	} {
+		git(t, f.repo, "config", c.key, c.value)
+		var re *RefusedError
+		if err := add(); !errors.As(err, &re) || !strings.EqualFold(re.Key, c.key) {
+			t.Errorf("with %s: %v", c.key, err)
+		}
+		git(t, f.repo, "config", "--unset", c.key)
+	}
+	git(t, f.repo, "remote", "set-url", "origin", f.decoy(t))
+	var re *RefusedError
+	if err := add(); !errors.As(err, &re) || re.Key != "remote.origin.url" || !strings.Contains(err.Error(), f.origin) {
+		t.Errorf("with origin pointed elsewhere: %v", err)
+	}
+	git(t, f.repo, "remote", "set-url", "origin", f.origin)
+	if err := add(); err != nil {
+		t.Error(err)
+	}
+	// The user's credential helper and askpass reach git-lfs, the repo's
+	// do not.
+	args := userTransportArgs(ctx, f.repo)
+	if !slices.Contains(args, "credential.helper=") || !slices.Contains(args, "core.askPass=") {
+		t.Errorf("userTransportArgs = %q", args)
+	}
+}
+
+func TestPushURLsFollowGit(t *testing.T) {
+	user := configEntries{
+		{"url.ssh://h/.pushinsteadof", "https://h/"},
+		{"url.git@g:.insteadof", "https://g/"},
+		{"url.https://g/longer/.insteadof", "https://g/lo"},
+	}
+	for _, c := range []struct {
+		o     Origin
+		fetch string
+		push  []string
+	}{
+		{Origin{URLs: []string{"https://h/r"}}, "https://h/r", []string{"ssh://h/r"}},
+		{Origin{URLs: []string{"https://g/r"}}, "git@g:r", []string{"git@g:r"}},
+		{Origin{URLs: []string{"https://g/lo/r"}}, "https://g/longer//r", []string{"https://g/longer//r"}},
+		{Origin{URLs: []string{"https://h/r"}, PushURLs: []string{"https://h/p", "https://g/p"}}, "https://h/r",
+			[]string{"https://h/p", "git@g:p"}},
+		{Origin{URLs: []string{"https://h/a", "https://g/b"}}, "https://h/a", []string{"ssh://h/a"}},
+	} {
+		if got := c.o.fetchURLs(user); len(got) != 1 || got[0] != c.fetch {
+			t.Errorf("%+v: fetch %q, want %q", c.o, got, c.fetch)
+		}
+		if got := c.o.pushURLs(user); !slices.Equal(got, c.push) {
+			t.Errorf("%+v: push %q, want %q", c.o, got, c.push)
+		}
+	}
+}
+
+func TestGitHubRepo(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	writeFile(t, global, "[url \"git@github.com:\"]\n\tinsteadOf = gh:\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	for url, want := range map[string]string{
+		"git@github.com:o/r.git":          "o/r",
+		"https://github.com/o/r":          "o/r",
+		"https://github.com/o/r.git/":     "o/r",
+		"ssh://git@github.com:22/o/r.git": "o/r",
+		"gh:o/r":                          "o/r",
+		"git@ghe.example.com:o/r.git":     "ghe.example.com/o/r",
+		"https://gitlab.com/g/s/r.git":    "",
+		"/srv/r.git":                      "",
+		"file:///srv/r.git":               "",
+	} {
+		got, ok := GitHubRepo(ctx, f.repo, to(url))
+		if got != want || ok != (want != "") {
+			t.Errorf("GitHubRepo(%s) = %q, %v; want %q", url, got, ok, want)
+		}
 	}
 }
 
@@ -353,6 +555,36 @@ func TestTransportRefusesRepoURLRewrites(t *testing.T) {
 	}
 }
 
+// TestTransportRefusesRepoHTTPSettings: an https origin's connection (and
+// the user's credentials for it) must not go through the repo's own proxy
+// or TLS settings; with an ssh origin they do not matter.
+func TestTransportRefusesRepoHTTPSettings(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	git(t, f.repo, "config", "http.https://example.invalid/.proxy", "http://127.0.0.1:1")
+	https := to("https://example.invalid/o/r.git")
+	for op, err := range map[string]error{
+		"push":      PushBranch(ctx, f.repo, https, "main", false, nil),
+		"fetch":     FetchOrigin(ctx, f.repo, https, nil),
+		"ls-remote": func() error { _, err := RemoteBranchExists(ctx, f.repo, https, "main"); return err }(),
+	} {
+		var re *RefusedError
+		if !errors.As(err, &re) || re.Key != "http.https://example.invalid/.proxy" {
+			t.Errorf("%s: %v, want a refusal naming the proxy", op, err)
+		}
+	}
+	// A push URL counts too.
+	o := Origin{URLs: []string{f.origin}, PushURLs: []string{"https://example.invalid/o/r.git"}}
+	var re *RefusedError
+	if err := FetchOrigin(ctx, f.repo, o, nil); !errors.As(err, &re) {
+		t.Errorf("fetch with an https push URL: %v", err)
+	}
+	hs, err := Hazards(ctx, f.repo, &Origin{URLs: []string{"git@example.invalid:o/r.git"}})
+	if err != nil || len(hs) != 0 {
+		t.Errorf("with an ssh origin: %+v, %v", hs, err)
+	}
+}
+
 // TestTransportRefusesProgramsInURLs: remotes that would run a program here
 // (ext::, a git:// proxy, an ssh command) do not.
 func TestTransportRefusesProgramsInURLs(t *testing.T) {
@@ -390,7 +622,7 @@ func TestTransportArgsKeepTheUsersOwnSettings(t *testing.T) {
 	git(t, f.repo, "config", "credential.helper", "evil")
 	git(t, f.repo, "config", "core.sshCommand", "evil")
 
-	args := transportArgs(ctx, f.repo, true, false)
+	args := slices.Concat(safetyArgs[1:], transportArgs(true, false, userConfig(ctx, f.repo)))
 	var kv []string
 	for i := 0; i+1 < len(args); i += 2 {
 		if args[i] != "-c" {
@@ -423,7 +655,7 @@ func TestTransportArgsKeepTheUsersOwnSettings(t *testing.T) {
 
 	// $GIT_SSH_COMMAND wins over any config: no core.sshCommand then.
 	t.Setenv("GIT_SSH_COMMAND", "ssh -F /dev/null")
-	if args := transportArgs(ctx, f.repo, false, true); slices.ContainsFunc(args, func(s string) bool { return strings.HasPrefix(s, "core.sshCommand=") }) ||
+	if args := transportArgs(false, true, userConfig(ctx, f.repo)); slices.ContainsFunc(args, func(s string) bool { return strings.HasPrefix(s, "core.sshCommand=") }) ||
 		slices.Contains(args, "protocol.file.allow=never") || slices.Contains(args, "push.pushOption=") {
 		t.Errorf("fetch args with $GIT_SSH_COMMAND, local origin: %q", args)
 	}

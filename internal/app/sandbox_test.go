@@ -284,7 +284,7 @@ func TestSandboxPinsOrigins(t *testing.T) {
 		if err := json.Unmarshal([]byte(readFile(t, p.OriginPin(name))), &o); err != nil {
 			t.Fatal(err)
 		}
-		if want := filepath.Join(root, "origins", name+".git"); o.URL != want || len(o.PushURLs) != 1 || o.PushURLs[0] != want {
+		if want := filepath.Join(root, "origins", name+".git"); !o.Equal(gitx.Origin{URLs: []string{want}}) {
 			t.Errorf("%s pin = %+v, want %s", name, o, want)
 		}
 	}
@@ -305,8 +305,10 @@ func TestSandboxPinsOrigins(t *testing.T) {
 		}
 		pin := paths.OriginPin("api")
 		for _, m := range spec.Mounts {
-			if rel, err := filepath.Rel(m.Src, pin); err == nil && !strings.HasPrefix(rel, "..") {
-				t.Errorf("mount %s reaches the pin %s", m.Src, pin)
+			for _, private := range []string{pin, paths.RefusalLog()} {
+				if rel, err := filepath.Rel(m.Src, private); err == nil && !strings.HasPrefix(rel, "..") {
+					t.Errorf("mount %s reaches %s", m.Src, private)
+				}
 			}
 		}
 	}

@@ -330,23 +330,35 @@ func TestNewTaskRollback(t *testing.T) {
 	}
 }
 
-// A failing post-checkout hook makes `git worktree add` fail after it has
-// created the branch and worktree: both must be rolled back.
+// breakCheckout makes a blob of rev unreadable in repo (a loose object), so
+// that `git worktree add` fails in its checkout, after it created the
+// branch. It returns the undo.
+func breakCheckout(t *testing.T, repo, rev string) func() {
+	t.Helper()
+	oid := git(t, repo, "rev-parse", rev)
+	path := filepath.Join(repo, ".git", "objects", oid[:2], oid[2:])
+	if err := os.Rename(path, path+".gone"); err != nil {
+		t.Fatalf("%s is not a loose object: %v", rev, err)
+	}
+	return func() {
+		if err := os.Rename(path+".gone", path); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A failed checkout makes `git worktree add` fail after it has created the
+// branch: what it made must be rolled back. (Hooks, the old way to make it
+// fail late, no longer run.)
 func TestNewTaskRollbackHookFailure(t *testing.T) {
 	e := newTaskEnv(t)
 	ctx := context.Background()
 	e.addRepo(t, "api", "main")
 	api := e.canonical("api")
-	hook := filepath.Join(api, ".git", "hooks", "post-checkout")
-	if err := os.MkdirAll(filepath.Dir(hook), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	restore := breakCheckout(t, api, "origin/main:README")
 	opts := NewTaskOpts{Title: "Hooked", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}}
 	if _, err := e.app.NewTask(ctx, opts); err == nil {
-		t.Fatal("NewTask succeeded despite failing hook")
+		t.Fatal("NewTask succeeded despite the failed checkout")
 	}
 	if out, err := exec.Command("git", "-C", api, "rev-parse", "--verify", "-q", "refs/heads/atl/hooked").CombinedOutput(); err == nil {
 		t.Fatalf("branch left behind: %s", out)
@@ -361,9 +373,7 @@ func TestNewTaskRollbackHookFailure(t *testing.T) {
 		t.Fatal("task dir left behind")
 	}
 
-	if err := os.Remove(hook); err != nil {
-		t.Fatal(err)
-	}
+	restore()
 	task, err := e.app.NewTask(ctx, opts)
 	if err != nil {
 		t.Fatal(err)

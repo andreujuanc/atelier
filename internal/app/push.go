@@ -67,7 +67,7 @@ func (a *App) Push(ctx context.Context, ref string, o PushOpts, out io.Writer) (
 		}
 		origin, err := a.remoteOrigin(ctx, r.Name, wt, out)
 		if err == nil {
-			err = gitx.PushBranch(ctx, wt, origin, branch, o.Force, out)
+			err = a.noteRefusal(r.Name, "git push", gitx.PushBranch(ctx, wt, origin, branch, o.Force, out))
 		}
 		res = append(res, RemoteResult{Repo: r.Name, Err: err})
 	}
@@ -94,7 +94,7 @@ func (a *App) Fetch(ctx context.Context, ref string, o FetchOpts, out io.Writer)
 		}
 		origin, err := a.remoteOrigin(ctx, r.Name, dir, out)
 		if err == nil {
-			err = gitx.FetchOrigin(ctx, dir, origin, out)
+			err = a.noteRefusal(r.Name, "git fetch", gitx.FetchOrigin(ctx, dir, origin, out))
 		}
 		res = append(res, RemoteResult{Repo: r.Name, Err: err})
 	}

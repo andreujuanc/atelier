@@ -158,6 +158,10 @@ func (p Paths) OriginPin(repo string) string {
 // HookLog returns StateDir/hook.log.
 func (p Paths) HookLog() string { return filepath.Join(p.StateDir, "hook.log") }
 
+// RefusalLog returns StateDir/refused.log, where atl records the git
+// commands it refused to run because of a repo's config.
+func (p Paths) RefusalLog() string { return filepath.Join(p.StateDir, "refused.log") }
+
 // ProjectFile returns ConfigDir/projects/<name>.toml.
 func (p Paths) ProjectFile(name string) string {
 	return filepath.Join(p.ConfigDir, "projects", name+".toml")

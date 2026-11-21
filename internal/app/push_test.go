@@ -145,9 +145,11 @@ func TestPushGoesToThePinnedOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Pinned when the task's worktree was made (for git-lfs; see
+	// gitx.AddWorktree), with the sandbox off too.
 	pin := e.app.Paths.OriginPin("api")
-	if exists(pin) {
-		t.Fatal("pinned before any push or fetch with the sandbox off")
+	if !exists(pin) {
+		t.Fatal("not pinned by atl new")
 	}
 	wt := e.app.Paths.WorktreePath(task.Slug, "api")
 	commit := func(msg string) string {
@@ -163,7 +165,7 @@ func TestPushGoesToThePinnedOrigin(t *testing.T) {
 	if res, err := e.app.Push(ctx, task.Slug, PushOpts{}, &out); err != nil || res[0].Err != nil {
 		t.Fatalf("push: %+v, %v\n%s", res, err, out.String())
 	}
-	if got, want := readPin(t, e, "api"), (gitx.Origin{URL: e.origin("api"), PushURLs: []string{e.origin("api")}}); !got.Equal(want) {
+	if got, want := readPin(t, e, "api"), (gitx.Origin{URLs: []string{e.origin("api")}}); !got.Equal(want) {
 		t.Errorf("pin = %+v, want %+v", got, want)
 	}
 	if strings.Contains(out.String(), "warning") {
@@ -187,7 +189,7 @@ func TestPushGoesToThePinnedOrigin(t *testing.T) {
 	if got := git(t, wt, "rev-parse", "refs/remotes/origin/atl/pin-me"); got != head {
 		t.Errorf("refs/remotes/origin/atl/pin-me = %s, want %s", got, head)
 	}
-	warning := "warning: repo api: its config now has origin " + decoy + "; using the pinned " + e.origin("api") + " (delete " + pin + " to accept the config's)\n"
+	warning := "warning: repo api: its config now has origin " + decoy + "; using the pinned " + e.origin("api") + " (run `atl repos pin api` to accept the config's)\n"
 	if !strings.Contains(out.String(), warning) {
 		t.Errorf("output lacks the warning %q:\n%s", warning, out.String())
 	}
@@ -217,16 +219,48 @@ func TestPushGoesToThePinnedOrigin(t *testing.T) {
 		t.Errorf("the decoy got refs: %s", got)
 	}
 
-	// Deleting the pin accepts the config's URL.
+	// atl repos pin accepts the config's URL.
 	git(t, e.canonical("api"), "config", "--remove-section", "url."+decoy)
+	old, had, now, err := e.app.RepinOrigin(ctx, "api")
+	if err != nil || !had || !old.Equal(gitx.Origin{URLs: []string{e.origin("api")}}) || !now.Equal(gitx.Origin{URLs: []string{decoy}}) {
+		t.Fatalf("RepinOrigin = %+v, %v, %+v, %v", old, had, now, err)
+	}
+	out.Reset()
+	if res, err := e.app.Push(ctx, task.Slug, PushOpts{}, &out); err != nil || res[0].Err != nil {
+		t.Fatalf("push after the repin: %+v, %v\n%s", res, err, out.String())
+	}
+	if got := git(t, decoy, "rev-parse", "atl/pin-me"); got != git(t, wt, "rev-parse", "HEAD") {
+		t.Errorf("decoy atl/pin-me = %s after the repin", got)
+	}
+	if strings.Contains(out.String(), "warning") {
+		t.Errorf("warning after the repin: %q", out.String())
+	}
+	// So does deleting the pin.
+	git(t, e.canonical("api"), "remote", "set-url", "origin", e.origin("api"))
 	if err := os.Remove(pin); err != nil {
 		t.Fatal(err)
 	}
 	if res, err := e.app.Push(ctx, task.Slug, PushOpts{}, &out); err != nil || res[0].Err != nil {
 		t.Fatalf("push after deleting the pin: %+v, %v\n%s", res, err, out.String())
 	}
-	if got := git(t, decoy, "rev-parse", "atl/pin-me"); got != git(t, wt, "rev-parse", "HEAD") {
-		t.Errorf("decoy atl/pin-me = %s after the pin was deleted", got)
+	if got := readPin(t, e, "api"); !got.Equal(gitx.Origin{URLs: []string{e.origin("api")}}) {
+		t.Errorf("pin after deleting it = %+v", got)
+	}
+	// A damaged pin is replaced by a repin; inside a task container there
+	// is none.
+	if err := os.WriteFile(pin, []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := e.app.Push(ctx, task.Slug, PushOpts{}, &out); err != nil || res[0].Err == nil ||
+		!strings.Contains(res[0].Err.Error(), "atl repos pin api") {
+		t.Errorf("push with a damaged pin: %+v, %v", res, err)
+	}
+	if _, _, _, err := e.app.RepinOrigin(ctx, "api"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(sandbox.InEnv, "x")
+	if _, _, _, err := e.app.RepinOrigin(ctx, "api"); err == nil {
+		t.Error("RepinOrigin from inside a task container succeeded")
 	}
 }
 
@@ -265,7 +299,7 @@ func TestFetch(t *testing.T) {
 	// Both repos are pinned now; a fetch after origin was pointed at a
 	// decoy (one commit ahead) still comes from the pinned origin.
 	for _, name := range []string{"api", "docs"} {
-		if got := readPin(t, e, name); got.URL != e.origin(name) {
+		if got := readPin(t, e, name); !got.Equal(gitx.Origin{URLs: []string{e.origin(name)}}) {
 			t.Errorf("%s pin = %+v", name, got)
 		}
 	}
@@ -298,29 +332,33 @@ func TestFetch(t *testing.T) {
 	}
 }
 
-// TestNewTaskFetchesThePinnedOrigin: with the sandbox on, atl's own fetch
-// before branching comes from the pinned origin too.
+// TestNewTaskFetchesThePinnedOrigin: atl's own fetch before branching comes
+// from the pinned origin too, with the sandbox on or off.
 func TestNewTaskFetchesThePinnedOrigin(t *testing.T) {
-	e := newTaskEnv(t)
-	ctx := context.Background()
-	e.app.Sandbox = &sandbox.Config{Image: "unused"}
-	e.addRepo(t, "api", "main")
-	if _, err := e.app.NewTask(ctx, NewTaskOpts{Title: "first", Repos: []RepoArg{{"api", model.ModeRW}}}); err != nil {
-		t.Fatal(err)
-	}
-	if got := readPin(t, e, "api"); got.URL != e.origin("api") {
-		t.Errorf("pin = %+v", got)
-	}
-	git(t, e.canonical("api"), "remote", "set-url", "origin", e.decoy(t, "api"))
-	tip := e.pushOrigin(t, "api", "new")
-	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "second", Repos: []RepoArg{{"api", model.ModeRW}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := task.Repos[0].BaseCommit; got != tip {
-		t.Errorf("second task based on %s, want origin's %s", got, tip)
-	}
-	if out := e.outString(); !strings.Contains(out, "warning: repo api: its config now has origin") {
-		t.Errorf("no warning:\n%s", out)
+	for _, sandboxed := range []bool{true, false} {
+		e := newTaskEnv(t)
+		ctx := context.Background()
+		if sandboxed {
+			e.app.Sandbox = &sandbox.Config{Image: "unused"}
+		}
+		e.addRepo(t, "api", "main")
+		if _, err := e.app.NewTask(ctx, NewTaskOpts{Title: "first", Repos: []RepoArg{{"api", model.ModeRW}}}); err != nil {
+			t.Fatal(err)
+		}
+		if got := readPin(t, e, "api"); !got.Equal(gitx.Origin{URLs: []string{e.origin("api")}}) {
+			t.Errorf("pin = %+v", got)
+		}
+		git(t, e.canonical("api"), "remote", "set-url", "origin", e.decoy(t, "api"))
+		tip := e.pushOrigin(t, "api", "new")
+		task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "second", Repos: []RepoArg{{"api", model.ModeRW}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := task.Repos[0].BaseCommit; got != tip {
+			t.Errorf("sandbox %v: second task based on %s, want origin's %s", sandboxed, got, tip)
+		}
+		if out := e.outString(); !strings.Contains(out, "warning: repo api: its config now has origin") {
+			t.Errorf("sandbox %v: no warning:\n%s", sandboxed, out)
+		}
 	}
 }

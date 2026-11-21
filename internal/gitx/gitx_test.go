@@ -148,7 +148,7 @@ func (f fixture) addWorktree(t *testing.T, ctx context.Context, name string) (wt
 		t.Fatal(err)
 	}
 	wt = filepath.Join(f.root, "wt-"+name)
-	if err := AddWorktree(ctx, f.repo, wt, "atl/"+name, base); err != nil {
+	if err := AddWorktree(ctx, f.repo, wt, "atl/"+name, base, to(f.origin)); err != nil {
 		t.Fatal(err)
 	}
 	return wt, base
@@ -289,7 +289,7 @@ func TestFetchAndRevParse(t *testing.T) {
 	if got, _ := RevParse(ctx, f.repo, "origin/main"); got != before {
 		t.Fatalf("origin/main moved before fetch")
 	}
-	if err := Fetch(ctx, f.repo); err != nil {
+	if err := FetchOrigin(ctx, f.repo, to(f.origin), nil); err != nil {
 		t.Fatal(err)
 	}
 	after, err := RevParse(ctx, f.repo, "origin/main")
@@ -310,8 +310,12 @@ func TestFetchAndRevParse(t *testing.T) {
 func TestFetchNoOrigin(t *testing.T) {
 	dir := t.TempDir()
 	git(t, dir, "init", "-q", "-b", "main")
-	err := Fetch(context.Background(), dir)
-	if err == nil || !strings.Contains(err.Error(), "git fetch:") || !strings.Contains(err.Error(), "origin") {
+	err := FetchOrigin(context.Background(), dir, Origin{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "no origin URL") {
+		t.Fatalf("err = %v", err)
+	}
+	err = FetchOrigin(context.Background(), dir, to(filepath.Join(dir, "missing.git")), nil)
+	if err == nil || !strings.Contains(err.Error(), "git fetch:") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -335,7 +339,7 @@ func TestAddWorktree(t *testing.T) {
 		t.Fatalf("atl/x = %s, want %s", got, base)
 	}
 
-	err = AddWorktree(ctx, f.repo, filepath.Join(f.root, "wt-dup"), "atl/x", base)
+	err = AddWorktree(ctx, f.repo, filepath.Join(f.root, "wt-dup"), "atl/x", base, to(f.origin))
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("duplicate branch err = %v", err)
 	}
@@ -374,7 +378,7 @@ func TestWorktreePathWithSpaces(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(wt), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := AddWorktree(ctx, f.repo, wt, "atl/sp", base); err != nil {
+	if err := AddWorktree(ctx, f.repo, wt, "atl/sp", base, to(f.origin)); err != nil {
 		t.Fatal(err)
 	}
 	if !IsRepo(wt) {
@@ -399,7 +403,7 @@ func TestWorktreeRelativePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Chdir(f.root)
-	if err := AddWorktree(ctx, f.repo, "rel-wt", "atl/rel", base); err != nil {
+	if err := AddWorktree(ctx, f.repo, "rel-wt", "atl/rel", base, to(f.origin)); err != nil {
 		t.Fatal(err)
 	}
 	abs := filepath.Join(f.root, "rel-wt")
@@ -461,7 +465,7 @@ func TestIsDirty(t *testing.T) {
 
 func TestIsDirtyNoIndexLock(t *testing.T) {
 	found := false
-	for _, kv := range gitEnv() {
+	for _, kv := range gitEnv(false) {
 		found = found || kv == "GIT_OPTIONAL_LOCKS=0"
 	}
 	if !found {
@@ -630,26 +634,35 @@ func TestRemoteBranchExists(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 	wt, _ := f.addWorktree(t, ctx, "x")
-	ok, err := RemoteBranchExists(ctx, wt, "atl/x")
+	origin := to(f.origin)
+	ok, err := RemoteBranchExists(ctx, wt, origin, "atl/x")
 	if err != nil || ok {
 		t.Fatalf("before push: %v, %v", ok, err)
 	}
 	git(t, wt, "push", "-q", "origin", "atl/x")
-	ok, err = RemoteBranchExists(ctx, wt, "atl/x")
+	ok, err = RemoteBranchExists(ctx, wt, origin, "atl/x")
 	if err != nil || !ok {
 		t.Fatalf("after push: %v, %v", ok, err)
 	}
 	// A branch whose name is a suffix of an existing one must not match.
-	ok, err = RemoteBranchExists(ctx, wt, "x")
+	ok, err = RemoteBranchExists(ctx, wt, origin, "x")
 	if err != nil || ok {
 		t.Fatalf("suffix match: %v, %v", ok, err)
 	}
+	// It asks the given origin, not the one in the repo's config.
+	git(t, f.repo, "remote", "set-url", "origin", f.decoy(t))
+	if ok, err = RemoteBranchExists(ctx, wt, origin, "atl/x"); err != nil || !ok {
+		t.Fatalf("with origin pointed elsewhere: %v, %v", ok, err)
+	}
 
-	// No origin → real error, not false.
+	// No origin, or one that is not there → real error, not false.
 	dir := t.TempDir()
 	git(t, dir, "init", "-q", "-b", "main")
-	if _, err := RemoteBranchExists(ctx, dir, "atl/x"); err == nil {
+	if _, err := RemoteBranchExists(ctx, dir, Origin{}, "atl/x"); err == nil {
 		t.Fatal("expected error without origin")
+	}
+	if _, err := RemoteBranchExists(ctx, dir, to(filepath.Join(dir, "missing.git")), "atl/x"); err == nil {
+		t.Fatal("expected error for a missing origin")
 	}
 }
 
@@ -1019,8 +1032,9 @@ func TestUniqueCommitsLocalRefsOnly(t *testing.T) {
 	f := newFixture(t)
 	wt, _ := f.addWorktree(t, ctx, "v")
 	commitFile(t, wt, "a", "a\n", "a")
-	// Push without updating the remote-tracking ref.
-	git(t, wt, "push", "-q", f.origin, "atl/v")
+	// Push without updating the remote-tracking ref (newer git updates it
+	// for a push to the URL of a configured remote, spelled the same).
+	git(t, wt, "push", "-q", "file://"+f.origin, "atl/v")
 	if n, err := UniqueCommits(ctx, f.repo, "atl/v"); err != nil || n != 1 {
 		t.Fatalf("before fetch: %d, %v", n, err)
 	}
