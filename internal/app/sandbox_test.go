@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -18,6 +19,41 @@ import (
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 )
+
+// TestSandboxStoredTokenFirstSession: with the token only in the file `atl
+// token` stores (none in atl's environment, so a tmux server started by atl
+// does not inherit it) and no tmux server running, as on the first session
+// after a reboot, the session still gets the token; and so does the next.
+func TestSandboxStoredTokenFirstSession(t *testing.T) {
+	e, _ := sandboxEnv(t)
+	ctx := context.Background()
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	os.Unsetenv("CLAUDE_CODE_OAUTH_TOKEN")
+	const stored = "sk-ant-oat01-stored-by-atl-token-made-up-0123456789"
+	if err := e.app.StoreToken(stored); err != nil {
+		t.Fatal(err)
+	}
+	// No tmux server: the launch starts it. (HOME is the test's, so no user
+	// tmux.conf is loaded.)
+	e.tmux(t, "kill-server")
+	if exec.Command("tmux", "-L", e.sock, "list-sessions").Run() == nil {
+		t.Fatal("a tmux server still runs")
+	}
+	e.task(t, "boxed", model.StatusActive, true)
+	for i := 0; i < 2; i++ {
+		s, err := e.app.NewSession(ctx, "boxed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.argv(t, s.ID)
+		if env := readFile(t, filepath.Join(e.out, "env-"+strconv.FormatInt(s.ID, 10))); !strings.Contains(env, "CLAUDE_CODE_OAUTH_TOKEN="+stored+"\n") {
+			t.Errorf("session %d did not get the stored token:\n%s", i+1, env)
+		}
+		if cmd := e.tmux(t, "display-message", "-p", "-t", s.TmuxTarget, "#{pane_start_command}"); strings.Contains(cmd, stored) {
+			t.Errorf("the token is in the window's command: %s", cmd)
+		}
+	}
+}
 
 // fakeDocker records docker CLI calls. No container exists until one is
 // "run"; then inspect reports it running with the spec label it was given.

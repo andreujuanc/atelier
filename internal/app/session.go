@@ -55,31 +55,31 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 	}
 	env := a.launchEnv(t, s)
 	argv := ClaudeArgv(a.roPaths(t), resumeID)
+	var auth map[string]string
 	if a.Sandbox != nil {
 		// The window runs a docker client attached to Claude in the task's
-		// container: the window dies with it, so tracking is unchanged.
+		// container.
 		if err := a.ensureSandbox(ctx, t); err != nil {
 			return "", fmt.Errorf("sandbox: %w", err)
 		}
-		auth, err := a.sandboxAuth()
-		if err != nil {
+		var err error
+		if auth, err = a.sandboxAuth(); err != nil {
 			return "", fmt.Errorf("sandbox: %w", err)
 		}
-		// The window takes the token from the tmux server's environment, set
-		// here from atl's own (current) one, or the stored token, without a
-		// command line.
-		if err := a.Tmux.SetGlobalEnv(ctx, auth); err != nil {
-			return "", fmt.Errorf("sandbox: pass Claude Code's token to the session: %w", err)
-		}
+		// The window takes the token from the tmux server's global
+		// environment: set from atl's own (current) one, or the stored
+		// token, on tmux's standard input, in the same tmux call that
+		// creates the window, and the server if none runs yet.
 		argv = a.sandboxArgv(t, dir, env, auth, argv)
 	}
 	return a.Tmux.NewWindow(ctx, tmux.WindowSpec{
-		Session: tmux.SessionName(t.Slug),
-		Name:    s.Name,
-		Dir:     dir,
-		Env:     env,
-		Argv:    argv,
-		Tag:     strconv.FormatInt(s.ID, 10),
+		Session:   tmux.SessionName(t.Slug),
+		Name:      s.Name,
+		Dir:       dir,
+		Env:       env,
+		Argv:      argv,
+		Tag:       strconv.FormatInt(s.ID, 10),
+		GlobalEnv: auth,
 	})
 }
 

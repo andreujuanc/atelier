@@ -57,6 +57,13 @@ type WindowSpec struct {
 	Env     map[string]string // passed with -e
 	Argv    []string          // command
 	Tag     string            // stored as window user option @atl_session; "" → untagged
+	// GlobalEnv is set in the server's global environment, which the window
+	// inherits, in the same tmux invocation that creates the window (and
+	// the server, if none runs yet: a server takes the environment of the
+	// process that starts it, which need not have these values): the values
+	// reach tmux on its standard input, never on a command line (see
+	// globalEnvScript).
+	GlobalEnv map[string]string
 }
 
 // Error is returned when a tmux invocation fails.
@@ -173,16 +180,11 @@ func gone(err error) bool {
 	return noServer(err) || strings.Contains(te.Stderr, "can't find window") || strings.Contains(te.Stderr, "no such window")
 }
 
-// SetGlobalEnv sets env in the server's global environment, which windows
-// created afterwards inherit. The commands reach tmux on its standard input
-// (source-file -), so no value appears on a command line, nor in the error.
-// A value may not contain a single quote or a control character. Without a
-// running server it does nothing: a server started later by this process
-// takes its environment anyway.
-func (c *Client) SetGlobalEnv(ctx context.Context, env map[string]string) error {
-	if len(env) == 0 {
-		return nil
-	}
+// globalEnvScript is the tmux commands that set env in the server's global
+// environment, for `source-file -`: on tmux's standard input, so that no
+// value appears on a command line, nor in an error (see redact). A value
+// may not contain a single quote or a control character. "" for no env.
+func globalEnvScript(env map[string]string) (string, error) {
 	keys := make([]string, 0, len(env))
 	for k := range env {
 		keys = append(keys, k)
@@ -192,25 +194,26 @@ func (c *Client) SetGlobalEnv(ctx context.Context, env map[string]string) error 
 	for _, k := range keys {
 		v := env[k]
 		if k == "" || strings.ContainsFunc(k+v, func(r rune) bool { return r == '\'' || r < 0x20 || r == 0x7f }) {
-			return fmt.Errorf("tmux: $%s has a character atl cannot pass to tmux (a quote or a control character)", k)
+			return "", fmt.Errorf("tmux: $%s has a character atl cannot pass to tmux (a quote or a control character)", k)
 		}
 		fmt.Fprintf(&script, "set-environment -g '%s' '%s'\n", k, v)
 	}
-	_, err := c.runIn(ctx, script.String(), "source-file", "-")
-	if err == nil || noServer(err) || serverExited(err) {
-		return nil
-	}
+	return script.String(), nil
+}
+
+// redact removes env's values from a tmux error.
+func redact(err error, env map[string]string) error {
 	var te *Error
-	if errors.As(err, &te) {
-		msg := te.Stderr
-		for _, v := range env {
-			if v != "" {
-				msg = strings.ReplaceAll(msg, v, "…")
-			}
-		}
-		return &Error{Args: te.Args, Stderr: msg, Err: te.Err}
+	if !errors.As(err, &te) {
+		return err
 	}
-	return err
+	msg := te.Stderr
+	for _, v := range env {
+		if v != "" {
+			msg = strings.ReplaceAll(msg, v, "…")
+		}
+	}
+	return &Error{Args: te.Args, Stderr: msg, Err: te.Err}
 }
 
 // HasSession reports whether a session with exactly this name exists.
@@ -239,12 +242,21 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	if spec.Session == "" {
 		return "", errors.New("tmux: new window: empty session name")
 	}
+	script, err := globalEnvScript(spec.GlobalEnv)
+	if err != nil {
+		return "", err
+	}
 	build := func(exists bool) []string {
 		var args []string
+		if script != "" {
+			// One invocation: if it starts the server, the variables are
+			// set in it before the window is created.
+			args = []string{"source-file", "-", ";"}
+		}
 		if exists {
-			args = []string{"new-window", "-t", "=" + spec.Session + ":"}
+			args = append(args, "new-window", "-t", "="+spec.Session+":")
 		} else {
-			args = []string{"new-session", "-d", "-s", spec.Session}
+			args = append(args, "new-session", "-d", "-s", spec.Session)
 		}
 		if spec.Name != "" {
 			args = append(args, "-n", spec.Name)
@@ -271,14 +283,21 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	defer cancel()
 
 	exists := c.HasSession(ctx, spec.Session)
-	out, err := c.run(ctx, build(exists)...)
+	out, err := c.runIn(ctx, script, build(exists)...)
+	if serverExited(err) {
+		// Reached a server on its way out (just killed, or its last
+		// session just closed), which ran nothing: once more, with the
+		// server that is there now, or a new one.
+		exists = c.HasSession(ctx, spec.Session)
+		out, err = c.runIn(ctx, script, build(exists)...)
+	}
 	var te *Error
 	if !exists && err != nil && out == "" && errors.As(err, &te) && strings.Contains(te.Stderr, "duplicate session") {
 		// Lost a race with another atl creating the same session.
-		out, err = c.run(ctx, build(true)...)
+		out, err = c.runIn(ctx, script, build(true)...)
 	}
 	if err != nil {
-		return "", fmt.Errorf("tmux: launch window in session %s: %w", spec.Session, err)
+		return "", fmt.Errorf("tmux: launch window in session %s: %w", spec.Session, redact(err, spec.GlobalEnv))
 	}
 	id := strings.TrimSpace(out)
 	if !strings.HasPrefix(id, "@") || strings.ContainsAny(id, " \n") {
