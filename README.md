@@ -234,6 +234,9 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `ATL_TMUX_SOCKET` | unset — tmux socket name (`tmux -L`) if you don't use the default server |
 | `ATL_BIN` | the running binary — `atl` path written into hook commands |
 | `ATL_CONTEXT` | unset — extra text appended to every task session's start context (max 1000 bytes; atl refuses to start if longer) |
+| `ATL_SANDBOX` | unset (off) — `docker` runs each task's sessions in the task's own container (see [Sandbox](#sandbox)) |
+| `ATL_SANDBOX_IMAGE` | `atelier` — the task container image, unless the task's project names one |
+| `ATL_SANDBOX_CONTEXT` | unset — what sandboxed sessions get in place of `ATL_CONTEXT` (same limit) |
 
 With `ATL_WORKSPACE` set (it must be an existing directory, so a typo or a missing mount
 is an error rather than a new empty database), atelier keeps everything in it, and you can
@@ -253,6 +256,92 @@ Claude windows and scripts get `ATL_TASK`, `ATL_TASK_DIR`, `ATL_PORT_OFFSET`
 (0, 100, 200… unique per open task) plus the project's `env`; scripts also get
 `ATL_REPO`, `ATL_WORKTREE`, `ATL_BRANCH`.
 
+## Sandbox
+
+By default a task's Claude sessions run next to `atl` and can reach everything it can: in
+the Docker image that is the host's Docker socket, your SSH agent, every repo and every
+other task. With `ATL_SANDBOX=docker` (a setting of the workspace, so of the box) each
+task gets its own container instead, and its sessions run there. `atl` stays where it is
+and is the only thing that talks to the Docker daemon directly.
+
+```
+atl (box)  ── docker exec ──▶  task container atl-<slug>-<hash>   one per task
+   │                              claude, your tools, the task dir
+   └─ atl gate <slug>  ◀── /run/atl/docker.sock ── docker / docker compose in the task
+          │
+          ▼
+     Docker daemon
+```
+
+A task container sees, at the same paths as `atl`: the task dir; the git database
+(`.git`) of each rw repo's clone, which the worktree needs; each ro repo, read-only;
+Claude Code's config dir; and atelier's database, hook log and project config, which the
+hooks, the status line and `atl note` use. It does not see the Docker socket, the SSH
+agent, other repos or other tasks. It is created on the task's first session, reused by
+later ones (so what a session installs is there for the next), restarted after a reboot
+and removed by `atl done`/`atl cancel`. When the task's repos change (`atl add`), it is
+replaced the next time a session starts while no other session runs in it.
+
+The tmux window of a session runs `docker exec` into the container, so everything else
+(session states, crash recovery, resume, the picker) works as before.
+
+**Tools.** Sessions can run whatever the image has and install more. As the image's
+ordinary user that is `npm`, `pip --user`, `go install` and the like; for system packages
+the task may be root in its own container: `docker exec -u 0 $ATL_CONTAINER apt-get
+install -y <pkg>`. The image is `ATL_SANDBOX_IMAGE`, or per project `image = "..."` in
+its toml. It needs `claude` and `sh`, and should have the user that runs `atl` (same
+name, uid and home directory, as the atelier image has), since Claude Code's config dir
+is used at its usual path.
+
+**Docker.** `docker` and `docker compose` in a task talk to the task's *gate*, not to the
+daemon. The gate (`atl gate <slug>`, started by `atl` and stopped when the task closes;
+log in `gate-<slug>.log` next to `hook.log`) forwards only what a task may do:
+
+- everything the task creates gets the label `atelier.task`; the task lists, inspects,
+  stops and removes only what carries its own;
+- bind mounts must come from the task dir (symlinks resolved); a mount of
+  `/var/run/docker.sock` becomes a mount of the gate's socket, so tools that drive Docker
+  themselves (localstack, testcontainers) stay inside the same rules;
+- privileged mode, host network/PID/IPC, added capabilities, devices, security options,
+  other runtimes and volume driver options are refused; a container setting the gate does
+  not know is refused too;
+- images are shared: a task may pull and build, not remove;
+- the task's own container is joined to every network the task creates, so services
+  answer by their compose service name; the task cannot stop or remove that container.
+
+`atl done`/`atl cancel` remove what the task left on the daemon (containers, networks,
+volumes).
+
+What the sandbox does not do yet:
+
+- Claude Code's config dir is shared, so a task can read your login and other tasks'
+  transcripts, and atelier's database is writable from a task.
+- The git database of a task's rw repos is writable from the task (other branches, hooks
+  and config of that clone included).
+- A task can swap a checked mount path for a symlink before the daemon mounts it.
+- Only the classic image builder goes through the gate (`DOCKER_BUILDKIT=0` is set in the
+  task); BuildKit sessions are refused.
+- Tasks can bind any free host port, and there is no network egress policy.
+- Project setup and teardown scripts still run where `atl` runs.
+- `git push` and `gh` have no credentials in a task; push from where `atl` runs.
+
+It needs `CLAUDE_CONFIG_DIR` to be set (the atelier image sets it), the workspace, repos
+and Claude config dir at the same paths for `atl` and the Docker daemon, and a workspace
+path short enough for the gate's socket (`<workspace>/run/<12 chars>/docker.sock`, at most
+107 bytes). `atl doctor` checks the setting, the daemon and the image.
+
+**Session context.** A sandboxed session's start context has a built-in note on the
+sandbox (tools run here, what Docker allows, no pushing). `ATL_CONTEXT` is *not* passed to
+task containers: it describes the place `atl` runs in, and rules for a shared box ("run
+everything through docker", "never mount ...") contradict a task's own container. Put
+what sandboxed sessions should know in `ATL_SANDBOX_CONTEXT` instead; `ATL_CONTEXT` still
+reaches whatever runs next to `atl` (the assistant, and tasks when the sandbox is off).
+
+**Git.** Commits work in the task container and land on the task branch. Your git config
+is not given to the container (it may hold credentials); only `user.name` and
+`user.email` are, as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`. There are no push credentials in a
+task: push `atl/<slug>` from where `atl` runs, as before.
+
 ## Projects
 
 `~/.config/atelier/projects/shop.toml`:
@@ -260,6 +349,7 @@ Claude windows and scripts get `ATL_TASK`, `ATL_TASK_DIR`, `ATL_PORT_OFFSET`
 ```toml
 setup = "npm ci"                          # sh -c in each rw worktree after creation
 teardown = "docker compose down -v"       # sh -c in each rw worktree before removal
+image = "shop-dev"                        # task container image with ATL_SANDBOX=docker (see Sandbox)
 
 [env]
 COMPOSE_PROJECT_NAME = "shop"

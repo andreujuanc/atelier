@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -15,8 +16,10 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/andreujuanc/atelier/internal/app"
+	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 func (c *cli) newCmd() *cobra.Command {
@@ -655,6 +658,45 @@ func (c *cli) statuslineCmd() *cobra.Command {
 		RunE: func(*cobra.Command, []string) error {
 			hook.StatusLineMain()
 			return nil
+		},
+	}
+}
+
+// gateCmd serves a task's gated Docker socket (see sandbox.Gate). atl starts
+// it itself, detached, when it launches a session in a sandboxed task; it
+// needs the paths only, never the database.
+func (c *cli) gateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "gate <slug>",
+		Short:  "Serve a sandboxed task's Docker socket (internal)",
+		Hidden: true,
+		Args:   args(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			p, err := config.Resolve()
+			if err != nil {
+				return err
+			}
+			slug := a[0]
+			if slug == "" || strings.ContainsAny(slug, `/\`) || slug == "." || slug == ".." {
+				return usagef("invalid task slug %q", slug)
+			}
+			dir := p.TaskDir(slug)
+			root, err := filepath.EvalSymlinks(dir)
+			if err != nil {
+				return fmt.Errorf("task dir: %w", err)
+			}
+			runDir := p.RunDir(slug)
+			id := sandbox.ID(slug, dir)
+			g := &sandbox.Gate{
+				ID:         id,
+				Root:       root,
+				SocketHost: sandbox.SocketPath(runDir),
+				Agent:      sandbox.ContainerName(id),
+				Upstream:   sandbox.UpstreamSocket(),
+				Log:        sandbox.NewLogger(),
+				Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
+			}
+			return sandbox.Serve(cmd.Context(), g, runDir)
 		},
 	}
 }

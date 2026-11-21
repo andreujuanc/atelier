@@ -40,8 +40,8 @@ type sessionStartOutput struct {
 // writeSessionContext builds the task context for task id and writes it to
 // w as one SessionStart JSON object. envText is the raw ATL_CONTEXT value
 // (may be empty). Nothing is written on error.
-func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p config.Paths, taskID int64, envText string, now time.Time) error {
-	text, err := sessionContext(ctx, st, p, taskID, envText, now)
+func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p config.Paths, taskID int64, envText string, sandboxed bool, now time.Time) error {
+	text, err := sessionContext(ctx, st, p, taskID, envText, sandboxed, now)
 	if err != nil {
 		return err
 	}
@@ -58,7 +58,7 @@ func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p co
 
 // sessionContext loads task id and its notes (one task query, one repos
 // query, one notes query) and renders them.
-func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID int64, envText string, now time.Time) (string, error) {
+func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID int64, envText string, sandboxed bool, now time.Time) (string, error) {
 	t, err := st.GetTask(ctx, taskID)
 	if err != nil {
 		return "", err
@@ -67,8 +67,16 @@ func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID
 	if err != nil {
 		return "", err
 	}
-	return renderContext(*t, notes, p, envText, now), nil
+	return renderSandboxContext(*t, notes, p, envText, sandboxed, now), nil
 }
+
+// sandboxNote tells a session that runs in the task's own container (see
+// package sandbox) what that changes.
+const sandboxNote = "Sandbox: this session runs in the task's own container. Run builds, tests and tools here directly and " +
+	"install what you need (system packages: `docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`). " +
+	"`docker` and `docker compose` are for services (databases, localstack, ...): mounts must come from the task dir, " +
+	"privileged and host modes are refused, you see only what this task started, and services answer by their compose " +
+	"service name. `git push` and `gh` are not available here."
 
 // renderContext renders the SessionStart task context: plain markdown of
 // at most contextMaxLen bytes. envText (the raw ATL_CONTEXT value) is
@@ -78,6 +86,12 @@ func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID
 // are the newest), cut at a line start (or a rune boundary when one line
 // is too long) after a truncation marker.
 func renderContext(t model.Task, notes string, p config.Paths, envText string, now time.Time) string {
+	return renderSandboxContext(t, notes, p, envText, false, now)
+}
+
+// renderSandboxContext is renderContext with, if sandboxed, the sandbox
+// note after ATL_PORT_OFFSET.
+func renderSandboxContext(t model.Task, notes string, p config.Paths, envText string, sandboxed bool, now time.Time) string {
 	slug := oneLine(t.Slug)
 	branch := t.Branch
 	if branch == "" {
@@ -105,6 +119,9 @@ func renderContext(t model.Task, notes string, p config.Paths, envText string, n
 		w("- %s (rw, worktree %s%s)\n", name, oneLine(p.WorktreePath(t.Slug, r.Name)), from)
 	}
 	w("\nATL_PORT_OFFSET=%d\n", t.PortOffset)
+	if sandboxed {
+		w("\n%s\n", sandboxNote)
+	}
 	if env := envBlock(envText); env != "" {
 		w("\nEnvironment notes (%s):\n%s\n", envContextVar, env)
 	}
@@ -191,12 +208,23 @@ func oneLine(s string) string {
 // (the hook itself still only cuts it: failing there would silently lose
 // the whole session context).
 func CheckEnvContext() error {
-	return checkEnvContext(os.Getenv(envContextVar))
+	if err := checkEnvContext(os.Getenv(envContextVar)); err != nil {
+		return err
+	}
+	return checkContextVar(SandboxContextVar, os.Getenv(SandboxContextVar))
 }
 
-func checkEnvContext(raw string) error {
+// SandboxContextVar names the environment variable whose text sandboxed
+// sessions get in place of $ATL_CONTEXT: atl passes it to a task container
+// as that container's ATL_CONTEXT. Rules for the place atl itself runs in
+// (a shared box) do not describe a task's own container.
+const SandboxContextVar = "ATL_SANDBOX_CONTEXT"
+
+func checkEnvContext(raw string) error { return checkContextVar(envContextVar, raw) }
+
+func checkContextVar(name, raw string) error {
 	if n := len(sanitiseEnv(raw)); n > contextEnvLen {
-		return fmt.Errorf("$%s is %d bytes, max %d", envContextVar, n, contextEnvLen)
+		return fmt.Errorf("$%s is %d bytes, max %d", name, n, contextEnvLen)
 	}
 	return nil
 }

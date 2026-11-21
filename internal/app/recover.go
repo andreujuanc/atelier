@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 // Recover marks live sessions (running, waiting, idle) whose tagged tmux
@@ -24,6 +26,10 @@ import (
 // really gone; and a session relaunched (or ended) after the snapshot no
 // longer matches the launch and is left alone.
 func (a *App) Recover(ctx context.Context) (int, error) {
+	if sandbox.Inside() {
+		// No tmux server in a task container: every window would look gone.
+		return 0, nil
+	}
 	live, err := a.Store.ListLaunchedLive(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("recover: %w", err)

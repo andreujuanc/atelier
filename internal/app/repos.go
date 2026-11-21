@@ -130,6 +130,9 @@ func lockFile(ctx context.Context, path string, wait time.Duration, busy string)
 // created as above and the same repo row becomes rw. Any other repeat is an
 // error.
 func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) (*model.Task, error) {
+	if err := outsideSandbox("add a repo"); err != nil {
+		return nil, err
+	}
 	name, mode, err := validRepoArg(r.Name, r.Mode)
 	if err != nil {
 		return nil, err

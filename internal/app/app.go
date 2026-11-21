@@ -16,6 +16,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/gen"
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
@@ -28,6 +29,13 @@ type App struct {
 	Out    io.Writer        // progress/warnings
 	Now    func() time.Time // nil → time.Now
 	AtlBin string           // for hook commands
+
+	// Sandbox, if not nil, runs every task's Claude sessions in the task's
+	// own Docker container ($ATL_SANDBOX=docker; see package sandbox).
+	Sandbox *sandbox.Config
+	Docker  sandbox.Runner // nil → the docker CLI
+	// StartGate starts a task's gate if none runs; nil → sandbox.Start.
+	StartGate func(atlBin, slug, runDir, logPath string) error
 }
 
 // New resolves paths from the environment, opens the store and returns an
@@ -49,11 +57,15 @@ func New(out io.Writer) (*App, error) {
 			return nil, fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
 		}
 	}
+	sb, err := sandbox.FromEnv()
+	if err != nil {
+		return nil, err
+	}
 	st, err := store.Open(paths.DB)
 	if err != nil {
 		return nil, err
 	}
-	return &App{Paths: paths, Store: st, Tmux: tmux.New(), Out: out, Now: time.Now, AtlBin: bin}, nil
+	return &App{Paths: paths, Store: st, Tmux: tmux.New(), Out: out, Now: time.Now, AtlBin: bin, Sandbox: sb}, nil
 }
 
 // Close closes the store.
@@ -83,7 +95,7 @@ func (a *App) now() time.Time {
 // atl path current) and CLAUDE.md is written only if missing.
 func (a *App) prepareTaskDir(ctx context.Context, t *model.Task) error {
 	dir := a.Paths.TaskDir(t.Slug)
-	if err := gen.WriteSettings(dir, a.AtlBin); err != nil {
+	if err := gen.WriteSettings(dir, a.hookBin()); err != nil {
 		return err
 	}
 	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); errors.Is(err, os.ErrNotExist) {
