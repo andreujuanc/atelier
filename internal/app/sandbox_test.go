@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/gitx"
@@ -52,6 +53,63 @@ func TestSandboxStoredTokenFirstSession(t *testing.T) {
 		if cmd := e.tmux(t, "display-message", "-p", "-t", s.TmuxTarget, "#{pane_start_command}"); strings.Contains(cmd, stored) {
 			t.Errorf("the token is in the window's command: %s", cmd)
 		}
+	}
+}
+
+// TestSandboxEndsWhatADeadWindowLeft: when a session's window is gone
+// (closed, or tmux or the box restarted) its docker exec client is gone,
+// not what it started in the container. Recover, which also runs when atl
+// starts, ends those processes; and a resume does too before it starts
+// Claude again, so two never share the conversation.
+func TestSandboxEndsWhatADeadWindowLeft(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	task := e.task(t, "boxed", model.StatusActive, true)
+	s, err := e.app.NewSession(ctx, "boxed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s.ID)
+	kill := strings.Join(sandbox.KillSessionArgs(e.app.sandboxID(task), s.ID), " ")
+	kills := func() int {
+		n := 0
+		for _, c := range fd.find("exec") {
+			if strings.Join(c, " ") == kill {
+				n++
+			}
+		}
+		return n
+	}
+	if n := kills(); n != 0 {
+		t.Fatalf("killed before the window died: %d", n)
+	}
+	e.tmux(t, "kill-window", "-t", s.TmuxTarget)
+	if n, err := e.app.Recover(ctx); err != nil || n != 1 {
+		t.Fatalf("Recover = %d, %v", n, err)
+	}
+	if n := kills(); n != 1 {
+		t.Errorf("after Recover: %d kills of session %d's processes, want 1", n, s.ID)
+	}
+	// Once only: the session is stopped now.
+	if _, err := e.app.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := kills(); n != 1 {
+		t.Errorf("after a second Recover: %d kills, want 1", n)
+	}
+	if err := e.app.Store.SetClaudeSessionID(ctx, s.ID, "cid-1", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := e.app.Resume(ctx, "boxed"); err != nil || n != 1 {
+		t.Fatalf("Resume = %d, %v", n, err)
+	}
+	if n := kills(); n != 2 {
+		t.Errorf("after Resume: %d kills, want 2 (one right before the relaunch)", n)
+	}
+	// The kill came before the new window's Claude: its docker exec runs in
+	// the window, so the last exec atl itself ran is the kill.
+	if calls := fd.find("exec"); strings.Join(calls[len(calls)-1], " ") != kill {
+		t.Errorf("last docker exec of atl: %q", calls[len(calls)-1])
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -168,6 +169,39 @@ func ExecArgv(id, workdir string, envKeys, argv []string) []string {
 	}
 	out = append(out, ContainerName(id), "sh", "-c", `PATH=`+filepath.Dir(InBin)+`:$PATH exec "$@"`, "atl-exec")
 	return append(out, argv...)
+}
+
+// KillSessionArgs are the docker arguments that end, in the task container
+// of sandbox id, every process of the session with id session: those whose
+// environment has ATL_SESSION=<session>, which ExecArgv's window passes to
+// Claude and Claude's children inherit. When the docker exec client of a
+// window dies (the window is closed, tmux or the box restarts), dockerd
+// leaves what it started running; this is what stands in for the hangup
+// the window's death used to be. TERM first, KILL after 5 seconds. It runs
+// with plain sh, tr and grep as the container's user, whose processes the
+// session's are: root in the container could not read their
+// /proc/<pid>/environ (that takes CAP_SYS_PTRACE, which containers do not
+// have). atl reads nothing of what it prints (the container is the task's).
+func KillSessionArgs(id string, session int64) []string {
+	const script = `s="ATL_SESSION=$1"
+pids() {
+	for d in /proc/[0-9]*; do
+		p=${d#/proc/}
+		[ "$p" = "$$" ] && continue
+		if tr '\0' '\n' 2> /dev/null < "$d/environ" | grep -qx -- "$s"; then echo "$p"; fi
+	done
+}
+set -- $(pids)
+[ $# -eq 0 ] && exit 0
+kill -TERM "$@" 2> /dev/null
+for i in 1 2 3 4 5; do
+	sleep 1
+	set -- $(pids)
+	[ $# -eq 0 ] && exit 0
+done
+kill -KILL "$@" 2> /dev/null
+exit 0`
+	return []string{"exec", ContainerName(id), "sh", "-c", script, "atl-kill", strconv.FormatInt(session, 10)}
 }
 
 // Runner runs the docker CLI with args and returns its trimmed stdout; a

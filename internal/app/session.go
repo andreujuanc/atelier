@@ -58,7 +58,8 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 	var auth map[string]string
 	if a.Sandbox != nil {
 		// The window runs a docker client attached to Claude in the task's
-		// container.
+		// container. Should the window die first, what it started there is
+		// ended when that is noticed (Recover, resumeClaimed).
 		if err := a.ensureSandbox(ctx, t); err != nil {
 			return "", fmt.Errorf("sandbox: %w", err)
 		}
@@ -110,6 +111,11 @@ func (a *App) NewSession(ctx context.Context, ref string) (*model.Session, error
 	if err != nil {
 		if serr := a.Store.SetSessionState(context.WithoutCancel(ctx), s.ID, model.StateEnded, a.now()); serr != nil {
 			err = errors.Join(err, serr)
+		}
+		if win != "" {
+			// The window started (its tag could not be set): what it
+			// started in the container goes with the session.
+			a.killSessionProcs(ctx, t, s.ID)
 		}
 		return nil, fmt.Errorf("task %s: launch session %d: %w", t.Slug, s.ID, err)
 	}
@@ -217,6 +223,10 @@ func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir st
 		return live, nil
 	}
 	if err == nil {
+		// No live window: whatever of the session still runs in the task's
+		// container (its docker exec client died with the window) goes
+		// first, so that two Claudes never share the conversation.
+		a.killSessionProcs(ctx, t, id)
 		win, err = a.launch(ctx, t, s, dir, s.ClaudeSessionID)
 	}
 	if err != nil {

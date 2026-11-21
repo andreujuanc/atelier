@@ -55,7 +55,27 @@ func (a *App) Recover(ctx context.Context) (int, error) {
 		}
 		if changed {
 			n++
+			a.killStopped(ctx, l.ID)
 		}
 	}
 	return n, errors.Join(errs...)
+}
+
+// killStopped ends what session id, whose window Recover found gone, left
+// running in its task's container (killSessionProcs). Recover runs when
+// atl starts, so this covers a box that restarted while the task
+// containers kept running.
+func (a *App) killStopped(ctx context.Context, id int64) {
+	if a.Sandbox == nil {
+		return
+	}
+	s, err := a.Store.GetSession(ctx, id)
+	if err != nil {
+		return
+	}
+	t, err := a.Store.GetTask(ctx, s.TaskID)
+	if err != nil {
+		return
+	}
+	a.killSessionProcs(ctx, t, id)
 }

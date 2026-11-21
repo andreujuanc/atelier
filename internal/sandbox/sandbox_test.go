@@ -4,11 +4,65 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestKillSessionArgs: the script docker exec runs in the container ends
+// every process whose environment has ATL_SESSION=<the session>, children
+// included, and nothing else (not session 17 for session 7). It is run
+// here with sh, as docker exec would run it in the container.
+func TestKillSessionArgs(t *testing.T) {
+	args := KillSessionArgs("t-abc", 7)
+	if !slices.Equal(args[:4], []string{"exec", "atl-t-abc", "sh", "-c"}) || args[len(args)-1] != "7" {
+		t.Fatalf("args = %q", args)
+	}
+	start := func(session string) *exec.Cmd {
+		// A session's process with a child (as Claude runs its tools).
+		cmd := exec.Command("sh", "-c", "sleep 300 & sleep 300; wait")
+		cmd.Env = append(os.Environ(), "ATL_SESSION="+session)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+		return cmd
+	}
+	mine, other := start("7"), start("17")
+	time.Sleep(200 * time.Millisecond)
+	count := func(session string) int {
+		n := 0
+		dirs, _ := filepath.Glob("/proc/[0-9]*")
+		for _, d := range dirs {
+			if b, err := os.ReadFile(filepath.Join(d, "environ")); err == nil && slices.Contains(strings.Split(string(b), "\x00"), "ATL_SESSION="+session) {
+				if st, err := os.ReadFile(filepath.Join(d, "stat")); err == nil && !strings.Contains(string(st), ") Z ") {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	if n := count("7"); n < 3 {
+		t.Fatalf("session 7 has %d processes, want its sh and two sleeps", n)
+	}
+	out, err := exec.Command("sh", append([]string{"-c", args[4]}, args[5:]...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("kill script: %v: %s", err, out)
+	}
+	if err := mine.Wait(); err == nil {
+		t.Error("session 7's process exited normally, want killed")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := count("7"); n != 0 {
+		t.Errorf("%d processes of session 7 left", n)
+	}
+	if n := count("17"); n < 3 || other.ProcessState != nil {
+		t.Errorf("session 17 lost processes: %d left", n)
+	}
+}
 
 func TestFromEnv(t *testing.T) {
 	t.Setenv(InEnv, "")

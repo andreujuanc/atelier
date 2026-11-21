@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/hook"
@@ -299,6 +300,32 @@ func (a *App) removeSandbox(ctx context.Context, t *model.Task) {
 	if err := os.Remove(a.gateLog(t)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		a.warnf("%v", err)
 	}
+}
+
+// killSessionProcs ends what session id started in the task's container
+// (sandbox.KillSessionArgs): its window is gone, and dockerd keeps what a
+// dead docker exec client started running, so Claude would go on there with
+// nobody attached, and a resume would run a second Claude on the same
+// conversation and worktree. A container that is not there or not running
+// has nothing to end; other failures are warnings. Nothing the container
+// prints is used.
+func (a *App) killSessionProcs(ctx context.Context, t *model.Task, id int64) {
+	if a.Sandbox == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if _, err := a.docker()(ctx, sandbox.KillSessionArgs(a.sandboxID(t), id)...); err != nil &&
+		!noContainer(err) {
+		a.warnf("task %s: end what session %d left running in its container: %v", t.Slug, id, err)
+	}
+}
+
+// noContainer reports whether a docker exec failed because the container is
+// not there or not running.
+func noContainer(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "no such container") || strings.Contains(s, "is not running")
 }
 
 // sandboxArgv wraps a Claude command line so that it runs in the task's
