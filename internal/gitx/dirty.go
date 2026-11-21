@@ -18,6 +18,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // IsDirty reports whether the worktree has uncommitted changes, counting
@@ -71,6 +75,16 @@ func isDirty(ctx context.Context, worktree string, depth int) (bool, error) {
 	if unborn && len(ix.entries) > 0 {
 		return true, nil
 	}
+	// The worktree's files are the task's: they are looked at through
+	// package nofollow, so a symlink in place of a directory on the way to a
+	// tracked file is a change, not a way to make atl read elsewhere, and a
+	// FIFO or device in place of a file is a change, not something to block
+	// on.
+	d, err := nofollow.Open(worktree)
+	if err != nil {
+		return false, err
+	}
+	defer d.Close()
 	fileMode := true
 	if v, err := run(ctx, worktree, "config", "--type=bool", "--get", "core.filemode"); err == nil {
 		fileMode = v != "false"
@@ -83,15 +97,14 @@ func isDirty(ctx context.Context, worktree string, depth int) (bool, error) {
 		if e.flags&(ceValid|ceSkipWorktree) != 0 {
 			continue // assume-unchanged or outside the sparse checkout: git does not look either
 		}
-		path := filepath.Join(worktree, filepath.FromSlash(e.path))
 		if e.mode == modeGitlink {
-			dirty, err := submoduleDirty(ctx, path, e.oid, depth)
+			dirty, err := submoduleDirty(ctx, d, e.path, e.oid, depth)
 			if err != nil || dirty {
 				return dirty, err
 			}
 			continue
 		}
-		changed, err := ix.changed(e, path, fileMode)
+		changed, err := ix.changed(e, d, fileMode)
 		if err != nil || changed {
 			return changed, err
 		}
@@ -99,13 +112,13 @@ func isDirty(ctx context.Context, worktree string, depth int) (bool, error) {
 	return false, nil
 }
 
-// submoduleDirty compares a submodule's checkout at path with the commit
-// oid its superproject records: dirty if it is gone, is at another commit
-// or has changes of its own. An empty directory is a submodule that is not
-// checked out, which is not a change.
-func submoduleDirty(ctx context.Context, path, oid string, depth int) (bool, error) {
-	fi, err := os.Lstat(path)
-	if errors.Is(err, fs.ErrNotExist) {
+// submoduleDirty compares a submodule's checkout at rel in the worktree d
+// with the commit oid its superproject records: dirty if it is gone, is at
+// another commit or has changes of its own. An empty directory is a
+// submodule that is not checked out, which is not a change.
+func submoduleDirty(ctx context.Context, d *nofollow.Dir, rel, oid string, depth int) (bool, error) {
+	fi, err := d.Lstat(rel)
+	if gone(err) {
 		return true, nil
 	}
 	if err != nil {
@@ -114,9 +127,10 @@ func submoduleDirty(ctx context.Context, path, oid string, depth int) (bool, err
 	if !fi.IsDir() {
 		return true, nil
 	}
-	if !populated(path) {
-		return false, nil
+	if _, err := d.Lstat(rel + "/.git"); err != nil {
+		return false, nil // not populated
 	}
+	path := filepath.Join(d.Path(), filepath.FromSlash(rel))
 	head, err := run(ctx, path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
 	if err != nil || head != oid {
 		return true, nil
@@ -132,6 +146,13 @@ func submoduleDirty(ctx context.Context, path, oid string, depth int) (bool, err
 func populated(path string) bool {
 	_, err := os.Lstat(filepath.Join(path, ".git"))
 	return err == nil
+}
+
+// gone reports whether err (from a nofollow lookup of a tracked path) means
+// the path is not there as the index has it: missing, or a file or a
+// symlink in place of a directory on the way.
+func gone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, nofollow.ErrSymlink)
 }
 
 const (
@@ -194,7 +215,7 @@ func readIndex(ctx context.Context, worktree string) (*gitIndex, error) {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(worktree, path)
 	}
-	if fi, err := os.Stat(path); err == nil {
+	if fi, err := os.Lstat(path); err == nil { // the index's own mtime, never what a symlink there names
 		ix.mtime = fi.ModTime()
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
@@ -263,13 +284,16 @@ func parseIndexEntry(head string, r *bufio.Reader) (indexEntry, error) {
 	return e, nil
 }
 
-// changed reports whether the file at path differs from index entry e.
-// Matching stat data is enough unless the file may have changed within the
-// second the index was written (git's "racily clean" case); otherwise the
-// file is hashed as a blob, as is, and compared with the entry's object.
-func (ix *gitIndex) changed(e *indexEntry, path string, fileMode bool) (bool, error) {
-	fi, err := os.Lstat(path)
-	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+// changed reports whether the file of index entry e in the worktree d
+// differs from it. Matching stat data is enough unless the file may have
+// changed within the second the index was written (git's "racily clean"
+// case); otherwise the file is hashed as a blob, as is, and compared with
+// the entry's object. Anything that is not what the index has there (a
+// directory on the way that is a symlink; a FIFO, device or directory in
+// place of a file) is a change.
+func (ix *gitIndex) changed(e *indexEntry, d *nofollow.Dir, fileMode bool) (bool, error) {
+	fi, err := d.Lstat(e.path)
+	if gone(err) {
 		return true, nil
 	}
 	if err != nil {
@@ -293,27 +317,29 @@ func (ix *gitIndex) changed(e *indexEntry, path string, fileMode bool) (bool, er
 	if uint32(fi.Size()) != e.size {
 		return true, nil
 	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
+	st, ok := fi.Sys().(*unix.Stat_t)
 	if !ok {
-		return false, fmt.Errorf("stat %s: no stat data", path)
+		return false, fmt.Errorf("stat %s: no stat data", e.path)
 	}
 	if sameStat(e, st) && !ix.racy(e) {
 		return false, nil
 	}
-	sum, err := blobHash(path, fi, len(e.oid))
+	sum, err := blobHash(d, e.path, fi, len(e.oid))
+	if errors.Is(err, nofollow.ErrNotRegular) || gone(err) {
+		return true, nil // swapped meanwhile
+	}
 	if err != nil {
 		return false, err
 	}
 	return sum != e.oid, nil
 }
 
-func sameStat(e *indexEntry, st *syscall.Stat_t) bool {
-	same := func(t statTime, ts syscall.Timespec) bool {
+func sameStat(e *indexEntry, st *unix.Stat_t) bool {
+	same := func(t statTime, ts unix.Timespec) bool {
 		// An index written without nanoseconds has 0 there.
 		return t.sec == uint32(ts.Sec) && (t.nsec == 0 || t.nsec == uint32(ts.Nsec))
 	}
-	mtime, ctime := statTimes(st)
-	return same(e.mtime, mtime) && same(e.ctime, ctime) &&
+	return same(e.mtime, st.Mtim) && same(e.ctime, st.Ctim) &&
 		e.ino == uint32(st.Ino) && e.uid == st.Uid && e.gid == st.Gid
 }
 
@@ -324,10 +350,12 @@ func (ix *gitIndex) racy(e *indexEntry) bool {
 	return ix.mtime.IsZero() || uint32(ix.mtime.Unix()) <= e.mtime.sec
 }
 
-// blobHash returns the object id the file at path would have as a blob, as
-// it is (its target, for a symlink), in the object format whose ids are
-// hexLen long. A file that changes size while it is read hashes to "".
-func blobHash(path string, fi fs.FileInfo, hexLen int) (string, error) {
+// blobHash returns the object id the file rel of the worktree d would have
+// as a blob, as it is (its target, for a symlink), in the object format
+// whose ids are hexLen long. A file that changes size while it is read
+// hashes to "". It opens only a regular file (nofollow.ErrNotRegular
+// otherwise), without blocking.
+func blobHash(d *nofollow.Dir, rel string, fi fs.FileInfo, hexLen int) (string, error) {
 	var h hash.Hash
 	switch hexLen {
 	case 40:
@@ -338,14 +366,14 @@ func blobHash(path string, fi fs.FileInfo, hexLen int) (string, error) {
 		return "", fmt.Errorf("unknown object id length %d", hexLen)
 	}
 	if fi.Mode()&fs.ModeSymlink != 0 {
-		target, err := os.Readlink(path)
+		target, err := d.Readlink(rel)
 		if err != nil {
 			return "", err
 		}
 		fmt.Fprintf(h, "blob %d\x00%s", len(target), target)
 		return hex.EncodeToString(h.Sum(nil)), nil
 	}
-	f, err := os.Open(path)
+	f, err := d.OpenFile(rel)
 	if err != nil {
 		return "", err
 	}
