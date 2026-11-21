@@ -80,7 +80,11 @@ func TestShowNotesTranscript(t *testing.T) {
 	}
 
 	// a session with a transcript
-	transcript := filepath.Join(root, "t.jsonl")
+	// (transcripts are read from a Claude config dir: the user's here)
+	transcript := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "projects", "x", "t.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcript), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	long := strings.Repeat("word ", 50)
 	lines := []string{
 		`{"type":"user","timestamp":"2026-05-01T10:00:00Z","message":{"role":"user","content":"Fix it\u001b[31m please"}}`,

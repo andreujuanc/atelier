@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -83,7 +82,7 @@ func (a *App) sessionChoices(ctx context.Context, t *model.Task) ([]SessionChoic
 		var info transcriptInfo
 		if s.TranscriptPath != "" {
 			var err error
-			info, err = readTranscriptInfo(s.TranscriptPath)
+			info, err = a.transcriptInfo(t, s.TranscriptPath)
 			if err != nil && !c.Live && errors.Is(err, fs.ErrNotExist) {
 				continue // claude --resume would find no conversation
 			}
@@ -243,7 +242,9 @@ func (a *App) OpenSession(ctx context.Context, ref string, sessionID int64) (*ex
 		return nil, fmt.Errorf("session %d of task %s cannot be resumed: %w (use --new for a new session)", s.ID, t.Slug, err)
 	}
 	if s.TranscriptPath != "" {
-		if _, err := os.Stat(s.TranscriptPath); errors.Is(err, fs.ErrNotExist) {
+		if f, err := a.openTranscript(t, s.TranscriptPath); err == nil {
+			f.Close()
+		} else if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("session %d of task %s: its transcript %s no longer exists; it cannot be resumed",
 				s.ID, t.Slug, s.TranscriptPath)
 		}
