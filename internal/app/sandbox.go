@@ -192,43 +192,46 @@ func fileExists(path string) bool {
 }
 
 // ensureSandbox makes the task's gate and container run, creating them if
-// needed. A container that predates a change to the task's repos is replaced
-// when no session runs in it; otherwise it is kept and a warning says so.
-// A new container gets its Claude dir seeded first (seedClaudeDir). Without
-// a Docker daemon (checked first: without one, `atl token` would not help)
-// or a token for Claude Code (claudeAuth) nothing is started.
-func (a *App) ensureSandbox(ctx context.Context, t *model.Task) error {
+// needed, and returns the container's full ID. A container that predates a
+// change to the task's repos is replaced when no session runs in it;
+// otherwise it is kept and a warning says so. A container that has the
+// task container's name but is not atl's own (sandbox.Agent) is an error,
+// and left alone. A new container gets its Claude dir seeded first
+// (seedClaudeDir). Without a Docker daemon (checked first: without one,
+// `atl token` would not help) or a token for Claude Code (claudeAuth)
+// nothing is started.
+func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) {
 	if _, err := a.checkDocker(ctx); err != nil {
-		return err
+		return "", err
 	}
 	if _, err := a.claudeAuth(); err != nil {
-		return err
+		return "", err
 	}
 	runDir := a.Paths.RunDir(t.Slug)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
-		return err
+		return "", err
 	}
 	// The run dir is named by a hash: say whose it is.
 	if err := os.WriteFile(filepath.Join(runDir, "task"), []byte(t.Slug+"\n"), 0o644); err != nil {
-		return err
+		return "", err
 	}
 	if err := sandbox.InstallBin(a.AtlBin, runDir); err != nil {
-		return fmt.Errorf("install atl for the task container: %w", err)
+		return "", fmt.Errorf("install atl for the task container: %w", err)
 	}
 	// Before the container can reach the repos' config (see pinOrigin).
 	if err := a.pinOrigins(ctx, t); err != nil {
-		return err
+		return "", err
 	}
 	startGate := a.StartGate
 	if startGate == nil {
 		startGate = sandbox.Start
 	}
 	if err := startGate(a.AtlBin, t.Slug, t.ID, runDir, a.gateLog(t)); err != nil {
-		return err
+		return "", err
 	}
 	spec, err := a.sandboxSpec(ctx, t)
 	if err != nil {
-		return err
+		return "", err
 	}
 	busy := func() bool {
 		live, err := a.hasLiveWindow(ctx, t, tmux.SessionName(t.Slug))
@@ -244,18 +247,21 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) error {
 		}
 		return a.seedClaudeDir(t)
 	}
-	stale, err := sandbox.Ensure(ctx, a.docker(), spec, busy, fresh)
+	container, stale, err := sandbox.Ensure(ctx, a.docker(), spec, busy, fresh)
 	if err != nil {
+		if errors.Is(err, sandbox.ErrNotAgent) {
+			return "", err
+		}
 		if missing, ierr := sandbox.ImageMissing(ctx, a.docker(), spec.Image); ierr == nil && missing {
 			_, from := a.taskImage(t)
-			return missingImage(spec.Image, from)
+			return "", missingImage(spec.Image, from)
 		}
-		return fmt.Errorf("task container (image %s): %w", spec.Image, err)
+		return "", fmt.Errorf("task container (image %s): %w", spec.Image, err)
 	}
 	if stale {
 		a.warnf("task %s: its container predates a change (repos, image or atl paths); it is replaced once the task has no running sessions", t.Slug)
 	}
-	return nil
+	return container, nil
 }
 
 // sandboxedSessionsRun reports whether the sandbox is on and the task's
@@ -268,8 +274,7 @@ func (a *App) sandboxedSessionsRun(ctx context.Context, t *model.Task) bool {
 	if live, err := a.hasLiveWindow(ctx, t, tmux.SessionName(t.Slug)); err != nil || !live {
 		return false
 	}
-	_, err := a.docker()(ctx, "inspect", "--type", "container", "--format", "{{.State.Running}}",
-		sandbox.ContainerName(a.sandboxID(t)))
+	_, err := sandbox.Agent(ctx, a.docker(), a.sandboxID(t))
 	return err == nil
 }
 
@@ -307,16 +312,20 @@ func (a *App) removeSandbox(ctx context.Context, t *model.Task) {
 // dead docker exec client started running, so Claude would go on there with
 // nobody attached, and a resume would run a second Claude on the same
 // conversation and worktree. A container that is not there or not running
-// has nothing to end; other failures are warnings. Nothing the container
-// prints is used.
+// has nothing to end; one that has the name but is not atl's own
+// (sandbox.Agent) is not touched; other failures are warnings. Nothing the
+// container prints is used.
 func (a *App) killSessionProcs(ctx context.Context, t *model.Task, id int64) {
 	if a.Sandbox == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	if _, err := a.docker()(ctx, sandbox.KillSessionArgs(a.sandboxID(t), id)...); err != nil &&
-		!noContainer(err) {
+	c, err := sandbox.Agent(ctx, a.docker(), a.sandboxID(t))
+	if err == nil && c.Running {
+		_, err = a.docker()(ctx, sandbox.KillSessionArgs(c.ID, id)...)
+	}
+	if err != nil && !noContainer(err) {
 		a.warnf("task %s: end what session %d left running in its container: %v", t.Slug, id, err)
 	}
 }
@@ -334,7 +343,7 @@ func noContainer(err error) bool {
 // exec takes their values from the window's environment, so a token is on
 // no command line and not in the container's stored config, and a new one
 // reaches the next session without a new container.
-func (a *App) sandboxArgv(t *model.Task, dir string, env, auth map[string]string, argv []string) []string {
+func (a *App) sandboxArgv(container, dir string, env, auth map[string]string, argv []string) []string {
 	keys := make([]string, 0, len(env)+len(auth))
 	for k := range env {
 		keys = append(keys, k)
@@ -343,5 +352,5 @@ func (a *App) sandboxArgv(t *model.Task, dir string, env, auth map[string]string
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return sandbox.ExecArgv(a.sandboxID(t), dir, keys, argv)
+	return sandbox.ExecArgv(container, dir, keys, argv)
 }

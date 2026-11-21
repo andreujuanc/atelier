@@ -588,7 +588,7 @@ func TestAddRepoWarnsSandboxedSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fd := &fakeDocker{label: "spec"} // the task's container exists
+	fd := &fakeDocker{label: "spec", agent: e.app.sandboxID(task)} // the task's container exists
 	e.app.Sandbox = &sandbox.Config{Image: "task-image"}
 	e.app.Docker = fd.run
 	const warning = "do not see"

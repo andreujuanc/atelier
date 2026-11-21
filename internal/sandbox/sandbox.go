@@ -13,12 +13,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -98,6 +100,18 @@ func ID(slug, taskDir string) string { return slug + "-" + shortHash(taskDir, 6)
 // ContainerName is the name of the task container of sandbox id.
 func ContainerName(id string) string { return "atl-" + id }
 
+// reservedName matches every ContainerName: atl-<slug>-<6 hex digits>.
+var reservedName = regexp.MustCompile(`(?i)^atl-.+-[0-9a-f]{6}$`)
+
+// ReservedName reports whether a container name given to Docker would be
+// in the pattern of ContainerName, which only atl may use (see Gate). It
+// reads the name as dockerd may: with any leading slash, in any case.
+// (dockerd strips one leading slash and refuses a second, and its names are
+// case-sensitive; both are covered with room to spare.)
+func ReservedName(name string) bool {
+	return reservedName.MatchString(strings.TrimLeft(name, "/"))
+}
+
 // Mount is a bind mount of a host path into the task container.
 type Mount struct {
 	Src, Dst string
@@ -152,13 +166,14 @@ func (s Spec) runArgs(hash string) []string {
 }
 
 // ExecArgv is the command for a tmux window that runs argv in the task
-// container of sandbox id, in workdir. The variables named in envKeys are
+// container, named by the full ID Ensure returned (not by its name, which
+// is only checked there), in workdir. The variables named in envKeys are
 // passed on from the window's environment. The atl binary of the run dir
 // comes first on PATH, so `atl` in the container is the atl that made it.
 //
 // docker's default detach sequence starts with ctrl-p, which it then holds
 // back until the next key; an unlikely sequence keeps ctrl-p usable.
-func ExecArgv(id, workdir string, envKeys, argv []string) []string {
+func ExecArgv(container, workdir string, envKeys, argv []string) []string {
 	out := []string{"docker", "exec", "-it", "--detach-keys", "ctrl-^,ctrl-^,ctrl-^", "-w", workdir}
 	keys := append([]string{"TERM", "COLORTERM", "COLORFGBG", "NO_COLOR"}, envKeys...)
 	sort.Strings(keys)
@@ -167,12 +182,13 @@ func ExecArgv(id, workdir string, envKeys, argv []string) []string {
 			out = append(out, "-e", k)
 		}
 	}
-	out = append(out, ContainerName(id), "sh", "-c", `PATH=`+filepath.Dir(InBin)+`:$PATH exec "$@"`, "atl-exec")
+	out = append(out, container, "sh", "-c", `PATH=`+filepath.Dir(InBin)+`:$PATH exec "$@"`, "atl-exec")
 	return append(out, argv...)
 }
 
 // KillSessionArgs are the docker arguments that end, in the task container
-// of sandbox id, every process of the session with id session: those whose
+// (by the full ID Agent found), every process of the session with id
+// session: those whose
 // environment has ATL_SESSION=<session>, which ExecArgv's window passes to
 // Claude and Claude's children inherit. When the docker exec client of a
 // window dies (the window is closed, tmux or the box restarts), dockerd
@@ -182,7 +198,7 @@ func ExecArgv(id, workdir string, envKeys, argv []string) []string {
 // session's are: root in the container could not read their
 // /proc/<pid>/environ (that takes CAP_SYS_PTRACE, which containers do not
 // have). atl reads nothing of what it prints (the container is the task's).
-func KillSessionArgs(id string, session int64) []string {
+func KillSessionArgs(container string, session int64) []string {
 	const script = `s="ATL_SESSION=$1"
 pids() {
 	for d in /proc/[0-9]*; do
@@ -201,7 +217,7 @@ for i in 1 2 3 4 5; do
 done
 kill -KILL "$@" 2> /dev/null
 exit 0`
-	return []string{"exec", ContainerName(id), "sh", "-c", script, "atl-kill", strconv.FormatInt(session, 10)}
+	return []string{"exec", container, "sh", "-c", script, "atl-kill", strconv.FormatInt(session, 10)}
 }
 
 // Runner runs the docker CLI with args and returns its trimmed stdout; a
@@ -228,60 +244,133 @@ func noSuch(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "no such")
 }
 
-// Ensure makes the task container exist and run. A container made from
-// another spec (the task's repos or the atl paths changed since) is replaced
-// unless busy reports that sessions are running in it; then it is kept and
-// stale is true.
+// AgentContainer is the task container of a sandbox as Docker has it.
+type AgentContainer struct {
+	ID      string // full ID: what atl addresses it by once checked
+	Running bool
+	Hash    string // its atelier.spec label (see Spec.Hash)
+}
+
+// ErrNotAgent wraps the error of Agent for a container that has the task
+// container's name but is not atl's.
+var ErrNotAgent = errors.New("not atl's")
+
+// Agent finds the task container of sandbox id by its name and checks that
+// atl made it: it carries atelier.agent=<id> and no atelier.task label. A
+// task cannot give a container that name through its gate (ReservedName)
+// nor the atelier.agent label, but a container takes over the labels of its
+// image, which a task can build; so a container of any task carries
+// atelier.task, which the gate sets on everything a task creates. A
+// container that fails the check is an error wrapping ErrNotAgent, one line
+// that names it. One that does not exist is docker's "No such" error
+// (IsNoSuch).
+func Agent(ctx context.Context, run Runner, id string) (AgentContainer, error) {
+	name := ContainerName(id)
+	out, err := run(ctx, "inspect", "--type", "container", "--format",
+		`{{.Id}} {{.State.Running}} {{json .Config.Labels}}`, name)
+	if err != nil {
+		return AgentContainer{}, err
+	}
+	fields := strings.SplitN(out, " ", 3)
+	var labels map[string]string
+	if len(fields) != 3 || json.Unmarshal([]byte(fields[2]), &labels) != nil || !fullID(fields[0]) {
+		return AgentContainer{}, fmt.Errorf("docker inspect %s: unexpected answer", name)
+	}
+	if _, isTasks := labels[LabelTask]; labels[LabelAgent] != id || isTasks {
+		return AgentContainer{}, fmt.Errorf("container %s (%.12s) is %w: it lacks the label %s=%s or has a label %s; "+
+			"atl neither uses nor removes it: remove or rename it yourself", name, fields[0], ErrNotAgent, LabelAgent, id, LabelTask)
+	}
+	return AgentContainer{ID: fields[0], Running: fields[1] == "true", Hash: labels[labelSpec]}, nil
+}
+
+// fullID reports whether s is a full Docker object ID: 64 hex digits.
+func fullID(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+// IsNoSuch reports whether err is docker's "No such ..." (container, image,
+// object).
+func IsNoSuch(err error) bool { return noSuch(err) }
+
+// Ensure makes the task container exist and run, and returns its full ID.
+// A container made from another spec (the task's repos or the atl paths
+// changed since) is replaced unless busy reports that sessions are running
+// in it; then it is kept and stale is true.
+//
+// Only atl's own container is used, replaced or started (see Agent): a
+// container that merely has the name is an error, and left alone.
 //
 // fresh, if not nil, runs right before a container is created, when no
 // container of the task exists (any old one was removed): what it prepares
 // for the container cannot be touched by the task meanwhile. Its error stops
 // the creation.
-func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh func() error) (stale bool, err error) {
-	name := ContainerName(spec.ID)
-	create := func() error {
+func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh func() error) (container string, stale bool, err error) {
+	create := func() (string, error) {
 		if fresh != nil {
 			if err := fresh(); err != nil {
-				return err
+				return "", err
 			}
 		}
-		_, err := run(ctx, spec.RunArgs()...)
-		return err
+		out, err := run(ctx, spec.RunArgs()...)
+		if err != nil {
+			if !strings.Contains(err.Error(), "already in use") {
+				return "", err
+			}
+			// Lost a race with another atl creating it: take theirs, if it is atl's.
+			c, err := Agent(ctx, run, spec.ID)
+			if err == nil && !c.Running {
+				_, err = run(ctx, "start", c.ID)
+			}
+			return c.ID, err
+		}
+		if lines := strings.Fields(out); len(lines) > 0 && fullID(lines[len(lines)-1]) {
+			return lines[len(lines)-1], nil // docker run -d prints the ID last
+		}
+		c, err := Agent(ctx, run, spec.ID)
+		return c.ID, err
 	}
-	out, err := run(ctx, "inspect", "--type", "container", "--format",
-		`{{.State.Running}} {{index .Config.Labels "`+labelSpec+`"}}`, name)
+	c, err := Agent(ctx, run, spec.ID)
 	switch {
 	case noSuch(err):
-		if err = create(); err != nil && strings.Contains(err.Error(), "already in use") {
-			// Lost a race with another atl creating it: take theirs.
-			_, err = run(ctx, "start", name)
-		}
-		return false, err
+		container, err = create()
+		return container, false, err
 	case err != nil:
-		return false, err
+		return "", false, err
 	}
-	state, hash, _ := strings.Cut(out, " ")
-	if hash != spec.Hash() {
-		if state == "true" && busy != nil && busy() {
-			return true, nil
+	if c.Hash != spec.Hash() {
+		if c.Running && busy != nil && busy() {
+			return c.ID, true, nil
 		}
-		if _, err := run(ctx, "rm", "-f", name); err != nil && !noSuch(err) {
-			return false, err
+		if _, err := run(ctx, "rm", "-f", c.ID); err != nil && !noSuch(err) {
+			return "", false, err
 		}
-		return false, create()
+		container, err = create()
+		return container, false, err
 	}
-	if state != "true" {
-		_, err = run(ctx, "start", name)
+	if !c.Running {
+		if _, err = run(ctx, "start", c.ID); err != nil {
+			return "", false, err
+		}
 	}
-	return false, err
+	return c.ID, false, nil
 }
 
-// Cleanup removes the task container of sandbox id and everything the task
-// created through its gate: containers (with their anonymous volumes),
-// networks and volumes. It keeps going on errors and returns them joined.
+// Cleanup removes the task container of sandbox id (only atl's own, see
+// Agent: one that merely has its name is left alone, and reported) and
+// everything the task created through its gate: containers (with their
+// anonymous volumes), networks and volumes. It keeps going on errors and
+// returns them joined.
 func Cleanup(ctx context.Context, run Runner, id string) error {
 	var errs []error
-	if _, err := run(ctx, "rm", "-f", ContainerName(id)); err != nil && !noSuch(err) {
+	if c, err := Agent(ctx, run, id); err == nil {
+		if _, err := run(ctx, "rm", "-f", c.ID); err != nil && !noSuch(err) {
+			errs = append(errs, err)
+		}
+	} else if !noSuch(err) {
 		errs = append(errs, err)
 	}
 	filter := "label=" + LabelTask + "=" + id

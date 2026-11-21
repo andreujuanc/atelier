@@ -118,7 +118,7 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			out["Name"] = "/" + obj.name
 		}
 		if obj.kind == "networks" {
-			out["Containers"] = map[string]any{"c1": map[string]any{"Name": "atl-" + testID}, "c2": map[string]any{"Name": "db"}}
+			out["Containers"] = map[string]any{"c1": map[string]any{"Name": "agent"}, "c2": map[string]any{"Name": "db"}}
 		}
 		json.NewEncoder(w).Encode(out)
 	case r.Method == "POST" && len(parts) == 3 && parts[2] == "rename" && obj != nil:
@@ -245,7 +245,9 @@ func newGate(t *testing.T) *gateClient {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g := &Gate{ID: testID, Root: root, SocketHost: "/host/run/docker.sock", Agent: "atl-" + testID, Upstream: upstream}
+	// The task's own container is the daemon's "agent" (atl names it
+	// atl-<id>, see ContainerName).
+	g := &Gate{ID: testID, Root: root, SocketHost: "/host/run/docker.sock", Agent: "agent", Upstream: upstream}
 	sock := filepath.Join(t.TempDir(), "gate.sock")
 	l, err := net.Listen("unix", sock)
 	if err != nil {
@@ -450,7 +452,7 @@ func TestGateOwnership(t *testing.T) {
 		t.Errorf("connect to another's network: %d", status)
 	}
 	// The gate hides the task's own container in a network it joined it to.
-	if _, out := c.do("GET", "/networks/mynet", ""); strings.Contains(out, "atl-"+testID) || !strings.Contains(out, `"db"`) {
+	if _, out := c.do("GET", "/networks/mynet", ""); strings.Contains(out, `"agent"`) || !strings.Contains(out, `"db"`) {
 		t.Errorf("network inspect = %s", out)
 	}
 	// What the gate forwards names the objects by the full IDs its checks
@@ -604,6 +606,79 @@ func TestGateVolumeDeleteWaitsForCreate(t *testing.T) {
 	}
 }
 
+// TestGateReservesTaskContainerNames: a task can neither create a container
+// under the name atl gives a task's own container (atl-<slug>-<hash>) nor
+// rename one to it, however Docker would read the name: with its leading
+// slash, in another case, given twice, or in a form body, which Docker reads
+// before the query.
+func TestGateReservesTaskContainerNames(t *testing.T) {
+	c := newGate(t)
+	victim := "atl-victim-1a2b3c"
+	for _, name := range []string{victim, "/" + victim, "//" + victim, "ATL-Victim-1A2B3C", "atl-" + testID} {
+		q := "?name=" + url.QueryEscape(name)
+		if status, out := c.do("POST", "/v1.45/containers/create"+q, `{"Image":"x"}`); status != http.StatusForbidden {
+			t.Errorf("create named %q: status %d (%s), want a refusal", name, status, out)
+		}
+		if status, out := c.do("POST", "/v1.45/containers/mine/rename"+q, ""); status != http.StatusForbidden {
+			t.Errorf("rename to %q: status %d (%s), want a refusal", name, status, out)
+		}
+	}
+	twice := "?name=db&name=" + victim
+	if status, _ := c.do("POST", "/v1.45/containers/create"+twice, `{"Image":"x"}`); status != http.StatusForbidden {
+		t.Errorf("create with the name twice: status %d", status)
+	}
+	if status, _ := c.do("POST", "/v1.45/containers/mine/rename"+twice, ""); status != http.StatusForbidden {
+		t.Errorf("rename with the name twice: status %d", status)
+	}
+	// Docker reads a form body into the request's values before the query.
+	for _, ct := range []string{"application/x-www-form-urlencoded", "Application/X-WWW-Form-Urlencoded; charset=utf-8", "multipart/form-data; boundary=x"} {
+		req, _ := http.NewRequest("POST", "http://gate/v1.45/containers/mine/rename?name=fine", strings.NewReader("name="+victim))
+		req.Header.Set("Content-Type", ct)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("rename with a %s body: status %d, want a refusal", ct, resp.StatusCode)
+		}
+	}
+	for _, r := range c.d.requests {
+		if strings.HasPrefix(r, "POST /v1.45/containers/create") || strings.Contains(r, "/rename") {
+			t.Errorf("reached the daemon: %s", r)
+		}
+	}
+	// Other names are the task's to use.
+	for _, name := range []string{"db", "atl-db", "atlas-1a2b3c", "stack-atl-x-1a2b3c-1"} {
+		if status, out := c.do("POST", "/v1.45/containers/create?name="+name, `{"Image":"x"}`); status != http.StatusCreated {
+			t.Errorf("create named %q: status %d (%s)", name, status, out)
+		}
+	}
+	if status, out := c.do("POST", "/v1.45/containers/mine/rename?name=db2", ""); status >= 400 {
+		t.Errorf("rename to db2: status %d (%s)", status, out)
+	}
+}
+
+// TestGateOwnContainerByLabelsOnly: a container is the task's own one only
+// if it has atelier.agent=<id> and no atelier.task label. A task cannot set
+// atelier.agent on a container through its gate, but a container takes the
+// labels of its image, which the task can build.
+func TestGateOwnContainerByLabelsOnly(t *testing.T) {
+	c := newGate(t)
+	c.d.mu.Lock()
+	c.d.objects = append(c.d.objects, &object{"containers", "5555555555555555555555555555555555555555555555555555555555555555", "fake-own",
+		map[string]string{LabelAgent: testID, LabelTask: "someone-else"}})
+	c.d.mu.Unlock()
+	for _, tc := range []struct{ method, uri string }{
+		{"GET", "/containers/fake-own/json"},
+		{"POST", "/containers/fake-own/exec"},
+	} {
+		if status, out := c.do(tc.method, "/v1.45"+tc.uri, "{}"); status != http.StatusForbidden {
+			t.Errorf("%s %s: status %d (%s), want 403", tc.method, tc.uri, status, out)
+		}
+	}
+}
+
 func TestGateListsOnlyTheTask(t *testing.T) {
 	c := newGate(t)
 	own := LabelTask + "=" + testID
@@ -677,7 +752,7 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 	if b := c.d.body("POST /networks/create"); !strings.Contains(b, `"atelier.task":"`+testID+`"`) {
 		t.Errorf("network create body = %s", b)
 	}
-	if b := c.d.body("POST /networks/new1/connect"); !strings.Contains(b, `"atl-`+testID+`"`) {
+	if b := c.d.body("POST /networks/new1/connect"); !strings.Contains(b, `"`+agentID+`"`) {
 		t.Errorf("the task's own container was not joined to its new network: %q", b)
 	}
 }

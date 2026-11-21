@@ -64,13 +64,13 @@ func TestSandboxStoredTokenFirstSession(t *testing.T) {
 func TestSandboxEndsWhatADeadWindowLeft(t *testing.T) {
 	e, fd := sandboxEnv(t)
 	ctx := context.Background()
-	task := e.task(t, "boxed", model.StatusActive, true)
+	e.task(t, "boxed", model.StatusActive, true)
 	s, err := e.app.NewSession(ctx, "boxed")
 	if err != nil {
 		t.Fatal(err)
 	}
 	e.argv(t, s.ID)
-	kill := strings.Join(sandbox.KillSessionArgs(e.app.sandboxID(task), s.ID), " ")
+	kill := strings.Join(sandbox.KillSessionArgs(fakeContainerID, s.ID), " ")
 	kills := func() int {
 		n := 0
 		for _, c := range fd.find("exec") {
@@ -113,15 +113,49 @@ func TestSandboxEndsWhatADeadWindowLeft(t *testing.T) {
 	}
 }
 
+// TestSandboxLeavesAContainerNotItsOwn: a container that has the task
+// container's name but not atl's labels (here: a task's, with atelier.agent
+// from its image) is not adopted: the session fails with one line naming
+// it, before a window or the token goes anywhere, and nothing of atl's
+// starts, removes or runs anything in it, atl done included.
+func TestSandboxLeavesAContainerNotItsOwn(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	task := e.task(t, "boxed", model.StatusActive, true)
+	id := e.app.sandboxID(task)
+	fd.label, fd.agent, fd.task = "old", id, "other-1a2b3c"
+	_, err := e.app.NewSession(ctx, "boxed")
+	if err == nil || !strings.Contains(err.Error(), sandbox.ContainerName(id)) || strings.Contains(err.Error(), "\n") {
+		t.Fatalf("NewSession = %v; want one line naming the container", err)
+	}
+	if tags, _ := e.app.Tmux.TaggedWindows(ctx); len(tags) != 0 {
+		t.Errorf("a window was started: %v", tags)
+	}
+	e.app.killSessionProcs(ctx, task, 1)
+	if _, err := e.app.Done(ctx, "boxed", true); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range fd.changes() {
+		if !slices.Contains([]string{"inspect", "ps", "network", "volume"}, c[0]) {
+			t.Errorf("docker %q", c)
+		}
+	}
+}
+
 // fakeDocker records docker CLI calls. No container exists until one is
 // "run"; then inspect reports it running with the spec label it was given.
 type fakeDocker struct {
 	mu      sync.Mutex
 	calls   [][]string
 	label   string          // atelier.spec of the existing container; "" → none exists
+	agent   string          // its atelier.agent (set by docker run)
+	task    string          // its atelier.task: a task's container that has the name; "" → atl's own
 	missing map[string]bool // images not on the daemon, which docker run cannot pull either
 	down    bool            // the daemon cannot be reached
 }
+
+// fakeContainerID is the full ID of fakeDocker's container.
+const fakeContainerID = "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff"
 
 // errDockerDown is what the docker CLI says when the daemon is not there.
 var errDockerDown = errors.New("docker version: Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n" +
@@ -141,7 +175,13 @@ func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 		if f.label == "" {
 			return "", errors.New("docker inspect: Error: No such container: x")
 		}
-		return "true " + f.label, nil
+		// The format of sandbox.Agent.
+		labels := map[string]string{"atelier.agent": f.agent, "atelier.spec": f.label}
+		if f.task != "" {
+			labels["atelier.task"] = f.task
+		}
+		b, _ := json.Marshal(labels)
+		return fakeContainerID + " true " + string(b), nil
 	case "image":
 		if image := args[len(args)-1]; f.missing[image] {
 			return "", errors.New("docker image: Error response from daemon: No such image: " + image + ":latest")
@@ -156,7 +196,11 @@ func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 			if a == "--label" && strings.HasPrefix(args[i+1], "atelier.spec=") {
 				f.label = strings.TrimPrefix(args[i+1], "atelier.spec=")
 			}
+			if a == "--label" && strings.HasPrefix(args[i+1], "atelier.agent=") {
+				f.agent = strings.TrimPrefix(args[i+1], "atelier.agent=")
+			}
 		}
+		return fakeContainerID, nil
 	case "rm":
 		f.label = ""
 	}
@@ -322,7 +366,7 @@ func TestSandboxSessionRunsInTaskContainer(t *testing.T) {
 	if err := os.MkdirAll(p.RepoPath("extra"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.app.ensureSandbox(ctx, task); err != nil {
+	if _, err := e.app.ensureSandbox(ctx, task); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(fd.find("run")); n != 1 {
@@ -364,7 +408,7 @@ func TestSandboxSessionRunsInTaskContainer(t *testing.T) {
 	}
 	all := strings.Join(cleanup, "\n")
 	for _, want := range []string{
-		"rm -f atl-" + id,
+		"rm -f " + fakeContainerID, // by the ID its labels were checked on
 		"ps -aq --filter label=atelier.task=" + id,
 		"network ls -q --filter label=atelier.task=" + id,
 		"volume ls -q --filter label=atelier.task=" + id,
@@ -401,7 +445,7 @@ func TestSandboxPinsOrigins(t *testing.T) {
 		}
 		return fd.run(ctx, args...)
 	}
-	if err := e.app.ensureSandbox(ctx, task); err != nil {
+	if _, err := e.app.ensureSandbox(ctx, task); err != nil {
 		t.Fatal(err)
 	}
 	if len(fd.find("run")) != 1 || !pinnedAtRun {
@@ -617,7 +661,7 @@ func TestSandboxTaskImage(t *testing.T) {
 	// Another image docker cannot pull either.
 	e.app.Sandbox = &sandbox.Config{Image: "mine:1"}
 	fd.missing = map[string]bool{"mine:1": true}
-	err = e.app.ensureSandbox(ctx, task)
+	_, err = e.app.ensureSandbox(ctx, task)
 	if err == nil || strings.Contains(err.Error(), "\n") ||
 		!strings.Contains(err.Error(), "task image mine:1 (from $ATL_SANDBOX_IMAGE) is not on the Docker daemon and could not be pulled") {
 		t.Fatalf("ensureSandbox without the image: %v", err)
@@ -628,7 +672,7 @@ func TestSandboxTaskImage(t *testing.T) {
 
 	// Once it is there, the container starts.
 	fd.missing = nil
-	if err := e.app.ensureSandbox(ctx, task); err != nil {
+	if _, err := e.app.ensureSandbox(ctx, task); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -749,19 +793,19 @@ func TestSandboxDockerUnreachable(t *testing.T) {
 
 	// Docker is back: the next missing thing is the token, then the image.
 	fd.down = false
-	if err := e.app.ensureSandbox(ctx, task); err == nil || !strings.Contains(err.Error(), "atl token") ||
+	if _, err := e.app.ensureSandbox(ctx, task); err == nil || !strings.Contains(err.Error(), "atl token") ||
 		strings.Contains(err.Error(), "ATL_SANDBOX") {
 		t.Errorf("without a token: %v", err)
 	}
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", testToken)
 	e.app.Sandbox = &sandbox.Config{Image: sandbox.DefaultImage}
 	fd.missing = map[string]bool{sandbox.DefaultImage: true}
-	if err := e.app.ensureSandbox(ctx, task); err == nil || !strings.Contains(err.Error(), sandbox.BuildDefaultImage) ||
+	if _, err := e.app.ensureSandbox(ctx, task); err == nil || !strings.Contains(err.Error(), sandbox.BuildDefaultImage) ||
 		strings.Contains(err.Error(), "ATL_SANDBOX") {
 		t.Errorf("without the image: %v", err)
 	}
 	fd.missing = nil
-	if err := e.app.ensureSandbox(ctx, task); err != nil {
+	if _, err := e.app.ensureSandbox(ctx, task); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -814,7 +858,7 @@ func TestSandboxSeedsClaudeDir(t *testing.T) {
 	user := userClaudeDir(t)
 	task := e.task(t, "boxed", model.StatusActive, true)
 	dir := e.app.Paths.ClaudeDir("boxed")
-	if err := e.app.ensureSandbox(ctx, task); err != nil {
+	if _, err := e.app.ensureSandbox(ctx, task); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"CLAUDE.md", "keybindings.json", "skills/review/SKILL.md", "agents/helper.md", "commands/go.md"} {
@@ -884,7 +928,7 @@ func TestSandboxSeedsClaudeDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	userSettings := readFile(t, filepath.Join(user, "settings.json"))
-	if err := e.app.ensureSandbox(ctx, task); err != nil {
+	if _, err := e.app.ensureSandbox(ctx, task); err != nil {
 		t.Fatal(err)
 	}
 	if got := readFile(t, filepath.Join(dir, "CLAUDE.md")); got != "changed by the task\n" {
@@ -894,7 +938,7 @@ func TestSandboxSeedsClaudeDir(t *testing.T) {
 	// A new container: the copies are the user's again, the symlink is
 	// replaced (the user's file untouched), Claude Code's state is kept.
 	fd.label = "" // the container is gone
-	if err := e.app.ensureSandbox(ctx, task); err != nil {
+	if _, err := e.app.ensureSandbox(ctx, task); err != nil {
 		t.Fatal(err)
 	}
 	if got := readFile(t, filepath.Join(dir, "CLAUDE.md")); got != "# my new rules\n" {

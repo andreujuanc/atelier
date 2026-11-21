@@ -41,7 +41,7 @@ type Gate struct {
 	ID         string      // sandbox ID, the value of the labels
 	Root       string      // task directory: the only place mounts may come from
 	SocketHost string      // the gate's socket as the host daemon sees it; a mount of the Docker socket becomes a mount of this
-	Agent      string      // the task's own container: joined to every network the task creates
+	Agent      string      // name of the task's own container: joined (by the ID its labels are checked on) to every network the task creates
 	Upstream   string      // host daemon socket
 	Log        *log.Logger // refusals (and every call if Verbose); nil: discarded
 	Verbose    bool
@@ -147,6 +147,13 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.deny(w, r, http.StatusForbidden, "encoded characters in the path are not accepted")
 		return
 	}
+	if formBody(r) {
+		// dockerd reads a form body into the request's values ahead of the
+		// query, which is what the gate checks (a container's new name, a
+		// build's remote, ...). No Docker client sends one.
+		g.deny(w, r, http.StatusForbidden, "form bodies are not accepted; parameters go in the query")
+		return
+	}
 	path := versionPrefix.ReplaceAllString(r.URL.Path, "")
 	for _, rt := range gateRoutes {
 		for _, method := range strings.Fields(rt.methods) {
@@ -160,6 +167,33 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	g.deny(w, r, http.StatusForbidden, "this Docker API call is not available to tasks")
+}
+
+// formBody reports whether a Content-Type of r makes Go's net/http, and so
+// dockerd, parse the body as form values: its media type (before any
+// parameters, trimmed, in any case, as mime.ParseMediaType reads it, which
+// dockerd also follows when the parameters are invalid) is a form.
+func formBody(r *http.Request) bool {
+	for _, ct := range r.Header.Values("Content-Type") {
+		mt, _, _ := strings.Cut(ct, ";")
+		if oneOf(strings.ToLower(strings.TrimSpace(mt)), "application/x-www-form-urlencoded", "multipart/form-data") {
+			return true
+		}
+	}
+	return false
+}
+
+// checkName refuses a container name in the query (all of them, should it
+// be given twice) that is in the pattern of atl's own task containers
+// (ReservedName): another task's session would run in a container the task
+// made, and get its Claude token there.
+func checkName(r *http.Request) error {
+	for _, name := range r.URL.Query()["name"] {
+		if ReservedName(name) {
+			return fmt.Errorf("container names like %s are reserved for atl's task containers", name)
+		}
+	}
+	return nil
 }
 
 func (g *Gate) deny(w http.ResponseWriter, r *http.Request, status int, reason string) {
@@ -183,6 +217,7 @@ func (g *Gate) forward(w http.ResponseWriter, r *http.Request, body any) {
 		r.ContentLength = int64(len(b))
 		r.TransferEncoding = nil
 		r.Header.Set("Content-Length", strconv.Itoa(len(b)))
+		r.Header.Set("Content-Type", "application/json")
 	}
 	g.allowed(r)
 	g.proxy.ServeHTTP(w, r)
@@ -295,8 +330,9 @@ func decodeBody(r *http.Request) (map[string]any, error) {
 var errNotFound = errors.New("not found")
 
 // owner returns who a container, network or volume belongs to: "task" if it
-// carries this task's label, "agent" if it is the task's own container. Any
-// other object is an error; errNotFound if it does not exist.
+// carries this task's label, "agent" if it is the task's own container
+// (atelier.agent=<ID> and no atelier.task label, see Agent). Any other
+// object is an error; errNotFound if it does not exist.
 //
 // It also returns the object's full ID (a volume's name), from the same
 // inspect that showed the label. What the gate forwards must name the
@@ -338,10 +374,13 @@ func (g *Gate) owner(kind, ref string) (who, id string, err error) {
 	if id == "" || strings.ContainsAny(id, "/?#%") {
 		return "", "", fmt.Errorf("cannot inspect %s", ref)
 	}
+	_, isTasks := labels[LabelTask]
 	switch {
 	case labels[LabelTask] == g.ID:
 		return "task", id, nil
-	case kind == "containers" && labels[LabelAgent] == g.ID:
+	case kind == "containers" && labels[LabelAgent] == g.ID && !isTasks:
+		// atl's, as Agent checks it: a container a task created carries
+		// atelier.task, and may carry atelier.agent from its image.
 		return "agent", id, nil
 	}
 	return "", "", fmt.Errorf("%s %q does not belong to this task", strings.TrimSuffix(kind, "s"), ref)
@@ -430,6 +469,12 @@ func gateContainer(g *Gate, w http.ResponseWriter, r *http.Request, m []string) 
 	case who == "agent" && !agentActions[action]:
 		g.deny(w, r, http.StatusForbidden, "this is the task's own container: it cannot be stopped, removed or renamed from inside")
 		return
+	}
+	if action == "rename" {
+		if err := checkName(r); err != nil {
+			g.deny(w, r, http.StatusForbidden, err.Error())
+			return
+		}
 	}
 	if action == "" {
 		setPath(r, "/containers/"+id)
@@ -604,12 +649,27 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 	g.label(body)
 	status, out := g.relay(w, r, body)
 	var created struct{ Id string }
-	if status == http.StatusCreated && g.Agent != "" && json.Unmarshal(out, &created) == nil {
+	if status == http.StatusCreated && json.Unmarshal(out, &created) == nil {
 		// The task's own container joins, so it reaches the services by name.
-		if s, msg, err := g.call("POST", "/networks/"+created.Id+"/connect", map[string]any{"Container": g.Agent}); err != nil || s != http.StatusOK {
-			g.logf("note  could not join %s to the new network: %v %s", g.Agent, err, msg)
+		if agent := g.agentID(); agent != "" {
+			if s, msg, err := g.call("POST", "/networks/"+url.PathEscape(created.Id)+"/connect", map[string]any{"Container": agent}); err != nil || s != http.StatusOK {
+				g.logf("note  could not join %s to the new network: %v %s", g.Agent, err, msg)
+			}
 		}
 	}
+}
+
+// agentID returns the full ID of the task's own container, found by its
+// name and checked by its labels (see owner), or "" if there is none.
+func (g *Gate) agentID() string {
+	if g.Agent == "" {
+		return ""
+	}
+	who, id, err := g.owner("containers", g.Agent)
+	if err != nil || who != "agent" {
+		return ""
+	}
+	return id
 }
 
 func gateNetworkDelete(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
@@ -617,8 +677,8 @@ func gateNetworkDelete(g *Gate, w http.ResponseWriter, r *http.Request, m []stri
 	if !ok {
 		return
 	}
-	if g.Agent != "" {
-		g.call("POST", "/networks/"+id+"/disconnect", map[string]any{"Container": g.Agent, "Force": true})
+	if agent := g.agentID(); agent != "" {
+		g.call("POST", "/networks/"+id+"/disconnect", map[string]any{"Container": agent, "Force": true})
 	}
 	setPath(r, "/networks/"+id)
 	g.forward(w, r, nil)
@@ -664,6 +724,10 @@ func gateNetworkConnect(g *Gate, w http.ResponseWriter, r *http.Request, m []str
 // the daemon has created the container, no volume delete of the task's
 // runs (see Gate.volumes); the body is read before that.
 func gateContainerCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
+	if err := checkName(r); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	body, err := decodeBody(r)
 	if err != nil {
 		g.deny(w, r, http.StatusBadRequest, err.Error())
