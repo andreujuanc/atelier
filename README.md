@@ -46,6 +46,8 @@ atl resume fix-login      # after a crash/reboot: relaunch stopped sessions with
 atl status fix-login review
 atl rename fix-login Fix the login page   # title only: slug, branch atl/<slug>, tmux session and dirs keep the old name
 atl diff fix-login        # git diff of each rw repo vs its base commit (paged on a TTY)
+atl push [fix-login] [--repo api] [--force]  # push atl/<slug> of each rw repo to origin (--force: with lease); task defaults to $ATL_TASK
+atl fetch [fix-login] [--repo api]           # git fetch origin in each repo of the task (rw and ro)
 atl pr fix-login          # gh pr create (--base = the repo's base branch) per rw repo with pushed commits; status → review
 atl show fix-login [--json]     # task, repos (dirty, commits ahead, last commit, pushed), sessions, notes
 atl show fix-login --notes      # only the notes text (same as atl notes; read-only spelling)
@@ -150,8 +152,9 @@ it (or the id) to refer to the task. An open task's generated `CLAUDE.md` is rew
 the new title; if its task dir is gone (the task is being closed) nothing is recreated and
 the rename only warns.
 
-`<task>` is a slug, numeric id, or unique slug prefix. atelier never pushes:
-push `atl/<slug>` yourself before `atl pr`.
+`<task>` is a slug, numeric id, or unique slug prefix. atelier pushes only when asked:
+push `atl/<slug>` (yourself, or with `atl push`) before `atl pr`. `atl push` pushes
+nothing but the task branch of the task's rw repos, to `origin`.
 
 `atl done`/`atl cancel` remove each worktree and then delete its `atl/<slug>` branch
 only if no commits on the branch would be lost (the branch's reflog is not kept): every
@@ -268,7 +271,7 @@ and is the only thing that talks to the Docker daemon directly.
 atl (box)  ── docker exec ──▶  task container atl-<slug>-<hash>   one per task
    │                              claude, your tools, the task dir
    └─ atl gate <slug>  ◀── /run/atl/docker.sock ── docker / docker compose in the task
-          │
+          │            ◀── /run/atl/atl.sock ───── atl push / atl fetch in the task
           ▼
      Docker daemon
 ```
@@ -323,7 +326,9 @@ What the sandbox does not do yet:
   task); BuildKit sessions are refused.
 - Tasks can bind any free host port, and there is no network egress policy.
 - Project setup and teardown scripts still run where `atl` runs.
-- `git push` and `gh` have no credentials in a task; push from where `atl` runs.
+- `gh` and plain `git push`/`git fetch` have no credentials in a task: pushing and
+  fetching go through `atl push`/`atl fetch` (see Git below), and `atl pr` runs where
+  `atl` runs.
 
 It needs `CLAUDE_CONFIG_DIR` to be set (the atelier image sets it), the workspace, repos
 and Claude config dir at the same paths for `atl` and the Docker daemon, and a workspace
@@ -331,16 +336,33 @@ path short enough for the gate's socket (`<workspace>/run/<12 chars>/docker.sock
 107 bytes). `atl doctor` checks the setting, the daemon and the image.
 
 **Session context.** A sandboxed session's start context has a built-in note on the
-sandbox (tools run here, what Docker allows, no pushing). `ATL_CONTEXT` is *not* passed to
-task containers: it describes the place `atl` runs in, and rules for a shared box ("run
-everything through docker", "never mount ...") contradict a task's own container. Put
+sandbox (tools run here, what Docker allows, `atl push`/`atl fetch` for git).
+`ATL_CONTEXT` is *not* passed to task containers: it describes the place `atl` runs in,
+and rules for a shared box ("run everything through docker", "never mount ...")
+contradict a task's own container. Put
 what sandboxed sessions should know in `ATL_SANDBOX_CONTEXT` instead; `ATL_CONTEXT` still
 reaches whatever runs next to `atl` (the assistant, and tasks when the sandbox is off).
 
 **Git.** Commits work in the task container and land on the task branch. Your git config
 is not given to the container (it may hold credentials); only `user.name` and
-`user.email` are, as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`. There are no push credentials in a
-task: push `atl/<slug>` from where `atl` runs, as before.
+`user.email` are, as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`.
+
+There are no push or fetch credentials in a task (no SSH agent, no `~/.ssh`), so plain
+`git push`, `git fetch` and `gh` fail there. Instead a session runs `atl push` (when you
+tell it to push) and `atl fetch` (to rebase on fresh remote branches). In the container
+these open nothing: they send a request to the task's gate on `/run/atl/atl.sock`, and the
+gate runs `atl push <slug>` or `atl fetch <slug>` where `atl` runs, with your SSH agent,
+`~/.ssh/config` and git credentials, and passes the output and exit status back. The
+request can only name the operation, one of the task's repos and `--force`; the task is
+always the gate's own. So an agent can push its own branch, and cannot push `main`, tags
+or another task's branch. Requests and refusals are in the gate log; a push may take its
+time (up to 10 minutes), e.g. while your SSH key waits for a touch.
+
+The push and fetch run git in a repo whose config and hooks the task can write, so git
+runs with hooks off and the settings that make it run programs (fsmonitor, credential
+helpers and askpass, ssh and proxy commands, `ext::` remotes) pinned to your own config on
+the command line. The remote URL is still the repo's `origin`, so a task can redirect its
+own branch elsewhere.
 
 ## Projects
 

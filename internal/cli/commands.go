@@ -696,9 +696,101 @@ func (c *cli) gateCmd() *cobra.Command {
 				Log:        sandbox.NewLogger(),
 				Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
 			}
-			return sandbox.Serve(cmd.Context(), g, runDir)
+			bin := os.Getenv("ATL_BIN")
+			if bin == "" {
+				if bin, err = os.Executable(); err != nil {
+					return fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
+				}
+			}
+			ctl := &sandbox.Control{Slug: slug, Atl: bin, Log: g.Log}
+			return sandbox.Serve(cmd.Context(), g, ctl, runDir)
 		},
 	}
+}
+
+// remoteCmd is `atl push` (push true) or `atl fetch`. Inside a task
+// container it opens nothing: it asks the task's gate (see sandbox.Control),
+// which runs the same command where atl runs, with its git credentials.
+func (c *cli) remoteCmd(push bool) *cobra.Command {
+	var repo string
+	var force bool
+	op, short := sandbox.OpFetch, "git fetch origin in each repo of the task (rw and ro), or only --repo"
+	use := "fetch [task] [--repo NAME]"
+	if push {
+		op, short = sandbox.OpPush, "Push the task branch (atl/<slug>) of each rw repo, or only --repo, to origin"
+		use = "push [task] [--repo NAME] [--force]"
+	}
+	cmd := &cobra.Command{
+		Use:   use,
+		Short: short,
+		Long: short + ".\n\n" +
+			"task defaults to $ATL_TASK (set in every task session). Inside a sandboxed task's container,\n" +
+			"which has no git credentials, the task's gate runs it where atl runs.",
+		Args: args(cobra.MaximumNArgs(1)),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			ref := os.Getenv("ATL_TASK")
+			if len(a) == 1 {
+				ref = strings.TrimSpace(a[0])
+			}
+			if ref == "" {
+				return usagef("which task? (no task argument and no $ATL_TASK)")
+			}
+			repo = strings.TrimSpace(repo)
+			if sandbox.Inside() {
+				return c.remoteViaGate(sandbox.ControlRequest{Op: op, Repo: repo, Force: force}, ref)
+			}
+			ap, err := c.App()
+			if err != nil {
+				return err
+			}
+			var res []app.RemoteResult
+			if push {
+				res, err = ap.Push(cmd.Context(), ref, app.PushOpts{Repo: repo, Force: force}, c.stderr)
+			} else {
+				res, err = ap.Fetch(cmd.Context(), ref, repo, c.stderr)
+			}
+			failed := false
+			for _, r := range res {
+				status := "pushed"
+				if !push {
+					status = "fetched"
+				}
+				if r.Err != nil {
+					status, failed = "failed: "+r.Err.Error(), true
+				}
+				fmt.Fprintf(c.stdout, "%s\t%s\n", r.Repo, status)
+			}
+			if err == nil && failed {
+				err = exitCodeError{exitErr} // the lines above say why
+			}
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&repo, "repo", "", "only this repo of the task")
+	if push {
+		cmd.Flags().BoolVar(&force, "force", false, "push with --force-with-lease (after a rebase)")
+	}
+	return cmd
+}
+
+// remoteViaGate sends req to the task's gate from inside its container and
+// relays the output and exit status. The gate acts on its own task only, so
+// a task named on the command line must be this one.
+func (c *cli) remoteViaGate(req sandbox.ControlRequest, ref string) error {
+	switch self := os.Getenv("ATL_TASK"); {
+	case self == "":
+		return fmt.Errorf("inside a task container atl %s needs $ATL_TASK (it works on the container's own task only)", req.Op)
+	case ref != self:
+		return usagef("inside a task container atl %s works on this task (%s) only", req.Op, self)
+	}
+	code, err := sandbox.ControlClient(os.Getenv("ATL_CONTROL_SOCK"), req, c.stdout)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return exitCodeError{code}
+	}
+	return nil
 }
 
 func (c *cli) hookCmd() *cobra.Command {

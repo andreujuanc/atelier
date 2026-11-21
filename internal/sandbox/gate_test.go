@@ -387,7 +387,7 @@ func TestServeOneGatePerRunDir(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Serve(ctx, g, runDir) }()
+	go func() { done <- Serve(ctx, g, &Control{Slug: "t1", Atl: "/bin/false"}, runDir) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for !Alive(runDir) {
 		if time.Now().After(deadline) {
@@ -396,11 +396,14 @@ func TestServeOneGatePerRunDir(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	// A second gate for the same run dir steps aside and leaves the socket alone.
-	if err := Serve(context.Background(), &Gate{ID: testID, Root: root, Upstream: upstream}, runDir); err != nil {
+	if err := Serve(context.Background(), &Gate{ID: testID, Root: root, Upstream: upstream}, nil, runDir); err != nil {
 		t.Fatalf("second Serve: %v", err)
 	}
 	if !Alive(runDir) {
 		t.Fatal("the second gate took the first one's socket down")
+	}
+	if code, err := ControlClient(ControlSocketPath(runDir), ControlRequest{Op: OpFetch}, io.Discard); err != nil || code != 1 {
+		t.Errorf("control socket of the first gate: exit %d, %v; want /bin/false's 1", code, err)
 	}
 	cancel()
 	select {
@@ -411,7 +414,9 @@ func TestServeOneGatePerRunDir(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not stop")
 	}
-	if _, err := os.Stat(SocketPath(runDir)); !os.IsNotExist(err) {
-		t.Errorf("socket left behind: %v", err)
+	for _, sock := range []string{SocketPath(runDir), ControlSocketPath(runDir)} {
+		if _, err := os.Stat(sock); !os.IsNotExist(err) {
+			t.Errorf("socket %s left behind: %v", sock, err)
+		}
 	}
 }
