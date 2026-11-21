@@ -9,9 +9,10 @@
 #     --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 #
 # The default task image (ATL_SANDBOX=docker): what a task's sessions run in.
-# claude, git, docker CLI/compose, a C toolchain and make, Node.js LTS with npm
-# and corepack, Python 3 with pip and venv, Go, and everyday tools. No atl
-# (it is mounted into task containers) and no tmux.
+# claude, git, docker CLI/compose, Node.js LTS with npm and corepack, and
+# everyday tools. No other language: a project brings its own in its image,
+# or a task installs it. No atl (it is mounted into task containers) and no
+# tmux.
 #
 #   docker build --target task -t atelier-task \
 #     --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
@@ -58,45 +59,44 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH=/home/$USERNAME/.local/bin:$PATH
 WORKDIR /home/$USERNAME
 
-# The default task image.
+# The default task image: lean on purpose. Languages other than Node.js come
+# from a project's own image (e.g. FROM atelier-task) or are installed in the
+# task.
 FROM base AS task
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential pkg-config \
-        python3 python3-pip python3-venv python-is-python3 \
         jq ripgrep unzip zip xz-utils procps \
+        libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Node.js (the current LTS line) from NodeSource, with npm; corepack (no
-# longer shipped with Node.js) from npm, its yarn and pnpm shims enabled.
+# Node.js (the newest release of the current LTS line) from nodejs.org, with
+# npm, checked against the release's SHASUMS256.txt, into /usr/local (it
+# needs libatomic1, above), without its C headers (only native addons need
+# them, and those need a compiler and python3 too, which this image has not).
+# Not NodeSource's package: it depends on python3. corepack (no longer shipped
+# with Node.js) from npm, its yarn and pnpm shims enabled.
 ARG NODE_MAJOR=26
-RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o /etc/apt/keyrings/nodesource.asc \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.asc] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" \
-        > /etc/apt/sources.list.d/nodesource.list \
-    && apt-get update && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/* \
+RUN arch="$(dpkg --print-architecture)" \
+    && case "$arch" in amd64) arch=x64 ;; arm64) arch=arm64 ;; *) echo "no Node.js build for $arch" >&2; exit 1 ;; esac \
+    && url="https://nodejs.org/dist/latest-v$NODE_MAJOR.x" \
+    && curl -fsSL "$url/SHASUMS256.txt" -o /tmp/SHASUMS256.txt \
+    && file="$(grep -oE "node-v$NODE_MAJOR\.[0-9.]+-linux-$arch\.tar\.xz$" /tmp/SHASUMS256.txt)" \
+    && curl -fsSL "$url/$file" -o "/tmp/$file" \
+    && (cd /tmp && grep "  $file\$" SHASUMS256.txt | sha256sum -c -) \
+    && tar -xJf "/tmp/$file" -C /usr/local --strip-components=1 --no-same-owner \
+        --anchored --no-wildcards-match-slash \
+        --exclude='node-v*/include' --exclude='node-v*/CHANGELOG.md' --exclude='node-v*/README.md' \
+    && mkdir -p /usr/local/share/doc/node && mv /usr/local/LICENSE /usr/local/share/doc/node/ \
+    && rm "/tmp/$file" /tmp/SHASUMS256.txt \
     && (command -v corepack > /dev/null || npm install -g corepack) \
     && corepack enable \
     && npm cache clean --force
 
-# Go from go.dev.
-ARG GO_VERSION=1.27.4
-RUN arch="$(dpkg --print-architecture)" \
-    && curl -fsSL "https://dl.google.com/go/go$GO_VERSION.linux-$arch.tar.gz" -o /tmp/go.tgz \
-    && echo "$(curl -fsSL "https://dl.google.com/go/go$GO_VERSION.linux-$arch.tar.gz.sha256")  /tmp/go.tgz" | sha256sum -c - \
-    && tar -C /usr/local -xzf /tmp/go.tgz \
-    && rm /tmp/go.tgz \
-    && echo 'export PATH="$PATH:$HOME/go/bin:/usr/local/go/bin"' > /etc/profile.d/go.sh
-
-# The ordinary user installs into their home, all on PATH: npm install -g
-# into ~/.local, pip install (--user) into ~/.local (Debian's Python refuses
-# without the override; a venv needs none), go install into ~/go/bin.
-# corepack fetches pnpm or yarn without asking first (no one may be there
-# to answer).
+# The ordinary user's npm install -g goes into ~/.local (its bin is on PATH
+# already, for Claude Code). corepack fetches pnpm or yarn without asking
+# first (no one may be there to answer).
 ARG USERNAME=atelier
-ENV PATH=$PATH:/home/$USERNAME/go/bin:/usr/local/go/bin \
-    NPM_CONFIG_PREFIX=/home/$USERNAME/.local \
-    PIP_BREAK_SYSTEM_PACKAGES=1 \
+ENV NPM_CONFIG_PREFIX=/home/$USERNAME/.local \
     COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 USER $USERNAME
 CMD ["bash", "-l"]

@@ -27,16 +27,17 @@ docker build --target task -t atelier-task \
   --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 ```
 
-It has Claude Code, git, the Docker CLI with the compose plugin, a C toolchain
-(`build-essential`, `pkg-config`), Node.js (the current LTS line, 26, from NodeSource) with
-npm and corepack, Python 3 with pip and venv (`python` is `python3`), Go (from go.dev), and
-curl, jq, ripgrep, unzip, zip, xz, less, procps, openssh-client and ca-certificates, with a
-UTF-8 locale (`C.UTF-8`); not `atl` (it is mounted into task containers), tmux or gh. As
-the ordinary user, `npm install -g` installs into `~/.local` and `pip install` (`--user`)
-too (`PIP_BREAK_SYSTEM_PACKAGES=1` lifts Debian's refusal; a venv needs no override), `go
-install` into `~/go/bin`, all on `PATH`. `--build-arg NODE_MAJOR=…` and `GO_VERSION=…`
-pick other versions. With Docker's legacy builder, building the box builds this stage
-too (every stage before the target is built; cached afterwards).
+It is lean on purpose: Claude Code, git, the Docker CLI with the compose plugin, Node.js
+(the current LTS line, 26, from nodejs.org) with npm and corepack, and curl, jq, ripgrep,
+unzip, zip, xz, less, procps, openssh-client and ca-certificates, with a UTF-8 locale
+(`C.UTF-8`); not `atl` (it is mounted into task containers), tmux or gh. There is no other
+language and no compiler (no Go, Python or C toolchain): those come from the project's own
+`image` (see [Projects](#projects); e.g. one built `FROM atelier-task`), or the task
+installs them itself, and what is installed by hand lasts only until the task's container
+is replaced (see [Sandbox](#sandbox)). As the ordinary user, `npm install -g` installs
+into `~/.local`, on `PATH`. `--build-arg NODE_MAJOR=…` picks another Node.js line. With
+Docker's legacy builder, building the box builds this stage too (every stage before the
+target is built; cached afterwards).
 
 Run it with `docker run -it atelier` (plus your mounts). The container starts a plain
 shell, not tmux: run `atl` there, press Enter on a task to open Claude full screen, and
@@ -398,12 +399,15 @@ to pull, and if that fails the launch says so in one line. An image needs `claud
 atelier's images have), so that what the task writes in the task dir and its Claude dir
 stays yours.
 
+The default image has Node.js and no other language (see [Docker image](#docker-image)): a
+project that needs Go, Python, a C toolchain or anything else names an image that has it.
 Sessions can run whatever the image has and install more: as the image's ordinary user
-`npm install -g`, `pip install --user`, `go install` and the like; for system packages
-the task may be root in its own container: `docker exec -u 0 $ATL_CONTAINER apt-get
-install -y <pkg>`. But what is installed by hand lives in the container only, and is gone
-when the task's container is replaced (after a change of the task's repos or image): what a project keeps needing belongs in its own `image`,
-e.g. one built `FROM atelier-task`. The session's start context says so too.
+`npm install -g` and the like; for system packages (a language included) the task may be
+root in its own container: `docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`.
+But what is installed by hand lives in the container only, and is gone when the task's
+container is replaced (after a change of the task's repos or image): what a project keeps
+needing belongs in its own `image`, e.g. one built `FROM atelier-task`. The session's start
+context says so too.
 
 **Docker.** `docker` and `docker compose` in a task talk to the task's *gate*, not to the
 daemon. The gate (`atl gate <slug>`, started by `atl` and stopped when the task closes;
