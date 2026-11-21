@@ -28,7 +28,7 @@ func WriteClaudeMD(taskDir string, t model.Task, repos []RepoInfo) error {
 		return fmt.Errorf("gen: create task dir: %w", err)
 	}
 	path := filepath.Join(taskDir, "CLAUDE.md")
-	if err := writeAtomic(path, []byte(ClaudeMD(t, repos))); err != nil {
+	if err := WriteAtomic(path, []byte(ClaudeMD(t, repos))); err != nil {
 		return fmt.Errorf("gen: write %s: %w", path, err)
 	}
 	return nil
@@ -39,7 +39,7 @@ func WriteClaudeMD(taskDir string, t model.Task, repos []RepoInfo) error {
 // and nothing is written.
 func RewriteClaudeMD(taskDir string, t model.Task, repos []RepoInfo) error {
 	path := filepath.Join(taskDir, "CLAUDE.md")
-	if err := writeAtomic(path, []byte(ClaudeMD(t, repos))); err != nil {
+	if err := WriteAtomic(path, []byte(ClaudeMD(t, repos))); err != nil {
 		return fmt.Errorf("gen: write %s: %w", path, err)
 	}
 	return nil

@@ -361,8 +361,27 @@ time (up to 10 minutes), e.g. while your SSH key waits for a touch.
 The push and fetch run git in a repo whose config and hooks the task can write, so git
 runs with hooks off and the settings that make it run programs (fsmonitor, credential
 helpers and askpass, ssh and proxy commands, `ext::` remotes) pinned to your own config on
-the command line. The remote URL is still the repo's `origin`, so a task can redirect its
-own branch elsewhere.
+the command line.
+
+Nor do they go wherever the repo's `origin` points now. `atl` pins each repo's origin
+URLs (fetch and push, as git resolves them) in `<workspace>/run/origins/<repo>.json`
+(without a workspace, `$XDG_STATE_HOME/atelier-run/origins/`), a place no task container
+sees, and pushes and fetches there, through a remote defined on the command line under a
+random name. `refs/remotes/origin/*` and `--force-with-lease` work as before. With the
+sandbox on, `atl new` and `atl add` fetch the pinned origin the same way before branching.
+The pin is written once per repo (clones are shared between tasks), the first time `atl`
+needs it: at the fetch of `atl new`/`atl add`, before the container of a task using the
+repo starts, or at the first `atl push`/`atl fetch`, whichever comes first. That is trust on first use: the URL is whatever
+the clone said at that moment, and `atl` never rewrites it. When the repo's config says
+something else later, `atl` uses the pin and prints a warning naming both; to accept the
+new URL, delete the pin file.
+
+`url.<base>.insteadOf` and `pushInsteadOf` rules would rewrite the pinned URL too, so a
+push or fetch is refused while the repo's own config (or a file it includes) has one;
+yours in `~/.gitconfig` stay. Two limits: the check and git's own reading of the config
+are two moments, so a task rewriting its config in a tight loop could slip a rule in
+between (part of the task being able to write the clone's `.git`, above); and the repo's
+own `http.*` settings (proxy, `sslVerify`) still apply to an https origin.
 
 ## Projects
 

@@ -126,11 +126,21 @@ func (p Paths) WorktreePath(slug, repo string) string { return filepath.Join(p.T
 // task container gets to see, so one task never sees another's socket.
 func (p Paths) RunDir(slug string) string {
 	sum := sha256.Sum256([]byte(p.TaskDir(slug)))
-	name := hex.EncodeToString(sum[:])[:12]
+	return filepath.Join(p.runRoot(), hex.EncodeToString(sum[:])[:12])
+}
+
+func (p Paths) runRoot() string {
 	if p.Workspace != "" {
-		return filepath.Join(p.Workspace, "run", name)
+		return filepath.Join(p.Workspace, "run")
 	}
-	return filepath.Join(p.StateDir+"-run", name)
+	return p.StateDir + "-run"
+}
+
+// OriginPin returns the file in which atl pins the origin URLs of repo:
+// origins/<repo>.json next to the run dirs. A task container gets only its
+// own run dir, never their parent, so no task can read or write it.
+func (p Paths) OriginPin(repo string) string {
+	return filepath.Join(p.runRoot(), "origins", repo+".json")
 }
 
 // HookLog returns StateDir/hook.log.

@@ -23,10 +23,10 @@ type PushOpts struct {
 	Force bool   // --force-with-lease
 }
 
-// Push pushes the task's branch of each rw repo (or only o.Repo) to origin,
-// from the repo's worktree, and never any other branch (see
-// gitx.PushBranch). git's output goes to out. A failure in one repo does
-// not stop the others; it is in that repo's result.
+// Push pushes the task's branch of each rw repo (or only o.Repo) to the
+// repo's pinned origin (see pinOrigin), from the repo's worktree, and never
+// any other branch (see gitx.PushBranch). git's output goes to out. A
+// failure in one repo does not stop the others; it is in that repo's result.
 func (a *App) Push(ctx context.Context, ref string, o PushOpts, out io.Writer) ([]RemoteResult, error) {
 	t, repos, err := a.remoteRepos(ctx, ref, o.Repo)
 	if err != nil {
@@ -57,13 +57,18 @@ func (a *App) Push(ctx context.Context, ref string, o PushOpts, out io.Writer) (
 			res = append(res, RemoteResult{Repo: r.Name, Err: errors.New("worktree missing")})
 			continue
 		}
-		res = append(res, RemoteResult{Repo: r.Name, Err: gitx.PushBranch(ctx, wt, branch, o.Force, out)})
+		origin, err := a.remoteOrigin(ctx, r.Name, wt, out)
+		if err == nil {
+			err = gitx.PushBranch(ctx, wt, origin, branch, o.Force, out)
+		}
+		res = append(res, RemoteResult{Repo: r.Name, Err: err})
 	}
 	return res, nil
 }
 
-// Fetch runs `git fetch origin` (see gitx.FetchOrigin) for each repo of the
-// task, rw and ro, or only for repo. git's output goes to out.
+// Fetch runs `git fetch origin` from the pinned origin (see
+// gitx.FetchOrigin) for each repo of the task, rw and ro, or only for repo.
+// git's output goes to out.
 func (a *App) Fetch(ctx context.Context, ref, repo string, out io.Writer) ([]RemoteResult, error) {
 	t, repos, err := a.remoteRepos(ctx, ref, repo)
 	if err != nil {
@@ -79,7 +84,11 @@ func (a *App) Fetch(ctx context.Context, ref, repo string, out io.Writer) ([]Rem
 			res = append(res, RemoteResult{Repo: r.Name, Err: fmt.Errorf("%s missing", dir)})
 			continue
 		}
-		res = append(res, RemoteResult{Repo: r.Name, Err: gitx.FetchOrigin(ctx, dir, out)})
+		origin, err := a.remoteOrigin(ctx, r.Name, dir, out)
+		if err == nil {
+			err = gitx.FetchOrigin(ctx, dir, origin, out)
+		}
+		res = append(res, RemoteResult{Repo: r.Name, Err: err})
 	}
 	return res, nil
 }
