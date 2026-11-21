@@ -102,31 +102,46 @@ func TestSessionName(t *testing.T) {
 	}
 }
 
-// TestSetGlobalEnv: variables reach windows created afterwards; values a
-// tmux command line cannot carry are refused without being repeated; no
-// server is no error.
-func TestSetGlobalEnv(t *testing.T) {
+// TestGlobalEnv: a window gets the variables of WindowSpec.GlobalEnv from
+// the server's global environment, whether a server runs already or the
+// launch starts it (the first session after a reboot), and they are not in
+// this process's environment (a stored token is not); values a tmux
+// command cannot carry are refused without being repeated.
+func TestGlobalEnv(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 	secret := "sk-ant-oat01-Abc_def-123$HOME~#{x}"
-	if err := c.SetGlobalEnv(ctx, map[string]string{"ATL_T_TOKEN": secret}); err != nil {
-		t.Fatal(err)
-	}
-	out, err := c.run(ctx, "show-environment", "-g", "ATL_T_TOKEN")
-	if err != nil || out != "ATL_T_TOKEN="+secret {
-		t.Fatalf("global env = %q, %v", out, err)
-	}
-	for _, bad := range []string{"a'b", "a\nb", "a\x1bb"} {
-		err := c.SetGlobalEnv(ctx, map[string]string{"ATL_T_TOKEN": bad})
-		if err == nil || strings.Contains(err.Error(), bad) {
-			t.Errorf("value %q: %v", bad, err)
+	os.Unsetenv("ATL_T_TOKEN")
+	dir := t.TempDir()
+	launch := func(name string) string {
+		t.Helper()
+		out := filepath.Join(dir, name)
+		_, err := c.NewWindow(ctx, WindowSpec{
+			Session: "atl-x", Name: name, GlobalEnv: map[string]string{"ATL_T_TOKEN": secret},
+			Argv: []string{"sh", "-c", fmt.Sprintf(`printf 'token=%%s\n' "${ATL_T_TOKEN:-<unset>}" > %s.tmp && mv %s.tmp %s; sleep 30`, out, out, out)},
+		})
+		if err != nil {
+			t.Fatal(err)
 		}
+		return waitFile(t, out)
+	}
+	if got := launch("running"); got != "token="+secret+"\n" {
+		t.Errorf("with a server running: window saw %q", got)
+	}
+	if out, err := c.run(ctx, "show-environment", "-g", "ATL_T_TOKEN"); err != nil || out != "ATL_T_TOKEN="+secret {
+		t.Errorf("global env = %q, %v", out, err)
 	}
 	if _, err := c.run(ctx, "kill-server"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.SetGlobalEnv(ctx, map[string]string{"ATL_T_TOKEN": secret}); err != nil {
-		t.Errorf("without a server: %v", err)
+	if got := launch("fresh"); got != "token="+secret+"\n" {
+		t.Errorf("first window of a new server: window saw %q", got)
+	}
+	for _, bad := range []string{"a'b", "a\nb", "a\x1bb"} {
+		_, err := c.NewWindow(ctx, WindowSpec{Session: "atl-x", GlobalEnv: map[string]string{"ATL_T_TOKEN": bad}, Argv: []string{"true"}})
+		if err == nil || strings.Contains(err.Error(), bad) {
+			t.Errorf("value %q: %v", bad, err)
+		}
 	}
 }
 
