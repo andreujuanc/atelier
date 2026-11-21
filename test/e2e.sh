@@ -50,6 +50,12 @@ mkdir -p "$W/bin"
 
 # Isolated environment.
 unset TMUX TMUX_PANE ATL_WORKSPACE ATL_BIN ATL_SESSION ATL_TASK ATL_TASK_DIR ATL_PORT_OFFSET CLAUDE_CONFIG_DIR
+# git takes config from the environment too (GIT_CONFIG_PARAMETERS and
+# GIT_CONFIG_COUNT, e.g. when run under `git -c`), and GIT_DIR & co. point it
+# at the caller's repo: only the config files below may count.
+for v in $(compgen -e); do
+	if [[ $v == GIT_* ]]; then unset "$v"; fi
+done
 export PATH="$W/bin:$STUBS:$PATH"
 export HOME="$W/home"
 export ATL_REPOS="$W/repos"
@@ -164,6 +170,15 @@ hook() {
 # ---- fake repos and project ------------------------------------------------
 
 step "fake repos"
+# atl pr hands gh the GitHub repository of the pinned origin, which is the
+# literal remote.origin.url, so api's origin is a GitHub URL; the user's own
+# (global) rule sends every fetch and push to the local bare repo. docs keeps
+# a local path as its origin.
+API_URL="https://github.com/example/api.git"
+cat >>"$GIT_CONFIG_GLOBAL" <<EOF
+[url "$W/origin/api.git"]
+	insteadOf = $API_URL
+EOF
 for r in api docs; do
 	git init -q --bare "$W/origin/$r.git"
 	git -C "$W/origin/$r.git" symbolic-ref HEAD refs/heads/main
@@ -172,8 +187,11 @@ for r in api docs; do
 	git -C "$W/seed/$r" add README.md
 	git -C "$W/seed/$r" commit -q -m "init $r"
 	git -C "$W/seed/$r" push -q "$W/origin/$r.git" HEAD:main
-	git clone -q "$W/origin/$r.git" "$ATL_REPOS/$r"
+	url="$W/origin/$r.git"
+	if [[ $r == api ]]; then url="$API_URL"; fi
+	git clone -q "$url" "$ATL_REPOS/$r"
 done
+expect_eq "api origin URL" "$(git -C "$ATL_REPOS/api" config remote.origin.url)" "$API_URL"
 
 # Make the canonical api clone stale and off its default branch: origin's main
 # gains a commit the clone has not fetched, and the clone sits on a local-only
@@ -372,9 +390,27 @@ expect_eq "remote atl/fix-login before manual push (atelier never pushes)" "$hea
 git -C "$T/api" push -q origin atl/fix-login
 out="$(atl pr fix-login)" || fail "atl pr failed: $out"
 [[ "$out" == *"https://github.com/example/api/pull/1"* ]] || fail "atl pr output: $out"
-grep -qF "[pr][create][--head][atl/fix-login][--base][dev]" "$E2E_GH_LOG" || fail "gh not called as expected: $(cat "$E2E_GH_LOG")"
-grep -qF "cwd=$T/api " "$E2E_GH_LOG" || fail "gh not run in the api worktree: $(cat "$E2E_GH_LOG")"
+expect_eq "gh calls" "$(grep -c '^gh ' "$E2E_GH_LOG")" "1"
+grep -qF "[pr][create][--repo][example/api][--head][atl/fix-login][--base][dev]" "$E2E_GH_LOG" || fail "gh not called as expected: $(cat "$E2E_GH_LOG")"
+# gh runs in an empty directory of its own (in the worktree it would read the
+# task's remotes and run git there), removed afterwards.
+gh_cwd="$(sed -n 's/^gh cwd=\(.*\) entries=[0-9]* argv=.*/\1/p' "$E2E_GH_LOG")"
+[[ -n "$gh_cwd" && "$gh_cwd" != "$W" && "$gh_cwd" != "$W/"* ]] || fail "gh run in the test's tree: $(cat "$E2E_GH_LOG")"
+grep -qF "cwd=$gh_cwd entries=0 " "$E2E_GH_LOG" || fail "gh's directory was not empty: $(cat "$E2E_GH_LOG")"
+[[ ! -e "$gh_cwd" ]] || fail "gh's directory $gh_cwd was left behind"
 expect_eq "status after pr" "$(task_field fix-login status)" "review"
+
+step "pr (non-GitHub origin)"
+# docs's origin is a local path: gh could not be told its repository.
+D="$ATL_TASKS/second-task/docs"
+echo "docs change" >>"$D/README.md"
+git -C "$D" commit -q -am "docs change"
+git -C "$D" push -q origin atl/second-task
+out="$(atl pr second-task)" || fail "atl pr second-task failed: $out"
+[[ "$out" == *"docs	skipped: origin $W/origin/docs.git is not a GitHub repository URL"* ]] ||
+	fail "atl pr did not skip docs with its local origin: $out"
+expect_eq "gh calls after skipped pr" "$(grep -c '^gh ' "$E2E_GH_LOG")" "1"
+expect_eq "second-task status after skipped pr" "$(task_field second-task status)" "active"
 
 # ---- done ------------------------------------------------------------------
 
