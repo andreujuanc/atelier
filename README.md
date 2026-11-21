@@ -5,8 +5,9 @@ worktrees (one per read-write repo, on branch `atl/<slug>`); the real Claude Cod
 runs inside tmux (session `atl-<slug>`, one window per Claude session); atelier
 tracks session state in SQLite via Claude Code hooks.
 
-Requires git, tmux ≥ 3.2, `claude`, and `gh` (for `atl pr`). Build with
-`go build -o ~/bin/atl ./cmd/atl`, then run `atl doctor`.
+Requires git, tmux ≥ 3.2, `claude`, `gh` (for `atl pr`), and Docker with the task image:
+each task's Claude sessions run in the task's own container (the [sandbox](#sandbox), on by
+default). Build with `go build -o ~/bin/atl ./cmd/atl`, then run `atl doctor`.
 
 ## Docker image
 
@@ -19,8 +20,8 @@ docker build -t atelier \
   --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 ```
 
-With the [sandbox](#sandbox) on, task containers use a second image from the same file,
-the `task` target, built for your user the same way:
+Task containers (the [sandbox](#sandbox), on by default) use a second image from the same
+file, the `task` target, built for your user the same way:
 
 ```bash
 docker build --target task -t atelier-task \
@@ -80,7 +81,7 @@ atl notes fix-login --clear            # clear the notes
 atl assistant [fix-login] # the atelier assistant (one Claude session for all tasks); attach
 atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
 atl cancel fix-login [--force]
-atl doctor                # tools, dirs, database; repos whose config atl refuses to run git with
+atl doctor                # tools, dirs, database, sandbox mode (Docker, image, token); repos whose config atl refuses to run git with
 atl token [--paste]       # sandbox: run claude setup-token and store its token for task sessions (see Sandbox)
 atl                       # TUI (on a terminal)
 ```
@@ -259,7 +260,7 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `ATL_TMUX_SOCKET` | unset — tmux socket name (`tmux -L`) if you don't use the default server |
 | `ATL_BIN` | the running binary — `atl` path written into hook commands |
 | `ATL_CONTEXT` | unset — extra text appended to every task session's start context (max 1000 bytes; atl refuses to start if longer) |
-| `ATL_SANDBOX` | unset (off) — `docker` runs each task's sessions in the task's own container (see [Sandbox](#sandbox)) |
+| `ATL_SANDBOX` | unset (on) — each task's sessions run in the task's own container (see [Sandbox](#sandbox)); unset, empty and `docker` mean on, `off` switches it off (going away), anything else is an error |
 | `ATL_SANDBOX_IMAGE` | `atelier-task` — the task container image, unless the task's project names one (see [Docker image](#docker-image)) |
 | `ATL_SANDBOX_CONTEXT` | unset — what sandboxed sessions get in place of `ATL_CONTEXT` (same limit) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | unset — with the sandbox on, the token (`claude setup-token`) that sandboxed sessions log in with; when set it wins over the one `atl token` stored |
@@ -285,11 +286,20 @@ Claude windows and scripts get `ATL_TASK`, `ATL_TASK_DIR`, `ATL_PORT_OFFSET`
 
 ## Sandbox
 
-By default a task's Claude sessions run next to `atl` and can reach everything it can: in
-the Docker image that is the host's Docker socket, your SSH agent, every repo and every
-other task. With `ATL_SANDBOX=docker` (a setting of the workspace, so of the box) each
-task gets its own container instead, and its sessions run there. `atl` stays where it is
-and is the only thing that talks to the Docker daemon directly.
+Each task gets its own Docker container, and its Claude sessions run there, not next to
+`atl`, where they could reach everything `atl` can: in the Docker image that is the host's
+Docker socket, your SSH agent, every repo and every other task. `atl` stays where it is and
+is the only thing that talks to the Docker daemon directly. This is the default; there is
+nothing to switch on.
+
+`ATL_SANDBOX=off` (a setting of the workspace, so of the box) switches it off: sessions
+run next to `atl` again, as they did before the sandbox. It is a way out while the sandbox
+is new, and it is going away, so do not build on it. Unset, empty or `docker` mean on; any
+other value is an error, and `atl` does not start. `atl doctor` says which mode is on.
+
+When Docker cannot be reached, starting a session fails, and `atl doctor` fails, with one
+line that gives docker's reason and says what to do: start Docker or give `atl` access to
+it, or set `ATL_SANDBOX=off`.
 
 ```
 atl (box)  ── docker exec ──▶  task container atl-<slug>-<hash>   one per task
@@ -385,9 +395,10 @@ A hook's `transcript_path` comes from the task: the gate records it only if it l
 task's own Claude dir (symlinks resolved), and logs and ignores any other. `atl done` and
 `atl cancel` empty the task's Claude dir except its transcripts (`projects/`, symlinks and
 other special files in it removed), which `atl show` and `atl transcript` still read for
-closed tasks; delete the dir yourself when you no longer need them. Sessions started
-before this change kept their transcripts in your own config dir, which the container does
-not see: they cannot be resumed in it.
+closed tasks; delete the dir yourself when you no longer need them. Sessions started with
+the sandbox off (before it was the default, or with `ATL_SANDBOX=off`) kept their
+transcripts in your own config dir, which the container does not see: they cannot be
+resumed in it.
 
 **Tools.** The image of a task's container is the project's `image = "..."` (in its
 toml), else `ATL_SANDBOX_IMAGE`, else `atelier-task`, the default task image (see
@@ -448,8 +459,8 @@ What the sandbox does not do yet:
 
 It needs a token for Claude Code (above), the workspace and repos at the same paths for
 `atl` and the Docker daemon, and a workspace path short enough for the gate's socket
-(`<workspace>/run/<12 chars>/docker.sock`, at most 107 bytes). `atl doctor` checks the
-setting, the daemon, the image and the token.
+(`<workspace>/run/<12 chars>/docker.sock`, at most 107 bytes). `atl doctor` reports the
+mode and checks the daemon, the image and the token.
 
 **Session context.** A sandboxed session's start context has a built-in note on the
 sandbox (tools run here, what Docker allows, `atl push`/`atl fetch` for git).
@@ -547,7 +558,7 @@ accept the new URL, run `atl repos pin <repo>` (where `atl` runs; not from a tas
 ```toml
 setup = "npm ci"                          # sh -c in each rw worktree after creation
 teardown = "docker compose down -v"       # sh -c in each rw worktree before removal
-image = "shop-dev"                        # task container image with ATL_SANDBOX=docker (see Sandbox)
+image = "shop-dev"                        # task container image (see Sandbox)
 
 [env]
 COMPOSE_PROJECT_NAME = "shop"

@@ -35,6 +35,9 @@ func TestMain(m *testing.M) {
 		// No global Claude Code settings (a global statusLine would keep
 		// atelier's out of task settings, see gen.WriteSettings).
 		"CLAUDE_CONFIG_DIR": filepath.Join(dir, "claude"),
+		// The sandbox is on by default; these tests run sessions next to
+		// atl, as with ATL_SANDBOX=off (the sandbox tests switch it on).
+		"ATL_SANDBOX": "off",
 	} {
 		os.Setenv(k, v)
 	}
@@ -250,6 +253,69 @@ func doctorLevel(out, name string) string {
 		}
 	}
 	return ""
+}
+
+// TestSandboxSetting: the sandbox is on unless ATL_SANDBOX=off, doctor says
+// which mode is on, any other value keeps atl from starting, and without
+// Docker a session fails in one line that names the way out.
+func TestSandboxSetting(t *testing.T) {
+	setup(t)
+	t.Setenv("ATL_SANDBOX_ID", "")
+	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock") // no daemon, whatever this machine has
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	line := func(out, name string) string {
+		for _, l := range strings.Split(out, "\n") {
+			if f := strings.Fields(l); len(f) >= 2 && f[1] == name {
+				return l
+			}
+		}
+		return ""
+	}
+
+	_, out, _ := atl(t, "doctor") // TestMain: ATL_SANDBOX=off
+	if l := line(out, "sandbox"); !strings.HasPrefix(l, "ok") || !strings.Contains(l, "off ($ATL_SANDBOX=off)") ||
+		!strings.Contains(l, "going away") || line(out, "docker") != "" {
+		t.Errorf("doctor, off:\n%s", out)
+	}
+	for v, want := range map[string]string{"": "docker (the default): ", "docker": "docker: ", "DOCKER": "docker: "} {
+		t.Setenv("ATL_SANDBOX", v)
+		code, out, _ := atl(t, "doctor")
+		if l := line(out, "sandbox"); code != 1 || !strings.HasPrefix(l, "ok") || !strings.Contains(l, want+"each task's sessions run in the task's own container") {
+			t.Errorf("doctor, ATL_SANDBOX=%q: %d\n%s", v, code, out)
+		}
+		if l := line(out, "docker"); !strings.HasPrefix(l, "FAIL") || !strings.Contains(l, "cannot reach Docker") ||
+			!strings.Contains(l, "set ATL_SANDBOX=off") {
+			t.Errorf("doctor, ATL_SANDBOX=%q, no Docker:\n%s", v, out)
+		}
+	}
+	t.Setenv("ATL_SANDBOX", "")
+	os.Unsetenv("ATL_SANDBOX")
+	if _, out, _ := atl(t, "doctor"); !strings.Contains(line(out, "sandbox"), "docker (the default): ") {
+		t.Errorf("doctor, unset:\n%s", out)
+	}
+
+	// The first thing a session says without Docker: one line, what to do.
+	if code, _, errs := atl(t, "new", "Boxed", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	code, out, errs := atl(t, "session", "boxed")
+	if code != 1 || strings.Count(errs, "\n") != 1 || !strings.Contains(errs, "cannot reach Docker, which runs each task's sessions in the task's own container (") ||
+		!strings.Contains(errs, "start Docker or give atl access to it, or set ATL_SANDBOX=off to run sessions without a container") {
+		t.Errorf("session without Docker: %d %q %q", code, out, errs)
+	}
+
+	// Anything else is refused, naming the two values.
+	for _, v := range []string{"dokcer", "0", "none"} {
+		t.Setenv("ATL_SANDBOX", v)
+		code, _, errs := atl(t, "ls")
+		if code != 1 || !strings.Contains(errs, `$ATL_SANDBOX="`+v+`": want docker (the default, also when unset) or off`) {
+			t.Errorf("ls with ATL_SANDBOX=%q: %d %q", v, code, errs)
+		}
+		if code, out, _ := atl(t, "doctor"); code != 1 || !strings.HasPrefix(line(out, "sandbox"), "FAIL") {
+			t.Errorf("doctor with ATL_SANDBOX=%q: %d\n%s", v, code, out)
+		}
+	}
 }
 
 func TestSessionsSummary(t *testing.T) {

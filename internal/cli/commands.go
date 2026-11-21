@@ -651,7 +651,7 @@ func (c *cli) finishCmd(verb string) *cobra.Command {
 func (c *cli) doctorCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
-		Short: "Check git, tmux, claude, gh, directories and the database",
+		Short: "Check git, tmux, claude, gh, directories, the database and the sandbox",
 		Args:  args(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ap, err := c.doctorApp()

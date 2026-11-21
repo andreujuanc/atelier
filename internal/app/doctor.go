@@ -72,15 +72,13 @@ func (a *App) Doctor(ctx context.Context) []Check {
 	if os.Getenv("ATL_CONTEXT") != "" || os.Getenv(hook.SandboxContextVar) != "" {
 		checks = append(checks, checkEnvContext())
 	}
-	if os.Getenv("ATL_SANDBOX") != "" {
-		checks = append(checks, a.checkSandbox(ctx)...)
-	}
+	checks = append(checks, a.checkSandbox(ctx)...)
 	return checks
 }
 
-// checkSandbox reports the sandbox setting and, when it is on, whether the
-// Docker daemon and the default task image are usable and Claude Code has a
-// token for task sessions.
+// checkSandbox reports the sandbox mode (on unless $ATL_SANDBOX=off) and,
+// when it is on, whether the Docker daemon and the default task image are
+// usable and Claude Code has a token for task sessions.
 func (a *App) checkSandbox(ctx context.Context) []Check {
 	const name = "sandbox"
 	if sandbox.Inside() {
@@ -91,12 +89,16 @@ func (a *App) checkSandbox(ctx context.Context) []Check {
 		return []Check{fail(name, err.Error())}
 	}
 	if sb == nil {
-		return []Check{pass(name, "off")}
+		return []Check{pass(name, "off ($ATL_SANDBOX=off): task sessions run next to atl; this mode is going away")}
 	}
-	checks := []Check{pass(name, "docker: each task's sessions run in the task's own container")}
+	mode := "docker"
+	if strings.TrimSpace(os.Getenv("ATL_SANDBOX")) == "" {
+		mode += " (the default)"
+	}
+	checks := []Check{pass(name, mode+": each task's sessions run in the task's own container")}
 	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
-	if ver, err := a.docker()(ctx, "version", "--format", "{{.Server.Version}}"); err != nil {
+	if ver, err := a.checkDocker(ctx); err != nil {
 		checks = append(checks, fail("docker", err.Error()))
 	} else {
 		checks = append(checks, pass("docker", "daemon "+ver+" via "+sandbox.UpstreamSocket()))

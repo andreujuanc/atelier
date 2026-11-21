@@ -31,7 +31,8 @@ type App struct {
 	AtlBin string           // for hook commands
 
 	// Sandbox, if not nil, runs every task's Claude sessions in the task's
-	// own Docker container ($ATL_SANDBOX=docker; see package sandbox).
+	// own Docker container (the default; nil with $ATL_SANDBOX=off, and in a
+	// task container; see package sandbox).
 	Sandbox *sandbox.Config
 	Docker  sandbox.Runner // nil → the docker CLI
 	// StartGate starts a task's gate if none runs; nil → sandbox.Start.

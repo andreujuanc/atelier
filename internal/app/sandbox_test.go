@@ -26,13 +26,23 @@ type fakeDocker struct {
 	calls   [][]string
 	label   string          // atelier.spec of the existing container; "" → none exists
 	missing map[string]bool // images not on the daemon, which docker run cannot pull either
+	down    bool            // the daemon cannot be reached
 }
+
+// errDockerDown is what the docker CLI says when the daemon is not there.
+var errDockerDown = errors.New("docker version: Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n" +
+	"Is the docker daemon running?")
 
 func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, args)
+	if f.down {
+		return "", errDockerDown
+	}
 	switch args[0] {
+	case "version":
+		return "29.0.0", nil
 	case "inspect":
 		if f.label == "" {
 			return "", errors.New("docker inspect: Error: No such container: x")
@@ -57,6 +67,20 @@ func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 		f.label = ""
 	}
 	return "", nil
+}
+
+// changes returns the calls other than the reachability check (docker
+// version), which starts nothing.
+func (f *fakeDocker) changes() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out [][]string
+	for _, c := range f.calls {
+		if c[0] != "version" {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (f *fakeDocker) find(verb string) [][]string {
@@ -386,7 +410,7 @@ func TestSandboxClaudeToken(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "atl token") || !strings.Contains(err.Error(), "CLAUDE_CODE_OAUTH_TOKEN") {
 		t.Fatalf("NewSession without a token: %v", err)
 	}
-	if len(fd.calls) != 0 || exists(e.app.Paths.RunDir("boxed")) {
+	if len(fd.changes()) != 0 || exists(e.app.Paths.RunDir("boxed")) {
 		t.Errorf("started something without a token: %q", fd.calls)
 	}
 
@@ -544,6 +568,107 @@ func TestDoctorTaskImage(t *testing.T) {
 	fd.missing = map[string]bool{"mine:1": true}
 	if c := check(); c.Level() != "warn" || !strings.Contains(c.Detail, "mine:1") {
 		t.Errorf("missing other: %s %q", c.Level(), c.Detail)
+	}
+}
+
+// TestDoctorSandboxMode: doctor says which mode is on. Off, it checks
+// nothing of the sandbox and says the mode is going away; on (unset, empty
+// or docker) it checks Docker, the task image and the token; when Docker
+// cannot be reached it fails in one line that names the way out; an unknown
+// value fails.
+func TestDoctorSandboxMode(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	t.Setenv("ATL_SANDBOX_IMAGE", "")
+	checks := func() map[string]Check {
+		t.Helper()
+		m := map[string]Check{}
+		for _, c := range e.app.checkSandbox(ctx) {
+			m[c.Name] = c
+		}
+		return m
+	}
+
+	t.Setenv("ATL_SANDBOX", "off")
+	m := checks()
+	if c := m["sandbox"]; c.Level() != "ok" || !strings.HasPrefix(c.Detail, "off") || !strings.Contains(c.Detail, "going away") {
+		t.Errorf("off: %s %q", c.Level(), c.Detail)
+	}
+	if len(m) != 1 || len(fd.calls) != 0 {
+		t.Errorf("off: checks %v, docker calls %q", m, fd.calls)
+	}
+
+	for v, want := range map[string]string{"": "docker (the default): ", "docker": "docker: "} {
+		t.Setenv("ATL_SANDBOX", v)
+		m := checks()
+		if c := m["sandbox"]; c.Level() != "ok" || !strings.HasPrefix(c.Detail, want) {
+			t.Errorf("ATL_SANDBOX=%q: sandbox %s %q", v, c.Level(), c.Detail)
+		}
+		if c := m["docker"]; c.Level() != "ok" || !strings.Contains(c.Detail, "daemon 29.0.0") {
+			t.Errorf("ATL_SANDBOX=%q: docker %s %q", v, c.Level(), c.Detail)
+		}
+		if c := m["task image"]; c.Level() != "ok" || c.Detail != sandbox.DefaultImage {
+			t.Errorf("ATL_SANDBOX=%q: task image %s %q", v, c.Level(), c.Detail)
+		}
+		if c := m["claude token"]; c.Level() != "ok" {
+			t.Errorf("ATL_SANDBOX=%q: claude token %s %q", v, c.Level(), c.Detail)
+		}
+	}
+	os.Unsetenv("ATL_SANDBOX") // t.Setenv above restores it
+	if c := checks()["sandbox"]; !strings.HasPrefix(c.Detail, "docker (the default): ") {
+		t.Errorf("unset: %s %q", c.Level(), c.Detail)
+	}
+
+	fd.down = true
+	if c := checks()["docker"]; c.Level() != "FAIL" || strings.Contains(c.Detail, "\n") ||
+		!strings.Contains(c.Detail, "cannot reach Docker") || !strings.Contains(c.Detail, "Is the docker daemon running?") ||
+		!strings.Contains(c.Detail, "set ATL_SANDBOX=off") {
+		t.Errorf("Docker down: %s %q", c.Level(), c.Detail)
+	}
+	fd.down = false
+
+	t.Setenv("ATL_SANDBOX", "dokcer")
+	if c := checks()["sandbox"]; c.Level() != "FAIL" || !strings.Contains(c.Detail, `"dokcer": want docker`) {
+		t.Errorf("unknown value: %s %q", c.Level(), c.Detail)
+	}
+}
+
+// TestSandboxDockerUnreachable: with the sandbox on and no Docker daemon,
+// starting a session fails before anything else (even without a token) in
+// one line that says why Docker is needed and what to do, the only message
+// that names ATL_SANDBOX=off; the token and image messages do not.
+func TestSandboxDockerUnreachable(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	task := e.task(t, "boxed", model.StatusActive, true)
+	fd.down = true
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	_, err := e.app.NewSession(ctx, "boxed")
+	if err == nil || strings.Contains(err.Error(), "\n") || !strings.Contains(err.Error(), "cannot reach Docker, which runs each task's sessions") ||
+		!strings.Contains(err.Error(), "(docker version: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?)") ||
+		!strings.Contains(err.Error(), "start Docker or give atl access to it, or set ATL_SANDBOX=off") {
+		t.Fatalf("NewSession without Docker: %v", err)
+	}
+	if len(fd.changes()) != 0 || exists(e.app.Paths.RunDir("boxed")) {
+		t.Errorf("started something without Docker: %q", fd.calls)
+	}
+
+	// Docker is back: the next missing thing is the token, then the image.
+	fd.down = false
+	if err := e.app.ensureSandbox(ctx, task); err == nil || !strings.Contains(err.Error(), "atl token") ||
+		strings.Contains(err.Error(), "ATL_SANDBOX") {
+		t.Errorf("without a token: %v", err)
+	}
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", testToken)
+	e.app.Sandbox = &sandbox.Config{Image: sandbox.DefaultImage}
+	fd.missing = map[string]bool{sandbox.DefaultImage: true}
+	if err := e.app.ensureSandbox(ctx, task); err == nil || !strings.Contains(err.Error(), sandbox.BuildDefaultImage) ||
+		strings.Contains(err.Error(), "ATL_SANDBOX") {
+		t.Errorf("without the image: %v", err)
+	}
+	fd.missing = nil
+	if err := e.app.ensureSandbox(ctx, task); err != nil {
+		t.Fatal(err)
 	}
 }
 

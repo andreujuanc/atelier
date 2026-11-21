@@ -8,7 +8,8 @@
 #   docker build -t atelier \
 #     --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 #
-# The default task image (ATL_SANDBOX=docker): what a task's sessions run in.
+# The default task image: what a task's sessions run in (the sandbox, on
+# unless ATL_SANDBOX=off).
 # claude, git, docker CLI/compose, Node.js LTS with npm and corepack, and
 # everyday tools. No other language: a project brings its own in its image,
 # or a task installs it. No atl (it is mounted into task containers) and no

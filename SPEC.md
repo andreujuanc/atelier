@@ -47,7 +47,7 @@ Every hook runs `atl hook <event>`, which reads the hook JSON from stdin (sessio
 
 ## Sessions / tmux
 - One tmux session per task: `atl-<slug>`. One tmux window per Claude session.
-- New session: window runs `claude` in <taskdir> with `--add-dir` for each ro repo.
+- New session: window runs `claude` in <taskdir> with `--add-dir` for each ro repo. By default it runs in the task's own Docker container (`docker exec`; README "Sandbox"); `ATL_SANDBOX=off` runs it next to atl (a way out, going away).
 - Resume: window runs `claude --resume <claude_session_id>` with the same flags.
 - Attach: if inside tmux → switch-client, else → attach.
 
