@@ -130,6 +130,14 @@ func noServer(err error) bool {
 		strings.Contains(s, "Connection refused")
 }
 
+// serverExited reports whether err is tmux's "server exited unexpectedly":
+// the client reached a server that was on its way out (e.g. just after
+// kill-server, or as its last session closed), so there is none now.
+func serverExited(err error) bool {
+	var te *Error
+	return errors.As(err, &te) && strings.Contains(te.Stderr, "server exited unexpectedly")
+}
+
 // noSessions reports whether err means there is no server or a server
 // without any session (tmux says "no current target" for -a listings and
 // session targets then).
@@ -188,7 +196,7 @@ func (c *Client) SetGlobalEnv(ctx context.Context, env map[string]string) error 
 		fmt.Fprintf(&script, "set-environment -g '%s' '%s'\n", k, v)
 	}
 	_, err := c.runIn(ctx, script.String(), "source-file", "-")
-	if err == nil || noServer(err) {
+	if err == nil || noServer(err) || serverExited(err) {
 		return nil
 	}
 	var te *Error
