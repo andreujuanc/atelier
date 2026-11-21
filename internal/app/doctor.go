@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/andreujuanc/atelier/internal/hook"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
 )
 
@@ -64,8 +65,47 @@ func (a *App) Doctor(ctx context.Context) []Check {
 		a.checkDB(ctx),
 		a.checkStateDir(),
 	)
-	if os.Getenv("ATL_CONTEXT") != "" {
+	if os.Getenv("ATL_CONTEXT") != "" || os.Getenv(hook.SandboxContextVar) != "" {
 		checks = append(checks, checkEnvContext())
+	}
+	if os.Getenv("ATL_SANDBOX") != "" {
+		checks = append(checks, a.checkSandbox(ctx)...)
+	}
+	return checks
+}
+
+// checkSandbox reports the sandbox setting and, when it is on, whether the
+// Docker daemon, the default task image and Claude Code's config dir are
+// usable.
+func (a *App) checkSandbox(ctx context.Context) []Check {
+	const name = "sandbox"
+	if sandbox.Inside() {
+		return []Check{pass(name, "inside a task container")}
+	}
+	sb, err := sandbox.FromEnv()
+	if err != nil {
+		return []Check{fail(name, err.Error())}
+	}
+	if sb == nil {
+		return []Check{pass(name, "off")}
+	}
+	checks := []Check{pass(name, "docker: each task's sessions run in the task's own container")}
+	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
+	defer cancel()
+	if ver, err := a.docker()(ctx, "version", "--format", "{{.Server.Version}}"); err != nil {
+		checks = append(checks, fail("docker", err.Error()))
+	} else {
+		checks = append(checks, pass("docker", "daemon "+ver+" via "+sandbox.UpstreamSocket()))
+		if _, err := a.docker()(ctx, "image", "inspect", "--format", "{{.Id}}", sb.Image); err != nil {
+			checks = append(checks, warn("task image", sb.Image+" is not on the daemon (docker will try to pull it); build it or set $ATL_SANDBOX_IMAGE"))
+		} else {
+			checks = append(checks, pass("task image", sb.Image))
+		}
+	}
+	if dir, err := sandboxClaudeDir(); err != nil {
+		checks = append(checks, fail("claude config", err.Error()))
+	} else {
+		checks = append(checks, pass("claude config", dir+" (shared with task containers)"))
 	}
 	return checks
 }

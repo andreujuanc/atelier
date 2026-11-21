@@ -140,6 +140,17 @@ func run(ctx context.Context, dir string, args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// ConfigValue returns the value git uses for config key in dir (a repo, or
+// any directory for the user's global value): "" if it is unset or cannot be
+// read.
+func ConfigValue(ctx context.Context, dir, key string) string {
+	out, err := run(ctx, dir, "config", "--get", key)
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
 // runInput is run with input fed to git's stdin.
 func runInput(ctx context.Context, dir, input string, args ...string) (string, error) {
 	var stdout, stderr bytes.Buffer

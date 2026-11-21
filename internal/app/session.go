@@ -30,6 +30,9 @@ func windowName(id int64) string { return fmt.Sprintf("claude-%d", id) }
 // checkLaunchable refuses closed tasks and tasks whose dir is missing, and
 // returns the task dir.
 func (a *App) checkLaunchable(t *model.Task) (string, error) {
+	if err := outsideSandbox("start Claude sessions"); err != nil {
+		return "", err
+	}
 	if !t.Status.Open() {
 		return "", fmt.Errorf("task %s is %s; cannot start Claude sessions in it", t.Slug, t.Status)
 	}
@@ -50,12 +53,22 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 	if err := a.prepareTaskDir(ctx, t); err != nil {
 		return "", fmt.Errorf("prepare task dir: %w", err)
 	}
+	env := a.launchEnv(t, s)
+	argv := ClaudeArgv(a.roPaths(t), resumeID)
+	if a.Sandbox != nil {
+		// The window runs a docker client attached to Claude in the task's
+		// container: the window dies with it, so tracking is unchanged.
+		if err := a.ensureSandbox(ctx, t); err != nil {
+			return "", fmt.Errorf("sandbox: %w", err)
+		}
+		argv = a.sandboxArgv(t, dir, env, argv)
+	}
 	return a.Tmux.NewWindow(ctx, tmux.WindowSpec{
 		Session: tmux.SessionName(t.Slug),
 		Name:    s.Name,
 		Dir:     dir,
-		Env:     a.launchEnv(t, s),
-		Argv:    ClaudeArgv(a.roPaths(t), resumeID),
+		Env:     env,
+		Argv:    argv,
 		Tag:     strconv.FormatInt(s.ID, 10),
 	})
 }

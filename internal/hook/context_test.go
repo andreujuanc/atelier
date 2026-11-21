@@ -270,10 +270,10 @@ func TestSessionStartContext(t *testing.T) {
 		}
 		st.Close()
 		var out bytes.Buffer
-		if err := writeSessionContext(context.Background(), &out, st, f.p, task.ID, "", now); err == nil || out.Len() != 0 {
+		if err := writeSessionContext(context.Background(), &out, st, f.p, task.ID, "", false, now); err == nil || out.Len() != 0 {
 			t.Errorf("err=%v stdout=%q", err, out.String())
 		}
-		if err := writeSessionContext(context.Background(), &out, f.st, f.p, 9999, "", now); err == nil || out.Len() != 0 {
+		if err := writeSessionContext(context.Background(), &out, f.st, f.p, 9999, "", false, now); err == nil || out.Len() != 0 {
 			t.Errorf("missing task: err=%v stdout=%q", err, out.String())
 		}
 	})

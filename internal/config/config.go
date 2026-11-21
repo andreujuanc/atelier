@@ -2,6 +2,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -115,6 +117,21 @@ func (p Paths) RepoPath(name string) string { return filepath.Join(p.Repos, name
 
 // WorktreePath returns Tasks/slug/repo.
 func (p Paths) WorktreePath(slug, repo string) string { return filepath.Join(p.Tasks, slug, repo) }
+
+// RunDir returns the directory of task slug's sandbox runtime files (the
+// gate's socket, the atl binary for the task container): a directory named
+// by a short hash of the task dir under $ATL_WORKSPACE/run, else under
+// <StateDir>-run. The name is short and fixed-length because the socket path
+// must fit in 107 bytes. It is outside StateDir and the data dir, which a
+// task container gets to see, so one task never sees another's socket.
+func (p Paths) RunDir(slug string) string {
+	sum := sha256.Sum256([]byte(p.TaskDir(slug)))
+	name := hex.EncodeToString(sum[:])[:12]
+	if p.Workspace != "" {
+		return filepath.Join(p.Workspace, "run", name)
+	}
+	return filepath.Join(p.StateDir+"-run", name)
+}
 
 // HookLog returns StateDir/hook.log.
 func (p Paths) HookLog() string { return filepath.Join(p.StateDir, "hook.log") }

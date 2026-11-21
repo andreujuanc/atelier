@@ -174,6 +174,9 @@ func checkRepo(ctx context.Context, name, path string) error {
 // project's setup script (if any) runs in each rw worktree; a setup failure
 // is only reported as a warning and leaves the task in place.
 func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
+	if err := outsideSandbox("create a task"); err != nil {
+		return nil, err
+	}
 	// The title is one line: collapse whitespace runs (newlines included).
 	title := strings.Join(strings.Fields(o.Title), " ")
 	if title == "" {
@@ -363,7 +366,7 @@ func (a *App) populateTaskDir(ctx context.Context, t *model.Task) (err error) {
 	if err := gen.WriteClaudeMD(dir, *t, a.repoInfos(t)); err != nil {
 		return err
 	}
-	return gen.WriteSettings(dir, a.AtlBin)
+	return gen.WriteSettings(dir, a.hookBin())
 }
 
 // taskProject loads the task's project, or returns nil if it has none.
@@ -655,6 +658,9 @@ func (a *App) finish(ctx context.Context, ref string, force bool, to model.Statu
 }
 
 func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to model.Status) error {
+	if err := outsideSandbox("close a task"); err != nil {
+		return err
+	}
 	if !t.Status.Open() {
 		return fmt.Errorf("task %s is already %s", t.Slug, t.Status)
 	}
@@ -738,6 +744,8 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		}
 		a.warnf("teardown for task %s: %v", t.Slug, err)
 	}
+	// Before the worktrees go: the task's containers may hold them mounted.
+	a.removeSandbox(ctx, t)
 	var removed []wt
 	for _, w := range wts {
 		if err := gitx.RemoveWorktree(ctx, w.repo, w.path, force); err != nil {
