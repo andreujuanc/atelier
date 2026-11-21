@@ -31,15 +31,35 @@ func (a *App) claudeConfigDirFor(t *model.Task) string {
 }
 
 // claudeCopied are what a task's Claude dir gets copied from the user's:
-// their own setup, nothing secret. Never the credentials, the state file
-// (account, MCP servers and their secrets), transcripts (projects/) or
-// anything else Claude Code keeps there.
+// their own setup. Never the credentials, the state file (account, MCP
+// servers and their secrets), transcripts (projects/) or anything else
+// Claude Code keeps there. What the task can read of the user's setup is
+// theirs to keep free of secrets, except where atl knows to look: the
+// settings that run a program for credentials (settingsDropped) and the
+// variables of the settings' env block whose names look secret
+// (secretEnvName) are dropped from the copy of settings.json; skills,
+// agents, commands and CLAUDE.md are copied as they are.
 var claudeCopied = []string{"settings.json", "CLAUDE.md", "keybindings.json", "skills", "agents", "commands"}
 
 // settingsDropped are the settings that run a program to get credentials:
 // in a task they would run there (where the program and its secrets are not)
 // and take precedence over the token.
 var settingsDropped = []string{"apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh", "otelHeadersHelper"}
+
+// secretEnvName reports whether a variable of the settings' env block looks
+// like it holds a secret, by its name: one that has KEY, TOKEN, SECRET,
+// PASSWORD, PASSWD, CREDENTIAL or AUTH in it, or starts with AWS_, in any
+// case. Claude Code exports the env block to every session, so the task
+// could read it.
+func secretEnvName(name string) bool {
+	u := strings.ToUpper(name)
+	for _, w := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH"} {
+		if strings.Contains(u, w) {
+			return true
+		}
+	}
+	return strings.HasPrefix(u, "AWS_")
+}
 
 // Bounds of what seedClaudeDir copies from the user's dir.
 const (
@@ -213,18 +233,42 @@ func (c *seedCopy) copy(src, dst string, depth int) error {
 	return nil // sockets, devices, pipes: not setup
 }
 
-// dropSettings removes settingsDropped from a settings file; a file that is
-// not a JSON object is copied as it is (Claude Code reports it).
+// dropSettings removes settingsDropped and the env variables whose names
+// look secret (secretEnvName) from a settings file. A file that is not a
+// JSON object is copied as it is (Claude Code reports it); an env that is
+// not an object is dropped.
 func dropSettings(data []byte) []byte {
 	var root map[string]json.RawMessage
 	if json.Unmarshal(data, &root) != nil || root == nil {
 		return data
 	}
-	n := len(root)
+	changed := false
 	for _, k := range settingsDropped {
-		delete(root, k)
+		if _, ok := root[k]; ok {
+			delete(root, k)
+			changed = true
+		}
 	}
-	if len(root) == n {
+	if raw, ok := root["env"]; ok {
+		var env map[string]json.RawMessage
+		if json.Unmarshal(raw, &env) != nil || env == nil {
+			delete(root, "env")
+			changed = true
+		} else {
+			for k := range env {
+				if secretEnvName(k) {
+					delete(env, k)
+					changed = true
+				}
+			}
+			if b, err := json.Marshal(env); err == nil {
+				root["env"] = b
+			} else {
+				delete(root, "env")
+			}
+		}
+	}
+	if !changed {
 		return data
 	}
 	out, err := json.MarshalIndent(root, "", "  ")

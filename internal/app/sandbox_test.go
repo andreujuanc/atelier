@@ -714,7 +714,10 @@ func userClaudeDir(t *testing.T) string {
 	t.Helper()
 	user := os.Getenv("CLAUDE_CONFIG_DIR")
 	for name, content := range map[string]string{
-		"settings.json":           `{"theme":"x","apiKeyHelper":"/home/u/bin/key","statusLine":{"type":"command","command":"mine"}}`,
+		"settings.json": `{"theme":"x","apiKeyHelper":"/home/u/bin/key","statusLine":{"type":"command","command":"mine"},` +
+			`"env":{"GITHUB_TOKEN":"SECRET-GH","aws_profile":"SECRET-AWS","MY_API_KEY":"SECRET-KEY","Db_Password":"SECRET-PW",` +
+			`"PGPASSWD":"SECRET-PG","OAUTH_CLIENT":"SECRET-OAUTH","GOOGLE_APPLICATION_CREDENTIALS":"SECRET-GCP","NPM_SECRET":"SECRET-NPM",` +
+			`"EDITOR":"vim","NODE_OPTIONS":"--max-old-space-size=4096"}}`,
 		"CLAUDE.md":               "# my rules\n",
 		"keybindings.json":        `{"bindings":[]}`,
 		"skills/review/SKILL.md":  "---\nname: review\n---\n",
@@ -767,6 +770,11 @@ func TestSandboxSeedsClaudeDir(t *testing.T) {
 	}
 	if _, ok := settings["apiKeyHelper"]; ok || settings["statusLine"] == nil || settings["theme"] != "x" {
 		t.Errorf("settings.json copy: %v", settings)
+	}
+	// The env block keeps what does not look secret (the walk below finds
+	// no SECRET in the copies).
+	if env, _ := settings["env"].(map[string]any); len(env) != 2 || env["EDITOR"] != "vim" || env["NODE_OPTIONS"] == nil {
+		t.Errorf("settings.json env copy: %v", settings["env"])
 	}
 	for _, never := range []string{".credentials.json", "projects", "todos", "skills/creds.md", "agents/old"} {
 		if _, err := os.Lstat(filepath.Join(dir, never)); !errors.Is(err, os.ErrNotExist) {

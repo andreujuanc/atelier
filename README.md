@@ -313,9 +313,11 @@ atl (box)  ── docker exec ──▶  task container atl-<slug>-<hash>   one 
 ```
 
 A task container sees, at the same paths as `atl`: the task dir; the git database
-(`.git`) of each rw repo's clone, which the worktree needs; each ro repo, read-only;
-and the task's own Claude Code config dir (see below). It does not see the Docker socket,
-the SSH agent, other repos, other tasks, your Claude Code config dir (login, settings,
+(`.git`) of each rw repo's clone, which the worktree needs and which every task with that
+repo rw shares (so such tasks can reach each other, see the first item of what the sandbox
+does not do yet); each ro repo, read-only; and the task's own Claude Code config dir (see
+below). It does not see the Docker socket, the SSH agent, other repos, other tasks' dirs,
+your Claude Code config dir (login, settings,
 other sessions' transcripts), nor atelier's database, state dir (hook log, gate logs) or
 config dir (projects). It is created on the task's first session, reused by later ones (so what a
 session installs is there for the next), restarted after a reboot and removed by `atl
@@ -380,9 +382,12 @@ keeps: its state file, the task's transcripts (so `claude --resume` works across
 container), history. When a new container is created for the task, `atl` refreshes in it
 copies of your own setup from your config dir (`$CLAUDE_CONFIG_DIR`, else `~/.claude`),
 whichever of these exist: `settings.json` (without `apiKeyHelper` and the other settings
-that run a program for credentials), `CLAUDE.md`, `keybindings.json`, `skills/`,
-`agents/` and `commands/`. They are copies: a task can change its own, never yours, and a
-change of yours reaches a task with its next new container. `atl` also sets in the task's
+that run a program for credentials, and without the variables of its `env` block whose
+name, in any case, contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or
+`AUTH`, or starts with `AWS_`), `CLAUDE.md`, `keybindings.json`, `skills/`, `agents/` and
+`commands/`. What is copied, the other `env` variables included, the task can read. They
+are copies: a task can change its own, never yours, and a change of yours reaches a task
+with its next new container. `atl` also sets in the task's
 state file (`.claude.json`) that onboarding is done (with your theme), that the task dir is
 trusted and, with an API key, that the key is approved, so no first-start screen
 shows. Not carried over: your login (`.credentials.json`), your state file (account, your
@@ -459,14 +464,24 @@ volumes).
 
 What the sandbox does not do yet:
 
+- A task can run code in every other task that has the same repo read-write. Both mount
+  that repo's clone (`.git`, with its hooks and config) read-write, so a hook,
+  `core.hooksPath`, `core.fsmonitor` or filter one task writes there runs in the other
+  task's container the next time git runs there. From there it reaches that task's
+  worktree, its Claude dir (transcripts), its token and its gate (`atl push`/`atl fetch`
+  of its branch, its notes). Tasks that share an rw repo are not kept apart.
 - The task can read Claude Code's token (or API key), which its sessions need to work:
   what runs in the task can use it to make model requests on your account, also from
   elsewhere, until you revoke it.
 - The git database of a task's rw repos is writable from the task (other branches, hooks
-  and config of that clone included). `atl` runs git in those repos where it runs (see
-  **Git where atl runs** below), and keeps that config from making git run a program or
-  contact a server; one limit remains there.
+  and config of that clone included). Only `atl`'s own git, where it runs, is guarded
+  against that config (see **Git where atl runs** below), with one limit there; git in a
+  task's container is not (see the first item).
 - A task can swap a checked mount path for a symlink before the daemon mounts it.
+- After the gate is restarted (`atl` upgraded, box restarted), services a task started with
+  the Docker socket mounted (localstack, testcontainers) need to be recreated.
+- Notes and transcripts a task writes reach the assistant where `atl` runs (`atl notes`,
+  `atl transcript`) as prompt input.
 - Only the classic image builder goes through the gate (`DOCKER_BUILDKIT=0` is set in the
   task); BuildKit sessions are refused.
 - Tasks can bind any free host port, and there is no network egress policy.
@@ -501,7 +516,8 @@ database id and exact slug, so no other task can be taken for it), with your SSH
 `~/.ssh/config` and git credentials, and passes the output and exit status back. The
 request can only name the operation, one of the task's repos and `--force`; the task is
 always the gate's own. So an agent can push its own branch, and cannot push `main`, tags
-or another task's branch. Requests and refusals are in the gate log; a push may take its
+or another task's branch through its gate (a task that runs code in another task that
+shares its rw repo, see above, uses that task's gate). Requests and refusals are in the gate log; a push may take its
 time (up to 10 minutes), e.g. while your SSH key waits for a touch.
 
 A push asked from a task runs without a terminal, so an SSH key that needs a PIN or a
