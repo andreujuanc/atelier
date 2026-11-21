@@ -10,8 +10,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strings"
+	"time"
 )
 
 // Origin is where a repo's origin points, as its config says it: the values
@@ -409,42 +411,77 @@ func isHTTPURL(u string) bool {
 // GitHubRepo returns "OWNER/REPO" (or "HOST/OWNER/REPO" for a host other
 // than github.com), what `gh --repo` takes, for the GitHub repository at
 // origin's fetch URL, with the user's rules applied (a shorthand like
-// gh:o/r), else as it is; ok is false when neither looks like one.
+// gh:o/r), else as it is; ok is false when neither looks like one. An ssh
+// URL's host that is not github.com may be an alias in the user's ssh
+// config (git@github-work:o/r, for a second account): when `ssh -G` says
+// its real host name is github.com, the repository is on github.com.
 func GitHubRepo(ctx context.Context, dir string, origin Origin) (repo string, ok bool) {
 	for _, u := range append(origin.fetchURLs(userConfig(ctx, dir)), origin.URLs...) {
-		if repo, ok := githubRepo(u); ok {
-			return repo, true
+		host, nwo, ssh, ok := githubRepo(u)
+		if !ok {
+			continue
 		}
+		if strings.EqualFold(host, "github.com") || ssh && strings.EqualFold(sshHostname(ctx, host), "github.com") {
+			return nwo, true
+		}
+		return host + "/" + nwo, true
 	}
 	return "", false
 }
 
-func githubRepo(raw string) (string, bool) {
-	var host, path string
+// githubRepo splits a URL into its host and OWNER/REPO path; ssh is true
+// for an ssh URL (ssh://, or scp-like [user@]host:path).
+func githubRepo(raw string) (host, nwo string, ssh, ok bool) {
+	var path string
 	if strings.Contains(raw, "://") {
 		u, err := url.Parse(raw)
 		if err != nil {
-			return "", false
+			return "", "", false, false
 		}
-		host, path = u.Hostname(), u.Path
+		host, path, ssh = u.Hostname(), u.Path, strings.EqualFold(u.Scheme, "ssh")
 	} else if !isLocalURL(raw) { // scp-like: [user@]host:path
 		h, p, _ := strings.Cut(raw, ":")
 		if i := strings.LastIndexByte(h, '@'); i >= 0 {
 			h = h[i+1:]
 		}
-		host, path = h, p
+		host, path, ssh = h, p, true
 	} else {
-		return "", false
+		return "", "", false, false
 	}
 	parts := strings.Split(strings.Trim(strings.TrimSuffix(strings.TrimSuffix(path, "/"), ".git"), "/"), "/")
 	if host == "" || len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", false
+		return "", "", false, false
 	}
-	nwo := parts[0] + "/" + parts[1]
-	if !strings.EqualFold(host, "github.com") {
-		nwo = host + "/" + nwo
+	return host, parts[0] + "/" + parts[1], ssh, true
+}
+
+// sshHost is what an ssh host alias may look like; anything else (an
+// option, say) never reaches ssh's command line.
+var sshHost = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// sshHostname returns the host name the user's ssh configuration gives
+// host (`ssh -G`, which only prints the configuration, connecting nowhere),
+// or "" if ssh cannot tell. ssh reads the user's own configuration only:
+// it runs outside any repo, with nothing of the repo's config.
+func sshHostname(ctx context.Context, host string) string {
+	if !sshHost.MatchString(host) {
+		return ""
 	}
-	return nwo, true
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ssh", "-G", "--", host)
+	cmd.Dir = "/"
+	cmd.WaitDelay = 2 * time.Second
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if v, ok := strings.CutPrefix(line, "hostname "); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 type configEntry struct{ key, value string }
