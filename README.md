@@ -400,6 +400,13 @@ the sandbox off (before it was the default, or with `ATL_SANDBOX=off`) kept thei
 transcripts in your own config dir, which the container does not see: they cannot be
 resumed in it.
 
+**Files a task can write.** Where `atl` itself reads or writes files the task can write
+too (the task dir's `CLAUDE.md` and `.claude/`, the task's Claude dir), it follows no
+symlink, neither on the way nor at the end, reads only regular files and never waits on a
+pipe: what a task plants there cannot make `atl` read or write anything else. A
+`.claude/settings.json` that is a symlink or not a regular file is replaced without being
+read, and a `.claude` that is a symlink makes the session launch fail.
+
 **Tools.** The image of a task's container is the project's `image = "..."` (in its
 toml), else `ATL_SANDBOX_IMAGE`, else `atelier-task`, the default task image (see
 [Docker image](#docker-image) for how to build it and what it has). When the default image

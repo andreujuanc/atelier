@@ -598,7 +598,9 @@ func (a *App) rewriteClaudeMD(ctx context.Context, id int64) error {
 	} else if err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); errors.Is(err, os.ErrNotExist) {
+	// Lstat: the task dir is the task's to write; RewriteClaudeMD replaces a
+	// symlink there rather than writing through it.
+	if _, err := os.Lstat(filepath.Join(dir, "CLAUDE.md")); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return err

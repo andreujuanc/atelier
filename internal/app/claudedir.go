@@ -9,11 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/andreujuanc/atelier/internal/config"
-	"github.com/andreujuanc/atelier/internal/gen"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // A sandboxed task's Claude Code runs with its own config dir
@@ -56,20 +55,28 @@ const (
 // (claudeCopied) and writes the state file's onboarding and trust keys.
 // A copy that fails is a warning; a state file that cannot be written is an
 // error (Claude Code would show its first-start screens).
+//
+// The dir is the task's to write; what is in it is reached through package
+// nofollow, so a symlink the task left there is never written through.
 func (a *App) seedClaudeDir(t *model.Task) error {
 	dir := a.Paths.ClaudeDir(t.Slug)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	d, err := nofollow.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
 	if user := config.ClaudeConfigDir(); user != "" {
-		c := &seedCopy{forbidden: forbiddenSources(user)}
+		c := &seedCopy{forbidden: forbiddenSources(user), dst: d}
 		for _, name := range claudeCopied {
-			if err := c.refresh(filepath.Join(user, name), filepath.Join(dir, name)); err != nil {
+			if err := c.refresh(filepath.Join(user, name), name); err != nil {
 				a.warnf("task %s: copy %s of your Claude config: %v", t.Slug, name, err)
 			}
 		}
 	}
-	if err := writeClaudeState(dir, a.Paths.TaskDir(t.Slug), os.Getenv("ANTHROPIC_API_KEY"), userTheme()); err != nil {
+	if err := writeClaudeState(d, a.Paths.TaskDir(t.Slug), os.Getenv("ANTHROPIC_API_KEY"), userTheme()); err != nil {
 		return fmt.Errorf("task %s: Claude state file: %w", t.Slug, err)
 	}
 	return nil
@@ -130,25 +137,30 @@ func forbiddenSources(user string) []string {
 	return out
 }
 
-// seedCopy copies from the user's Claude dir within the seed bounds.
+// seedCopy copies from the user's Claude dir within the seed bounds into
+// dst, the task's Claude dir.
 type seedCopy struct {
 	forbidden    []string
+	dst          *nofollow.Dir
 	bytes, files int
 }
 
-// refresh replaces dst with a copy of src, or removes it when src does not
-// exist. dst is removed first, without following it: what the task left
-// there (a symlink, say) is never written through. src is followed.
-func (c *seedCopy) refresh(src, dst string) error {
-	if err := os.RemoveAll(dst); err != nil {
+// refresh replaces name (a top-level entry of the task's Claude dir) with a
+// copy of src, or removes it when src does not exist. It is removed first,
+// without following it (os.RemoveAll does not follow the last component
+// and walks what it removes by file descriptor): what the task left there
+// (a symlink, say) is never written through. src is followed.
+func (c *seedCopy) refresh(src, name string) error {
+	if err := os.RemoveAll(filepath.Join(c.dst.Path(), name)); err != nil {
 		return err
 	}
 	if _, err := os.Stat(src); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	return c.copy(src, dst, 0)
+	return c.copy(src, name, 0)
 }
 
+// copy copies src to dst, a path relative to the task's Claude dir.
 func (c *seedCopy) copy(src, dst string, depth int) error {
 	real, err := filepath.EvalSymlinks(src)
 	if err != nil {
@@ -172,12 +184,12 @@ func (c *seedCopy) copy(src, dst string, depth int) error {
 		if err != nil {
 			return err
 		}
-		if err := os.Mkdir(dst, 0o700); err != nil {
+		if err := c.dst.MkdirAll(dst, 0o700); err != nil {
 			return err
 		}
 		var errs []error
 		for _, e := range entries {
-			if err := c.copy(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name()), depth+1); err != nil {
+			if err := c.copy(filepath.Join(src, e.Name()), dst+"/"+e.Name(), depth+1); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -193,10 +205,10 @@ func (c *seedCopy) copy(src, dst string, depth int) error {
 		if err != nil {
 			return err
 		}
-		if filepath.Base(dst) == "settings.json" && depth == 0 {
+		if dst == "settings.json" && depth == 0 {
 			data = dropSettings(data)
 		}
-		return writeNew(dst, data, fi.Mode().Perm()&0o755|0o600)
+		return c.dst.WriteFile(dst, data, fi.Mode().Perm()&0o755|0o600)
 	}
 	return nil // sockets, devices, pipes: not setup
 }
@@ -220,19 +232,6 @@ func dropSettings(data []byte) []byte {
 		return data
 	}
 	return append(out, '\n')
-}
-
-// writeNew creates path, which must not exist, without following a symlink.
-func writeNew(path string, data []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, perm)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
 }
 
 // userStateFile is the user's Claude Code state file: .claude.json in
@@ -276,20 +275,14 @@ func userTheme() string {
 // asks once per key and keeps its last 20 characters). Everything else
 // Claude Code wrote there is kept; a file that is not a JSON object is
 // replaced.
-func writeClaudeState(dir, taskDir, apiKey, theme string) error {
-	path := filepath.Join(dir, ".claude.json")
+func writeClaudeState(d *nofollow.Dir, taskDir, apiKey, theme string) error {
 	st := map[string]any{}
-	if f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0); err == nil {
-		fi, err := f.Stat()
-		if err == nil && fi.Mode().IsRegular() && fi.Size() <= maxStateFile {
-			data, _ := io.ReadAll(io.LimitReader(f, maxStateFile))
-			dec := json.NewDecoder(bytes.NewReader(data))
-			dec.UseNumber()
-			if dec.Decode(&st) != nil || st == nil {
-				st = map[string]any{}
-			}
+	if data, err := d.ReadFile(".claude.json", maxStateFile); err == nil {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if dec.Decode(&st) != nil || st == nil {
+			st = map[string]any{}
 		}
-		f.Close()
 	}
 	st["hasCompletedOnboarding"] = true
 	if _, ok := st["theme"]; !ok && theme != "" {
@@ -341,6 +334,6 @@ func writeClaudeState(dir, taskDir, apiKey, theme string) error {
 	if err != nil {
 		return err
 	}
-	// WriteAtomic renames over path: a symlink there is replaced, not followed.
-	return gen.WriteAtomic(path, append(data, '\n'))
+	// A symlink there is replaced, not followed.
+	return d.WriteFile(".claude.json", append(data, '\n'), 0o644)
 }
