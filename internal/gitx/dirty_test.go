@@ -2,11 +2,15 @@ package gitx
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // TestIsDirtyCases: IsDirty agrees with `git status --porcelain` (run here
@@ -201,6 +205,50 @@ func TestIsDirtyUnborn(t *testing.T) {
 	}
 	if _, err := IsDirty(ctx, filepath.Join(dir, "nope")); err == nil {
 		t.Fatal("IsDirty of a missing dir: no error")
+	}
+}
+
+// TestIsDirtyOpensNoFIFO: a tracked file the task swaps for a FIFO (or a
+// symlink, or anything that is not a regular file) between IsDirty's look
+// at it and the read of its content is a change; the read neither blocks
+// nor follows anything.
+func TestIsDirtyOpensNoFIFO(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "sub", "f"), "content\n")
+	d, err := nofollow.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	fi, err := d.Lstat("sub/f") // what IsDirty saw: a regular file
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(filepath.Join(dir, "sub", "f"))
+	if err := syscall.Mkfifo(filepath.Join(dir, "sub", "f"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := blobHash(d, "sub/f", fi, 40); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, nofollow.ErrNotRegular) {
+			t.Errorf("hashing a FIFO: %v, want ErrNotRegular", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hashing a FIFO blocked")
+	}
+	// A directory on the way swapped for a symlink to one with the same file.
+	other := t.TempDir()
+	writeFile(t, filepath.Join(other, "f"), "content\n")
+	os.RemoveAll(filepath.Join(dir, "sub"))
+	if err := os.Symlink(other, filepath.Join(dir, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	ix := &gitIndex{}
+	e := &indexEntry{mode: modeRegular | 0o644, oid: "d95f3ad14dee633a758d2e331151e950dd13e4ed", path: "sub/f", size: 8}
+	if changed, err := ix.changed(e, d, true); err != nil || !changed {
+		t.Errorf("a tracked file reached through a symlinked directory: changed = %v, %v; want a change", changed, err)
 	}
 }
 
