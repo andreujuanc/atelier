@@ -1,42 +1,62 @@
 package sandbox
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// daemon is a fake Docker daemon on a unix socket. It knows a few objects by
-// name and records what reaches it.
+// daemon is a fake Docker daemon on a unix socket. It knows a few objects,
+// finds them as dockerd does (full ID, then name, then unique ID prefix;
+// volumes by name only) and records what reaches it.
 type daemon struct {
 	mu       sync.Mutex
 	requests []string          // "METHOD path?query"
 	bodies   map[string]string // last body per "METHOD path"
-	labels   map[string]map[string]string
+	objects  []*object
+	execIn   []string // IDs of the containers execs were created in
+}
+
+type object struct {
+	kind, id, name string
+	labels         map[string]string
 }
 
 const testID = "task-abc123"
 
+// IDs of the fake daemon's objects.
+const (
+	mineID    = "1111111111111111111111111111111111111111111111111111111111111111"
+	agentID   = "2222222222222222222222222222222222222222222222222222222222222222"
+	otherID   = "3333333333333333333333333333333333333333333333333333333333333333"
+	hostID    = "abcd999999999999999999999999999999999999999999999999999999999999" // the box, say
+	mynetID   = "4444444444444444444444444444444444444444444444444444444444444444"
+	hostnetID = "abcd555555555555555555555555555555555555555555555555555555555555"
+)
+
 func newDaemon(t *testing.T) (*daemon, string) {
 	t.Helper()
-	d := &daemon{bodies: map[string]string{}, labels: map[string]map[string]string{
-		"containers/mine":  {LabelTask: testID},
-		"containers/agent": {LabelAgent: testID},
-		"containers/other": {LabelTask: "someone-else"},
-		"containers/host":  {},
-		"networks/mynet":   {LabelTask: testID},
-		"networks/hostnet": {},
-		"volumes/myvol":    {LabelTask: testID},
-		"volumes/hostvol":  {},
+	d := &daemon{bodies: map[string]string{}, objects: []*object{
+		{"containers", mineID, "mine", map[string]string{LabelTask: testID}},
+		{"containers", agentID, "agent", map[string]string{LabelAgent: testID}},
+		{"containers", otherID, "other", map[string]string{LabelTask: "someone-else"}},
+		{"containers", hostID, "host", map[string]string{}},
+		{"networks", mynetID, "mynet", map[string]string{LabelTask: testID}},
+		{"networks", hostnetID, "hostnet", map[string]string{}},
+		{"volumes", "myvol", "myvol", map[string]string{LabelTask: testID}},
+		{"volumes", "hostvol", "hostvol", map[string]string{}},
 	}}
 	sock := filepath.Join(t.TempDir(), "daemon.sock")
 	l, err := net.Listen("unix", sock)
@@ -63,27 +83,85 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	parts := strings.Split(strings.Trim(versionPrefix.ReplaceAllString(r.URL.Path, ""), "/"), "/")
-	inspect := r.Method == "GET" && (len(parts) == 2 && parts[0] != "containers" || len(parts) == 3 && parts[0] == "containers" && parts[2] == "json")
-	if inspect && parts[1] != "json" {
-		labels, ok := d.labels[parts[0]+"/"+parts[1]]
-		if !ok {
+	var obj *object
+	if len(parts) >= 2 && oneOf(parts[0], "containers", "networks", "volumes") && !oneOf(parts[1], "json", "create", "prune") {
+		if obj = d.find(parts[0], parts[1]); obj == nil {
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `{"message":"no such object"}`)
 			return
 		}
-		obj := map[string]any{"Labels": labels, "Config": map[string]any{"Labels": labels}}
-		if parts[0] == "networks" {
-			obj["Containers"] = map[string]any{"c1": map[string]any{"Name": "atl-" + testID}, "c2": map[string]any{"Name": "db"}}
-		}
-		json.NewEncoder(w).Encode(obj)
-		return
 	}
-	if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/create") || strings.HasSuffix(r.URL.Path, "/exec") {
+	inspect := r.Method == "GET" && (len(parts) == 2 && parts[0] != "containers" || len(parts) == 3 && parts[0] == "containers" && parts[2] == "json")
+	switch {
+	case inspect && obj != nil:
+		out := map[string]any{"Labels": obj.labels, "Config": map[string]any{"Labels": obj.labels}, "Name": obj.name}
+		if obj.kind != "volumes" {
+			out["Id"] = obj.id
+		}
+		if obj.kind == "containers" {
+			out["Name"] = "/" + obj.name
+		}
+		if obj.kind == "networks" {
+			out["Containers"] = map[string]any{"c1": map[string]any{"Name": "atl-" + testID}, "c2": map[string]any{"Name": "db"}}
+		}
+		json.NewEncoder(w).Encode(out)
+	case r.Method == "POST" && len(parts) == 3 && parts[2] == "rename" && obj != nil:
+		d.mu.Lock()
+		obj.name = r.URL.Query().Get("name")
+		d.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == "DELETE" && len(parts) == 2 && obj != nil:
+		d.mu.Lock()
+		for i, o := range d.objects {
+			if o == obj {
+				d.objects = append(d.objects[:i], d.objects[i+1:]...)
+				break
+			}
+		}
+		d.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == "POST" && len(parts) == 3 && parts[2] == "exec" && obj != nil:
+		d.mu.Lock()
+		d.execIn = append(d.execIn, obj.id)
+		d.mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
 		io.WriteString(w, `{"Id":"new1"}`)
-		return
+	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/create"):
+		w.WriteHeader(http.StatusCreated)
+		io.WriteString(w, `{"Id":"new1"}`)
+	default:
+		io.WriteString(w, `{}`)
 	}
-	io.WriteString(w, `{}`)
+}
+
+// find looks an object up as dockerd does: by full ID, then by name, then
+// by a unique ID prefix; a volume by its name only.
+func (d *daemon) find(kind, ref string) *object {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, o := range d.objects {
+		if o.kind == kind && o.id == ref {
+			return o
+		}
+	}
+	for _, o := range d.objects {
+		if o.kind == kind && o.name == ref {
+			return o
+		}
+	}
+	if kind == "volumes" {
+		return nil
+	}
+	var hit *object
+	for _, o := range d.objects {
+		if o.kind == kind && strings.HasPrefix(o.id, ref) {
+			if hit != nil {
+				return nil
+			}
+			hit = o
+		}
+	}
+	return hit
 }
 
 func (d *daemon) saw(prefix string) string {
@@ -108,6 +186,7 @@ type gateClient struct {
 	http *http.Client
 	root string
 	d    *daemon
+	sock string // the gate's
 }
 
 // newGate serves a Gate for task testID in front of a fake daemon.
@@ -130,7 +209,7 @@ func newGate(t *testing.T) *gateClient {
 	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 	}}}
-	return &gateClient{t: t, http: client, root: root, d: d}
+	return &gateClient{t: t, http: client, root: root, d: d, sock: sock}
 }
 
 // do sends a request through the gate and returns the status and body.
@@ -183,6 +262,11 @@ func TestGateRefusesHostReachingContainers(t *testing.T) {
 		"another's netns":      `{"HostConfig":{"NetworkMode":"container:other"}}`,
 		"another's volumes":    `{"HostConfig":{"VolumesFrom":["other"]}}`,
 		"own container's vols": `{"HostConfig":{"VolumesFrom":["agent"]}}`,
+		"another's by prefix":  `{"HostConfig":{"NetworkMode":"container:abcd"}}`,
+		"another's endpoint ID": `{"HostConfig":{"NetworkMode":"bridge"},` +
+			`"NetworkingConfig":{"EndpointsConfig":{"hostnet":{"NetworkID":"` + mynetID + `"}}}}`,
+		"syslog log driver": `{"HostConfig":{"LogConfig":{"Type":"syslog","Config":{"syslog-address":"tcp://127.0.0.1:22"}}}}`,
+		"gelf log driver":   `{"HostConfig":{"LogConfig":{"Type":"gelf","Config":{"gelf-address":"udp://127.0.0.1:1"}}}}`,
 	} {
 		status, out := c.do("POST", "/v1.45/containers/create", body)
 		if status != http.StatusForbidden || !strings.Contains(out, "atelier gate:") {
@@ -204,8 +288,9 @@ func TestGateForwardsTaskContainers(t *testing.T) {
 		"Binds":["` + work + `:/app:ro","` + c.root + `/new/dir:/n","myvol:/data","/var/run/docker.sock:/var/run/docker.sock"],
 		"Mounts":[{"Type":"bind","Source":"` + work + `","Target":"/m"},{"Type":"tmpfs","Target":"/t"}],
 		"NetworkMode":"mynet","Memory":9007199254740993,"MemorySwappiness":-1,"Privileged":false,"CapAdd":[],
-		"PortBindings":{"5432/tcp":[{"HostPort":"5732"}]},"RestartPolicy":{"Name":"no"},"MaskedPaths":null},
-		"NetworkingConfig":{"EndpointsConfig":{"mynet":{}}}}`
+		"PortBindings":{"5432/tcp":[{"HostPort":"5732"}]},"RestartPolicy":{"Name":"no"},"MaskedPaths":null,
+		"VolumesFrom":["mine:ro"],"LogConfig":{"Type":"json-file","Config":{"max-size":"1m"}}},
+		"NetworkingConfig":{"EndpointsConfig":{"mynet":{"NetworkID":"hostnet","Aliases":["db"]}}}}`
 	status, out := c.do("POST", "/v1.45/containers/create?name=db", body)
 	if status != http.StatusCreated {
 		t.Fatalf("create: status %d: %s", status, out)
@@ -213,8 +298,16 @@ func TestGateForwardsTaskContainers(t *testing.T) {
 	var got struct {
 		Labels     map[string]string
 		HostConfig struct {
-			Binds  []string
-			Memory json.Number
+			Binds       []string
+			Memory      json.Number
+			NetworkMode string
+			VolumesFrom []string
+		}
+		NetworkingConfig struct {
+			EndpointsConfig map[string]struct {
+				NetworkID string
+				Aliases   []string
+			}
 		}
 	}
 	if err := json.Unmarshal([]byte(c.d.body("POST /v1.45/containers/create")), &got); err != nil {
@@ -232,6 +325,21 @@ func TestGateForwardsTaskContainers(t *testing.T) {
 	}
 	if got.HostConfig.Memory.String() != "9007199254740993" {
 		t.Errorf("a 64-bit number was changed on the way: %s", got.HostConfig.Memory)
+	}
+	// Containers and networks go to the daemon by the IDs the checks found,
+	// the endpoint's NetworkID (which the daemon prefers) included.
+	if got.HostConfig.NetworkMode != mynetID || !slices.Equal(got.HostConfig.VolumesFrom, []string{mineID + ":ro"}) {
+		t.Errorf("network mode %q, volumes from %q; want them by ID", got.HostConfig.NetworkMode, got.HostConfig.VolumesFrom)
+	}
+	if ep, ok := got.NetworkingConfig.EndpointsConfig[mynetID]; !ok || ep.NetworkID != mynetID || len(got.NetworkingConfig.EndpointsConfig) != 1 ||
+		!slices.Equal(ep.Aliases, []string{"db"}) {
+		t.Errorf("endpoints = %+v; want mynet's by its ID, with its NetworkID and aliases", got.NetworkingConfig.EndpointsConfig)
+	}
+	if status, out := c.do("POST", "/containers/create", `{"HostConfig":{"NetworkMode":"container:agent"}}`); status != http.StatusCreated {
+		t.Fatalf("create in the own container's network: %d %s", status, out)
+	}
+	if b := c.d.body("POST /containers/create"); !strings.Contains(b, `"NetworkMode":"container:`+agentID+`"`) {
+		t.Errorf("create body = %s; want the network mode by the container's ID", b)
 	}
 
 	// A volume named in a mount that does not exist yet is created with the label.
@@ -251,8 +359,7 @@ func TestGateOwnership(t *testing.T) {
 	}{
 		{"GET", "/containers/mine/json", 200},
 		{"POST", "/containers/mine/stop", 200},
-		{"DELETE", "/containers/mine", 200},
-		{"GET", "/containers/missing/json", 404}, // the daemon's own answer
+		{"GET", "/containers/missing/json", 404}, // the daemon's own status
 		{"GET", "/containers/other/json", 403},
 		{"GET", "/containers/host/json", 403},
 		{"POST", "/containers/host/stop", 403},
@@ -267,7 +374,6 @@ func TestGateOwnership(t *testing.T) {
 		{"POST", "/containers/agent/rename", 403},
 		{"DELETE", "/containers/agent", 403},
 		{"GET", "/networks/mynet", 200},
-		{"DELETE", "/networks/mynet", 200},
 		{"GET", "/networks/hostnet", 403},
 		{"DELETE", "/networks/hostnet", 403},
 		{"GET", "/volumes/myvol", 200},
@@ -298,6 +404,104 @@ func TestGateOwnership(t *testing.T) {
 	// The gate hides the task's own container in a network it joined it to.
 	if _, out := c.do("GET", "/networks/mynet", ""); strings.Contains(out, "atl-"+testID) || !strings.Contains(out, `"db"`) {
 		t.Errorf("network inspect = %s", out)
+	}
+	// What the gate forwards names the objects by the full IDs its checks
+	// found, never by the task's reference.
+	for _, tc := range []struct{ method, uri, want string }{
+		{"POST", "/containers/mine/stop", "POST /v1.45/containers/" + mineID + "/stop"},
+		{"GET", "/containers/agent/json", "GET /v1.45/containers/" + agentID + "/json"},
+		{"GET", "/networks/mynet", "GET /v1.45/networks/" + mynetID},
+		{"POST", "/networks/mynet/connect", "POST /v1.45/networks/" + mynetID + "/connect"},
+		{"GET", "/volumes/myvol", "GET /v1.45/volumes/myvol"},
+		{"DELETE", "/containers/mine", "DELETE /v1.45/containers/" + mineID},
+		{"DELETE", "/networks/mynet", "DELETE /v1.45/networks/" + mynetID},
+	} {
+		body := ""
+		if strings.HasSuffix(tc.uri, "/connect") {
+			body = `{"Container":"agent","EndpointConfig":{"NetworkID":"hostnet","Aliases":["a"]}}`
+		}
+		if status, out := c.do(tc.method, "/v1.45"+tc.uri, body); status >= 400 {
+			t.Errorf("%s %s: status %d (%s)", tc.method, tc.uri, status, out)
+		}
+		if got := c.d.saw(tc.want); got == "" {
+			t.Errorf("%s %s did not reach the daemon as %s", tc.method, tc.uri, tc.want)
+		}
+	}
+	// The endpoint's NetworkID, which the daemon prefers to the network in
+	// the path, is the checked network's; the container goes by its ID.
+	if b := c.d.body("POST /v1.45/networks/" + mynetID + "/connect"); !strings.Contains(b, `"NetworkID":"`+mynetID+`"`) ||
+		!strings.Contains(b, `"Container":"`+agentID+`"`) {
+		t.Errorf("connect body = %s", b)
+	}
+}
+
+// TestGateChecksWhatItForwards: a reference that names one of the task's
+// objects when the gate checks it, and another (the box, say) when the
+// daemon resolves it, cannot reach the other. The task holds back the body
+// of an exec create while the gate checks the path, renames its container
+// to a prefix of another container's ID, then sends the body; and the same
+// with a network it deletes in between.
+func TestGateChecksWhatItForwards(t *testing.T) {
+	c := newGate(t)
+	sock := c.sock
+	// Control: by the box's ID prefix, refused.
+	if status, _ := c.do("POST", "/v1.45/containers/abcd/exec", `{"Cmd":["id"]}`); status != http.StatusForbidden {
+		t.Errorf("exec by the box's ID prefix: %d", status)
+	}
+	// The task's container is named "abcd", a prefix of the box's ID.
+	if status, out := c.do("POST", "/v1.45/containers/mine/rename?name=abcd", ""); status >= 400 {
+		t.Fatalf("rename: %d %s", status, out)
+	}
+	send := func(method, uri, body string, between func()) (int, string) {
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+			method, uri, len(body), body[:1])
+		time.Sleep(200 * time.Millisecond) // the gate has the head
+		between()
+		io.WriteString(conn, body[1:])
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(out)
+	}
+	status, out := send("POST", "/v1.45/containers/abcd/exec", `{"Cmd":["sh","-c","id"],"User":"0"}`, func() {
+		if status, out := c.do("POST", "/v1.45/containers/abcd/rename?name=elsewhere", ""); status >= 400 {
+			t.Fatalf("rename: %d %s", status, out)
+		}
+	})
+	c.d.mu.Lock()
+	execIn := slices.Clone(c.d.execIn)
+	c.d.mu.Unlock()
+	if slices.Contains(execIn, hostID) {
+		t.Errorf("an exec was created in the box container (answer %d %s)", status, out)
+	}
+	if status == http.StatusCreated && !slices.Equal(execIn, []string{mineID}) {
+		t.Errorf("exec created in %v, want only in the task's own (%s)", execIn, mineID)
+	}
+
+	// The network variant: the task's network "abcd" (a prefix of another
+	// task's network ID), connected to and deleted in between.
+	c.d.mu.Lock()
+	c.d.objects = append(c.d.objects, &object{"networks", "9999999999999999999999999999999999999999999999999999999999999999", "abcd",
+		map[string]string{LabelTask: testID}})
+	c.d.mu.Unlock()
+	status, out = send("POST", "/v1.45/networks/abcd/connect", `{"Container":"agent"}`, func() {
+		if status, out := c.do("DELETE", "/v1.45/networks/abcd", ""); status >= 400 {
+			t.Fatalf("delete: %d %s", status, out)
+		}
+	})
+	if got := c.d.saw("POST /v1.45/networks/" + hostnetID); got != "" {
+		t.Errorf("the connect reached another's network: %s", got)
+	}
+	if got := c.d.saw("POST /v1.45/networks/abcd/"); got != "" {
+		t.Errorf("the connect was forwarded by name: %s (answer %d %s)", got, status, out)
 	}
 }
 
@@ -335,6 +539,8 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/session", ""},
 		{"POST", "/build?version=2", ""},
 		{"POST", "/build?networkmode=host", ""},
+		{"POST", "/build?remote=" + url.QueryEscape("git@github.com:org/private.git"), ""},
+		{"POST", "/build?remote=" + url.QueryEscape("https://example.com/context.tar"), ""},
 		{"POST", "/containers/mine/update", "{}"},
 		{"GET", "/containers/mine/export", ""},
 		{"GET", "/containers/mine%2Fx/json", ""},

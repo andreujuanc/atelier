@@ -436,14 +436,21 @@ daemon. The gate (`atl gate <slug>`, started by `atl` and stopped when the task 
 log in `gate-<slug>.log` next to `hook.log`) forwards only what a task may do:
 
 - everything the task creates gets the label `atelier.task`; the task lists, inspects,
-  stops and removes only what carries its own;
+  stops and removes only what carries its own. Each container or network a call names (in
+  the path or in the request: a network mode, volumes from, endpoint settings, network
+  connect) is checked and forwarded by the full ID the check found, so a name that comes
+  to mean something else by the time Docker reads it (Docker also takes a unique ID
+  prefix for a name) never reaches another object; volumes are named exactly;
 - bind mounts must come from the task dir (symlinks resolved); a mount of
   `/var/run/docker.sock` becomes a mount of the gate's socket, so tools that drive Docker
   themselves (localstack, testcontainers) stay inside the same rules;
 - privileged mode, host network/PID/IPC, added capabilities, devices, security options,
-  other runtimes and volume driver options are refused; a container setting the gate does
-  not know is refused too;
-- images are shared: a task may pull and build, not remove;
+  other runtimes, volume driver options and log drivers other than `json-file`, `local` and
+  `none` (the others send logs to an address from where the daemon runs) are refused; a
+  container setting the gate does not know is refused too;
+- images are shared: a task may pull and build, not remove; a build from a remote URL
+  (`docker build <git or https URL>`) is refused, since the daemon would fetch it with the
+  host's credentials: build from a local context;
 - the task's own container is joined to every network the task creates, so services
   answer by their compose service name; the task cannot stop or remove that container.
 
