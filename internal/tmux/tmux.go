@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -56,6 +57,13 @@ type WindowSpec struct {
 	Env     map[string]string // passed with -e
 	Argv    []string          // command
 	Tag     string            // stored as window user option @atl_session; "" → untagged
+	// GlobalEnv is set in the server's global environment, which the window
+	// inherits, in the same tmux invocation that creates the window (and
+	// the server, if none runs yet: a server takes the environment of the
+	// process that starts it, which need not have these values): the values
+	// reach tmux on its standard input, never on a command line (see
+	// globalEnvScript).
+	GlobalEnv map[string]string
 }
 
 // Error is returned when a tmux invocation fails.
@@ -91,8 +99,16 @@ func (c *Client) args(args ...string) []string {
 
 // run executes tmux and returns trimmed stdout.
 func (c *Client) run(ctx context.Context, args ...string) (string, error) {
+	return c.runIn(ctx, "", args...)
+}
+
+// runIn is run with stdin as tmux's standard input.
+func (c *Client) runIn(ctx context.Context, stdin string, args ...string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "tmux", c.args(args...)...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	// A freshly started server daemonizes; never hang on inherited pipes.
@@ -120,6 +136,14 @@ func noServer(err error) bool {
 	return strings.Contains(s, "no server running") ||
 		strings.Contains(s, "No such file or directory") ||
 		strings.Contains(s, "Connection refused")
+}
+
+// serverExited reports whether err is tmux's "server exited unexpectedly":
+// the client reached a server that was on its way out (e.g. just after
+// kill-server, or as its last session closed), so there is none now.
+func serverExited(err error) bool {
+	var te *Error
+	return errors.As(err, &te) && strings.Contains(te.Stderr, "server exited unexpectedly")
 }
 
 // noSessions reports whether err means there is no server or a server
@@ -156,6 +180,42 @@ func gone(err error) bool {
 	return noServer(err) || strings.Contains(te.Stderr, "can't find window") || strings.Contains(te.Stderr, "no such window")
 }
 
+// globalEnvScript is the tmux commands that set env in the server's global
+// environment, for `source-file -`: on tmux's standard input, so that no
+// value appears on a command line, nor in an error (see redact). A value
+// may not contain a single quote or a control character. "" for no env.
+func globalEnvScript(env map[string]string) (string, error) {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var script strings.Builder
+	for _, k := range keys {
+		v := env[k]
+		if k == "" || strings.ContainsFunc(k+v, func(r rune) bool { return r == '\'' || r < 0x20 || r == 0x7f }) {
+			return "", fmt.Errorf("tmux: $%s has a character atl cannot pass to tmux (a quote or a control character)", k)
+		}
+		fmt.Fprintf(&script, "set-environment -g '%s' '%s'\n", k, v)
+	}
+	return script.String(), nil
+}
+
+// redact removes env's values from a tmux error.
+func redact(err error, env map[string]string) error {
+	var te *Error
+	if !errors.As(err, &te) {
+		return err
+	}
+	msg := te.Stderr
+	for _, v := range env {
+		if v != "" {
+			msg = strings.ReplaceAll(msg, v, "…")
+		}
+	}
+	return &Error{Args: te.Args, Stderr: msg, Err: te.Err}
+}
+
 // HasSession reports whether a session with exactly this name exists.
 func (c *Client) HasSession(ctx context.Context, name string) bool {
 	_, err := c.run(ctx, "has-session", "-t", "="+name)
@@ -182,12 +242,21 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	if spec.Session == "" {
 		return "", errors.New("tmux: new window: empty session name")
 	}
+	script, err := globalEnvScript(spec.GlobalEnv)
+	if err != nil {
+		return "", err
+	}
 	build := func(exists bool) []string {
 		var args []string
+		if script != "" {
+			// One invocation: if it starts the server, the variables are
+			// set in it before the window is created.
+			args = []string{"source-file", "-", ";"}
+		}
 		if exists {
-			args = []string{"new-window", "-t", "=" + spec.Session + ":"}
+			args = append(args, "new-window", "-t", "="+spec.Session+":")
 		} else {
-			args = []string{"new-session", "-d", "-s", spec.Session}
+			args = append(args, "new-session", "-d", "-s", spec.Session)
 		}
 		if spec.Name != "" {
 			args = append(args, "-n", spec.Name)
@@ -214,14 +283,21 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	defer cancel()
 
 	exists := c.HasSession(ctx, spec.Session)
-	out, err := c.run(ctx, build(exists)...)
+	out, err := c.runIn(ctx, script, build(exists)...)
+	if serverExited(err) {
+		// Reached a server on its way out (just killed, or its last
+		// session just closed), which ran nothing: once more, with the
+		// server that is there now, or a new one.
+		exists = c.HasSession(ctx, spec.Session)
+		out, err = c.runIn(ctx, script, build(exists)...)
+	}
 	var te *Error
 	if !exists && err != nil && out == "" && errors.As(err, &te) && strings.Contains(te.Stderr, "duplicate session") {
 		// Lost a race with another atl creating the same session.
-		out, err = c.run(ctx, build(true)...)
+		out, err = c.runIn(ctx, script, build(true)...)
 	}
 	if err != nil {
-		return "", fmt.Errorf("tmux: launch window in session %s: %w", spec.Session, err)
+		return "", fmt.Errorf("tmux: launch window in session %s: %w", spec.Session, redact(err, spec.GlobalEnv))
 	}
 	id := strings.TrimSpace(out)
 	if !strings.HasPrefix(id, "@") || strings.ContainsAny(id, " \n") {
@@ -341,11 +417,100 @@ func (c *Client) SelectWindow(ctx context.Context, window string) error {
 	return nil
 }
 
+// SetWindowOption sets option opt of window (an id, "@N") to value.
+func (c *Client) SetWindowOption(ctx context.Context, window, opt, value string) error {
+	if !strings.HasPrefix(window, "@") {
+		return fmt.Errorf("tmux: set window option: bad window id %q", window)
+	}
+	if _, err := c.run(ctx, "set-option", "-w", "-t", window, opt, value); err != nil {
+		return fmt.Errorf("tmux: set %s of window %s: %w", opt, window, err)
+	}
+	return nil
+}
+
+// SetSessionOption sets option opt of the named session (exact name) to
+// value.
+func (c *Client) SetSessionOption(ctx context.Context, session, opt, value string) error {
+	if _, err := c.run(ctx, "set-option", "-t", "="+session+":", opt, value); err != nil {
+		return fmt.Errorf("tmux: set %s of session %s: %w", opt, session, err)
+	}
+	return nil
+}
+
+// CapturePane returns the text of the first pane of window (an id, "@N"),
+// its scrollback included, with lines tmux wrapped joined (capture-pane -J),
+// and the pane's width in columns. The text stays in this process: it is on
+// no command line and in no error.
+func (c *Client) CapturePane(ctx context.Context, window string) (text string, width int, err error) {
+	if !strings.HasPrefix(window, "@") {
+		return "", 0, fmt.Errorf("tmux: capture pane: bad window id %q", window)
+	}
+	w, err := c.run(ctx, "display-message", "-p", "-t", window, "#{pane_width}")
+	if err != nil {
+		return "", 0, fmt.Errorf("tmux: capture pane of window %s: %w", window, err)
+	}
+	width, _ = strconv.Atoi(strings.TrimSpace(w))
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "tmux", c.args("capture-pane", "-p", "-J", "-S", "-", "-E", "-", "-t", window)...)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.WaitDelay = 2 * time.Second
+	if err := cmd.Run(); err != nil {
+		return "", 0, fmt.Errorf("tmux: capture pane of window %s: %s", window, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), width, nil
+}
+
 // SetBuffer puts text in a new automatic paste buffer, the one tmux's
 // paste-buffer (prefix ]) pastes by default.
 func (c *Client) SetBuffer(ctx context.Context, text string) error {
 	if _, err := c.run(ctx, "set-buffer", "--", text); err != nil {
 		return fmt.Errorf("tmux: set paste buffer: %w", err)
+	}
+	return nil
+}
+
+// ErrNoClient is returned by Copy when no terminal is attached to the
+// session.
+var ErrNoClient = errors.New("no terminal is attached to the session")
+
+// Copy puts text in a new automatic paste buffer and in the clipboard of the
+// terminal attached to the named session (exact name), the one active last
+// if there are several: load-buffer -w, which sends it to that terminal with
+// the xterm escape sequence (OSC 52) if tmux takes the terminal for one that
+// supports it (its terminfo's Ms, or the clipboard terminal feature; tmux
+// gives xterm* that by default) and set-clipboard is not off. This is what
+// Claude Code does itself when it runs in tmux. Without an attached
+// terminal it returns ErrNoClient (wrapped) and copies nothing: whoever
+// copies does so where the user is looking.
+//
+// The text reaches tmux on its standard input, never on a command line, and
+// is in no error.
+func (c *Client) Copy(ctx context.Context, session string, text []byte) error {
+	if len(text) == 0 {
+		return errors.New("tmux: copy: nothing to copy")
+	}
+	out, err := c.run(ctx, "list-clients", "-t", "="+session, "-F", "#{client_activity} #{client_name}")
+	if err != nil {
+		if noSession(err) {
+			return fmt.Errorf("tmux: copy: session %s: %w", session, ErrNoClient)
+		}
+		return fmt.Errorf("tmux: copy: %w", err)
+	}
+	client, last := "", int64(-1)
+	for _, line := range strings.Split(out, "\n") {
+		act, name, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || name == "" {
+			continue
+		}
+		if n, err := strconv.ParseInt(act, 10, 64); err == nil && n > last {
+			client, last = name, n
+		}
+	}
+	if client == "" {
+		return fmt.Errorf("tmux: copy: session %s: %w", session, ErrNoClient)
+	}
+	if _, err := c.runIn(ctx, string(text), "load-buffer", "-w", "-t", client, "-"); err != nil {
+		return fmt.Errorf("tmux: copy to the terminal of session %s: %w", session, err)
 	}
 	return nil
 }

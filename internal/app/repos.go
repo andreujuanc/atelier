@@ -130,6 +130,9 @@ func lockFile(ctx context.Context, path string, wait time.Duration, busy string)
 // created as above and the same repo row becomes rw. Any other repeat is an
 // error.
 func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) (*model.Task, error) {
+	if err := outsideSandbox("add a repo"); err != nil {
+		return nil, err
+	}
 	name, mode, err := validRepoArg(r.Name, r.Mode)
 	if err != nil {
 		return nil, err
@@ -169,7 +172,7 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 	if mode == model.ModeRW {
 		if !noFetch {
 			fmt.Fprintf(a.out(), "fetching %s...\n", name)
-			if err := gitx.Fetch(ctx, repo); err != nil {
+			if err := a.fetchOrigin(ctx, name, repo); err != nil {
 				return nil, fmt.Errorf("repo %s: %w", name, err)
 			}
 		}
@@ -184,9 +187,9 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 		}
 		_, berr := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
 		branchExisted := berr == nil
-		if err := gitx.AddWorktree(ctx, repo, wt, t.Branch, tr.BaseCommit); err != nil {
+		if err := a.addWorktree(ctx, name, repo, wt, t.Branch, tr.BaseCommit); err != nil {
 			// git may have created the branch (and worktree) before
-			// failing, e.g. in a post-checkout hook: undo only what this
+			// failing, e.g. when the checkout fails: undo only what this
 			// call verifiably created. "already exists" means git refused
 			// up front and whatever is there belongs to someone else.
 			if !strings.Contains(err.Error(), "already exists") {
@@ -200,6 +203,9 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 			return nil, fmt.Errorf("repo %s: %w", name, err)
 		}
 		createdBranch = !branchExisted
+		if afterWorktreeAdd != nil {
+			afterWorktreeAdd(wt)
+		}
 	}
 	record := a.Store.AddTaskRepo
 	if upgrade {
@@ -239,6 +245,23 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 		if err := a.runSetup(ctx, t, func(x model.TaskRepo) bool { return x.Name == name }); err != nil {
 			a.warnf("setup for %s in task %s failed (repo kept): %v", name, t.Slug, err)
 		}
+	}
+	if a.sandboxedSessionsRun(ctx, t) {
+		// A running container cannot get a new mount: neither the repo (ro)
+		// nor its clone's git database (rw) is in there.
+		msg := fmt.Sprintf("added %s (%s) to %s", name, mode, t.Slug)
+		if upgrade {
+			msg = fmt.Sprintf("upgraded %s to rw in %s", name, t.Slug)
+		}
+		if mode == model.ModeRW {
+			msg += ": worktree at " + wt
+		}
+		fmt.Fprintln(a.out(), msg)
+		a.warnf("the sessions running now in %s do not see %s: their container was made before; close them, then start or resume a session to get a container that does",
+			t.Slug, name)
+		return t, nil
+	}
+	if mode == model.ModeRW {
 		if upgrade {
 			fmt.Fprintf(a.out(), "upgraded %s to rw in %s: worktree at %s; running sessions can already see it\n", name, t.Slug, wt)
 		} else {
@@ -250,6 +273,10 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 	}
 	return t, nil
 }
+
+// afterWorktreeAdd, if set (tests only), runs in AddRepo between the
+// worktree's creation and the repo's insert.
+var afterWorktreeAdd func(wt string)
 
 // undoWorktree removes (if removeWT) worktree wt of repo name and, if
 // deleteBranch and the branch exists, deletes it; failures are warnings.

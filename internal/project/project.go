@@ -29,6 +29,7 @@ type Project struct {
 	Setup    string            `toml:"setup"`    // sh -c in each rw worktree after creation
 	Teardown string            `toml:"teardown"` // sh -c in each rw worktree before removal
 	Env      map[string]string `toml:"env"`
+	Image    string            `toml:"image"` // task container image when tasks are sandboxed ("" → the workspace default)
 }
 
 // Load reads and validates the project called name. An unknown name yields

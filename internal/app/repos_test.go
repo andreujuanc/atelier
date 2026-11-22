@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,7 +21,9 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
+	"github.com/andreujuanc/atelier/internal/tmux"
 )
 
 func TestAvailableRepos(t *testing.T) {
@@ -339,22 +342,14 @@ func TestAddRepoRollback(t *testing.T) {
 		}
 	}
 
-	// A failing post-checkout hook: git creates branch + worktree, then fails.
-	hookPath := filepath.Join(web, ".git", "hooks", "post-checkout")
-	if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// A failed checkout: git creates the branch, then fails.
+	restore := breakCheckout(t, web, "origin/main:README")
 	if _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"web", model.ModeRW}, true); err == nil {
-		t.Fatal("AddRepo succeeded despite failing hook")
+		t.Fatal("AddRepo succeeded despite the failed checkout")
 	}
-	check("hook")
+	check("checkout")
 	noBranch(t, web, task.Branch)
-	if err := os.Remove(hookPath); err != nil {
-		t.Fatal(err)
-	}
+	restore()
 
 	// The branch already exists: AddWorktree fails, the branch is kept.
 	git(t, web, "branch", task.Branch)
@@ -519,37 +514,13 @@ func TestAddRepoTaskClosedMeanwhile(t *testing.T) {
 		t.Fatal(err)
 	}
 	web := e.canonical("web")
-	sig := filepath.Join(e.root, "sig")
-	if err := os.MkdirAll(sig, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	hookPath := filepath.Join(web, ".git", "hooks", "post-checkout")
-	if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	script := "#!/bin/sh\ntouch '" + sig + "/started'\nwhile [ ! -f '" + sig + "/go' ]; do sleep 0.02; done\n"
-	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"web", model.ModeRW}, true)
-		done <- err
-	}()
-	deadline := time.Now().Add(20 * time.Second)
-	for !exists(filepath.Join(sig, "started")) {
-		if time.Now().After(deadline) {
-			t.Fatal("hook never started")
+	afterWorktreeAdd = func(string) {
+		if err := e.app.Store.SetTaskStatus(ctx, task.ID, model.StatusDone); err != nil {
+			t.Error(err)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	if err := e.app.Store.SetTaskStatus(ctx, task.ID, model.StatusDone); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sig, "go"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	err = <-done
+	t.Cleanup(func() { afterWorktreeAdd = nil })
+	_, err = e.app.AddRepo(ctx, task.Slug, RepoArg{"web", model.ModeRW}, true)
 	if err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("err = %v, want task closed", err)
 	}
@@ -600,5 +571,79 @@ func TestDoneWaitsForAddRepo(t *testing.T) {
 	}
 	if exists(wt) || worktreeCount(t, web) != 1 {
 		t.Fatal("worktree of the repo added meanwhile left behind")
+	}
+}
+
+// TestAddRepoWarnsSandboxedSessions: with the sandbox on, a repo added (or
+// upgraded to rw) while the task's container runs sessions is not in that
+// container, and atl add says so; it does not when no session runs, nor
+// when there is no container.
+func TestAddRepoWarnsSandboxedSessions(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	for _, r := range []string{"api", "docs", "lib", "web", "more"} {
+		e.addRepo(t, r, "main")
+	}
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Boxed", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd := &fakeDocker{label: "spec", agent: e.app.sandboxID(task)} // the task's container exists
+	e.app.Sandbox = &sandbox.Config{Image: "task-image"}
+	e.app.Docker = fd.run
+	const warning = "do not see"
+	add := func(r RepoArg) string {
+		t.Helper()
+		e.app.Out.(*bytes.Buffer).Reset()
+		if _, err := e.app.AddRepo(ctx, task.Slug, r, true); err != nil {
+			t.Fatal(err)
+		}
+		return e.outString()
+	}
+
+	// No live session: the next session gets a new container anyway.
+	if out := add(RepoArg{"docs", model.ModeRO}); strings.Contains(out, warning) {
+		t.Errorf("warned without live sessions:\n%s", out)
+	}
+
+	// A live session in the container.
+	s := &model.Session{TaskID: task.ID, State: model.StateIdle}
+	if err := e.app.Store.CreateSession(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.app.Tmux.NewWindow(ctx, tmux.WindowSpec{Session: tmux.SessionName(task.Slug), Name: "claude-x",
+		Dir: e.app.Paths.TaskDir(task.Slug), Argv: []string{"sleep", "300"}, Tag: strconv.FormatInt(s.ID, 10)}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		r    RepoArg
+		name string
+	}{
+		{RepoArg{"lib", model.ModeRO}, "lib"},
+		{RepoArg{"web", model.ModeRW}, "web"},
+		{RepoArg{"docs", model.ModeRW}, "docs"}, // ro → rw
+	} {
+		out := add(c.r)
+		if !strings.Contains(out, "the sessions running now in "+task.Slug+" do not see "+c.name) ||
+			!strings.Contains(out, "start or resume a session") || strings.Contains(out, "can already see it") {
+			t.Errorf("add %+v:\n%s", c.r, out)
+		}
+	}
+
+	// Live sessions, but no container (they predate the sandbox): no warning.
+	fd.label = ""
+	if out := add(RepoArg{"more", model.ModeRO}); strings.Contains(out, warning) {
+		t.Errorf("warned without a container:\n%s", out)
+	}
+	// And never with the sandbox off.
+	e.app.Sandbox = nil
+	fd.label = "spec"
+	task2, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Plain", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task = task2
+	if out := add(RepoArg{"docs", model.ModeRO}); strings.Contains(out, warning) {
+		t.Errorf("warned with the sandbox off:\n%s", out)
 	}
 }

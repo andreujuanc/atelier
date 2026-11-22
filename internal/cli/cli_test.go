@@ -35,6 +35,9 @@ func TestMain(m *testing.M) {
 		// No global Claude Code settings (a global statusLine would keep
 		// atelier's out of task settings, see gen.WriteSettings).
 		"CLAUDE_CONFIG_DIR": filepath.Join(dir, "claude"),
+		// The sandbox is on by default; these tests run sessions next to
+		// atl, as with ATL_SANDBOX=off (the sandbox tests switch it on).
+		"ATL_SANDBOX": "off",
 	} {
 		os.Setenv(k, v)
 	}
@@ -252,6 +255,110 @@ func doctorLevel(out, name string) string {
 	return ""
 }
 
+// TestSandboxSetting: the sandbox is on unless ATL_SANDBOX=off, doctor says
+// which mode is on, any other value keeps atl from starting, and without
+// Docker a session fails in one line that names the way out.
+func TestSandboxSetting(t *testing.T) {
+	setup(t)
+	t.Setenv("ATL_SANDBOX_ID", "")
+	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock") // no daemon, whatever this machine has
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	line := func(out, name string) string {
+		for _, l := range strings.Split(out, "\n") {
+			if f := strings.Fields(l); len(f) >= 2 && f[1] == name {
+				return l
+			}
+		}
+		return ""
+	}
+
+	_, out, _ := atl(t, "doctor") // TestMain: ATL_SANDBOX=off
+	if l := line(out, "sandbox"); !strings.HasPrefix(l, "ok") || !strings.Contains(l, "off ($ATL_SANDBOX=off)") ||
+		!strings.Contains(l, "going away") || line(out, "docker") != "" {
+		t.Errorf("doctor, off:\n%s", out)
+	}
+	for v, want := range map[string]string{"": "docker (the default): ", "docker": "docker: ", "DOCKER": "docker: "} {
+		t.Setenv("ATL_SANDBOX", v)
+		code, out, _ := atl(t, "doctor")
+		if l := line(out, "sandbox"); code != 1 || !strings.HasPrefix(l, "ok") || !strings.Contains(l, want+"each task's sessions run in the task's own container") {
+			t.Errorf("doctor, ATL_SANDBOX=%q: %d\n%s", v, code, out)
+		}
+		if l := line(out, "docker"); !strings.HasPrefix(l, "FAIL") || !strings.Contains(l, "cannot reach Docker") ||
+			!strings.Contains(l, "set ATL_SANDBOX=off") {
+			t.Errorf("doctor, ATL_SANDBOX=%q, no Docker:\n%s", v, out)
+		}
+	}
+	t.Setenv("ATL_SANDBOX", "")
+	os.Unsetenv("ATL_SANDBOX")
+	if _, out, _ := atl(t, "doctor"); !strings.Contains(line(out, "sandbox"), "docker (the default): ") {
+		t.Errorf("doctor, unset:\n%s", out)
+	}
+
+	// The first thing a session says without Docker: one line, what to do.
+	if code, _, errs := atl(t, "new", "Boxed", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	code, out, errs := atl(t, "session", "boxed")
+	if code != 1 || strings.Count(errs, "\n") != 1 || !strings.Contains(errs, "cannot reach Docker, which runs each task's sessions in the task's own container (") ||
+		!strings.Contains(errs, "start Docker or give atl access to it, or set ATL_SANDBOX=off to run sessions without a container") {
+		t.Errorf("session without Docker: %d %q %q", code, out, errs)
+	}
+
+	// Anything else is refused, naming the two values.
+	for _, v := range []string{"dokcer", "0", "none"} {
+		t.Setenv("ATL_SANDBOX", v)
+		code, _, errs := atl(t, "ls")
+		if code != 1 || !strings.Contains(errs, `$ATL_SANDBOX="`+v+`": want docker (the default, also when unset) or off`) {
+			t.Errorf("ls with ATL_SANDBOX=%q: %d %q", v, code, errs)
+		}
+		if code, out, _ := atl(t, "doctor"); code != 1 || !strings.HasPrefix(line(out, "sandbox"), "FAIL") {
+			t.Errorf("doctor with ATL_SANDBOX=%q: %d\n%s", v, code, out)
+		}
+	}
+}
+
+// TestSandboxMountsSetting: with the sandbox on, a bad $ATL_SANDBOX_MOUNTS
+// keeps atl from starting, in one line that names the path and the rule it
+// broke, and doctor fails on it; a good one starts; with the sandbox off it
+// is not checked.
+func TestSandboxMountsSetting(t *testing.T) {
+	root := setup(t)
+	t.Setenv("ATL_SANDBOX_ID", "")
+	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
+	t.Setenv("ATL_SANDBOX", "docker")
+	host := t.TempDir()
+	file := filepath.Join(host, "npmrc")
+	if err := os.WriteFile(file, []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for v, want := range map[string]string{
+		"/":                         "atl: $ATL_SANDBOX_MOUNTS: / is the root directory: every task would get the whole host\n",
+		file + ":relative/x":        "atl: $ATL_SANDBOX_MOUNTS: relative/x is not an absolute path\n",
+		file + ":" + host + "/gone": "atl: $ATL_SANDBOX_MOUNTS: " + host + "/gone does not exist here (it must exist here and at the same path on the host)\n",
+		filepath.Join(root, "repos"): "atl: $ATL_SANDBOX_MOUNTS: " + filepath.Join(root, "repos") + " is the repos dir ($ATL_REPOS), " +
+			filepath.Join(root, "repos") + ", which the sandbox keeps from tasks\n",
+	} {
+		t.Setenv("ATL_SANDBOX_MOUNTS", v)
+		if code, out, errs := atl(t, "ls"); code != 1 || out != "" || errs != want {
+			t.Errorf("ls with %q: %d %q %q; want %q", v, code, out, errs, want)
+		}
+		if code, out, _ := atl(t, "doctor"); code != 1 || doctorLevel(out, "sandbox") != "ok" || !strings.Contains(out, "FAIL  sandbox mounts") {
+			t.Errorf("doctor with %q: %d\n%s", v, code, out)
+		}
+	}
+	// ~ is the home dir (root here; host is next to it).
+	t.Setenv("ATL_SANDBOX_MOUNTS", "~/../"+filepath.Base(host)+"/npmrc:")
+	if code, _, errs := atl(t, "ls"); code != 0 {
+		t.Errorf("ls with a good list: %d %q", code, errs)
+	}
+	t.Setenv("ATL_SANDBOX", "off")
+	t.Setenv("ATL_SANDBOX_MOUNTS", "/")
+	if code, _, errs := atl(t, "ls"); code != 0 {
+		t.Errorf("ls, sandbox off: %d %q", code, errs)
+	}
+}
+
 func TestSessionsSummary(t *testing.T) {
 	ss := func(states ...model.SessionState) []model.Session {
 		var out []model.Session
@@ -283,6 +390,13 @@ func TestPRExitCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// An origin gh can name, which the user's own rule maps to the local one.
+	global := filepath.Join(root, "gitconfig")
+	if err := os.WriteFile(global, []byte("[url \""+filepath.Join(root, "origin.git")+"\"]\n\tinsteadOf = https://github.com/o/api.git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	git(t, filepath.Join(root, "repos", "api"), "remote", "set-url", "origin", "https://github.com/o/api.git")
 
 	if code, _, errs := atl(t, "new", "ship", "--repo", "api", "--no-fetch"); code != 0 {
 		t.Fatalf("new: %d %s", code, errs)
@@ -302,6 +416,24 @@ func TestPRExitCode(t *testing.T) {
 	git(t, wt, "push", "-q", "origin", "atl/ship")
 	if code, out, errs := atl(t, "pr", "ship"); code != 1 || out != "api\tskipped: gh: boom\n" || errs != "" {
 		t.Fatalf("pr (gh fails): %d %q %q", code, out, errs)
+	}
+}
+
+func TestReposPin(t *testing.T) {
+	root := setup(t)
+	origin := filepath.Join(root, "origin.git")
+	if code, out, errs := atl(t, "repos", "pin", "api"); code != 0 || out != "api: pinned "+origin+"\n" {
+		t.Fatalf("repos pin: %d %q %s", code, out, errs)
+	}
+	git(t, filepath.Join(root, "repos", "api"), "remote", "set-url", "origin", "/elsewhere.git")
+	if code, out, errs := atl(t, "repos", "pin", "api"); code != 0 || out != "api: pinned /elsewhere.git (was "+origin+")\n" {
+		t.Fatalf("repos pin after set-url: %d %q %s", code, out, errs)
+	}
+	if code, _, errs := atl(t, "repos", "pin", "nope"); code != 1 || !strings.Contains(errs, "does not exist") {
+		t.Fatalf("repos pin nope: %d %s", code, errs)
+	}
+	if code, _, _ := atl(t, "repos", "pin"); code != 2 {
+		t.Fatalf("repos pin without a repo: %d", code)
 	}
 }
 

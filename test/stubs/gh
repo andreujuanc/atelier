@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Stub `gh` for test/e2e.sh: logs argv and cwd to $E2E_GH_LOG (default
-# ./.e2e-gh.log) and prints a PR URL.
+# Stub `gh` for test/e2e.sh: logs its cwd, the number of entries in it and its
+# argv to $E2E_GH_LOG (default ./.e2e-gh.log), and prints the URL of a PR in
+# the repository given with --repo. Like gh run outside a git repository, it
+# fails without --repo.
 set -euo pipefail
 
 if [[ "${1:-}" == "--version" ]]; then
@@ -8,10 +10,24 @@ if [[ "${1:-}" == "--version" ]]; then
 	exit 0
 fi
 
+shopt -s nullglob dotglob
+entries=(*)
 log="${E2E_GH_LOG:-$PWD/.e2e-gh.log}"
 {
-	printf 'gh cwd=%s argv=' "$PWD"
+	printf 'gh cwd=%s entries=%d argv=' "$PWD" "${#entries[@]}"
 	printf '[%s]' "$@"
 	printf '\n'
 } >>"$log"
-echo "https://github.com/example/$(basename "$PWD")/pull/1"
+
+repo="" prev=""
+for a in "$@"; do
+	if [[ "$prev" == "--repo" ]]; then
+		repo="$a"
+	fi
+	prev="$a"
+done
+if [[ -z "$repo" ]]; then
+	echo "gh stub: no --repo given" >&2
+	exit 1
+fi
+echo "https://github.com/$repo/pull/1"

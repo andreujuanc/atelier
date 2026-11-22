@@ -18,6 +18,7 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/tmux"
 	"github.com/andreujuanc/atelier/internal/tui"
 )
@@ -174,6 +175,27 @@ func args(v cobra.PositionalArgs) cobra.PositionalArgs {
 	}
 }
 
+// insideContainer refuses, in a sandboxed task's container, every command
+// but the ones that work there: they ask the task's gate and never open
+// atelier's database, which is not in the container (hook, statusline,
+// note, notes, push, fetch), or need nothing at all (help, completion).
+func insideContainer(cmd *cobra.Command) error {
+	if !sandbox.Inside() {
+		return nil
+	}
+	for c := cmd; c.HasParent(); c = c.Parent() {
+		switch c.Name() {
+		case "hook", "statusline", "note", "notes", "push", "fetch", "help", "completion":
+			return nil
+		}
+	}
+	what := cmd.CommandPath()
+	if !cmd.HasParent() {
+		what = "atl (the TUI)"
+	}
+	return fmt.Errorf("%s does not work inside a task container (in here atl only does hooks, the status line, note, notes, push and fetch, through the task's gate); run it where atelier runs", what)
+}
+
 func (c *cli) rootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "atl",
@@ -182,6 +204,9 @@ func (c *cli) rootCmd() *cobra.Command {
 			"across one or more repos; Claude runs inside tmux.",
 		SilenceErrors: true,
 		SilenceUsage:  true,
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			return insideContainer(cmd)
+		},
 		// With no subcommand: the TUI on a terminal, else the help.
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if !isTerminal(os.Stdin) || !isTerminal(c.stdout) {
@@ -198,7 +223,8 @@ func (c *cli) rootCmd() *cobra.Command {
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	root.AddCommand(
 		c.newCmd(), c.addCmd(), c.reposCmd(), c.lsCmd(), c.openCmd(), c.sessionCmd(), c.resumeCmd(), c.statusCmd(), c.renameCmd(),
-		c.diffCmd(), c.prCmd(), c.finishCmd("done"), c.finishCmd("cancel"), c.doctorCmd(), c.hookCmd(), c.statuslineCmd(),
+		c.diffCmd(), c.prCmd(), c.finishCmd("done"), c.finishCmd("cancel"), c.doctorCmd(), c.hookCmd(), c.statuslineCmd(), c.gateCmd(),
+		c.remoteCmd(true), c.remoteCmd(false), c.tokenCmd(),
 		c.showCmd(), c.transcriptCmd(), c.noteCmd(), c.notesCmd(), c.assistantCmd(),
 	)
 	return root

@@ -2,6 +2,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,7 +35,7 @@ func Resolve() (Paths, error) {
 		return Paths{}, fmt.Errorf("resolve home directory: %w", err)
 	}
 	get := func(env, def string) (string, error) {
-		v := expandHome(os.Getenv(env), home)
+		v := ExpandHome(os.Getenv(env), home)
 		// Per the XDG Base Directory spec, relative XDG_* values are invalid
 		// and must be ignored.
 		if v == "" || (strings.HasPrefix(env, "XDG_") && !filepath.IsAbs(v)) {
@@ -97,7 +99,8 @@ func Resolve() (Paths, error) {
 	return p, nil
 }
 
-func expandHome(p, home string) string {
+// ExpandHome replaces a leading "~" ("~" alone or "~/...") in p with home.
+func ExpandHome(p, home string) string {
 	if p == "~" {
 		return home
 	}
@@ -116,8 +119,63 @@ func (p Paths) RepoPath(name string) string { return filepath.Join(p.Repos, name
 // WorktreePath returns Tasks/slug/repo.
 func (p Paths) WorktreePath(slug, repo string) string { return filepath.Join(p.Tasks, slug, repo) }
 
+// RunDir returns the directory of task slug's sandbox runtime files (the
+// gate's socket, the atl binary for the task container): a directory named
+// by a short hash of the task dir under $ATL_WORKSPACE/run, else under
+// <StateDir>-run. The name is short and fixed-length because the socket path
+// must fit in 107 bytes. It is outside StateDir and the data dir, which a
+// task container gets to see, so one task never sees another's socket.
+func (p Paths) RunDir(slug string) string {
+	return filepath.Join(p.runRoot(), p.taskHash(slug))
+}
+
+func (p Paths) taskHash(slug string) string {
+	sum := sha256.Sum256([]byte(p.TaskDir(slug)))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// ClaudeDir returns the Claude Code config dir of task slug's container
+// (its $CLAUDE_CONFIG_DIR: state file, settings, transcripts): claude/<hash>
+// next to the run dirs, the hash as in RunDir. A task container mounts its
+// own, never the parent, so no task reaches another's dir or the user's.
+func (p Paths) ClaudeDir(slug string) string {
+	return filepath.Join(p.runRoot(), "claude", p.taskHash(slug))
+}
+
+// RunRoot returns the directory of the run dirs, the task Claude dirs, the
+// origin pins and the stored Claude token: $ATL_WORKSPACE/run, else
+// <StateDir>-run. No task container sees it, only its own entries in it.
+func (p Paths) RunRoot() string { return p.runRoot() }
+
+func (p Paths) runRoot() string {
+	if p.Workspace != "" {
+		return filepath.Join(p.Workspace, "run")
+	}
+	return p.StateDir + "-run"
+}
+
+// OriginPin returns the file in which atl pins the origin URLs of repo:
+// origins/<repo>.json next to the run dirs. A task container gets only its
+// own run dir, never their parent, so no task can read or write it.
+func (p Paths) OriginPin(repo string) string {
+	return filepath.Join(p.runRoot(), "origins", repo+".json")
+}
+
+// ClaudeToken returns the file in which `atl token` stores the Claude Code
+// token of sandboxed sessions: claude-token.json next to the run dirs. A
+// task container gets only its own run dir and Claude dir, never their
+// parent, so no task can read it (its sessions get the token by name, see
+// app.sandboxArgv).
+func (p Paths) ClaudeToken() string {
+	return filepath.Join(p.runRoot(), "claude-token.json")
+}
+
 // HookLog returns StateDir/hook.log.
 func (p Paths) HookLog() string { return filepath.Join(p.StateDir, "hook.log") }
+
+// RefusalLog returns StateDir/refused.log, where atl records the git
+// commands it refused to run because of a repo's config.
+func (p Paths) RefusalLog() string { return filepath.Join(p.StateDir, "refused.log") }
 
 // ProjectFile returns ConfigDir/projects/<name>.toml.
 func (p Paths) ProjectFile(name string) string {

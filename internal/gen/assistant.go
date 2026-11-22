@@ -3,8 +3,9 @@ package gen
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
+
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // AssistantGuardEvent is the `atl hook` event that keeps the atelier
@@ -70,15 +71,19 @@ func WriteAssistantFiles(dir, atlBin string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("gen: create assistant dir: %w", err)
 	}
-	path := filepath.Join(dir, "CLAUDE.md")
-	if err := writeAtomic(path, []byte(AssistantClaudeMD())); err != nil {
-		return fmt.Errorf("gen: write %s: %w", path, err)
+	d, err := nofollow.Open(dir)
+	if err != nil {
+		return fmt.Errorf("gen: %w", err)
 	}
-	return writeAssistantSettings(dir, atlBin)
+	defer d.Close()
+	if err := d.WriteFile("CLAUDE.md", []byte(AssistantClaudeMD()), 0o644); err != nil {
+		return fmt.Errorf("gen: %w", err)
+	}
+	return writeAssistantSettings(d, atlBin)
 }
 
-func writeAssistantSettings(dir, atlBin string) error {
-	path, root, err := loadSettings(dir)
+func writeAssistantSettings(d *nofollow.Dir, atlBin string) error {
+	root, err := loadSettings(d)
 	if err != nil {
 		return err
 	}
@@ -88,12 +93,12 @@ func writeAssistantSettings(dir, atlBin string) error {
 			return nil
 		}
 		backedUp = true
-		data, err := os.ReadFile(path)
+		data, err := d.ReadFile(settingsRel, maxSettings)
 		if err != nil {
-			return fmt.Errorf("gen: back up %s: %w", path, err)
+			return fmt.Errorf("gen: back up settings: %w", err)
 		}
-		if err := os.WriteFile(path+".bak", data, 0o644); err != nil {
-			return fmt.Errorf("gen: back up %s: %w", path, err)
+		if err := d.WriteFile(settingsBakRel, data, 0o644); err != nil {
+			return fmt.Errorf("gen: back up settings: %w", err)
 		}
 		return nil
 	}
@@ -159,7 +164,7 @@ func writeAssistantSettings(dir, atlBin string) error {
 	}
 	setAtelierHook(hooks, "PreToolUse", "Edit|Write|MultiEdit|NotebookEdit", AssistantGuardEvent, atlBin)
 	root["hooks"] = hooks
-	return saveSettings(path, root)
+	return saveSettings(d, root)
 }
 
 // AssistantClaudeMD renders the atelier assistant's CLAUDE.md.

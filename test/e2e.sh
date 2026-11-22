@@ -31,8 +31,13 @@ SOCK="atl-e2e-$$"
 export TMUX_TMPDIR="$W/t" # keeps the isolated server's socket inside $W
 mkdir -p "$TMUX_TMPDIR"
 
+OUTER="$SOCK-outer" # the copy relay's terminal (see "copy relay")
+GATE_PID=
+
 cleanup() {
 	local rc=$?
+	if [[ -n $GATE_PID ]]; then kill "$GATE_PID" 2>/dev/null || true; fi
+	tmux -L "$OUTER" kill-server >/dev/null 2>&1 || true
 	tmux -L "$SOCK" kill-server >/dev/null 2>&1 || true
 	if [[ $rc -ne 0 && -n "${KEEP_E2E:-}" ]]; then
 		echo "keeping $W" >&2
@@ -50,6 +55,12 @@ mkdir -p "$W/bin"
 
 # Isolated environment.
 unset TMUX TMUX_PANE ATL_WORKSPACE ATL_BIN ATL_SESSION ATL_TASK ATL_TASK_DIR ATL_PORT_OFFSET CLAUDE_CONFIG_DIR
+# git takes config from the environment too (GIT_CONFIG_PARAMETERS and
+# GIT_CONFIG_COUNT, e.g. when run under `git -c`), and GIT_DIR & co. point it
+# at the caller's repo: only the config files below may count.
+for v in $(compgen -e); do
+	if [[ $v == GIT_* ]]; then unset "$v"; fi
+done
 export PATH="$W/bin:$STUBS:$PATH"
 export HOME="$W/home"
 export ATL_REPOS="$W/repos"
@@ -61,6 +72,9 @@ export ATL_TMUX_SOCKET="$SOCK"
 export GIT_CONFIG_GLOBAL="$W/gitconfig"
 export GIT_CONFIG_NOSYSTEM=1
 export SHELL=/bin/sh
+# The sandbox is on by default; this test runs sessions next to atl (the
+# stub claude records what it gets there), so it switches the sandbox off.
+export ATL_SANDBOX=off
 export E2E_OUT="$W/out"
 export E2E_LOG="$W/out/claude.log"
 export E2E_GH_LOG="$W/out/gh.log"
@@ -161,6 +175,15 @@ hook() {
 # ---- fake repos and project ------------------------------------------------
 
 step "fake repos"
+# atl pr hands gh the GitHub repository of the pinned origin, which is the
+# literal remote.origin.url, so api's origin is a GitHub URL; the user's own
+# (global) rule sends every fetch and push to the local bare repo. docs keeps
+# a local path as its origin.
+API_URL="https://github.com/example/api.git"
+cat >>"$GIT_CONFIG_GLOBAL" <<EOF
+[url "$W/origin/api.git"]
+	insteadOf = $API_URL
+EOF
 for r in api docs; do
 	git init -q --bare "$W/origin/$r.git"
 	git -C "$W/origin/$r.git" symbolic-ref HEAD refs/heads/main
@@ -169,8 +192,11 @@ for r in api docs; do
 	git -C "$W/seed/$r" add README.md
 	git -C "$W/seed/$r" commit -q -m "init $r"
 	git -C "$W/seed/$r" push -q "$W/origin/$r.git" HEAD:main
-	git clone -q "$W/origin/$r.git" "$ATL_REPOS/$r"
+	url="$W/origin/$r.git"
+	if [[ $r == api ]]; then url="$API_URL"; fi
+	git clone -q "$url" "$ATL_REPOS/$r"
 done
+expect_eq "api origin URL" "$(git -C "$ATL_REPOS/api" config remote.origin.url)" "$API_URL"
 
 # Make the canonical api clone stale and off its default branch: origin's main
 # gains a commit the clone has not fetched, and the clone sits on a local-only
@@ -308,6 +334,53 @@ expect_eq "status line by cwd" "$out" "● Second task"
 out="$(printf 'not json' | ATL_TASK=fix-login atl statusline 2>&1)" || fail "atl statusline (bad input) exit code"
 expect_eq "status line on bad input" "$out" ""
 
+# ---- copy relay ------------------------------------------------------------
+
+# In a task container wl-copy is atl, linked as wl-copy next to it; it asks
+# the task's gate, which puts the text in the clipboard of the terminal on
+# the task's tmux session (load-buffer -w: OSC 52). The gate runs here as atl
+# starts it, without Docker (only its Docker socket would need the daemon);
+# the terminal is a pane of a second tmux server that takes OSC 52
+# (set-clipboard on), and atl's server takes any terminal for one that does.
+step "copy relay"
+mkdir -p "$W/relay"
+for tool in wl-copy wl-paste; do ln -s "$W/bin/atl" "$W/relay/$tool"; done
+# Reading the clipboard is refused, and prints nothing.
+out="$(printf 'x' | ATL_SANDBOX_ID=e2e "$W/relay/wl-paste" 2>/dev/null)" && fail "wl-paste succeeded"
+expect_eq "wl-paste output" "$out" ""
+atl gate fix-login --task-id "$(task_field fix-login id)" >"$E2E_OUT/gate.log" 2>&1 &
+GATE_PID=$!
+ctl_sock() { find "$XDG_STATE_HOME" -name atl.sock -type s 2>/dev/null | head -n1; }
+gate_up() { [[ -n "$(ctl_sock)" ]]; }
+wait_for "the gate's control socket" gate_up
+CTL="$(ctl_sock)"
+relay() { ATL_SANDBOX_ID=e2e ATL_CONTROL_SOCK="$CTL" "$W/relay/wl-copy" "$@"; }
+TEXT='echo "copied from a task" \
+  --flag=x'
+rc=0
+printf '%s' "$TEXT" | relay 2>"$E2E_OUT/wl-copy.err" || rc=$?
+expect_eq "wl-copy without a terminal on the session: exit code" "$rc" "1"
+grep -q "no terminal is attached" "$E2E_OUT/wl-copy.err" || fail "wl-copy without a terminal: $(cat "$E2E_OUT/wl-copy.err")"
+tm set-option -as terminal-features ',*:clipboard'
+tmux -L "$OUTER" -f /dev/null new-session -d -s term "env -u TMUX tmux -L $SOCK attach-session -t =atl-fix-login" \; \
+	set-option -g set-clipboard on || fail "start the terminal's tmux server"
+attached() { [[ -n "$(tm list-clients -t =atl-fix-login -F '#{client_name}')" ]]; }
+wait_for "a terminal on atl-fix-login" attached
+before="$(tm list-buffers | wc -l)"
+printf '%s' "$TEXT" | relay || fail "wl-copy failed"
+printf '%s' "$TEXT" | relay --primary || fail "wl-copy --primary failed"
+expect_eq "tmux paste buffer" "$(tm show-buffer)" "$TEXT"
+expect_eq "paste buffers added (the primary selection is not copied again)" "$(($(tm list-buffers | wc -l) - before))" "1"
+clipboard() { [[ "$(tmux -L "$OUTER" show-buffer 2>/dev/null)" == "$TEXT" ]]; }
+wait_for "the copy in the terminal's clipboard" clipboard
+grep -qF "copy  ${#TEXT} bytes for fix-login to the clipboard" "$E2E_OUT/gate.log" || fail "gate log lacks the copy: $(cat "$E2E_OUT/gate.log")"
+if grep -qF "copied from a task" "$E2E_OUT/gate.log"; then fail "the gate logged the copied text"; fi
+kill "$GATE_PID"
+wait "$GATE_PID" 2>/dev/null || true
+GATE_PID=
+tmux -L "$OUTER" kill-server
+rm -rf "$(dirname "$CTL")" # as before the gate: no run dir, nothing for atl done to clean up
+
 # ---- crash recovery + resume -----------------------------------------------
 
 step "crash recovery"
@@ -369,9 +442,27 @@ expect_eq "remote atl/fix-login before manual push (atelier never pushes)" "$hea
 git -C "$T/api" push -q origin atl/fix-login
 out="$(atl pr fix-login)" || fail "atl pr failed: $out"
 [[ "$out" == *"https://github.com/example/api/pull/1"* ]] || fail "atl pr output: $out"
-grep -qF "[pr][create][--head][atl/fix-login][--base][dev]" "$E2E_GH_LOG" || fail "gh not called as expected: $(cat "$E2E_GH_LOG")"
-grep -qF "cwd=$T/api " "$E2E_GH_LOG" || fail "gh not run in the api worktree: $(cat "$E2E_GH_LOG")"
+expect_eq "gh calls" "$(grep -c '^gh ' "$E2E_GH_LOG")" "1"
+grep -qF "[pr][create][--repo][example/api][--head][atl/fix-login][--base][dev]" "$E2E_GH_LOG" || fail "gh not called as expected: $(cat "$E2E_GH_LOG")"
+# gh runs in an empty directory of its own (in the worktree it would read the
+# task's remotes and run git there), removed afterwards.
+gh_cwd="$(sed -n 's/^gh cwd=\(.*\) entries=[0-9]* argv=.*/\1/p' "$E2E_GH_LOG")"
+[[ -n "$gh_cwd" && "$gh_cwd" != "$W" && "$gh_cwd" != "$W/"* ]] || fail "gh run in the test's tree: $(cat "$E2E_GH_LOG")"
+grep -qF "cwd=$gh_cwd entries=0 " "$E2E_GH_LOG" || fail "gh's directory was not empty: $(cat "$E2E_GH_LOG")"
+[[ ! -e "$gh_cwd" ]] || fail "gh's directory $gh_cwd was left behind"
 expect_eq "status after pr" "$(task_field fix-login status)" "review"
+
+step "pr (non-GitHub origin)"
+# docs's origin is a local path: gh could not be told its repository.
+D="$ATL_TASKS/second-task/docs"
+echo "docs change" >>"$D/README.md"
+git -C "$D" commit -q -am "docs change"
+git -C "$D" push -q origin atl/second-task
+out="$(atl pr second-task)" || fail "atl pr second-task failed: $out"
+[[ "$out" == *"docs	skipped: origin $W/origin/docs.git is not a GitHub repository URL"* ]] ||
+	fail "atl pr did not skip docs with its local origin: $out"
+expect_eq "gh calls after skipped pr" "$(grep -c '^gh ' "$E2E_GH_LOG")" "1"
+expect_eq "second-task status after skipped pr" "$(task_field second-task status)" "active"
 
 # ---- done ------------------------------------------------------------------
 
@@ -433,5 +524,32 @@ expect_eq "status after cancel" "$(task_field second-task status)" "cancelled"
 [[ -e "$E2E_OUT/teardown-second-task" ]] || fail "teardown did not run for second-task"
 [[ ! -e "$ATL_TASKS/second-task/api" ]] || fail "second-task worktree still exists"
 expect_eq "worktrees of api" "$(git -C "$ATL_REPOS/api" worktree list --porcelain | grep -c '^worktree ')" "1"
+
+# ---- reopen ----------------------------------------------------------------
+
+# An open status brings a closed task back: api on the branch cancel kept,
+# docs (pushed, so cancel deleted its branch) on a new one from origin's.
+step reopen
+S="$ATL_TASKS/second-task"
+rm -f "$E2E_OUT/setup-second-task"
+out="$(atl status second-task active 2>&1)" || fail "atl status (reopen) failed: $out"
+[[ "$out" == *"repo docs: branch atl/second-task is gone here; made again from origin/atl/second-task"* ]] ||
+	fail "reopen did not say where docs' branch came from: $out"
+[[ "$out" != *"warning"* ]] || fail "reopen warned: $out"
+expect_eq "status after reopen" "$(task_field second-task status)" "active"
+expect_eq "reopened api branch" "$(git -C "$S/api" rev-parse --abbrev-ref HEAD)" "atl/second-task"
+expect_eq "reopened api commit" "$(git -C "$S/api" log -1 --format=%s)" "unpushed work"
+expect_eq "reopened docs branch" "$(git -C "$S/docs" rev-parse --abbrev-ref HEAD)" "atl/second-task"
+expect_eq "reopened docs commit" "$(git -C "$S/docs" log -1 --format=%s)" "docs change"
+[[ -f "$S/CLAUDE.md" && -f "$S/.claude/settings.json" ]] || fail "reopen did not write CLAUDE.md and settings.json"
+expect_eq "setup after reopen" "$(cat "$E2E_OUT/setup-second-task")" "100"
+out="$(atl session second-task)" || fail "atl session after reopen failed: $out"
+has_cid2() { [[ -n "$(sess_field second-task claude_session_id)" ]]; }
+wait_for "SessionStart hook in the reopened task" has_cid2
+out="$(atl cancel second-task 2>&1)" || fail "atl cancel (after reopen) failed: $out"
+[[ "$out" == *"kept branch atl/second-task in api (1 unpushed commit(s))"* &&
+	"$out" == *"deleted branch atl/second-task in docs"* ]] || fail "atl cancel (after reopen) branch messages: $out"
+[[ ! -e "$S" ]] || fail "second-task dir still exists"
+expect_eq "worktrees of api after the second cancel" "$(git -C "$ATL_REPOS/api" worktree list --porcelain | grep -c '^worktree ')" "1"
 
 echo "E2E OK"

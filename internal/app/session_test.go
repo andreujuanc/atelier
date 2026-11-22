@@ -45,6 +45,7 @@ func newEnv(t *testing.T) *env {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, ".config"))
 	t.Setenv("SHELL", "/bin/sh")
 	t.Setenv("CLAUDE_CONFIG_DIR", "") // Claude's config dir is $HOME/.claude
+	t.Setenv("ATL_SANDBOX_ID", "")    // the tests may themselves run in a task container
 
 	bin := filepath.Join(root, "bin")
 	out := filepath.Join(root, "out")

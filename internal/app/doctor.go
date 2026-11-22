@@ -6,13 +6,17 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/hook"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
 )
 
@@ -64,8 +68,181 @@ func (a *App) Doctor(ctx context.Context) []Check {
 		a.checkDB(ctx),
 		a.checkStateDir(),
 	)
-	if os.Getenv("ATL_CONTEXT") != "" {
+	checks = append(checks, a.checkRepoConfigs(ctx)...)
+	if os.Getenv("ATL_CONTEXT") != "" || os.Getenv(hook.SandboxContextVar) != "" {
 		checks = append(checks, checkEnvContext())
+	}
+	checks = append(checks, a.checkSandbox(ctx)...)
+	return checks
+}
+
+// checkSandbox reports the sandbox mode (on unless $ATL_SANDBOX=off) and,
+// when it is on, whether the Docker daemon and the default task image are
+// usable and Claude Code has a token for task sessions.
+func (a *App) checkSandbox(ctx context.Context) []Check {
+	const name = "sandbox"
+	if sandbox.Inside() {
+		return []Check{pass(name, "inside a task container")}
+	}
+	sb, err := sandbox.FromEnv()
+	if err != nil {
+		return []Check{fail(name, err.Error())}
+	}
+	if sb == nil {
+		checks := []Check{pass(name, "off ($ATL_SANDBOX=off): task sessions run next to atl; this mode is going away")}
+		if strings.TrimSpace(os.Getenv(sandbox.MountsVar)) != "" {
+			checks = append(checks, warn(mountsCheck, "$"+sandbox.MountsVar+" is set, but with the sandbox off nothing is mounted"))
+		}
+		return checks
+	}
+	mode := "docker"
+	if strings.TrimSpace(os.Getenv("ATL_SANDBOX")) == "" {
+		mode += " (the default)"
+	}
+	checks := []Check{pass(name, mode+": each task's sessions run in the task's own container"), a.checkSandboxMounts()}
+	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
+	defer cancel()
+	if ver, err := a.checkDocker(ctx); err != nil {
+		checks = append(checks, fail("docker", err.Error()))
+	} else {
+		checks = append(checks, pass("docker", "daemon "+ver+" via "+sandbox.UpstreamSocket()))
+		switch missing, err := sandbox.ImageMissing(ctx, a.docker(), sb.Image); {
+		case err != nil:
+			checks = append(checks, warn("task image", err.Error()))
+		case missing && sb.Image == sandbox.DefaultImage:
+			checks = append(checks, fail("task image", missingImageDetail(sb.Image, "default")))
+		case missing:
+			checks = append(checks, warn("task image", sb.Image+" (from $ATL_SANDBOX_IMAGE) is not on the Docker daemon (docker will try to pull it); build or pull it"))
+		default:
+			checks = append(checks, pass("task image", sb.Image))
+		}
+	}
+	checks = append(checks, a.checkClaudeToken())
+	detail := "each task has its own, in " + filepath.Dir(a.Paths.ClaudeDir("x"))
+	if user := config.ClaudeConfigDir(); user != "" {
+		detail += "; your setup is copied from " + user
+	}
+	checks = append(checks, pass("claude config", detail))
+	return checks
+}
+
+const mountsCheck = "sandbox mounts"
+
+// checkSandboxMounts lists the host paths every task gets read-only
+// ($ATL_SANDBOX_MOUNTS, resolved), and fails naming each one that is
+// missing or refused, and why (see sandbox.ROMounts).
+func (a *App) checkSandboxMounts() Check {
+	paths, errs := sandbox.CheckROMounts(a.Paths)
+	if len(errs) > 0 {
+		msgs := make([]string, len(errs))
+		for i, err := range errs {
+			if inner := errors.Unwrap(err); inner != nil {
+				err = inner // without the variable's name, said once
+			}
+			msgs[i] = err.Error()
+		}
+		detail := "$" + sandbox.MountsVar + ": " + strings.Join(msgs, "; ")
+		if len(paths) > 0 {
+			detail += "; the others are fine: " + strings.Join(paths, ", ")
+		}
+		return fail(mountsCheck, detail+" (atl does not start until this is fixed)")
+	}
+	if len(paths) == 0 {
+		return pass(mountsCheck, "none ($"+sandbox.MountsVar+" is unset)")
+	}
+	return pass(mountsCheck, strings.Join(paths, ", ")+": read-only in every task (they must be at the same paths on the host)")
+}
+
+// checkClaudeToken says where the token of sandboxed sessions comes from:
+// atl's environment, or the file `atl token` stored it in, with its age. A
+// stored token warns within tokenWarnBefore of a year old and fails after.
+// It never shows the value.
+func (a *App) checkClaudeToken() Check {
+	const name = "claude token"
+	auth, err := a.claudeAuth()
+	if err != nil {
+		return fail(name, err.Error())
+	}
+	if !auth.stored {
+		names := make([]string, 0, len(auth.vars))
+		for _, k := range claudeAuthVars {
+			if _, ok := auth.vars[k]; ok {
+				names = append(names, "$"+k)
+			}
+		}
+		detail := "from the environment: " + strings.Join(names, " and ") + " set (passed to task sessions by name)"
+		if _, ok, _ := a.loadToken(); ok {
+			detail += "; the token stored by `atl token` is not used while it is set"
+		}
+		return pass(name, detail)
+	}
+	age := a.now().Sub(auth.storedAt)
+	days := int(age / (24 * time.Hour))
+	on := auth.storedAt.Local().Format(time.DateOnly)
+	switch {
+	case age >= tokenLifetime:
+		return fail(name, fmt.Sprintf("the token stored by `atl token` on %s is %d days old and has expired (they last a year): run `atl token` again", on, days))
+	case age >= tokenLifetime-tokenWarnBefore:
+		return warn(name, fmt.Sprintf("the token stored by `atl token` on %s is %d days old and expires by %s (they last a year): run `atl token` again",
+			on, days, auth.storedAt.Add(tokenLifetime).Local().Format(time.DateOnly)))
+	}
+	return pass(name, fmt.Sprintf("from %s: stored by `atl token` on %s, %d days old (passed to task sessions by name)",
+		a.Paths.ClaudeToken(), on, days))
+}
+
+// checkRepoConfigs lists, for each repo in Paths.Repos (its canonical
+// clone and its worktrees), the settings of its own config that make atl
+// refuse a git command now (see gitx.Hazards): one warning per repo that
+// has any. Settings atl overrides on every git it runs (hooks, fsmonitor,
+// ssh command, ...) are not listed: they do nothing there.
+func (a *App) checkRepoConfigs(ctx context.Context) []Check {
+	const name = "repo configs"
+	ctx, cancel := context.WithTimeout(ctx, 4*checkTimeout)
+	defer cancel()
+	repos, err := a.AvailableRepos(ctx)
+	if err != nil {
+		return []Check{warn(name, err.Error())}
+	}
+	var checks []Check
+	for _, r := range repos {
+		dir := a.Paths.RepoPath(r)
+		var origin *gitx.Origin
+		if o, ok, err := a.loadPin(r); err == nil && ok {
+			origin = &o
+		} else if o, ok, err := gitx.CurrentOrigin(ctx, dir); err == nil && ok {
+			origin = &o
+		}
+		dirs := []string{dir}
+		if wts, err := gitx.Worktrees(ctx, dir); err == nil {
+			dirs = append(dirs, wts...)
+		}
+		seen := map[string]bool{}
+		var found []string
+		for _, d := range dirs {
+			hs, err := gitx.Hazards(ctx, d, origin)
+			if err != nil {
+				if d == dir {
+					found = append(found, err.Error())
+				}
+				continue
+			}
+			for _, h := range hs {
+				s := fmt.Sprintf("%s = %s (%s; blocks %s)", h.Key, h.Value, h.Scope, h.Blocks())
+				if h.Scope == "worktree" {
+					s = fmt.Sprintf("%s = %s (worktree %s; blocks %s)", h.Key, h.Value, d, h.Blocks())
+				}
+				if !seen[s] {
+					seen[s] = true
+					found = append(found, s)
+				}
+			}
+		}
+		if len(found) > 0 {
+			checks = append(checks, warn("repo "+r, "its own config has what atl refuses to run git with: "+strings.Join(found, "; ")))
+		}
+	}
+	if len(checks) == 0 {
+		return []Check{pass(name, fmt.Sprintf("%d repos: nothing atl refuses to run git with", len(repos)))}
 	}
 	return checks
 }

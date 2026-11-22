@@ -19,8 +19,18 @@ import (
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
+// readTranscriptInfoAt is readTranscriptInfo of the file at path.
+func readTranscriptInfoAt(path string) (transcriptInfo, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return transcriptInfo{}, err
+	}
+	defer f.Close()
+	return readTranscriptInfo(f)
+}
+
 func TestReadTranscriptInfo(t *testing.T) {
-	info, err := readTranscriptInfo(filepath.Join("testdata", "transcript.jsonl"))
+	info, err := readTranscriptInfoAt(filepath.Join("testdata", "transcript.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +66,7 @@ func TestReadTranscriptInfo(t *testing.T) {
 		user("last one"),
 		user("<command-name>/clear</command-name>"),
 	)
-	info, err = readTranscriptInfo(p)
+	info, err = readTranscriptInfoAt(p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,17 +77,17 @@ func TestReadTranscriptInfo(t *testing.T) {
 
 	// Generated titles only: the newest wins.
 	p = write("ai.jsonl", `{"type":"summary","summary":"a summary"}`, `{"type":"ai-title","aiTitle":"the ai title"}`, user("hi"))
-	if info, _ := readTranscriptInfo(p); info.Title != "the ai title" || info.FirstPrompt != "hi" || info.LastPrompt != "hi" {
+	if info, _ := readTranscriptInfoAt(p); info.Title != "the ai title" || info.FirstPrompt != "hi" || info.LastPrompt != "hi" {
 		t.Fatalf("ai info = %+v", info)
 	}
 	// Nothing usable.
 	p = write("empty.jsonl", "not json", `{"type":"assistant","message":{"content":"x"}}`)
-	if info, err := readTranscriptInfo(p); err != nil || info != (transcriptInfo{}) {
+	if info, err := readTranscriptInfoAt(p); err != nil || info != (transcriptInfo{}) {
 		t.Fatalf("empty info = %+v, %v", info, err)
 	}
 	// Long texts are capped.
 	p = write("long.jsonl", `{"type":"ai-title","aiTitle":"`+strings.Repeat("t", 500)+`"}`, user(strings.Repeat("p", 500)))
-	if info, _ := readTranscriptInfo(p); len([]rune(info.Title)) != maxTitleRunes+1 || len([]rune(info.LastPrompt)) != maxPromptRunes+1 {
+	if info, _ := readTranscriptInfoAt(p); len([]rune(info.Title)) != maxTitleRunes+1 || len([]rune(info.LastPrompt)) != maxPromptRunes+1 {
 		t.Fatalf("caps: %d %d", len([]rune(info.Title)), len([]rune(info.LastPrompt)))
 	}
 
@@ -96,7 +106,7 @@ func TestReadTranscriptInfo(t *testing.T) {
 	if fi, _ := os.Stat(p); fi.Size() <= 2*transcriptWindow {
 		t.Fatalf("big transcript only %d bytes", fi.Size())
 	}
-	info, err = readTranscriptInfo(p)
+	info, err = readTranscriptInfoAt(p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +114,7 @@ func TestReadTranscriptInfo(t *testing.T) {
 		t.Fatalf("big info = %+v, want %+v", info, want)
 	}
 
-	if _, err := readTranscriptInfo(filepath.Join(dir, "missing.jsonl")); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := readTranscriptInfoAt(filepath.Join(dir, "missing.jsonl")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("missing transcript: %v", err)
 	}
 }

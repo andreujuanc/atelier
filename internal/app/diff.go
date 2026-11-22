@@ -38,15 +38,18 @@ func (a *App) Diff(ctx context.Context, ref string, w io.Writer, color bool) err
 		if _, err := fmt.Fprintf(w, "==> %s (%s vs %s)\n", r.Name, t.Branch, shortSHA(r.BaseCommit)); err != nil {
 			return err
 		}
-		wt := a.Paths.WorktreePath(t.Slug, r.Name)
-		if _, err := os.Stat(wt); errors.Is(err, os.ErrNotExist) {
+		wt, err := a.checkWorktree(ctx, t, r) // a check, not a guarantee: the task can still swap it afterwards
+		if errors.Is(err, os.ErrNotExist) {
 			if _, err := fmt.Fprintln(w, "(worktree missing)"); err != nil {
 				return err
 			}
 			continue
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("repo %s: %w", r.Name, err))
+			continue
 		}
 		if err := gitx.Diff(ctx, wt, r.BaseCommit, color, w); err != nil {
-			errs = append(errs, fmt.Errorf("repo %s: %w", r.Name, err))
+			errs = append(errs, fmt.Errorf("repo %s: %w", r.Name, a.noteRefusal(r.Name, "git diff", err)))
 			continue
 		}
 		untracked, err := gitx.Untracked(ctx, wt)

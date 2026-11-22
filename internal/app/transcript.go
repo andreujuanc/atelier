@@ -9,11 +9,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
+	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // Turn is one condensed conversation turn of a Claude Code transcript.
@@ -51,19 +55,64 @@ func (a *App) Transcript(ctx context.Context, ref string, sessionID int64, tail 
 	case sess.TranscriptPath == "":
 		return nil, fmt.Errorf("session %d of task %s has no recorded transcript", sess.ID, t.Slug)
 	}
-	f, err := os.Open(sess.TranscriptPath)
+	f, err := a.openTranscript(t, sess.TranscriptPath)
 	if err != nil {
 		return nil, fmt.Errorf("session %d transcript: %w", sess.ID, err)
 	}
 	defer f.Close()
-	turns, err := ParseTranscript(f)
+	turns, err := parseTranscript(f, tail)
 	if err != nil {
 		return nil, fmt.Errorf("session %d transcript %s: %w", sess.ID, sess.TranscriptPath, err)
 	}
-	if tail > 0 && len(turns) > tail {
-		turns = turns[len(turns)-tail:]
-	}
 	return turns, nil
+}
+
+// openTranscript opens a session's recorded transcript for reading. The
+// path came from a hook, so from the task, and the gate's check of it when
+// it was recorded says nothing about what is there now: the task can swap
+// the file, or a directory on the way, for a symlink or a FIFO since. So it
+// is opened only in the task's own Claude dir or the user's (where sessions
+// run with the sandbox off keep theirs), through package nofollow: no
+// symlink is followed, only a regular file is read, and nothing blocks. A
+// path elsewhere is not read at all.
+func (a *App) openTranscript(t *model.Task, path string) (*os.File, error) {
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("%q is not an absolute path; not read", path)
+	}
+	path = filepath.Clean(path)
+	for _, root := range []string{a.Paths.ClaudeDir(t.Slug), config.ClaudeConfigDir()} {
+		if root == "" {
+			continue
+		}
+		real, err := filepath.EvalSymlinks(root) // the dir itself is not the task's to swap
+		if err != nil {
+			real = root
+		}
+		for _, form := range []string{root, real} {
+			rel, err := filepath.Rel(form, path)
+			if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				continue
+			}
+			d, err := nofollow.Open(real)
+			if err != nil {
+				return nil, err
+			}
+			defer d.Close()
+			return d.OpenFile(rel)
+		}
+	}
+	return nil, fmt.Errorf("%s is neither in the task's Claude dir nor in yours; not read", path)
+}
+
+// transcriptInfo is readTranscriptInfo of a session's transcript, opened
+// with openTranscript.
+func (a *App) transcriptInfo(t *model.Task, path string) (transcriptInfo, error) {
+	f, err := a.openTranscript(t, path)
+	if err != nil {
+		return transcriptInfo{}, err
+	}
+	defer f.Close()
+	return readTranscriptInfo(f)
 }
 
 // transcriptEntry is the part of a Claude Code transcript JSONL line used.
@@ -103,28 +152,74 @@ type transcriptBlock struct {
 //     <bash-stdout>/<bash-stderr> output is dropped;
 //   - consecutive entries of the same role are collapsed into one turn;
 //   - each turn's text is capped at maxTurnRunes runes;
-//   - malformed lines are ignored.
+//   - malformed lines are ignored, and so are lines longer than
+//     maxTranscriptLine.
 //
-// Only read errors are returned.
-func ParseTranscript(r io.Reader) ([]Turn, error) {
+// The task writes its transcripts, so the file is read as a stream: it
+// holds one line (at most maxTranscriptLine bytes) and the turns, each
+// kept to its cap as it is collapsed. Only read errors are returned.
+func ParseTranscript(r io.Reader) ([]Turn, error) { return parseTranscript(r, 0) }
+
+// maxTranscriptLine bounds one line of a transcript that is parsed: far
+// above Claude Code's longest entries (a pasted image, a large tool result
+// run to several MB). A longer line is read past and skipped like a
+// malformed one. A var so tests can lower it.
+var maxTranscriptLine = 32 << 20
+
+// parseTranscript is ParseTranscript keeping only the last keep turns
+// (all if keep <= 0) as it goes.
+func parseTranscript(r io.Reader, keep int) ([]Turn, error) {
 	br := bufio.NewReaderSize(r, 64<<10)
-	var turns []Turn
+	var turns []turnText
+	var buf []byte
 	for {
-		line, err := br.ReadBytes('\n')
-		if len(bytes.TrimSpace(line)) > 0 {
+		line, tooLong, err := readLine(br, buf[:0], maxTranscriptLine)
+		buf = line
+		if !tooLong && len(bytes.TrimSpace(line)) > 0 {
 			if role, text, at, ok := parseEntry(line); ok {
 				if n := len(turns); n > 0 && turns[n-1].Role == role {
-					turns[n-1].Text += "\n" + text
+					turns[n-1].add("\n")
+					turns[n-1].add(text)
 				} else {
-					turns = append(turns, Turn{Role: role, Text: text, Time: at})
+					if keep > 0 && len(turns) >= 2*keep {
+						turns = append(turns[:0], turns[len(turns)-keep+1:]...)
+					}
+					turns = append(turns, turnText{Turn: Turn{Role: role, Time: at}})
+					turns[len(turns)-1].add(text)
 				}
 			}
 		}
-		if errors.Is(err, io.EOF) {
-			return capTurns(turns), nil
-		}
 		if err != nil {
-			return capTurns(turns), err
+			if keep > 0 && len(turns) > keep {
+				turns = turns[len(turns)-keep:]
+			}
+			out := make([]Turn, len(turns))
+			for i, t := range turns {
+				out[i] = t.turn()
+			}
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			return out, err
+		}
+	}
+}
+
+// readLine reads the next line from br into buf, its newline included (the
+// last line may have none, with io.EOF). A line longer than max is read to
+// its end but not kept: tooLong, and line empty.
+func readLine(br *bufio.Reader, buf []byte, max int) (line []byte, tooLong bool, err error) {
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if !tooLong {
+			if len(buf)+len(chunk) > max {
+				tooLong, buf = true, buf[:0]
+			} else {
+				buf = append(buf, chunk...)
+			}
+		}
+		if err != bufio.ErrBufferFull {
+			return buf, tooLong, err
 		}
 	}
 }
@@ -132,15 +227,40 @@ func ParseTranscript(r io.Reader) ([]Turn, error) {
 // maxTurnRunes caps the text of one condensed turn.
 const maxTurnRunes = 3000
 
-// capTurns truncates each turn's text to maxTurnRunes runes, appending
-// "… (N more chars)".
-func capTurns(turns []Turn) []Turn {
-	for i := range turns {
-		if r := []rune(turns[i].Text); len(r) > maxTurnRunes {
-			turns[i].Text = string(r[:maxTurnRunes]) + fmt.Sprintf("… (%d more chars)", len(r)-maxTurnRunes)
+// turnText is a turn being collapsed: Text holds at most its first
+// maxTurnRunes runes, runes counts them all.
+type turnText struct {
+	Turn
+	runes int
+}
+
+func (t *turnText) add(s string) {
+	n := utf8.RuneCountInString(s)
+	if room := maxTurnRunes - t.runes; room > 0 {
+		if n <= room {
+			t.Text += s
+		} else {
+			cut := 0
+			for i := range s {
+				if room == 0 {
+					cut = i
+					break
+				}
+				room--
+			}
+			t.Text += s[:cut]
 		}
 	}
-	return turns
+	t.runes += n
+}
+
+// turn is the turn with its text capped at maxTurnRunes runes and
+// "… (N more chars)" appended if it was longer.
+func (t turnText) turn() Turn {
+	if t.runes > maxTurnRunes {
+		t.Text += fmt.Sprintf("… (%d more chars)", t.runes-maxTurnRunes)
+	}
+	return t.Turn
 }
 
 func parseEntry(line []byte) (role, text string, at time.Time, ok bool) {
@@ -300,17 +420,12 @@ const (
 )
 
 // readTranscriptInfo reads a session's title and first/last user prompts
-// from its Claude Code transcript (see transcriptInfo). Large files are
+// from its Claude Code transcript f (see transcriptInfo). Large files are
 // scanned only in their first and last transcriptWindow bytes (the first
 // prompt is at the head, the last prompt and the newest titles near the
 // tail), so a title or prompt in the middle of a huge file may be missed.
-func readTranscriptInfo(path string) (transcriptInfo, error) {
+func readTranscriptInfo(f *os.File) (transcriptInfo, error) {
 	var info transcriptInfo
-	f, err := os.Open(path)
-	if err != nil {
-		return info, err
-	}
-	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
 		return info, err

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -270,10 +271,10 @@ func TestSessionStartContext(t *testing.T) {
 		}
 		st.Close()
 		var out bytes.Buffer
-		if err := writeSessionContext(context.Background(), &out, st, f.p, task.ID, "", now); err == nil || out.Len() != 0 {
+		if err := writeSessionContext(context.Background(), &out, st, f.p, task.ID, "", false, nil, now); err == nil || out.Len() != 0 {
 			t.Errorf("err=%v stdout=%q", err, out.String())
 		}
-		if err := writeSessionContext(context.Background(), &out, f.st, f.p, 9999, "", now); err == nil || out.Len() != 0 {
+		if err := writeSessionContext(context.Background(), &out, f.st, f.p, 9999, "", false, nil, now); err == nil || out.Len() != 0 {
 			t.Errorf("missing task: err=%v stdout=%q", err, out.String())
 		}
 	})
@@ -515,6 +516,117 @@ func TestRenderContextEnv(t *testing.T) {
 			t.Errorf("pathological: len %d:\n%s", len(got), got)
 		}
 	})
+}
+
+// TestRenderSandboxContext: a sandboxed session is told to use a repo's own
+// container setup, and the note leaves room under the cap for the rest.
+func TestRenderSandboxContext(t *testing.T) {
+	p := config.Paths{Tasks: "/home/someone/atelier/workspaces/me/tasks", Repos: "/home/someone/atelier/workspaces/me/repos"}
+	task := model.Task{Slug: "shop-checkout-fix", Title: "Fix the checkout total rounding", Status: model.StatusActive,
+		Branch: "atl/shop-checkout-fix", PortOffset: 300,
+		Repos: []model.TaskRepo{{Name: "shop-api", Mode: model.ModeRW, BaseBranch: "main"},
+			{Name: "shop-web", Mode: model.ModeRW, BaseBranch: "main"}, {Name: "shop-docs", Mode: model.ModeRO}}}
+	now := time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC)
+
+	got := renderSandboxContext(task, "", p, "", true, nil, now)
+	if !strings.Contains(got, "\nATL_PORT_OFFSET=300\n\n"+sandboxNote+"\n") || !strings.Contains(got, "run a repo in its own container setup, if any (`.devcontainer`") {
+		t.Errorf("sandbox note missing or misplaced:\n%s", got)
+	}
+	if plain := renderSandboxContext(task, "", p, "", false, []string{"/x"}, now); strings.Contains(plain, "Sandbox:") || strings.Contains(plain, mountsHead) {
+		t.Errorf("note without the sandbox:\n%s", plain)
+	}
+
+	// Room left for notes: most of the cap without ATL_CONTEXT, and still
+	// a notes section with half its allowance used.
+	room := func(env string) int {
+		return contextMaxLen - len(renderSandboxContext(task, "", p, env, true, nil, now)) - len("\nNotes:\n") - 1
+	}
+	marker := "… (earlier notes truncated; `atl notes shop-checkout-fix` for all)\n"
+	if r := room(""); r < 600 {
+		t.Errorf("note is %d bytes: only %d left for notes", len(sandboxNote), r)
+	}
+	if r := room(strings.Repeat("e", contextEnvLen/2)); r < len(marker)+contextMinNotes {
+		t.Errorf("note is %d bytes: only %d left for notes with a %d-byte ATL_CONTEXT", len(sandboxNote), r, contextEnvLen/2)
+	}
+	t.Logf("note %d bytes; room for notes %d, %d with a %d-byte ATL_CONTEXT", len(sandboxNote), room(""),
+		room(strings.Repeat("e", contextEnvLen/2)), contextEnvLen/2)
+}
+
+// TestRenderSandboxMounts: a sandboxed session is told, in one line after
+// the sandbox note, which host paths it has read-only and may bind-mount
+// read-only; a long list is cut, saying how many more; the line never takes
+// the notes' useful part.
+func TestRenderSandboxMounts(t *testing.T) {
+	p := config.Paths{Tasks: "/home/someone/atelier/workspaces/me/tasks", Repos: "/home/someone/atelier/workspaces/me/repos"}
+	task := model.Task{Slug: "shop-checkout-fix", Title: "Fix the checkout total rounding", Status: model.StatusActive,
+		Branch: "atl/shop-checkout-fix", PortOffset: 300,
+		Repos: []model.TaskRepo{{Name: "shop-api", Mode: model.ModeRW, BaseBranch: "main"},
+			{Name: "shop-web", Mode: model.ModeRW, BaseBranch: "main"}, {Name: "shop-docs", Mode: model.ModeRO}}}
+	now := time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC)
+	normal := []string{"/home/someone/.work.npmrc", "/home/someone/certs/corp-ca.pem"}
+	marker := notesMarker(task.Slug)
+	var notes strings.Builder
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&notes, "note %02d: something the last session found out\n", i)
+	}
+
+	// A normal list, with a usual ATL_SANDBOX_CONTEXT and long notes: the
+	// whole list, right after the note, and notes (cut, newest kept).
+	env := strings.Repeat("e", 200)
+	got := renderSandboxContext(task, notes.String(), p, env, true, normal, now)
+	want := "\n" + sandboxNote + "\n" + mountsHead + normal[0] + ", " + normal[1] + "\n\nEnvironment notes"
+	if !strings.Contains(got, want) || len(got) > contextMaxLen || !strings.Contains(got, "\nNotes:\n"+marker) || !strings.Contains(got, "note 39") {
+		t.Errorf("normal list (len %d):\n%s", len(got), got)
+	}
+	if strings.Count(got, mountsHead) != 1 {
+		t.Errorf("not one line:\n%s", got)
+	}
+
+	// A long list is cut to mountsLineMax, saying how many more.
+	var long []string
+	for i := 0; i < 20; i++ {
+		long = append(long, fmt.Sprintf("/home/someone/shared/readonly-thing-%02d", i))
+	}
+	got = renderSandboxContext(task, "", p, "", true, long, now)
+	line := ""
+	for _, l := range strings.Split(got, "\n") {
+		if strings.HasPrefix(l, mountsHead) {
+			line = l
+		}
+	}
+	if len(line)+1 > mountsLineMax || !strings.Contains(line, long[0]+", "+long[1]) || !regexp.MustCompile(` and \d+ more$`).MatchString(line) {
+		t.Errorf("long list: %q", line)
+	}
+	shown := strings.Count(line, "/home/someone/shared/")
+	if !strings.HasSuffix(line, fmt.Sprintf(" and %d more", len(long)-shown)) {
+		t.Errorf("long list: %d shown, line %q", shown, line)
+	}
+
+	// Where room is short (half the ATL_SANDBOX_CONTEXT allowance), the notes
+	// keep their useful part: the line gives way, down to the count or none.
+	for _, paths := range [][]string{normal, long} {
+		got = renderSandboxContext(task, notes.String(), p, strings.Repeat("e", contextEnvLen/2), true, paths, now)
+		if len(got) > contextMaxLen || !strings.Contains(got, "\nNotes:\n"+marker) {
+			t.Errorf("short room, %d paths: notes pushed out (len %d):\n%s", len(paths), len(got), got)
+		}
+		t.Logf("short room, %d paths: %q", len(paths), regexp.MustCompile(regexp.QuoteMeta(mountsHead)+`.*`).FindString(got))
+	}
+	// Short notes are kept whole, the line takes the rest.
+	got = renderSandboxContext(task, "short note", p, strings.Repeat("e", 400), true, long, now)
+	if len(got) > contextMaxLen || len(got) < contextMaxLen-60 || !strings.Contains(got, "\nNotes:\nshort note\n") ||
+		!strings.Contains(got, mountsHead+long[0]) {
+		t.Errorf("short notes, long list (len %d):\n%s", len(got), got)
+	}
+
+	if l := mountsLine(normal, len(mountsHead)+len("2, not listed here\n")); l != mountsHead+"2, not listed here\n" {
+		t.Errorf("only the count fits: %q", l)
+	}
+	if l := mountsLine(normal, len(mountsHead)+5); l != "" {
+		t.Errorf("nothing fits: %q", l)
+	}
+	if l := mountsLine([]string{"/a\nInjected: x"}, mountsLineMax); strings.Count(l, "\n") != 1 {
+		t.Errorf("a path's newline survived: %q", l)
+	}
 }
 
 // TestSessionStartContextLatency measures the SessionStart path that also

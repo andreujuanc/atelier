@@ -337,6 +337,56 @@ func (s *Store) SetTaskStatus(ctx context.Context, id int64, st model.Status) er
 	return checkAffected(res, "task", id)
 }
 
+// ErrTaskOpen is returned (wrapped) by ReopenTask when the task is not
+// closed (any more).
+var ErrTaskOpen = errors.New("task is open")
+
+// ReopenTask sets closed (done or cancelled) task id to the open status to
+// and, in the same transaction, the base branch and commit of each of its rw
+// repos named in rebased. A task that is not closed is ErrTaskOpen, an
+// unknown one ErrNotFound, and nothing changes.
+func (s *Store) ReopenTask(ctx context.Context, id int64, to model.Status, rebased []model.TaskRepo) error {
+	if !to.Open() {
+		return fmt.Errorf("store: reopen task %d as %q: not an open status", id, to)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE tasks SET status = ?, updated_at = ?
+		WHERE id = ? AND status IN ('done', 'cancelled')`, string(to), toMS(now()), id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		var st string
+		err := tx.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id = ?`, id).Scan(&st)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("task %d: %w", id, ErrNotFound)
+		case err != nil:
+			return err
+		}
+		return fmt.Errorf("store: task %d is %s: %w", id, st, ErrTaskOpen)
+	}
+	for _, r := range rebased {
+		res, err := tx.ExecContext(ctx, `UPDATE task_repos SET base_branch = ?, base_commit = ?
+			WHERE task_id = ? AND name = ? AND mode = 'rw'`, r.BaseBranch, r.BaseCommit, id, r.Name)
+		if err != nil {
+			return fmt.Errorf("store: set base of repo %q for task %d: %w", r.Name, id, err)
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return err
+		} else if n == 0 {
+			return fmt.Errorf("store: rw repo %q of task %d: %w", r.Name, id, ErrNotFound)
+		}
+	}
+	return tx.Commit()
+}
+
 // UpdateTaskTitle sets a task's title and bumps updated_at; nothing else
 // changes (slug, branch and dirs keep the original name). The title must
 // already be in its stored form: model.NormalizeTitle must return it

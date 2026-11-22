@@ -40,6 +40,10 @@ func TestMain(m *testing.M) {
 		// No global Claude Code settings (a global statusLine would keep
 		// atelier's out of task settings, see gen.WriteSettings).
 		"CLAUDE_CONFIG_DIR": filepath.Join(dir, "claude"),
+		// The sandbox is on by default. These tests build Apps without it
+		// (sessions run next to atl) and doctor must say the same, as with
+		// ATL_SANDBOX=off; the sandbox tests set what they need.
+		"ATL_SANDBOX": "off",
 	} {
 		os.Setenv(k, v)
 	}
@@ -330,23 +334,35 @@ func TestNewTaskRollback(t *testing.T) {
 	}
 }
 
-// A failing post-checkout hook makes `git worktree add` fail after it has
-// created the branch and worktree: both must be rolled back.
+// breakCheckout makes a blob of rev unreadable in repo (a loose object), so
+// that `git worktree add` fails in its checkout, after it created the
+// branch. It returns the undo.
+func breakCheckout(t *testing.T, repo, rev string) func() {
+	t.Helper()
+	oid := git(t, repo, "rev-parse", rev)
+	path := filepath.Join(repo, ".git", "objects", oid[:2], oid[2:])
+	if err := os.Rename(path, path+".gone"); err != nil {
+		t.Fatalf("%s is not a loose object: %v", rev, err)
+	}
+	return func() {
+		if err := os.Rename(path+".gone", path); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A failed checkout makes `git worktree add` fail after it has created the
+// branch: what it made must be rolled back. (Hooks, the old way to make it
+// fail late, no longer run.)
 func TestNewTaskRollbackHookFailure(t *testing.T) {
 	e := newTaskEnv(t)
 	ctx := context.Background()
 	e.addRepo(t, "api", "main")
 	api := e.canonical("api")
-	hook := filepath.Join(api, ".git", "hooks", "post-checkout")
-	if err := os.MkdirAll(filepath.Dir(hook), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	restore := breakCheckout(t, api, "origin/main:README")
 	opts := NewTaskOpts{Title: "Hooked", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}}
 	if _, err := e.app.NewTask(ctx, opts); err == nil {
-		t.Fatal("NewTask succeeded despite failing hook")
+		t.Fatal("NewTask succeeded despite the failed checkout")
 	}
 	if out, err := exec.Command("git", "-C", api, "rev-parse", "--verify", "-q", "refs/heads/atl/hooked").CombinedOutput(); err == nil {
 		t.Fatalf("branch left behind: %s", out)
@@ -361,9 +377,7 @@ func TestNewTaskRollbackHookFailure(t *testing.T) {
 		t.Fatal("task dir left behind")
 	}
 
-	if err := os.Remove(hook); err != nil {
-		t.Fatal(err)
-	}
+	restore()
 	task, err := e.app.NewTask(ctx, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -830,6 +844,57 @@ func TestPrepareTaskDir(t *testing.T) {
 	}
 	if s, _ := os.ReadFile(filepath.Join(dir, ".claude", "settings.json")); !strings.Contains(string(s), gen.HookCommand("/opt/atl", "Stop")) {
 		t.Fatalf("settings not refreshed: %s", s)
+	}
+}
+
+// TestPrepareTaskDirSymlinks: what a task plants in its task dir (from its
+// container) before its next session launch cannot make prepareTaskDir
+// write where atl runs, nor read a file there into the task dir.
+func TestPrepareTaskDirSymlinks(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	task := &model.Task{Slug: "prep", Title: "Prep", Status: model.StatusActive, Branch: "atl/prep",
+		Repos: []model.TaskRepo{{Name: "docs", Mode: model.ModeRO}}}
+	dir := e.app.Paths.TaskDir("prep")
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "bashrc")
+	secret := filepath.Join(outside, "settings.json")
+	for p, s := range map[string]string{victim: "# the user's\n", secret: `{"env":{"TOKEN":"SECRET-OF-THE-USER"}}`} {
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for link, target := range map[string]string{
+		filepath.Join(dir, ".claude", "settings.json"):     secret,
+		filepath.Join(dir, ".claude", "settings.json.bak"): victim,
+		filepath.Join(dir, "CLAUDE.md"):                    victim,
+	} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.app.prepareTaskDir(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "# the user's\n" {
+		t.Errorf("a file outside the task dir was written: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, ".claude", "settings.json")); strings.Contains(string(b), "SECRET-OF-THE-USER") {
+		t.Errorf("settings.json got the content of the file its symlink named: %s", b)
+	}
+	// .claude itself a symlink: the launch fails rather than write there.
+	os.RemoveAll(filepath.Join(dir, ".claude"))
+	if err := os.Symlink(outside, filepath.Join(dir, ".claude")); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.app.prepareTaskDir(ctx, task); err == nil {
+		t.Error("prepareTaskDir through a symlinked .claude succeeded")
+	}
+	if b, _ := os.ReadFile(secret); !strings.Contains(string(b), "SECRET-OF-THE-USER") || strings.Contains(string(b), "hook") {
+		t.Errorf("the other dir's settings.json was rewritten: %s", b)
 	}
 }
 

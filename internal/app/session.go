@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
 
@@ -27,9 +28,27 @@ func ClaudeArgv(roPaths []string, resumeID string) []string {
 
 func windowName(id int64) string { return fmt.Sprintf("claude-%d", id) }
 
+type attachKey struct{}
+
+// attaching marks ctx as that of a launch the caller attaches a terminal
+// to right after (Open, OpenNew, OpenSession): a sandboxed window then
+// waits for that client before it starts docker exec (see
+// sandbox.WindowArgv), so that Claude starts at the terminal's size.
+func attaching(ctx context.Context) context.Context {
+	return context.WithValue(ctx, attachKey{}, true)
+}
+
+func attachFollows(ctx context.Context) bool {
+	v, _ := ctx.Value(attachKey{}).(bool)
+	return v
+}
+
 // checkLaunchable refuses closed tasks and tasks whose dir is missing, and
 // returns the task dir.
 func (a *App) checkLaunchable(t *model.Task) (string, error) {
+	if err := outsideSandbox("start Claude sessions"); err != nil {
+		return "", err
+	}
 	if !t.Status.Open() {
 		return "", fmt.Errorf("task %s is %s; cannot start Claude sessions in it", t.Slug, t.Status)
 	}
@@ -50,13 +69,38 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 	if err := a.prepareTaskDir(ctx, t); err != nil {
 		return "", fmt.Errorf("prepare task dir: %w", err)
 	}
+	env := a.launchEnv(t, s)
+	argv := ClaudeArgv(a.roPaths(t), resumeID)
+	var auth map[string]string
+	if a.Sandbox != nil {
+		// The window runs a docker client attached to Claude in the task's
+		// container. Should the window die first, what it started there is
+		// ended when that is noticed (Recover, resumeClaimed).
+		// It names the container by the ID ensureSandbox checked to be atl's
+		// own: the token goes there.
+		container, err := a.ensureSandbox(ctx, t)
+		if err != nil {
+			return "", fmt.Errorf("sandbox: %w", err)
+		}
+		if auth, err = a.sandboxAuth(); err != nil {
+			return "", fmt.Errorf("sandbox: %w", err)
+		}
+		// The window takes the token from the tmux server's global
+		// environment: set from atl's own (current) one, or the stored
+		// token, on tmux's standard input, in the same tmux call that
+		// creates the window, and the server if none runs yet.
+		// The window starts docker exec so that Claude has the window's
+		// size from its first frame on (sandbox.WindowArgv).
+		argv = sandbox.WindowArgv(attachFollows(ctx), a.sandboxArgv(container, dir, env, auth, argv))
+	}
 	return a.Tmux.NewWindow(ctx, tmux.WindowSpec{
-		Session: tmux.SessionName(t.Slug),
-		Name:    s.Name,
-		Dir:     dir,
-		Env:     a.launchEnv(t, s),
-		Argv:    ClaudeArgv(a.roPaths(t), resumeID),
-		Tag:     strconv.FormatInt(s.ID, 10),
+		Session:   tmux.SessionName(t.Slug),
+		Name:      s.Name,
+		Dir:       dir,
+		Env:       env,
+		Argv:      argv,
+		Tag:       strconv.FormatInt(s.ID, 10),
+		GlobalEnv: auth,
 	})
 }
 
@@ -87,6 +131,11 @@ func (a *App) NewSession(ctx context.Context, ref string) (*model.Session, error
 	if err != nil {
 		if serr := a.Store.SetSessionState(context.WithoutCancel(ctx), s.ID, model.StateEnded, a.now()); serr != nil {
 			err = errors.Join(err, serr)
+		}
+		if win != "" {
+			// The window started (its tag could not be set): what it
+			// started in the container goes with the session.
+			a.killSessionProcs(ctx, t, s.ID)
 		}
 		return nil, fmt.Errorf("task %s: launch session %d: %w", t.Slug, s.ID, err)
 	}
@@ -133,6 +182,8 @@ func (a *App) Resume(ctx context.Context, ref string) (int, error) {
 			if err := a.Store.SetSessionState(ctx, s.ID, model.StateEnded, a.now()); err != nil {
 				return 0, err
 			}
+			// Its window is gone (it was stopped): nothing of it may run on.
+			a.killSessionProcs(ctx, t, s.ID)
 			continue
 		}
 		stopped = append(stopped, s)
@@ -194,11 +245,20 @@ func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir st
 		return live, nil
 	}
 	if err == nil {
+		// No live window: whatever of the session still runs in the task's
+		// container (its docker exec client died with the window) goes
+		// first, so that two Claudes never share the conversation.
+		a.killSessionProcs(ctx, t, id)
 		win, err = a.launch(ctx, t, s, dir, s.ClaudeSessionID)
 	}
 	if err != nil {
 		if serr := a.Store.SetSessionState(bg, id, restore, a.now()); serr != nil {
 			err = errors.Join(err, serr)
+		}
+		if win != "" {
+			// The window started (its tag could not be set): what it
+			// started in the container goes, as in NewSession.
+			a.killSessionProcs(ctx, t, id)
 		}
 		return "", err
 	}
@@ -225,6 +285,7 @@ func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir st
 // (remain-on-exit) windows does not count, so a crashed claude is relaunched
 // rather than attached to.
 func (a *App) Open(ctx context.Context, ref string) (*exec.Cmd, error) {
+	ctx = attaching(ctx)
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
 		return nil, err

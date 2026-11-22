@@ -1,0 +1,21 @@
+#!/bin/sh
+# Builds atelier's two images for the user running it, from the checkout this
+# script is in (from any directory): the box, then the task image (the
+# Dockerfile's "task" target). Arguments are passed on to both docker build
+# calls (e.g. --no-cache).
+#
+#   ATL_BOX_IMAGE      name of the box image  (default atelier)
+#   ATL_SANDBOX_IMAGE  name of the task image (default atelier-task; atl reads
+#                      the same variable for the image of task containers)
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+box=${ATL_BOX_IMAGE:-atelier}
+task=${ATL_SANDBOX_IMAGE:-atelier-task}
+user=$(id -un)
+uid=$(id -u)
+gid=$(id -g)
+
+docker build -t "$box" --build-arg USERNAME="$user" --build-arg UID="$uid" --build-arg GID="$gid" "$@" "$here"
+docker build --target task -t "$task" --build-arg USERNAME="$user" --build-arg UID="$uid" --build-arg GID="$gid" "$@" "$here"
+
+echo "built $box (box) and $task (task image)"

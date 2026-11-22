@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -15,8 +17,11 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/andreujuanc/atelier/internal/app"
+	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/sandbox"
+	"github.com/andreujuanc/atelier/internal/tmux"
 )
 
 func (c *cli) newCmd() *cobra.Command {
@@ -141,7 +146,7 @@ func (c *cli) addCmd() *cobra.Command {
 }
 
 func (c *cli) reposCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "repos",
 		Short: "List the git repos in $ATL_REPOS, one per line",
 		Args:  args(cobra.NoArgs),
@@ -160,6 +165,33 @@ func (c *cli) reposCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "pin <repo>...",
+		Short: "Pin each repo's origin anew from its config (accept a changed origin URL for atl push/fetch)",
+		Args:  args(cobra.MinimumNArgs(1)),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			ap, err := c.App()
+			if err != nil {
+				return err
+			}
+			for _, name := range a {
+				old, had, now, err := ap.RepinOrigin(cmd.Context(), name)
+				if err != nil {
+					return err
+				}
+				switch {
+				case !had:
+					fmt.Fprintf(c.stdout, "%s: pinned %s\n", name, now)
+				case old.Equal(now):
+					fmt.Fprintf(c.stdout, "%s: pinned %s (unchanged)\n", name, now)
+				default:
+					fmt.Fprintf(c.stdout, "%s: pinned %s (was %s)\n", name, now, old)
+				}
+			}
+			return nil
+		},
+	})
+	return cmd
 }
 
 // parseStatuses parses --status: "" → open statuses, "all" → nil (every
@@ -442,7 +474,7 @@ func (c *cli) resumeCmd() *cobra.Command {
 func (c *cli) statusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status <task> <backlog|active|review|done|cancelled>",
-		Short: "Set a task's status (no other side effects)",
+		Short: "Set a task's status; a done or cancelled task set to an open status is reopened (task dir, worktrees, CLAUDE.md, setup)",
 		Args:  args(cobra.ExactArgs(2)),
 		RunE: func(cmd *cobra.Command, a []string) error {
 			st, err := model.ParseStatus(a[1])
@@ -620,7 +652,7 @@ func (c *cli) finishCmd(verb string) *cobra.Command {
 func (c *cli) doctorCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
-		Short: "Check git, tmux, claude, gh, directories and the database",
+		Short: "Check git, tmux, claude, gh, directories, the database and the sandbox",
 		Args:  args(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ap, err := c.doctorApp()
@@ -657,6 +689,223 @@ func (c *cli) statuslineCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// gateCmd serves a task's gated Docker socket (see sandbox.Gate) and its
+// control socket (sandbox.Control): push and fetch, and the hooks, status
+// line and notes of the task's container, which it answers itself from the
+// database (hook.TaskServer) for this one task only, and the copy relay
+// (sandbox.CopyMain) to the terminal on this task's tmux session. atl starts it itself,
+// detached, when it launches a session in a sandboxed task.
+func (c *cli) gateCmd() *cobra.Command {
+	var taskID int64
+	var roMounts []string
+	cmd := &cobra.Command{
+		Use:    "gate <slug> [--ro-mount PATH]... --task-id ID",
+		Short:  "Serve a sandboxed task's Docker socket and atl requests (internal)",
+		Hidden: true,
+		Args:   args(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			p, err := config.Resolve()
+			if err != nil {
+				return err
+			}
+			slug := a[0]
+			if slug == "" || strings.ContainsAny(slug, `/\`) || slug == "." || slug == ".." {
+				return usagef("invalid task slug %q", slug)
+			}
+			if taskID <= 0 {
+				return usagef("--task-id is required")
+			}
+			// atl checked them (sandbox.ROMounts); the same rules again.
+			for _, m := range roMounts {
+				if err := sandbox.CheckROMount(p, m); err != nil {
+					return fmt.Errorf("--ro-mount: %w", err)
+				}
+			}
+			dir := p.TaskDir(slug)
+			root, err := filepath.EvalSymlinks(dir)
+			if err != nil {
+				return fmt.Errorf("task dir: %w", err)
+			}
+			runDir := p.RunDir(slug)
+			id := sandbox.ID(slug, dir)
+			bin := os.Getenv("ATL_BIN")
+			if bin == "" {
+				if bin, err = os.Executable(); err != nil {
+					return fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
+				}
+			}
+			// The task by database id, checked against the slug once: a
+			// request never names a task.
+			ts, err := hook.OpenTaskServer(p, taskID, slug)
+			if err != nil {
+				return err
+			}
+			defer ts.Close()
+			g := &sandbox.Gate{
+				ID:         id,
+				Root:       root,
+				SocketHost: sandbox.SocketPath(runDir),
+				Agent:      sandbox.ContainerName(id),
+				Upstream:   sandbox.UpstreamSocket(),
+				Log:        sandbox.NewLogger(),
+				Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
+				Ident:      sandbox.Ident(taskID, bin, roMounts),
+				ROMounts:   roMounts,
+			}
+			ts.SetROMounts(roMounts)
+			// A session ended (Claude exits): what it left running in the
+			// container goes once Claude is gone.
+			ts.OnSessionEnd(func(session int64) {
+				go func() {
+					if err := g.EndSession(session); err != nil {
+						g.Log.Printf("note  end what session %d left running: %v", session, err)
+					}
+				}()
+			})
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
+			go func() { // a gate outliving its task stops
+				tick := time.NewTicker(10 * time.Second)
+				defer tick.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-tick.C:
+						if gone, _ := ts.Gone(ctx); gone {
+							g.Log.Printf("task %d (%s) is gone; stopping", taskID, slug)
+							cancel()
+							return
+						}
+					}
+				}
+			}()
+			ctl := &sandbox.Control{Slug: slug, TaskID: taskID, Atl: bin, Task: ts, Log: g.Log}
+			// The copy relay (wl-copy in the container): to the terminal
+			// attached to this task's tmux session, on atl's tmux server.
+			tc, session := tmux.New(), tmux.SessionName(slug)
+			ctl.Copy = func(ctx context.Context, text []byte) error { return tc.Copy(ctx, session, text) }
+			return sandbox.Serve(ctx, g, ctl, runDir)
+		},
+	}
+	cmd.Flags().Int64Var(&taskID, "task-id", 0, "the task's database id (must still have this slug)")
+	cmd.Flags().StringArrayVar(&roMounts, "ro-mount", nil, "a host path of $"+sandbox.MountsVar+" (resolved) the task may bind-mount, read-only only")
+	return cmd
+}
+
+// remoteCmd is `atl push` (push true) or `atl fetch`. Inside a task
+// container it opens nothing: it asks the task's gate (see sandbox.Control),
+// which runs the same command where atl runs, with its git credentials.
+func (c *cli) remoteCmd(push bool) *cobra.Command {
+	var repo string
+	var force bool
+	var taskID int64
+	op, short := sandbox.OpFetch, "git fetch origin in each repo of the task (rw and ro), or only --repo"
+	use := "fetch [task] [--repo NAME]"
+	if push {
+		op, short = sandbox.OpPush, "Push the task branch (atl/<slug>) of each rw repo, or only --repo, to origin"
+		use = "push [task] [--repo NAME] [--force]"
+	}
+	cmd := &cobra.Command{
+		Use:   use,
+		Short: short,
+		Long: short + ".\n\n" +
+			"task defaults to $ATL_TASK (set in every task session). Inside a sandboxed task's container,\n" +
+			"which has no git credentials, the task's gate runs it where atl runs.",
+		Args: args(cobra.MaximumNArgs(1)),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			ref := os.Getenv("ATL_TASK")
+			if len(a) == 1 {
+				ref = strings.TrimSpace(a[0])
+			}
+			if ref == "" {
+				return usagef("which task? (no task argument and no $ATL_TASK)")
+			}
+			repo = strings.TrimSpace(repo)
+			if sandbox.Inside() {
+				if taskID != 0 {
+					return usagef("--task-id is for the task's gate, not for a task container")
+				}
+				return c.viaGate(sandbox.ControlRequest{Op: op, Repo: repo, Force: force}, ref, nil, 0)
+			}
+			ap, err := c.App()
+			if err != nil {
+				return err
+			}
+			var res []app.RemoteResult
+			if push {
+				res, err = ap.Push(cmd.Context(), ref, app.PushOpts{Repo: repo, Force: force, TaskID: taskID}, c.stderr)
+			} else {
+				res, err = ap.Fetch(cmd.Context(), ref, app.FetchOpts{Repo: repo, TaskID: taskID}, c.stderr)
+			}
+			failed := false
+			for _, r := range res {
+				status := "pushed"
+				if !push {
+					status = "fetched"
+				}
+				if r.Err != nil {
+					status, failed = "failed: "+r.Err.Error(), true
+				}
+				fmt.Fprintf(c.stdout, "%s\t%s\n", r.Repo, status)
+			}
+			if err == nil && failed {
+				err = exitCodeError{exitErr} // the lines above say why
+			}
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&repo, "repo", "", "only this repo of the task")
+	if push {
+		cmd.Flags().BoolVar(&force, "force", false, "push with --force-with-lease (after a rebase)")
+	}
+	// The gate names its task by id and slug, so that nothing else (a
+	// prefix, a slug that is all digits, a task created after its own was
+	// deleted) can be taken for it.
+	cmd.Flags().Int64Var(&taskID, "task-id", 0, "only the task with this id, which must have the exact slug given (internal)")
+	cmd.Flags().MarkHidden("task-id")
+	return cmd
+}
+
+// ownTask checks, in a task container, that ref is the container's own task
+// ($ATL_TASK): the only one atl op can work on there.
+func ownTask(op, ref string) error {
+	switch self := os.Getenv("ATL_TASK"); {
+	case self == "":
+		return fmt.Errorf("inside a task container atl %s needs $ATL_TASK (it works on the container's own task only)", op)
+	case ref != self:
+		return usagef("inside a task container atl %s works on this task (%s) only", op, self)
+	}
+	return nil
+}
+
+// viaGateTimeout bounds note and notes through the gate (push and fetch
+// may wait for the user: they have the gate's own limit).
+const viaGateTimeout = 30 * time.Second
+
+// viaGate sends req (with body) to the task's gate from inside its container
+// and relays the output and exit status; timeout 0 waits as long as the gate
+// does. The gate acts on its own task only, so a task named on the command
+// line must be this one. push and fetch get all output on stdout, as before;
+// note and notes keep stdout and stderr apart.
+func (c *cli) viaGate(req sandbox.ControlRequest, ref string, body []byte, timeout time.Duration) error {
+	if err := ownTask(req.Op, ref); err != nil {
+		return err
+	}
+	stderr := c.stderr
+	if req.Op == sandbox.OpPush || req.Op == sandbox.OpFetch {
+		stderr = c.stdout
+	}
+	code, _, err := sandbox.Ask(os.Getenv("ATL_CONTROL_SOCK"), req, body, c.stdout, stderr, timeout)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return exitCodeError{code}
+	}
+	return nil
 }
 
 func (c *cli) hookCmd() *cobra.Command {

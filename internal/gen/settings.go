@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // hookEvents lists the Claude Code hook events atelier installs, in order.
@@ -58,8 +59,22 @@ func StatusLineCommand(atlBin string) string {
 // removed, since project settings would override the user's. A file that
 // is not a valid settings object is backed up to settings.json.bak and
 // replaced. The write is atomic.
+//
+// The task dir is the task's to write (a sandboxed task's container has it
+// mounted), so it is accessed through package nofollow: a symlink in place
+// of .claude, settings.json or settings.json.bak is never followed. A
+// settings.json that is a symlink or not a regular file is not read: it is
+// replaced as if it were missing.
 func WriteSettings(taskDir, atlBin string) error {
-	path, root, err := loadSettings(taskDir)
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		return fmt.Errorf("gen: create task dir: %w", err)
+	}
+	d, err := nofollow.Open(taskDir)
+	if err != nil {
+		return fmt.Errorf("gen: %w", err)
+	}
+	defer d.Close()
+	root, err := loadSettings(d)
 	if err != nil {
 		return err
 	}
@@ -72,7 +87,7 @@ func WriteSettings(taskDir, atlBin string) error {
 	}
 	root["hooks"] = hooks
 	setStatusLine(root, atlBin, globalStatusLine(config.ClaudeUserSettings()))
-	return saveSettings(path, root)
+	return saveSettings(d, root)
 }
 
 // setStatusLine sets root's statusLine to atelier's command unless it holds
@@ -154,36 +169,48 @@ func setAtelierHook(hooks map[string]any, event, matcher, cmdEvent, atlBin strin
 	hooks[event] = append(groups, group)
 }
 
-// loadSettings creates <dir>/.claude and returns the path of its
-// settings.json and the parsed contents ({} if the file is missing or
-// empty). A file that is not a valid settings object is backed up to
-// settings.json.bak and treated as empty.
-func loadSettings(dir string) (string, map[string]any, error) {
-	cdir := filepath.Join(dir, ".claude")
-	if err := os.MkdirAll(cdir, 0o755); err != nil {
-		return "", nil, fmt.Errorf("gen: create %s: %w", cdir, err)
+// settingsRel and settingsBakRel are where loadSettings and saveSettings
+// keep the settings, relative to the dir they are given.
+const (
+	settingsRel    = ".claude/settings.json"
+	settingsBakRel = ".claude/settings.json.bak"
+)
+
+// maxSettings caps how much of a settings file loadSettings reads; a larger
+// file is replaced as if it were not there.
+const maxSettings = 4 << 20
+
+// loadSettings creates .claude in d and returns the parsed contents of its
+// settings.json ({} if the file is missing or empty). A file that is not a
+// valid settings object is backed up to settings.json.bak and treated as
+// empty; one that is a symlink, not a regular file, or larger than
+// maxSettings is not read and treated as missing.
+func loadSettings(d *nofollow.Dir) (map[string]any, error) {
+	if err := d.MkdirAll(".claude", 0o755); err != nil {
+		return nil, fmt.Errorf("gen: create .claude: %w", err)
 	}
-	path := filepath.Join(cdir, "settings.json")
 	root := map[string]any{}
-	data, err := os.ReadFile(path)
+	data, err := d.ReadFile(settingsRel, maxSettings)
 	switch {
-	case errors.Is(err, os.ErrNotExist):
+	case errors.Is(err, os.ErrNotExist) || errors.Is(err, nofollow.ErrSymlink) ||
+		errors.Is(err, nofollow.ErrNotRegular) || errors.Is(err, nofollow.ErrTooLarge):
 	case err != nil:
-		return "", nil, fmt.Errorf("gen: read %s: %w", path, err)
+		return nil, fmt.Errorf("gen: read settings: %w", err)
 	case len(bytes.TrimSpace(data)) == 0:
 	default:
 		if root, err = parseSettings(data); err != nil {
-			if err := os.WriteFile(path+".bak", data, 0o644); err != nil {
-				return "", nil, fmt.Errorf("gen: back up invalid %s: %w", path, err)
+			if err := d.WriteFile(settingsBakRel, data, 0o644); err != nil {
+				return nil, fmt.Errorf("gen: back up invalid settings: %w", err)
 			}
 			root = map[string]any{}
 		}
 	}
-	return path, root, nil
+	return root, nil
 }
 
-// saveSettings writes root as indented JSON to path atomically.
-func saveSettings(path string, root map[string]any) error {
+// saveSettings writes root as indented JSON to d's .claude/settings.json
+// atomically.
+func saveSettings(d *nofollow.Dir, root map[string]any) error {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -191,8 +218,8 @@ func saveSettings(path string, root map[string]any) error {
 	if err := enc.Encode(root); err != nil {
 		return fmt.Errorf("gen: encode settings: %w", err)
 	}
-	if err := writeAtomic(path, buf.Bytes()); err != nil {
-		return fmt.Errorf("gen: write %s: %w", path, err)
+	if err := d.WriteFile(settingsRel, buf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("gen: write settings: %w", err)
 	}
 	return nil
 }
@@ -337,9 +364,9 @@ loop:
 	return s[:i], b.String()
 }
 
-// writeAtomic writes data to path via a temp file in the same directory,
+// WriteAtomic writes data to path via a temp file in the same directory,
 // synced to disk before the rename so a crash never leaves an empty file.
-func writeAtomic(path string, data []byte) error {
+func WriteAtomic(path string, data []byte) error {
 	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
 	if err != nil {
 		return err

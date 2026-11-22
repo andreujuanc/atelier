@@ -15,6 +15,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/palette"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
 )
 
@@ -28,7 +29,8 @@ import (
 // resolved. Like the hook it is fast (one read-only DB open, a schema
 // version check and two queries), never prints errors to stdout and always
 // exits 0; errors go to hook.log. It never writes the database (see
-// store.OpenReadOnly).
+// store.OpenReadOnly). In a task container it asks the task's gate, which
+// answers from its own task only (see TaskServer).
 
 // EventStatusLine names `atl statusline` in hook.log lines.
 const EventStatusLine = "statusline"
@@ -57,61 +59,73 @@ func StatusLineMain() int {
 }
 
 func runStatusLine(stdin io.Reader, stdout, stderr io.Writer, env func(string) string) (code int) {
+	if env(sandbox.InEnv) != "" {
+		return statusLineViaGate(stdin, stdout, stderr, env)
+	}
 	var p config.Paths
-	sid := ""
 	defer func() {
 		if r := recover(); r != nil {
-			logError(p, stderr, EventStatusLine, sid, fmt.Errorf("panic: %v\n%s", r, debug.Stack()))
+			logError(p, stderr, EventStatusLine, "", fmt.Errorf("panic: %v\n%s", r, debug.Stack()))
 			code = 0
 		}
 	}()
 	p, err := config.Resolve()
 	if err != nil {
-		logError(p, stderr, EventStatusLine, sid, err)
+		logError(p, stderr, EventStatusLine, "", err)
 		return 0
 	}
 	data, err := io.ReadAll(io.LimitReader(stdin, maxStatusInput+1))
 	if err != nil {
-		logError(p, stderr, EventStatusLine, sid, fmt.Errorf("read stdin: %w", err))
+		logError(p, stderr, EventStatusLine, "", fmt.Errorf("read stdin: %w", err))
 		return 0
 	}
+	db{p: p}.statusLine(data, stdout, stderr, env)
+	return 0
+}
+
+// statusLine prints the status line for the input data. Without a store in
+// d it opens the database read-only for the call.
+func (d db) statusLine(data []byte, stdout, stderr io.Writer, env func(string) string) {
+	p := d.p
 	if len(data) > maxStatusInput {
-		logError(p, stderr, EventStatusLine, sid, fmt.Errorf("status line input exceeds %d bytes", maxStatusInput))
-		return 0
+		logError(p, stderr, EventStatusLine, "", fmt.Errorf("status line input exceeds %d bytes", maxStatusInput))
+		return
 	}
 	in, err := parseStatusInput(data)
 	if err != nil {
-		logError(p, stderr, EventStatusLine, sid, fmt.Errorf("decode status line input: %w", err))
-		return 0
+		logError(p, stderr, EventStatusLine, "", fmt.Errorf("decode status line input: %w", err))
+		return
 	}
-	sid = in.SessionID
-	if _, err := os.Stat(p.DB); err != nil {
-		return 0 // no database (yet): never create one from here
+	sid := in.SessionID
+	if d.st == nil {
+		if _, err := os.Stat(p.DB); err != nil {
+			return // no database (yet): never create one from here
+		}
+		// Read-only: the status line never creates, migrates or writes the
+		// database. An older (not yet migrated), newer or empty schema prints
+		// nothing and is not logged; the next hook or atl command migrates it.
+		st, err := store.OpenReadOnly(p.DB, dbBusyTimeout)
+		if errors.Is(err, store.ErrSchemaVersion) {
+			return
+		}
+		if err != nil {
+			logError(p, stderr, EventStatusLine, sid, err)
+			return
+		}
+		defer st.Close()
+		d.st = st
 	}
-	// Read-only: the status line never creates, migrates or writes the
-	// database. An older (not yet migrated), newer or empty schema prints
-	// nothing and is not logged; the next hook or atl command migrates it.
-	st, err := store.OpenReadOnly(p.DB, dbBusyTimeout)
-	if errors.Is(err, store.ErrSchemaVersion) {
-		return 0
-	}
-	if err != nil {
-		logError(p, stderr, EventStatusLine, sid, err)
-		return 0
-	}
-	defer st.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), statusLineTimeout)
 	defer cancel()
 
-	task, state, err := statusTask(ctx, st, in, env, p)
+	task, state, err := d.statusTask(ctx, in, env)
 	if err != nil {
 		logError(p, stderr, EventStatusLine, sid, err)
 	}
 	if task == nil {
-		return 0
+		return
 	}
 	fmt.Fprintln(stdout, statusLineText(task, state, env("NO_COLOR") == "", palette.DarkBackground(env("COLORFGBG"))))
-	return 0
 }
 
 // parseStatusInput decodes Claude Code's status line JSON defensively:
@@ -153,10 +167,12 @@ func jsonString(raw json.RawMessage) string {
 // the row with the input's claude session id (that session's own state),
 // else the task from ATL_TASK or the cwd as the hook resolves it
 // (resolveTask; the state of all its sessions, model.TaskState). A task
-// with no match is nil. At most two queries on the common paths.
-func statusTask(ctx context.Context, st *store.Store, in statusInput, env func(string) string, p config.Paths) (*model.Task, model.SessionState, error) {
+// with no match is nil. At most two queries on the common paths. With a
+// scope both are the scope's task only.
+func (d db) statusTask(ctx context.Context, in statusInput, env func(string) string) (*model.Task, model.SessionState, error) {
+	st, p := d.st, d.p
 	if in.SessionID != "" {
-		sess, err := st.GetSessionByClaudeID(ctx, in.SessionID)
+		sess, err := d.sessionByClaudeID(ctx, in.SessionID)
 		if err == nil {
 			t, err := st.GetTaskBrief(ctx, sess.TaskID)
 			if err == nil {
@@ -169,9 +185,17 @@ func statusTask(ctx context.Context, st *store.Store, in statusInput, env func(s
 			return nil, "", err
 		}
 	}
-	t, err := resolveTask(statusCwd(in.Cwds, p), env, p, func(slug string) (*model.Task, error) {
-		return st.GetTaskBriefBySlug(ctx, slug)
-	})
+	var t *model.Task
+	var err error
+	if d.scope != 0 {
+		if t, err = st.GetTaskBrief(ctx, d.scope); errors.Is(err, store.ErrNotFound) {
+			t, err = nil, nil
+		}
+	} else {
+		t, err = resolveTask(statusCwd(in.Cwds, p), env, p, func(slug string) (*model.Task, error) {
+			return st.GetTaskBriefBySlug(ctx, slug)
+		})
+	}
 	if err != nil || t == nil {
 		return nil, "", err
 	}

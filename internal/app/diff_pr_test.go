@@ -92,9 +92,28 @@ func TestDiff(t *testing.T) {
 	}
 }
 
+// githubOrigins points the origin of each named repo at
+// https://github.com/o/<name>.git in its config, which the user's own
+// (global) rules turn back into the local origin: a pin gh can name.
+func (e *taskEnv) githubOrigins(t *testing.T, names ...string) {
+	t.Helper()
+	var rules strings.Builder
+	for _, name := range names {
+		url := "https://github.com/o/" + name + ".git"
+		rules.WriteString("[url \"" + e.origin(name) + "\"]\n\tinsteadOf = " + url + "\n")
+		git(t, e.canonical(name), "remote", "set-url", "origin", url)
+	}
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(global, []byte(rules.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+}
+
 const ghStub = `#!/bin/sh
 echo call >> "$GH_STUB_LOG.calls"
 pwd > "$GH_STUB_LOG.cwd"
+env > "$GH_STUB_LOG.env"
 printf '%s\0' "$@" > "$GH_STUB_LOG.args"
 case "$GH_STUB_MODE" in
 fail)
@@ -160,6 +179,7 @@ func TestPR(t *testing.T) {
 	for _, r := range []string{"api", "lib", "web", "docs"} {
 		e.addRepo(t, r, "main")
 	}
+	e.githubOrigins(t, "api", "lib", "web", "docs")
 	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Ship it", Description: "Does things.\nMore.",
 		Repos: []RepoArg{{"api", model.ModeRW}, {"lib", model.ModeRW}, {"web", model.ModeRW}, {"docs", model.ModeRO}}})
 	if err != nil {
@@ -208,14 +228,32 @@ func TestPR(t *testing.T) {
 	if res[0] != (PRResult{Repo: "api", URL: "https://github.com/o/r/pull/1"}) || res[1] != want[1] || res[2] != want[2] {
 		t.Fatalf("res = %+v", res)
 	}
-	if gh.calls() != 1 || !samePathT(t, gh.cwd(t), api) {
-		t.Fatalf("gh calls %d cwd %s", gh.calls(), gh.cwd(t))
+	// gh is told the pinned origin's repository and runs outside the
+	// worktree (it would read the remotes and run git there), with git's
+	// guards in its environment.
+	if cwd := gh.cwd(t); gh.calls() != 1 || strings.HasPrefix(cwd, e.root) || exists(cwd) {
+		t.Fatalf("gh calls %d cwd %s", gh.calls(), cwd)
 	}
-	wantArgs := []string{"pr", "create", "--head", "atl/ship-it", "--base", "main", "--title", "Ship it",
+	wantArgs := []string{"pr", "create", "--repo", "o/api", "--head", "atl/ship-it", "--base", "main", "--title", "Ship it",
 		"--body", "Does things.\nMore.\n\nCreated by atelier"}
 	if got := gh.args(t); strings.Join(got, "|") != strings.Join(wantArgs, "|") {
 		t.Fatalf("gh args %q\nwant %q", got, wantArgs)
 	}
+	env := readFile(t, gh.base+".env")
+	for _, s := range []string{"\nGIT_CONFIG_KEY_0=core.fsmonitor\n", "\nGIT_CONFIG_VALUE_1=/dev/null\n", "\nGIT_CEILING_DIRECTORIES="} {
+		if !strings.Contains(env, s) {
+			t.Errorf("gh's environment lacks %q", s)
+		}
+	}
+	// The repo's config pointing origin elsewhere changes nothing.
+	git(t, e.canonical("api"), "remote", "set-url", "origin", "https://github.com/evil/api.git")
+	if res, err = e.app.PR(ctx, task.Slug); err != nil || res[0].URL == "" {
+		t.Fatalf("res = %+v, %v", res, err)
+	}
+	if got := gh.args(t); got[3] != "o/api" {
+		t.Fatalf("gh args %q after origin was pointed elsewhere", got)
+	}
+	git(t, e.canonical("api"), "remote", "set-url", "origin", "https://github.com/o/api.git")
 	st, _ = e.app.Store.GetTaskBySlug(ctx, task.Slug)
 	if st.Status != model.StatusReview {
 		t.Fatalf("status %s", st.Status)
@@ -231,6 +269,7 @@ func TestPRGhFailureAndExisting(t *testing.T) {
 	gh := installGH(t)
 	e.addRepo(t, "api", "trunk")
 	e.addRepo(t, "gone", "main")
+	e.githubOrigins(t, "api", "gone")
 	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "fail",
 		Repos: []RepoArg{{"api", model.ModeRW}, {"gone", model.ModeRW}}})
 	if err != nil {
@@ -266,7 +305,7 @@ func TestPRGhFailureAndExisting(t *testing.T) {
 	if res[0] != (PRResult{Repo: "api", URL: "https://github.com/o/r/pull/7"}) {
 		t.Fatalf("res = %+v", res)
 	}
-	if got := gh.args(t); got[5] != "trunk" || got[len(got)-1] != "Created by atelier" {
+	if got := gh.args(t); got[7] != "trunk" || got[len(got)-1] != "Created by atelier" {
 		t.Fatalf("gh args %q", got)
 	}
 	st, _ = e.app.Store.GetTaskBySlug(ctx, task.Slug)

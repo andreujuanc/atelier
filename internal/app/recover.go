@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 // Recover marks live sessions (running, waiting, idle) whose tagged tmux
@@ -24,6 +26,10 @@ import (
 // really gone; and a session relaunched (or ended) after the snapshot no
 // longer matches the launch and is left alone.
 func (a *App) Recover(ctx context.Context) (int, error) {
+	if sandbox.Inside() {
+		// No tmux server in a task container: every window would look gone.
+		return 0, nil
+	}
 	live, err := a.Store.ListLaunchedLive(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("recover: %w", err)
@@ -49,7 +55,27 @@ func (a *App) Recover(ctx context.Context) (int, error) {
 		}
 		if changed {
 			n++
+			a.killStopped(ctx, l.ID)
 		}
 	}
 	return n, errors.Join(errs...)
+}
+
+// killStopped ends what session id, whose window Recover found gone, left
+// running in its task's container (killSessionProcs). Recover runs when
+// atl starts, so this covers a box that restarted while the task
+// containers kept running.
+func (a *App) killStopped(ctx context.Context, id int64) {
+	if a.Sandbox == nil {
+		return
+	}
+	s, err := a.Store.GetSession(ctx, id)
+	if err != nil {
+		return
+	}
+	t, err := a.Store.GetTask(ctx, s.TaskID)
+	if err != nil {
+		return
+	}
+	a.killSessionProcs(ctx, t, id)
 }

@@ -44,12 +44,19 @@ const (
 	modeNotesLoading
 )
 
-// confirmState is a pending done/cancel confirmation.
+// confirmState is the done/cancel dialog: confirming (space ticks the box,
+// then enter) closes the task, with force exactly when the dialog shows
+// the uncommitted-changes line.
 type confirmState struct {
-	verb  string // "done" or "cancel"
-	id    int64
-	slug  string
-	dirty string // non-empty: the refusal; F forces
+	verb string // "done" or "cancel"
+	id   int64
+	slug string
+	// dirty: a rw worktree has uncommitted changes; the dialog says they
+	// will be deleted and confirming forces the close.
+	dirty  bool
+	ticked bool // the "Delete them" box
+	// unticked: enter was pressed with the box unticked (shows a hint).
+	unticked bool
 }
 
 // Messages.
@@ -87,6 +94,14 @@ type (
 		op   string
 		text string
 		err  error
+	}
+	// closeCheckMsg ends the dirty check `d`/`c` runs before its dialog;
+	// dirty is false when it could not be told.
+	closeCheckMsg struct {
+		id    int64
+		slug  string
+		verb  string
+		dirty bool
 	}
 	finishMsg struct {
 		id    int64
@@ -234,8 +249,9 @@ type Model struct {
 	// renameFill is the input's value right after prefilling: renameOrig
 	// cut to the input's CharLimit (a legacy title may be longer).
 	renameFill string
-	// pending holds dirty refusals that arrived outside normal mode; they
-	// are shown once back in normal mode.
+	// pending holds done/cancel dialogs (a dirty check's result or a
+	// refusal for uncommitted changes) that arrived outside normal mode;
+	// they are shown once back in normal mode.
 	pending []*confirmState
 
 	busy     map[int64]string // task id → op in progress
@@ -859,21 +875,18 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.setStatus(msg.text)
 		}
 		return m.reload()
+	case closeCheckMsg:
+		delete(m.busy, msg.id)
+		m.showConfirm(&confirmState{verb: msg.verb, id: msg.id, slug: msg.slug, dirty: msg.dirty})
+		return nil
 	case finishMsg:
 		delete(m.busy, msg.id)
 		if msg.err != nil {
 			if !msg.force && isDirtyErr(msg.err) {
-				c := &confirmState{verb: msg.verb, id: msg.id, slug: msg.slug, dirty: firstLine(msg.err.Error())}
-				if m.mode != modeNormal {
-					// Don't yank the user out of the form/filter/another
-					// prompt: Update shows it once back in normal mode.
-					if m.form != nil {
-						m.lastForm = m.form
-					}
-					m.pending = append(m.pending, c)
-					return nil
-				}
-				m.confirm, m.mode = c, modeConfirm
+				// Changes the dialog did not show: ask again, now saying
+				// they will be deleted. Never forced without that.
+				m.setErr(fmt.Errorf("%s: %w", msg.verb, msg.err))
+				m.showConfirm(&confirmState{verb: msg.verb, id: msg.id, slug: msg.slug, dirty: true})
 				return nil
 			}
 			m.setErr(fmt.Errorf("%s: %w", msg.verb, msg.err))
@@ -974,10 +987,51 @@ func lastLine(s string) string {
 }
 
 // isDirtyErr reports whether a done/cancel refusal is about uncommitted
-// changes.
+// changes (also those teardown left), which force deletes.
 func isDirtyErr(err error) bool {
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "uncommitted") || strings.Contains(s, "dirty")
+	return strings.Contains(s, "uncommitted") || strings.Contains(s, "dirty") ||
+		strings.Contains(s, "changes after teardown")
+}
+
+// showConfirm opens the done/cancel dialog c, or queues it while another
+// mode has the keyboard (Update shows it once back in normal mode).
+func (m *Model) showConfirm(c *confirmState) {
+	if m.mode != modeNormal || m.quitRequested {
+		// Don't yank the user out of the form/filter/another prompt.
+		if m.form != nil {
+			m.lastForm = m.form
+		}
+		m.pending = append(m.pending, c)
+		return
+	}
+	m.confirm, m.mode = c, modeConfirm
+}
+
+// closeCheckCmd finds out whether task slug has uncommitted changes in a
+// rw worktree, for the `d`/`c` dialog. When that cannot be told (an error
+// on a repo or the task), dirty is false: the close then runs without
+// force and the app's answer is shown.
+func (m *Model) closeCheckCmd(id int64, slug, verb string) tea.Cmd {
+	m.busy[id] = "check " + slug
+	be, ctx := m.be, m.ctx
+	return func() tea.Msg {
+		v, err := be.Get(ctx, slug)
+		dirty := false
+		if err == nil {
+			for _, r := range v.RepoStatus {
+				if r.Mode != model.ModeRW {
+					continue
+				}
+				if r.Err != "" && r.Err != "missing" {
+					dirty = false
+					break
+				}
+				dirty = dirty || r.Dirty
+			}
+		}
+		return closeCheckMsg{id: id, slug: slug, verb: verb, dirty: dirty}
+	}
 }
 
 // exec runs c with the terminal handed over; stderr is captured for the
@@ -1226,18 +1280,34 @@ func (m *Model) formKey(msg tea.KeyMsg) tea.Cmd {
 	return tea.Batch(cmd, m.syncProject())
 }
 
+// confirmKey handles a key in the done/cancel dialog: space ticks the box,
+// enter confirms once it is ticked, esc and n close the dialog; other keys
+// (a stray y too) do nothing.
 func (m *Model) confirmKey(key string) tea.Cmd {
 	c := m.confirm
-	m.confirm, m.mode = nil, modeNormal
-	force := false
-	switch {
-	case c.dirty == "" && (key == "y" || key == "Y"):
-	case c.dirty != "" && key == "F":
-		force = true
-	default:
-		m.setStatus(c.verb + " " + c.slug + " aborted")
+	if c == nil {
+		m.mode = modeNormal
 		return nil
 	}
+	switch key {
+	case "esc", "n", "N":
+		m.confirm, m.mode = nil, modeNormal
+		m.setStatus(c.verb + " " + c.slug + " aborted")
+		return nil
+	case " ":
+		c.ticked, c.unticked = !c.ticked, false
+		return nil
+	case "enter":
+		if !c.ticked {
+			c.unticked = true
+			return nil
+		}
+	default:
+		return nil
+	}
+	m.confirm, m.mode = nil, modeNormal
+	// Forced only when the dialog said the uncommitted changes go too.
+	force := c.dirty
 	if _, busy := m.busy[c.id]; busy {
 		m.setStatus("busy: " + m.busy[c.id])
 		return nil
@@ -1355,9 +1425,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 			m.setStatusErr(fmt.Sprintf("%s: task %s is already %s", verb, slug, t.Task.Status), true)
 			return nil
 		}
-		m.confirm = &confirmState{verb: verb, id: t.Task.ID, slug: slug}
-		m.mode = modeConfirm
-		return nil
+		return m.closeCheckCmd(t.Task.ID, slug, verb)
 	case "p":
 		be := m.be
 		return m.startOp(t, "pr", func(ctx context.Context) (string, error) {
