@@ -659,6 +659,33 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 	}
 }
 
+// EndSession starts, detached in the task's own container (by the ID its
+// labels were checked on), EndSessionCmd for session: once the session's
+// Claude has exited, what it left running there is ended; while it runs,
+// nothing. The gate calls it when a SessionEnd hook of the task recorded
+// the session as ended. The exec runs as the container's user and is not
+// the task's (it is not in g.execs).
+func (g *Gate) EndSession(session int64) error {
+	g.init()
+	agent := g.agentID()
+	if agent == "" {
+		return errors.New("the task's own container is not there")
+	}
+	status, out, err := g.call("POST", "/containers/"+agent+"/exec", map[string]any{"Cmd": EndSessionCmd(session)})
+	if err != nil || status != http.StatusCreated {
+		return fmt.Errorf("exec create: %v %d %s", err, status, out)
+	}
+	var created struct{ Id string }
+	if err := json.Unmarshal(out, &created); err != nil || created.Id == "" || strings.ContainsAny(created.Id, "/?#%") {
+		return fmt.Errorf("exec create: unexpected answer %s", out)
+	}
+	status, out, err = g.call("POST", "/exec/"+created.Id+"/start", map[string]any{"Detach": true})
+	if err != nil || status != http.StatusOK && status != http.StatusNoContent {
+		return fmt.Errorf("exec start: %v %d %s", err, status, out)
+	}
+	return nil
+}
+
 // agentID returns the full ID of the task's own container, found by its
 // name and checked by its labels (see owner), or "" if there is none.
 func (g *Gate) agentID() string {

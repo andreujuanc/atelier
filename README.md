@@ -353,6 +353,14 @@ process there with the session's `ATL_SESSION`, Claude's children included) when
 notices the window gone, which it checks when it starts, and again right before it resumes
 the session.
 
+A session that ends normally (Claude exits, the window closes) is ended the same way: what
+it started that still runs in the container (a dev server it put in the background, say)
+is ended once Claude is gone. The gate does it when Claude's `SessionEnd` hook records the
+end, and `atl` does it wherever else it records a session as ended. A session that still
+runs (after `/clear`, which reports an end too) and the task's other sessions are left
+alone. What should outlive a session belongs in a Docker service (`docker compose`); the
+session's start context says so.
+
 **Claude Code in the container.** Your Claude Code login stays where `atl` runs. Sessions
 in a task log in with a token instead:
 

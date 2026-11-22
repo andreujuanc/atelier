@@ -767,6 +767,7 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 	if err != nil {
 		return err
 	}
+	var ended []int64
 	for _, s := range sessions {
 		if s.State == model.StateEnded {
 			continue
@@ -774,9 +775,17 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		if err := a.Store.SetSessionState(ctx, s.ID, model.StateEnded, a.now()); err != nil {
 			return err
 		}
+		ended = append(ended, s.ID)
 	}
 	if err := a.runTeardown(ctx, t, force); err != nil {
 		if !force {
+			// The task stays open, and so does its container: what the
+			// sessions just ended (their windows are gone) left running in
+			// it goes now. Otherwise removeSandbox takes it with the
+			// container.
+			for _, id := range ended {
+				a.killSessionProcs(ctx, t, id)
+			}
 			return fmt.Errorf("task %s: teardown: %w (use --force to continue anyway)", t.Slug, err)
 		}
 		a.warnf("teardown for task %s: %v", t.Slug, err)

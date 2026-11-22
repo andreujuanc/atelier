@@ -744,6 +744,15 @@ func (c *cli) gateCmd() *cobra.Command {
 				Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
 				Ident:      sandbox.Ident(taskID, bin),
 			}
+			// A session ended (Claude exits): what it left running in the
+			// container goes once Claude is gone.
+			ts.OnSessionEnd(func(session int64) {
+				go func() {
+					if err := g.EndSession(session); err != nil {
+						g.Log.Printf("note  end what session %d left running: %v", session, err)
+					}
+				}()
+			})
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 			go func() { // a gate outliving its task stops
