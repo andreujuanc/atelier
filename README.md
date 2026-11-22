@@ -94,20 +94,24 @@ atl done fix-login [--force]    # teardown, remove worktrees and fully pushed br
 atl cancel fix-login [--force]
 atl doctor                # tools, the workspace and where each setting came from, dirs, database, port offsets shared with another workspace, sandbox mode (Docker, image, token); repos whose config atl refuses to run git with
 atl token [--paste]       # sandbox: run claude setup-token and store its token for task sessions (see Sandbox)
-atl                       # TUI (on a terminal), in the selected workspace
+atl                       # TUI (on a terminal), in the selected workspace; with none selected, the workspace selector
 atl -w shop ls            # any command in workspace shop (--workspace; else $ATL_WORKSPACE, else the current directory)
 atl workspace list [--json]          # workspaces under $ATL_WORKSPACES: open tasks, waiting sessions; * the selected one
 atl workspace new shop [--repos DIR] [--mount PATH]... [--image IMAGE]   # create (or adopt) $ATL_WORKSPACES/shop
 atl workspace open shop   # the TUI in workspace shop (same as atl -w shop)
+atl workspace open        # the workspace selector, whatever $ATL_WORKSPACE and the current directory say
 ```
 
 TUI keys: `n` new task, `enter` open (see below), `s` new session, `r` resume, `a` add repos to the
 selected task, `m` edit the selected task's notes in place (see [Notes](#notes)), `t` rename
 the selected task (an input prefilled with its title; `enter` saves, `esc` cancels), `d` done,
 `c` cancel (both ask first, see below), `p` pr, `D` diff, `A` assistant (about the selected task), `1`-`5` status,
-`/` filter (matches the slug or the title), `q` quit (while operations are running it
+`/` filter (matches the slug or the title), `w` switch workspace (leaves the TUI for the
+workspace selector, see [Workspaces](#workspaces)), `q` quit (while operations are running it
 waits for them and then quits; `ctrl+c` again forces it; meanwhile `n`, `t`, `a`, `d`, `c`
-and `/` are refused so no input is lost). The task list shows each task's title
+and `/` are refused so no input is lost; `w` waits the same way and then switches, `q`
+or `ctrl+c` meanwhile make it a plain quit). The status line shows the workspace's name at
+its right end when there is room. The task list shows each task's title
 (with its session-state dot and `*` for uncommitted changes), truncated to the pane; the slug
 is in the details pane, with the task's notes below the details.
 Repos (in the new-task form and for `a`) are picked from a list of `$ATL_REPOS`: type to
@@ -342,8 +346,9 @@ token stays in `run/claude-token.json` (see [Sandbox](#sandbox)).
 3. the current directory, when it is `$ATL_WORKSPACES/<name>` or inside it (symlinks
    resolved in both; `atl` does not look for `atelier.toml` up the tree).
 
-With none of them, the command fails with one line that names these ways and the existing
-workspaces, and `atl doctor` fails its `workspace` check and checks only the tools. A
+With none of them, `atl` alone on a terminal shows the workspace selector (below); any
+other command fails with one line that names these ways and the existing workspaces, and
+`atl doctor` fails its `workspace` check and checks only the tools. A
 selected directory without `atelier.toml` is an error that says to run `atl workspace new
 <name>`. `atl workspace`, help and completion need no workspace, and neither does `atl` in
 a task container (it talks to the task's gate).
@@ -419,7 +424,25 @@ clones of its rw repos (see [Notes](#notes)).
   `$ATL_REPOS`, `$ATL_SANDBOX_MOUNTS`, `$ATL_SANDBOX_IMAGE`, `$ATL_SANDBOX_CONTEXT` and
   `$ATL_CONTEXT` when you set them (not when `atl` did, for the workspace it runs in), so
   run in a box it writes the box's settings. Prints the name and the directory.
-- `atl workspace open <name>`: the TUI in that workspace, as `atl -w <name>`.
+- `atl workspace open <name>`: the TUI in that workspace, as `atl -w <name>`. Without a
+  name: the workspace selector, whatever `$ATL_WORKSPACE` and the current directory say
+  (with `-w <name>`, that workspace). Both need a terminal.
+
+**The selector.** A full-screen list of every directory under `$ATL_WORKSPACES` with a valid
+name, as `atl workspace list` shows them: the name, the open tasks, the waiting sessions
+(highlighted as the TUI highlights a waiting session) and the path; a directory without
+`atelier.toml` is dimmed as "not a workspace (no atelier.toml)", and one whose database
+cannot be read shows the error. It starts on the workspace whose TUI was opened last
+(recorded in `$ATL_WORKSPACES/.last`; atl ignores it when it cannot read or write it), else
+on the first. Keys: `↑`/`↓` (`k`/`j`) move, `enter` opens the workspace, `n` creates one (type
+its name; `enter` creates it as `atl workspace new <name>` does with no flags, and selects
+it), `/` filters by name, `r` reloads the list, `q` or `ctrl+c` quits. `enter` on a directory
+without `atelier.toml` asks whether to adopt it (`y`), as `atl workspace new <name>` does,
+keeping its contents and the `tmux_socket = "default"` rule above. Opening a workspace
+replaces the selector with `atl -w <name>`, run in the environment `atl` started with (not
+the one a workspace was applied to), so nothing of one workspace reaches the next. `w` in
+the TUI does the same the other way: once no operation is running, it leaves the TUI and
+runs `atl workspace open` in that environment, on the workspace it left.
 
 A box that sets `ATL_WORKSPACE` to a directory works only once that directory has an
 `atelier.toml`: run `atl workspace new <name>` in the box once (its sessions stay on tmux's

@@ -567,3 +567,33 @@ func TestCreate(t *testing.T) {
 		t.Error("made the too-long workspace")
 	}
 }
+
+// TestLast: the last workspace opened, kept in the root; anything wrong
+// reads as none.
+func TestLast(t *testing.T) {
+	root := t.TempDir()
+	if got := Last(root); got != "" {
+		t.Errorf("none: %q", got)
+	}
+	if err := SaveLast(root, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if got := Last(root); got != "alpha" {
+		t.Errorf("Last = %q", got)
+	}
+	if err := SaveLast(root, "Bad"); err == nil {
+		t.Error("saved an invalid name")
+	}
+	if err := SaveLast(filepath.Join(root, "missing"), "alpha"); err == nil {
+		t.Error("saved into a missing root")
+	}
+	if err := os.WriteFile(filepath.Join(root, ".last"), []byte("../x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := Last(root); got != "" {
+		t.Errorf("invalid content: %q", got)
+	}
+	if es, _ := List(root); len(es) != 0 {
+		t.Errorf("listed %v", es)
+	}
+}

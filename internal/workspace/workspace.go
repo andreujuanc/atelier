@@ -322,3 +322,47 @@ func CheckSocketBudget(dir string) error {
 	}
 	return nil
 }
+
+// lastFile, in the root, holds the name of the workspace whose TUI was
+// opened last (the selector preselects it).
+const lastFile = ".last"
+
+// Last returns the name recorded by SaveLast in root, "" if none or it is
+// not a valid name.
+func Last(root string) string {
+	data, err := os.ReadFile(filepath.Join(root, lastFile))
+	if err != nil {
+		return ""
+	}
+	name := strings.TrimSpace(string(data))
+	if CheckName(name) != nil {
+		return ""
+	}
+	return name
+}
+
+// SaveLast records name as the last workspace opened in root (an existing
+// directory: it is not created). Errors are the caller's to ignore.
+func SaveLast(root, name string) error {
+	if err := CheckName(name); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
+		return fmt.Errorf("workspaces root %s is not a directory", root)
+	}
+	tmp, err := os.CreateTemp(root, lastFile+".*")
+	if err != nil {
+		return err
+	}
+	_, err = tmp.WriteString(name + "\n")
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), filepath.Join(root, lastFile))
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+	}
+	return err
+}

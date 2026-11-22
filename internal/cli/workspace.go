@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -49,7 +52,7 @@ func (c *cli) workspaceListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			entries, err := workspace.List(root)
+			entries, err := app.ListWorkspaces(cmd.Context(), root)
 			if err != nil {
 				return err
 			}
@@ -59,11 +62,10 @@ func (c *cli) workspaceListCmd() *cobra.Command {
 			}
 			out := make([]jsonWorkspace, 0, len(entries))
 			for _, e := range entries {
-				w := jsonWorkspace{Name: e.Name, Path: e.Dir, Workspace: e.Workspace, Current: filepath.Clean(e.Dir) == current}
-				if e.Workspace {
-					if w.OpenTasks, w.Waiting, err = app.WorkspaceCounts(cmd.Context(), e.Dir); err != nil {
-						w.Error = err.Error()
-					}
+				w := jsonWorkspace{Name: e.Name, Path: e.Dir, Workspace: e.Workspace, Current: filepath.Clean(e.Dir) == current,
+					OpenTasks: e.OpenTasks, Waiting: e.Waiting}
+				if e.Err != nil {
+					w.Error = e.Err.Error()
 				}
 				out = append(out, w)
 			}
@@ -130,8 +132,7 @@ func (c *cli) workspaceNewCmd() *cobra.Command {
 			}
 			cfg.Repos = strings.TrimSpace(cfg.Repos)
 			cfg.Sandbox = &workspace.SandboxConfig{Image: strings.TrimSpace(image), Mounts: ms}
-			workspace.FillFromEnv(&cfg)
-			dir, notes, err := workspace.Create(root, name, cfg)
+			dir, notes, err := createWorkspace(root, name, cfg)
 			if err != nil {
 				return err
 			}
@@ -150,26 +151,124 @@ func (c *cli) workspaceNewCmd() *cobra.Command {
 }
 
 func (c *cli) workspaceOpenCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "open <name>",
-		Short: "The TUI in workspace <name> (same as atl --workspace <name>)",
-		Args:  args(cobra.ExactArgs(1)),
+	var preselect string
+	cmd := &cobra.Command{
+		Use: "open [<name>]",
+		Short: "The TUI in workspace <name> (same as atl --workspace <name>); without a name, the workspace selector " +
+			"(whatever $" + workspace.Var + " and the current directory say)",
+		Args: args(cobra.MaximumNArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
-			if c.wsFlag != "" && c.wsFlag != a[0] {
-				return usagef("both --workspace %s and workspace %s given", c.wsFlag, a[0])
+			terminal := isTerminal(os.Stdin) && isTerminal(c.stdout)
+			if len(a) == 0 && c.wsFlag == "" {
+				if !terminal {
+					return fmt.Errorf("atl workspace open without a name shows the workspace selector, which needs a terminal; name the workspace: atl workspace open <name>")
+				}
+				return c.selectWorkspace(cmd.Context(), preselect)
 			}
-			c.wsFlag = a[0]
+			if len(a) == 1 {
+				if c.wsFlag != "" && c.wsFlag != a[0] {
+					return usagef("both --workspace %s and workspace %s given", c.wsFlag, a[0])
+				}
+				c.wsFlag = a[0]
+			}
 			if err := c.applyWorkspace(); err != nil {
 				return err
 			}
-			if !isTerminal(os.Stdin) || !isTerminal(c.stdout) {
+			if !terminal {
 				return fmt.Errorf("atl workspace open needs a terminal")
 			}
-			ap, err := c.openApp()
-			if err != nil {
-				return err
-			}
-			return tui.RunContext(cmd.Context(), ap)
+			return c.runTUI(cmd.Context())
 		},
 	}
+	// What the TUI's switch key (w) passes: the workspace it leaves.
+	cmd.Flags().StringVar(&preselect, "preselect", "", "the workspace the selector starts on")
+	_ = cmd.Flags().MarkHidden("preselect")
+	return cmd
 }
+
+// createWorkspace is `atl workspace new`: cfg with what it does not set
+// taken from the environment, then created (or adopted) under root.
+func createWorkspace(root, name string, cfg workspace.Config) (string, []string, error) {
+	workspace.FillFromEnv(&cfg)
+	return workspace.Create(root, name, cfg)
+}
+
+// execProcess replaces this process with another program; tests replace it.
+var execProcess = syscall.Exec
+
+// reexec replaces this process with atl args in atl's environment as it
+// was before a workspace was applied (workspace.OriginalEnv), so that
+// nothing of this workspace leaks into the next one. It returns only on
+// failure.
+func (c *cli) reexec(args ...string) error {
+	bin := os.Getenv("ATL_BIN")
+	if bin == "" {
+		var err error
+		if bin, err = os.Executable(); err != nil {
+			return fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
+		}
+	}
+	if c.app != nil {
+		c.app.Close()
+		c.app = nil
+	}
+	if err := execProcess(bin, append([]string{bin}, args...), workspace.OriginalEnv()); err != nil {
+		return fmt.Errorf("run %s %s: %w", bin, strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+// runTUI runs the task TUI in the selected workspace, recording it as the
+// last one opened (the selector preselects it). When the user leaves it
+// for the selector (w), atl re-executes itself as `atl workspace open`.
+func (c *cli) runTUI(ctx context.Context) error {
+	ap, err := c.openApp()
+	if err != nil {
+		return err
+	}
+	current := ""
+	if root, err := workspace.Root(); err == nil && c.ws != nil && c.ws.Workspace != nil && filepath.Dir(c.ws.Dir) == root {
+		current = c.ws.Name
+		_ = workspace.SaveLast(root, current) // only a convenience
+	}
+	err = tui.RunContext(ctx, ap)
+	if !errors.Is(err, tui.ErrSwitchWorkspace) {
+		return err
+	}
+	args := []string{"workspace", "open"}
+	if current != "" {
+		args = append(args, "--preselect", current)
+	}
+	return c.reexec(args...)
+}
+
+// selectWorkspace shows the workspace selector (on preselect, else the
+// last workspace opened) and re-executes atl as `atl -w <name>` in the one
+// chosen; nothing when the user quits.
+func (c *cli) selectWorkspace(ctx context.Context, preselect string) error {
+	root, err := workspace.Root()
+	if err != nil {
+		return err
+	}
+	if preselect == "" {
+		preselect = workspace.Last(root)
+	}
+	home, _ := os.UserHomeDir()
+	name, err := tui.RunWorkspaces(ctx, tui.WorkspaceSelector{
+		Root:      root,
+		Home:      home,
+		Preselect: preselect,
+		Load:      func(ctx context.Context) ([]app.WorkspaceInfo, error) { return app.ListWorkspaces(ctx, root) },
+		Create: func(name string) ([]string, error) {
+			_, notes, err := createWorkspace(root, name, workspace.Config{})
+			return notes, err
+		},
+	})
+	if err != nil || name == "" {
+		return err
+	}
+	return c.openChosen(name)
+}
+
+// openChosen re-executes atl in workspace name (the selector's choice).
+func (c *cli) openChosen(name string) error { return c.reexec("--workspace", name) }

@@ -361,3 +361,84 @@ func TestNoWorkspaceToken(t *testing.T) {
 		t.Errorf("doctor: %d\n%s", code, out)
 	}
 }
+
+// TestWorkspaceSelectorRouting: off a terminal, atl with no workspace
+// selected still shows the help, and atl workspace open without a name
+// (the selector) says it needs a terminal, whatever $ATL_WORKSPACE says.
+func TestWorkspaceSelectorRouting(t *testing.T) {
+	_, wsRoot := wsEnv(t)
+	if code, _, errs := atl(t, "workspace", "new", "a"); code != 0 {
+		t.Fatalf("new a: %d %s", code, errs)
+	}
+	if code, out, errs := atl(t); code != 0 || !strings.Contains(out, "Usage:") || errs != "" {
+		t.Errorf("atl, none selected: %d %q %q", code, out, errs)
+	}
+	for _, env := range []string{"", "a"} {
+		t.Setenv("ATL_WORKSPACE", env)
+		code, out, errs := atl(t, "workspace", "open")
+		if code != exitErr || out != "" || !strings.Contains(errs, "shows the workspace selector, which needs a terminal") ||
+			!strings.Contains(errs, "atl workspace open <name>") {
+			t.Errorf("open, $ATL_WORKSPACE=%q: %d %q %q", env, code, out, errs)
+		}
+	}
+	t.Setenv("ATL_WORKSPACE", "")
+	// With --workspace and no name: that workspace (here: no terminal).
+	if code, _, errs := atl(t, "-w", "a", "workspace", "open"); code != exitErr || !strings.Contains(errs, "atl workspace open needs a terminal") {
+		t.Errorf("-w a workspace open: %d %q", code, errs)
+	}
+	if code, _, _ := atl(t, "workspace", "open", "a", "b"); code != exitUsage {
+		t.Errorf("open a b: %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(wsRoot, ".last")); !os.IsNotExist(err) {
+		t.Errorf(".last written without a TUI: %v", err)
+	}
+}
+
+// TestReexec: opening the selector's choice re-executes atl as
+// `atl --workspace <name>` in the environment atl started with, not the
+// one a workspace was applied to.
+func TestReexec(t *testing.T) {
+	_, wsRoot := wsEnv(t)
+	if code, _, errs := atl(t, "workspace", "new", "a"); code != 0 {
+		t.Fatalf("new a: %d %s", code, errs)
+	}
+	var gotBin string
+	var gotArgv, gotEnv []string
+	old := execProcess
+	t.Cleanup(func() { execProcess = old })
+	execProcess = func(bin string, argv, env []string) error {
+		gotBin, gotArgv, gotEnv = bin, argv, env
+		return nil
+	}
+	t.Setenv("ATL_BIN", "/opt/atl")
+
+	ws, err := workspace.Load(filepath.Join(wsRoot, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ap, err := workspace.Apply(ws, workspace.ByFlag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ap.Undo()
+	c := &cli{}
+	if err := c.openChosen("beta"); err != nil {
+		t.Fatal(err)
+	}
+	if gotBin != "/opt/atl" || strings.Join(gotArgv, " ") != "/opt/atl --workspace beta" {
+		t.Errorf("exec %q %q", gotBin, gotArgv)
+	}
+	for _, kv := range gotEnv {
+		if kv == "ATL_WORKSPACE="+ws.Dir {
+			t.Errorf("the applied workspace leaked into the environment: %s", kv)
+		}
+	}
+	if len(gotEnv) == 0 {
+		t.Error("empty environment")
+	}
+
+	execProcess = func(string, []string, []string) error { return os.ErrPermission }
+	if err := c.reexec("workspace", "open"); err == nil || !strings.Contains(err.Error(), "run /opt/atl workspace open") {
+		t.Errorf("failed exec: %v", err)
+	}
+}

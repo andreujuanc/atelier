@@ -108,7 +108,8 @@ cleanup.)
   `ATL_SANDBOX_MOUNTS`, `ATL_SANDBOX_IMAGE`, `ATL_SANDBOX_CONTEXT`, `ATL_CONTEXT`), so
   running it inside an old box writes that box's settings. Refuses a name whose gate
   socket path (`<ws>/run/<12 chars>/docker.sock`) would exceed 107 bytes.
-- `atl workspace open <name>` — the TUI in that workspace (same as `atl -w <name>`).
+- `atl workspace open <name>` — the TUI in that workspace (same as `atl -w <name>`). Without
+  a name: the workspace selector, ignoring `$ATL_WORKSPACE` and the current directory.
 
 ## Collisions between workspaces
 
@@ -146,7 +147,7 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
 |---|---|---|
 | W1 | workspace package, atelier.toml, selection, `atl workspace list/new/open`, env apply, per-workspace tmux socket, git_config, doctor + README | done |
 | W2 | collisions: cross-workspace port offsets, slug suffix for dir/branch, doctor warning | done |
-| W3 | workspace selector TUI (`atl` with none selected), switch workspace from the TUI | |
+| W3 | workspace selector TUI (`atl` with none selected), switch workspace from the TUI | done |
 | W4 | host mode: generated tmux.conf, static-binary check, README install-on-host + migration from devcontainers | |
 
 ## Decisions
@@ -230,3 +231,29 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   `atl/<slug>` still fails it). A branch in the way of `atl/<slug>` as a directory
   (`atl/<slug>/x`) is not checked; `TestNewTaskRollback` now uses that to make the second
   worktree fail.
+- W3, the selector (`tui.WorkspacePicker`, run by `tui.RunWorkspaces`) lists what
+  `app.ListWorkspaces` returns (`workspace.List` plus `WorkspaceCounts`; `atl workspace
+  list` uses it too). It is shown by `atl` alone on a terminal when `applyWorkspace` fails
+  with `*workspace.NoneError` (any other selection error is printed as before; off a
+  terminal `atl` still prints the help), and by `atl workspace open` without a name and
+  without `-w` (off a terminal: an error naming `atl workspace open <name>`). `-w <name>
+  workspace open` is the same as `workspace open <name>`.
+- The selector's `n` and its adopt (`enter` on a row without `atelier.toml`, then `y`) call
+  `createWorkspace`, the same function as `atl workspace new` (`FillFromEnv` then
+  `workspace.Create`, so the `tmux_socket = "default"` rule applies); the notes `Create`
+  returns are shown on the status line. The name is checked as typed (`CheckName`, and not
+  an existing workspace); a directory without `atelier.toml` is announced as adopted.
+- Last used: `$ATL_WORKSPACES/.last` holds the name of the workspace whose task TUI was
+  started last (written, atomically, only for a workspace directly under the root; never
+  creates the root; every error ignored). The selector preselects `--preselect` (hidden
+  flag of `workspace open`, what `w` passes), else `.last`, else the first row. `.last`
+  is not a valid workspace name, so `workspace.List` skips it.
+- Opening and switching re-execute atl (`syscall.Exec`, through the package variable
+  `execProcess` so tests can replace it) with `workspace.OriginalEnv()`: `$ATL_BIN`, else
+  `os.Executable()`, as `atl --workspace <name>` from the selector and as `atl workspace open
+  --preselect <current>` from the TUI. The App's database is closed first.
+- `w` in the task TUI is a quit with `switching` set: it waits for operations exactly as
+  `q` does (`requestQuit`), `q` or `ctrl+c` meanwhile clear it, and a forced quit is never
+  a switch. `RunContext` returns `tui.ErrSwitchWorkspace` after the usual shutdown; the
+  CLI then re-executes. The workspace's name is drawn at the right end of the task TUI's
+  status line when it fits (there is no header line).

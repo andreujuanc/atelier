@@ -270,11 +270,22 @@ type Model struct {
 	// user forced the quit with operations still running.
 	quitRequested bool
 	forceQuit     bool
+	// switching: the pending (or done) quit is to the workspace selector
+	// (w), not out of atl.
+	switching bool
+
+	// workspace is the name of the workspace the TUI runs in ("" unknown),
+	// shown on the status line.
+	workspace string
 }
 
 // Forced reports whether the user forced the quit (second ctrl+c) while
 // operations were still running.
 func (m *Model) Forced() bool { return m.forceQuit }
+
+// SwitchRequested reports whether the TUI quit to switch workspaces (w)
+// rather than to leave atl. A forced quit is never a switch.
+func (m *Model) SwitchRequested() bool { return m.switching && !m.forceQuit }
 
 // New returns a Model over be.
 func New(ctx context.Context, be Backend) *Model {
@@ -671,12 +682,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if n == 0 {
 			return m, tea.Quit
 		}
-		m.setStatus(quitText(n))
+		m.setStatus(m.quitText(n))
 	}
 	return m, cmd
 }
 
-func quitText(n int) string {
+func (m *Model) quitText(n int) string {
+	if m.switching {
+		return fmt.Sprintf("%d operation(s) running — switching workspace when they finish, q quits instead, ctrl+c forces a quit", n)
+	}
 	return fmt.Sprintf("%d operation(s) running — quitting when they finish, ctrl+c again to force", n)
 }
 
@@ -1049,6 +1063,7 @@ func (m *Model) exec(op, slug string, c *exec.Cmd) tea.Cmd {
 func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	key := msg.String()
 	if key == "ctrl+c" {
+		m.switching = false
 		if m.mode == modeNotes && m.notes != nil {
 			return m.notesQuit()
 		}
@@ -1331,12 +1346,18 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		// The pending quit fires in any mode: input opened now would be
 		// thrown away.
 		if m.quitRequested {
-			m.setStatus(quitText(len(m.busyOps())))
+			m.setStatus(m.quitText(len(m.busyOps())))
 			return nil
 		}
 	}
 	switch key {
 	case "q":
+		m.switching = false
+		return m.requestQuit(key)
+	case "w":
+		// Leave for the workspace selector once no operation is in
+		// flight, as q quits.
+		m.switching = true
 		return m.requestQuit(key)
 	case "j", "down":
 		return m.move(1)

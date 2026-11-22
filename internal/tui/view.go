@@ -410,6 +410,13 @@ func (m *Model) statusLine(w int) string {
 	if s == "" && m.filter != "" {
 		s = dimStyle.Render("filter: /" + clean(m.filter) + "  (esc clears)")
 	}
+	// The workspace's name at the right, when it fits.
+	if ws := clean(m.workspace); ws != "" {
+		tag := "workspace " + ws
+		if pad := w - ansi.StringWidth(s) - ansi.StringWidth(tag); pad >= 2 {
+			return s + strings.Repeat(" ", pad) + dimStyle.Render(tag)
+		}
+	}
 	return trunc(s, w)
 }
 
@@ -521,7 +528,7 @@ func (m *Model) helpLine(w int) string {
 	case modeConfirm:
 		s = "space tick/untick  enter confirm (box ticked)  esc/n cancel"
 	default:
-		s = "n new  enter open  s session  r resume  a add repo  m edit notes  t rename  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  q quit"
+		s = "n new  enter open  s session  r resume  a add repo  m edit notes  t rename  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  w workspace  q quit"
 		for _, l := range legends {
 			if ansi.StringWidth(s)+2+ansi.StringWidth(l) <= w {
 				return dimStyle.Render(s+"  ") + l

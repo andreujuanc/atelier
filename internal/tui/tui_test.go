@@ -2471,9 +2471,9 @@ func TestSelectedRowSeparator(t *testing.T) {
 func TestLegend(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks()}
 	m, _ := newTest(t, fb)
-	m.Update(tea.WindowSizeMsg{Width: 200, Height: 30})
+	m.Update(tea.WindowSizeMsg{Width: 220, Height: 30})
 	lines := strings.Split(plainView(m), "\n")
-	if help := lines[len(lines)-1]; !strings.Contains(help, "● waiting/running/idle  ○ stopped  * uncommitted") || ansi.StringWidth(help) > 200 {
+	if help := lines[len(lines)-1]; !strings.Contains(help, "● waiting/running/idle  ○ stopped  * uncommitted") || ansi.StringWidth(help) > 220 {
 		t.Fatalf("wide help %q", help)
 	}
 	// just too narrow for the stopped mark: the short legend

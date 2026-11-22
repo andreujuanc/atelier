@@ -20,6 +20,10 @@ import (
 // forceGrace is how long a forced quit waits for cancelled operations.
 const forceGrace = 5 * time.Second
 
+// ErrSwitchWorkspace is returned by RunContext when the user left the TUI
+// for the workspace selector (w), every operation having ended.
+var ErrSwitchWorkspace = errors.New("switch workspace")
+
 // Run starts the TUI on the terminal with the alternate screen.
 func Run(a *app.App) error { return RunContext(context.Background(), a) }
 
@@ -34,6 +38,9 @@ func RunContext(ctx context.Context, a *app.App) error {
 	defer cancelOps()
 	tr := &tracker{}
 	m := New(opsCtx, &trackedBackend{Backend: NewBackend(a), tr: tr})
+	if a.Workspace != nil && a.Workspace.Workspace != nil {
+		m.workspace = a.Workspace.Name
+	}
 	bin, err := os.Executable()
 	if err != nil || bin == "" {
 		bin = a.AtlBin
@@ -68,6 +75,9 @@ func RunContext(ctx context.Context, a *app.App) error {
 	}
 	if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {
 		return nil
+	}
+	if err == nil && m.SwitchRequested() && ctx.Err() == nil {
+		return ErrSwitchWorkspace
 	}
 	return err
 }

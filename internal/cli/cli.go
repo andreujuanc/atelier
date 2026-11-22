@@ -20,7 +20,6 @@ import (
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/tmux"
-	"github.com/andreujuanc/atelier/internal/tui"
 	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
@@ -234,16 +233,20 @@ func (c *cli) rootCmd() *cobra.Command {
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			return insideContainer(cmd)
 		},
-		// With no subcommand: the TUI on a terminal, else the help.
+		// With no subcommand: the TUI on a terminal (the workspace
+		// selector when no workspace is selected), else the help.
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if !isTerminal(os.Stdin) || !isTerminal(c.stdout) {
 				return cmd.Help()
 			}
-			ap, err := c.openApp()
-			if err != nil {
+			if err := c.applyWorkspace(); err != nil {
+				var none *workspace.NoneError
+				if errors.As(err, &none) {
+					return c.selectWorkspace(cmd.Context(), "")
+				}
 				return err
 			}
-			return tui.RunContext(cmd.Context(), ap)
+			return c.runTUI(cmd.Context())
 		},
 	}
 	root.CompletionOptions.HiddenDefaultCmd = true

@@ -44,6 +44,33 @@ func WorkspaceCounts(ctx context.Context, dir string) (open, waiting int, err er
 	return len(tasks), len(sessions), nil
 }
 
+// WorkspaceInfo is a directory under the workspaces root (see
+// workspace.List) with, for a workspace, its counts (see WorkspaceCounts).
+type WorkspaceInfo struct {
+	workspace.Entry
+	OpenTasks int
+	Waiting   int
+	Err       error // its database could not be read
+}
+
+// ListWorkspaces returns the directories under root (workspace.List), each
+// workspace with its open tasks and waiting sessions.
+func ListWorkspaces(ctx context.Context, root string) ([]WorkspaceInfo, error) {
+	entries, err := workspace.List(root)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WorkspaceInfo, 0, len(entries))
+	for _, e := range entries {
+		w := WorkspaceInfo{Entry: e}
+		if e.Workspace {
+			w.OpenTasks, w.Waiting, w.Err = WorkspaceCounts(ctx, e.Dir)
+		}
+		out = append(out, w)
+	}
+	return out, nil
+}
+
 // openTasks returns the open tasks (backlog, active, review) in database
 // db, read read-only.
 func openTasks(ctx context.Context, db string) ([]model.Task, error) {
