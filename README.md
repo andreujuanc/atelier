@@ -39,7 +39,9 @@ The task image is lean on purpose: Claude Code, git, the Docker CLI with the com
 (the current LTS line, 26, from nodejs.org) with npm and corepack, and curl, jq, ripgrep,
 unzip, zip, xz, less, procps, openssh-client and ca-certificates, with a UTF-8 locale
 (`C.UTF-8`); not `atl` (it is mounted into task containers), tmux or gh. There is no other
-language and no compiler (no Go, Python or C toolchain): those come from the project's own
+language and no compiler (no Go, Python or C toolchain): a repo with its own container
+setup (`.devcontainer`, compose files) is built and tested in that setup (see **Tools** in
+[Sandbox](#sandbox)); otherwise they come from the project's own
 `image` (see [Projects](#projects); e.g. one built `FROM atelier-task`), or the task
 installs them itself, and what is installed by hand lasts only until the task's container
 is replaced (see [Sandbox](#sandbox)). As the ordinary user, `npm install -g` installs
@@ -469,8 +471,16 @@ to pull, and if that fails the launch says so in one line. An image needs `claud
 atelier's images have), so that what the task writes in the task dir and its Claude dir
 stays yours.
 
-The default image has Node.js and no other language (see [Docker image](#docker-image)): a
-project that needs Go, Python, a C toolchain or anything else names an image that has it.
+The default image has Node.js and no other language (see [Docker image](#docker-image)). A
+repo with its own container setup (a `.devcontainer`, compose files, or one its docs or
+`CLAUDE.md` describe) is built, tested and run in that setup, with `docker` and `docker
+compose` through the gate (see **Docker** below); the session's start context tells it so.
+When that setup asks for something the gate refuses (a mount from outside the task dir such
+as `~/.npmrc`, a privileged service, a Dockerfile that needs BuildKit), the session does not
+edit the repo: it overrides that part with a file in the task dir (for compose, an override
+file passed with `-f`) and tells you what it overrode. The project's `image` is for repos
+without such a setup, or for tools Claude should have next to it: a project that needs Go,
+Python, a C toolchain or anything else there names an image that has it.
 Sessions can run whatever the image has and install more: as the image's ordinary user
 `npm install -g` and the like; for system packages (a language included) the task may be
 root in its own container: `docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`.
@@ -555,7 +565,8 @@ It needs a token for Claude Code (above), the workspace and repos at the same pa
 mode and checks the daemon, the image and the token.
 
 **Session context.** A sandboxed session's start context has a built-in note on the
-sandbox (tools run here, what Docker allows, `atl push`/`atl fetch` for git).
+sandbox (a repo's own container setup first, else tools run here; what the Docker gate
+refuses and how to override a repo's setup for it; `atl push`/`atl fetch` for git).
 `ATL_CONTEXT` is *not* passed to task containers: it describes the place `atl` runs in,
 and rules for a shared box ("run everything through docker", "never mount ...")
 contradict a task's own container. Put
