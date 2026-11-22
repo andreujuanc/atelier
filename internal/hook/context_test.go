@@ -517,6 +517,40 @@ func TestRenderContextEnv(t *testing.T) {
 	})
 }
 
+// TestRenderSandboxContext: a sandboxed session is told to use a repo's own
+// container setup, and the note leaves room under the cap for the rest.
+func TestRenderSandboxContext(t *testing.T) {
+	p := config.Paths{Tasks: "/home/someone/atelier/workspaces/me/tasks", Repos: "/home/someone/atelier/workspaces/me/repos"}
+	task := model.Task{Slug: "shop-checkout-fix", Title: "Fix the checkout total rounding", Status: model.StatusActive,
+		Branch: "atl/shop-checkout-fix", PortOffset: 300,
+		Repos: []model.TaskRepo{{Name: "shop-api", Mode: model.ModeRW, BaseBranch: "main"},
+			{Name: "shop-web", Mode: model.ModeRW, BaseBranch: "main"}, {Name: "shop-docs", Mode: model.ModeRO}}}
+	now := time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC)
+
+	got := renderSandboxContext(task, "", p, "", true, now)
+	if !strings.Contains(got, "\nATL_PORT_OFFSET=300\n\n"+sandboxNote+"\n") || !strings.Contains(got, "run a repo in its own container setup, if any (`.devcontainer`") {
+		t.Errorf("sandbox note missing or misplaced:\n%s", got)
+	}
+	if plain := renderSandboxContext(task, "", p, "", false, now); strings.Contains(plain, "Sandbox:") {
+		t.Errorf("note without the sandbox:\n%s", plain)
+	}
+
+	// Room left for notes: most of the cap without ATL_CONTEXT, and still
+	// a notes section with half its allowance used.
+	room := func(env string) int {
+		return contextMaxLen - len(renderSandboxContext(task, "", p, env, true, now)) - len("\nNotes:\n") - 1
+	}
+	marker := "… (earlier notes truncated; `atl notes shop-checkout-fix` for all)\n"
+	if r := room(""); r < 600 {
+		t.Errorf("note is %d bytes: only %d left for notes", len(sandboxNote), r)
+	}
+	if r := room(strings.Repeat("e", contextEnvLen/2)); r < len(marker)+contextMinNotes {
+		t.Errorf("note is %d bytes: only %d left for notes with a %d-byte ATL_CONTEXT", len(sandboxNote), r, contextEnvLen/2)
+	}
+	t.Logf("note %d bytes; room for notes %d, %d with a %d-byte ATL_CONTEXT", len(sandboxNote), room(""),
+		room(strings.Repeat("e", contextEnvLen/2)), contextEnvLen/2)
+}
+
 // TestSessionStartContextLatency measures the SessionStart path that also
 // prints the task context (task with notes), as a separate process.
 func TestSessionStartContextLatency(t *testing.T) {
