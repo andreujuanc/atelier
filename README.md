@@ -7,7 +7,8 @@ tracks session state in SQLite via Claude Code hooks.
 
 Requires git, tmux ≥ 3.2, `claude`, `gh` (for `atl pr`), and Docker with the task image:
 each task's Claude sessions run in the task's own container (the [sandbox](#sandbox), on by
-default). Build with `go build -o ~/bin/atl ./cmd/atl`, then run `atl doctor`.
+default). Build with `go build -o ~/bin/atl ./cmd/atl`, create a [workspace](#workspaces)
+with `atl workspace new <name>`, then run `atl doctor` in it.
 
 ## Docker image
 
@@ -91,9 +92,13 @@ atl notes fix-login --clear            # clear the notes
 atl assistant [fix-login] # the atelier assistant (one Claude session for all tasks); attach
 atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
 atl cancel fix-login [--force]
-atl doctor                # tools, dirs, database, sandbox mode (Docker, image, token); repos whose config atl refuses to run git with
+atl doctor                # tools, the workspace and where each setting came from, dirs, database, sandbox mode (Docker, image, token); repos whose config atl refuses to run git with
 atl token [--paste]       # sandbox: run claude setup-token and store its token for task sessions (see Sandbox)
-atl                       # TUI (on a terminal)
+atl                       # TUI (on a terminal), in the selected workspace
+atl -w shop ls            # any command in workspace shop (--workspace; else $ATL_WORKSPACE, else the current directory)
+atl workspace list [--json]          # workspaces under $ATL_WORKSPACES: open tasks, waiting sessions; * the selected one
+atl workspace new shop [--repos DIR] [--mount PATH]... [--image IMAGE]   # create (or adopt) $ATL_WORKSPACES/shop
+atl workspace open shop   # the TUI in workspace shop (same as atl -w shop)
 ```
 
 TUI keys: `n` new task, `enter` open (see below), `s` new session, `r` resume, `a` add repos to the
@@ -232,7 +237,7 @@ work on closed tasks too.
 `atl assistant [task]` (TUI `A`) opens the atelier assistant: a single Claude Code session,
 in tmux session `atl_assistant`, for managing tasks rather than writing code ("what's the
 status of X?", "where did I leave off?", "add repo Y to X"). It runs in
-`$XDG_DATA_HOME/atelier/assistant/` with a generated `CLAUDE.md` (role and `atl` command
+`<workspace>/data/assistant/` with a generated `CLAUDE.md` (role and `atl` command
 reference, always rewritten) and `.claude/settings.json` (merged): read-only `atl`
 commands (`ls`, `show`, `transcript`, `repos`) and Read/Grep/Glob are allowed,
 every state-changing `atl` command asks first (`atl note` appends; `atl notes --set` replaces
@@ -279,17 +284,139 @@ added later (tasks created before this choice existed keep origin's default bran
 per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; repo
 `base_branch`), and the TUI details pane shows `← <branch>` per rw repo.
 
+## Workspaces
+
+A workspace is one directory with everything atelier owns for one body of work: its
+tasks, its database, its projects and the settings `atl` runs with. Workspaces live under
+`$ATL_WORKSPACES` (default `~/atelier/workspaces`), one directory each,
+`$ATL_WORKSPACES/<name>/`. A name is lowercase letters, digits, `-` and `_`, starts with a
+letter or digit, and has at most 32 characters. A directory is a workspace when it has an
+`atelier.toml`; without one it is not, whatever else is in it.
+
+```
+$ATL_WORKSPACES/<name>/
+  atelier.toml  the workspace's settings
+  tasks/        task dirs and worktrees (unless ATL_TASKS is set)
+  data/         atelier.db, assistant/
+  config/       projects/<name>.toml
+  state/        hook.log
+  run/          gate sockets, task Claude dirs, origin pins, the stored Claude token
+  repos/        canonical clones (unless repos names another directory)
+  gitconfig     optional: the global git config of atl and all it runs
+```
+
+`atelier.toml` is strict TOML: every key is optional, and an unknown key is an error.
+
+```toml
+repos = "/home/you/src/shop"   # canonical clones; relative = to the workspace dir; default "repos"
+git_config = "gitconfig"        # global git config (GIT_CONFIG_GLOBAL); relative = to the workspace dir;
+                                # default "gitconfig" if that file exists, else git's own (~/.gitconfig)
+context = "..."                 # appended to every task session's start context (ATL_CONTEXT)
+tmux_socket = "atl-shop"        # tmux -L name of atl's tmux server; default "atl-<name>"
+
+[sandbox]
+image = "atelier-task"          # the task container image (ATL_SANDBOX_IMAGE)
+mounts = ["~/.npmrc"]           # host paths every task gets read-only (ATL_SANDBOX_MOUNTS)
+context = "..."                 # what sandboxed sessions get in place of context (ATL_SANDBOX_CONTEXT)
+```
+
+`~/` is your home in `repos`, `git_config` and `mounts`. No secrets go in it: the Claude
+token stays in `run/claude-token.json` (see [Sandbox](#sandbox)).
+
+**Which workspace.** A command that needs one uses the first of:
+
+1. `--workspace <name|path>` (`-w`), on any command;
+2. `$ATL_WORKSPACE`, a name or an absolute path;
+3. the current directory, when it is `$ATL_WORKSPACES/<name>` or inside it (symlinks
+   resolved in both; `atl` does not look for `atelier.toml` up the tree).
+
+With none of them, the command fails with one line that names these ways and the existing
+workspaces, and `atl doctor` fails its `workspace` check and checks only the tools. A
+selected directory without `atelier.toml` is an error that says to run `atl workspace new
+<name>`. `atl workspace`, help and completion need no workspace, and neither does `atl` in
+a task container (it talks to the task's gate).
+
+**How it is applied.** `atl` sets environment variables in its own process before
+anything reads them, so everything it starts (its tmux server and the windows there, the
+gate, hooks, scripts, `atl diff` from the TUI) has them too:
+
+| setting | variable |
+|---|---|
+| the workspace dir | `ATL_WORKSPACE` (absolute) |
+| `repos` | `ATL_REPOS` |
+| `git_config` | `GIT_CONFIG_GLOBAL` |
+| `context` | `ATL_CONTEXT` |
+| `tmux_socket` | `ATL_TMUX_SOCKET` |
+| `sandbox.image` | `ATL_SANDBOX_IMAGE` |
+| `sandbox.mounts` | `ATL_SANDBOX_MOUNTS` (joined with `:`) |
+| `sandbox.context` | `ATL_SANDBOX_CONTEXT` |
+
+A variable that is already set (not empty) in the environment wins over the file, so a box
+that sets them keeps its values. One that `atl` set itself does not: `atl` records each
+variable it set, with a hash of its value, in `ATL_WORKSPACE_VARS`, and an `atl` started
+with that environment sets those again from the workspace it applies, while their values
+are still the recorded ones. So `atl -w other` run from the assistant's window (or a task
+window with `ATL_SANDBOX=off`; in a task container `atl` does not open workspaces) gets
+`other`'s settings, not those of the workspace the window is in; an `atl` started by `atl`
+follows `atelier.toml` as it is now; and a value you set yourself, even in such a window,
+always wins. Every tmux window `atl` creates gets `ATL_WORKSPACE`, `ATL_WORKSPACE_VARS` and
+the variables of the table (empty when unset; `GIT_CONFIG_GLOBAL` only when set) as its
+own, whatever environment the tmux server started with.
+`atl doctor` shows the workspace, how it was selected, and each setting with its value and
+where it came from: `env`, `atelier.toml` or `default` (a context by its size).
+
+**tmux.** Each workspace has its own tmux server, `tmux -L atl-<name>` unless
+`tmux_socket` says otherwise, so the `atl-<slug>` sessions of two workspaces never meet and
+`atl` never touches your own tmux server. To attach by hand: `tmux -L atl-<name> attach -t
+atl-<slug>`. `tmux_socket = "default"` is tmux's default server, which `atl` used before
+workspaces; sessions running there are not seen from `atl-<name>`, and `atl` would take
+them for stopped and end them. So `atl workspace new` adopting a directory that already
+has a database, while `ATL_TMUX_SOCKET` is not set, writes `tmux_socket = "default"` with
+a comment, and says so: remove that line once no session runs on the old server (e.g.
+when moving `atl` to the host). Opening a task from inside a client of another tmux server
+(another workspace's, or your own) attaches a nested client; from inside this
+workspace's server it switches the client.
+
+**git_config.** With `GIT_CONFIG_GLOBAL` set, git reads that file instead of
+`~/.gitconfig`, for `atl` and everything it runs: who commits (`user.name` and
+`user.email`, which task containers get as `GIT_AUTHOR_*` and `GIT_COMMITTER_*`; never the
+file itself), `insteadOf` rules, credential helpers. Without it git uses its own default.
+`atl doctor` warns when `git_config` names a file that does not exist. Neither it nor
+`~/.gitconfig` or `~/.config/git` can be an `ATL_SANDBOX_MOUNTS` path.
+
+**Commands.**
+
+- `atl workspace list [--json]`: every directory under `$ATL_WORKSPACES` with a valid
+  name, with its open tasks (backlog, active, review) and, when any, its waiting sessions,
+  read from its database read-only; one without `atelier.toml` is listed as "not a
+  workspace (no atelier.toml)". `*` marks the selected one (by `-w`, `$ATL_WORKSPACE` or
+  the current directory).
+- `atl workspace new <name> [--repos DIR] [--mount PATH]... [--image IMAGE]`: makes
+  `$ATL_WORKSPACES/<name>/` with `atelier.toml`, `tasks/ data/ config/ state/`, and the
+  repos dir when it is inside the workspace. A directory that exists without
+  `atelier.toml` is adopted: its contents are kept. It refuses when `atelier.toml` exists,
+  and a name whose task gate sockets (`<workspace>/run/<12 chars>/docker.sock`) would not
+  fit the 107 bytes of a socket path. What the flags do not give is taken from
+  `$ATL_REPOS`, `$ATL_SANDBOX_MOUNTS`, `$ATL_SANDBOX_IMAGE`, `$ATL_SANDBOX_CONTEXT` and
+  `$ATL_CONTEXT` when you set them (not when `atl` did, for the workspace it runs in), so
+  run in a box it writes the box's settings. Prints the name and the directory.
+- `atl workspace open <name>`: the TUI in that workspace, as `atl -w <name>`.
+
+A box that sets `ATL_WORKSPACE` to a directory works only once that directory has an
+`atelier.toml`: run `atl workspace new <name>` in the box once (its sessions stay on tmux's
+default server, see **tmux** above).
+
 ## Environment
 
 | variable | default |
 |---|---|
-| `ATL_WORKSPACE` | unset — one folder for everything atelier owns (see below) |
-| `ATL_REPOS` | `~/repos` — canonical clones, `$ATL_REPOS/<name>` (never edited) |
-| `ATL_TASKS` | `$ATL_WORKSPACE/tasks`, else `~/tasks` — task dirs, `$ATL_TASKS/<slug>/` |
-| `XDG_DATA_HOME` | `~/.local/share` — DB at `atelier/atelier.db` (ignored with `ATL_WORKSPACE`) |
-| `XDG_STATE_HOME` | `~/.local/state` — hook errors in `atelier/hook.log` (ignored with `ATL_WORKSPACE`) |
-| `XDG_CONFIG_HOME` | `~/.config` — projects in `atelier/projects/<name>.toml` (ignored with `ATL_WORKSPACE`) |
-| `ATL_TMUX_SOCKET` | unset — tmux socket name (`tmux -L`) if you don't use the default server |
+| `ATL_WORKSPACES` | `~/atelier/workspaces` — the workspaces root (see [Workspaces](#workspaces)) |
+| `ATL_WORKSPACE` | unset — the workspace, a name or an absolute path (see [Workspaces](#workspaces)); `atl` sets it to the workspace dir for everything it starts |
+| `ATL_WORKSPACE_VARS` | set by `atl` — the variables it set itself, each with a hash of its value (see [Workspaces](#workspaces)) |
+| `ATL_REPOS` | `repos` of `atelier.toml`, default `<workspace>/repos` — canonical clones, `$ATL_REPOS/<name>` (never edited) |
+| `ATL_TASKS` | `<workspace>/tasks` — task dirs, `$ATL_TASKS/<slug>/` |
+| `ATL_TMUX_SOCKET` | `tmux_socket` of `atelier.toml`, default `atl-<name>` — the tmux socket name (`tmux -L`) of atl's tmux server |
+| `GIT_CONFIG_GLOBAL` | `git_config` of `atelier.toml`, default `<workspace>/gitconfig` if it exists, else unset (git's `~/.gitconfig`) |
 | `ATL_BIN` | the running binary — `atl` path written into hook commands |
 | `ATL_CONTEXT` | unset — extra text appended to every task session's start context (max 1000 bytes; atl refuses to start if longer) |
 | `ATL_SANDBOX` | unset (on) — each task's sessions run in the task's own container (see [Sandbox](#sandbox)); unset, empty and `docker` mean on, `off` switches it off (going away), anything else is an error |
@@ -299,19 +426,10 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `CLAUDE_CODE_OAUTH_TOKEN` | unset — with the sandbox on, the token (`claude setup-token`) that sandboxed sessions log in with; when set it wins over the one `atl token` stored |
 | `ANTHROPIC_API_KEY` | unset — with the sandbox on, an API key for sandboxed sessions instead of a token (also wins over the stored one) |
 
-With `ATL_WORKSPACE` set (it must be an existing directory, so a typo or a missing mount
-is an error rather than a new empty database), atelier keeps everything in it, and you can
-keep several independent workspaces (e.g. one per box):
-
-```
-$ATL_WORKSPACE/
-  tasks/      task dirs and worktrees (unless ATL_TASKS is set)
-  data/       atelier.db, assistant/
-  config/     projects/<name>.toml
-  state/      hook.log
-```
-
-`atl doctor` prints the workspace and every path it resolved.
+`ATL_CONTEXT` and the `ATL_SANDBOX_*` settings also come from `atelier.toml` when they are
+not set; a variable set in the environment wins over the file (see
+[Workspaces](#workspaces)). `atl doctor` prints the workspace, every setting with where it
+came from, and every path it resolved.
 
 Claude windows and scripts get `ATL_TASK`, `ATL_TASK_DIR`, `ATL_PORT_OFFSET`
 (0, 100, 200… unique per open task) plus the project's `env`; scripts also get
@@ -427,8 +545,7 @@ in a task log in with a token instead:
    plan). It runs `claude setup-token` in a tmux window you are attached to: open the URL
    it shows, approve access in the browser (paste the code back if it asks), and press
    Enter when the token is on the screen. `atl` reads the token from that screen and
-   stores it in `<workspace>/run/claude-token.json` (without a workspace,
-   `$XDG_STATE_HOME/atelier-run/claude-token.json`), mode 0600, a place no task container
+   stores it in `<workspace>/run/claude-token.json`, mode 0600, a place no task container
    sees; the window and its scrollback are removed. If `atl` cannot pick out exactly one
    token of the expected shape (`sk-ant-oat01-…`) there, it asks you to paste it, without
    echo. `atl token --paste` stores a token you already have the same way (read from the
@@ -451,8 +568,7 @@ the container's stored configuration, and a new token reaches the next session w
 new container. `atl` never prints it. A token-authenticated session can only make model
 requests: claude.ai connectors and Remote Control are not available in it.
 
-Each task has its own Claude Code config dir, `<workspace>/run/claude/<hash>` (without a
-workspace, `$XDG_STATE_HOME/atelier-run/claude/<hash>`), mounted at the same path in that
+Each task has its own Claude Code config dir, `<workspace>/run/claude/<hash>`, mounted at the same path in that
 task's container only and set as `CLAUDE_CONFIG_DIR` there. It holds what Claude Code
 keeps: its state file, the task's transcripts (so `claude --resume` works across a new
 container), history. When a new container is created for the task, `atl` refreshes in it
@@ -587,7 +703,8 @@ rule, when a path is not absolute, does not exist, is not a file or directory, h
 or quote in it (docker's `--mount` cannot take one), is `/`, or is, contains or lies inside
 what the sandbox keeps from tasks: the workspace (without one, atelier's data, state and
 config dirs), the run dir (gate sockets, task Claude dirs, origin pins, the stored token),
-`ATL_REPOS`, the tasks dir, your Claude Code config dir, the Docker socket, the SSH agent's
+`ATL_REPOS`, the tasks dir, your Claude Code config dir, your git config
+(`GIT_CONFIG_GLOBAL`, `~/.gitconfig`, `~/.config/git`), the Docker socket, the SSH agent's
 socket, `/proc`, `/sys` or `/dev`. `atl doctor` lists the paths and names each one that is
 missing or refused, and why. A sandboxed session's start context names them in one line
 (cut, saying how many more, when the list is long). A changed list reaches a task the next
@@ -727,10 +844,9 @@ partial clone (`clone --filter`) cannot be an rw repo: the checkout of `atl new`
 
 **Origin pin.** Push and fetch do not go wherever the repo's `origin` points now. `atl`
 pins each repo's origin URLs (fetch and push, as the config says them, before any
-`insteadOf` rule) in `<workspace>/run/origins/<repo>.json` (without a workspace,
-`$XDG_STATE_HOME/atelier-run/origins/`), a place no task container sees, and pushes and
+`insteadOf` rule) in `<workspace>/run/origins/<repo>.json`, a place no task container sees, and pushes and
 fetches there, through a remote defined on the command line under a random name; your own
-`insteadOf`/`pushInsteadOf` rules (in `~/.gitconfig`) apply to it then, once.
+`insteadOf`/`pushInsteadOf` rules (in your global git config, see [Workspaces](#workspaces)) apply to it then, once.
 `refs/remotes/origin/*`, `refs/remotes/origin/HEAD` (created when missing, as `git
 fetch` does since git 2.48) and `--force-with-lease` work as before. `atl new` and `atl
 add` fetch the pinned origin the same way before branching. The pin is written once per
@@ -743,7 +859,7 @@ accept the new URL, run `atl repos pin <repo>` (where `atl` runs; not from a tas
 
 ## Projects
 
-`~/.config/atelier/projects/shop.toml`:
+`<workspace>/config/projects/shop.toml`:
 
 ```toml
 setup = "npm ci"                          # sh -c in each rw worktree after creation

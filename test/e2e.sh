@@ -65,9 +65,8 @@ export PATH="$W/bin:$STUBS:$PATH"
 export HOME="$W/home"
 export ATL_REPOS="$W/repos"
 export ATL_TASKS="$W/tasks"
-export XDG_DATA_HOME="$W/data"
-export XDG_STATE_HOME="$W/state"
-export XDG_CONFIG_HOME="$W/config"
+export ATL_WORKSPACES="$W/workspaces"
+WS="$ATL_WORKSPACES/e2e" # made by `atl workspace new` below
 export ATL_TMUX_SOCKET="$SOCK"
 export GIT_CONFIG_GLOBAL="$W/gitconfig"
 export GIT_CONFIG_NOSYSTEM=1
@@ -78,7 +77,7 @@ export ATL_SANDBOX=off
 export E2E_OUT="$W/out"
 export E2E_LOG="$W/out/claude.log"
 export E2E_GH_LOG="$W/out/gh.log"
-mkdir -p "$HOME" "$ATL_REPOS" "$ATL_TASKS" "$XDG_CONFIG_HOME/atelier/projects" "$E2E_OUT" "$W/origin" "$W/seed"
+mkdir -p "$HOME" "$ATL_REPOS" "$ATL_TASKS" "$E2E_OUT" "$W/origin" "$W/seed"
 touch "$E2E_LOG"
 cat >"$GIT_CONFIG_GLOBAL" <<'EOF'
 [user]
@@ -89,6 +88,12 @@ cat >"$GIT_CONFIG_GLOBAL" <<'EOF'
 [advice]
 	detachedHead = false
 EOF
+
+# The workspace: atelier.toml takes ATL_REPOS from the environment.
+out="$(atl workspace new e2e)" || fail "atl workspace new failed: $out"
+[[ $out == "e2e	$WS" ]] || fail "atl workspace new output: $out"
+grep -qF "repos = \"$ATL_REPOS\"" "$WS/atelier.toml" || fail "atelier.toml lacks repos: $(cat "$WS/atelier.toml")"
+export ATL_WORKSPACE="$WS"
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -222,7 +227,8 @@ ORIGIN_MAIN="$(git -C "$W/origin/api.git" rev-parse main)"
 CANON_HEAD="$(git -C "$ATL_REPOS/api" rev-parse HEAD)"
 [[ "$(git -C "$ATL_REPOS/api" rev-parse main)" != "$ORIGIN_MAIN" ]] || fail "canonical api main is not stale"
 
-cat >"$XDG_CONFIG_HOME/atelier/projects/shop.toml" <<'EOF'
+mkdir -p "$WS/config/projects"
+cat >"$WS/config/projects/shop.toml" <<'EOF'
 setup = 'printf "%s\n" "$ATL_PORT_OFFSET" > "$E2E_OUT/setup-$ATL_TASK"'
 teardown = 'touch "$E2E_OUT/teardown-$ATL_TASK"'
 
@@ -247,6 +253,12 @@ out="$(atl doctor 2>&1)" || fail "atl doctor failed:
 $out"
 if grep -q FAIL <<<"$out"; then fail "doctor reported FAIL:
 $out"; fi
+grep -qE "^ok +workspace +e2e: $WS \(from [$]ATL_WORKSPACE\)$" <<<"$out" || fail "doctor lacks the workspace:
+$out"
+grep -qE "^ok +repos +[$]ATL_REPOS = $ATL_REPOS \(env\)$" <<<"$out" || fail "doctor lacks repos from env:
+$out"
+out="$(atl workspace list)" || fail "atl workspace list failed: $out"
+grep -qE "^\* e2e +0 open +$WS$" <<<"$out" || fail "atl workspace list: $out"
 
 # ---- new -------------------------------------------------------------------
 
@@ -350,7 +362,7 @@ out="$(printf 'x' | ATL_SANDBOX_ID=e2e "$W/relay/wl-paste" 2>/dev/null)" && fail
 expect_eq "wl-paste output" "$out" ""
 atl gate fix-login --task-id "$(task_field fix-login id)" >"$E2E_OUT/gate.log" 2>&1 &
 GATE_PID=$!
-ctl_sock() { find "$XDG_STATE_HOME" -name atl.sock -type s 2>/dev/null | head -n1; }
+ctl_sock() { find "$WS/run" -name atl.sock -type s 2>/dev/null | head -n1; }
 gate_up() { [[ -n "$(ctl_sock)" ]]; }
 wait_for "the gate's control socket" gate_up
 CTL="$(ctl_sock)"

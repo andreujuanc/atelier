@@ -18,6 +18,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
+	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
 // Check is one result of Doctor. OK is false only for failures; a warning
@@ -59,7 +60,12 @@ func (a *App) Doctor(ctx context.Context) []Check {
 		}()
 	}
 	wg.Wait()
-	if a.Paths.Workspace != "" {
+	if a.WorkspaceErr != nil {
+		return append(checks, fail("workspace", a.WorkspaceErr.Error()))
+	}
+	if a.Workspace != nil {
+		checks = append(checks, workspaceChecks(a.Workspace)...)
+	} else if a.Paths.Workspace != "" {
 		checks = append(checks, pass("workspace", a.Paths.Workspace))
 	}
 	checks = append(checks,
@@ -373,4 +379,31 @@ func (c Check) Level() string {
 		return "warn"
 	}
 	return "ok"
+}
+
+// workspaceChecks are the workspace (name, directory, how it was selected)
+// and each of its settings: the value in effect and where it came from (the
+// environment, atelier.toml or the default). A context is shown by its
+// size.
+func workspaceChecks(w *workspace.Applied) []Check {
+	checks := []Check{pass("workspace", fmt.Sprintf("%s: %s (from %s)", w.Name, w.Dir, w.By))}
+	for _, s := range w.Settings {
+		v := s.Value
+		if strings.HasSuffix(s.Key, "context") && v != "" {
+			v = fmt.Sprintf("%d bytes", len(v))
+		}
+		detail := fmt.Sprintf("$%s = %s (%s)", s.Var, v, s.Source)
+		if s.Value == "" {
+			detail = "$" + s.Var + " unset"
+		}
+		if s.Key == "git_config" && s.Value != "" {
+			if fi, err := os.Stat(s.Value); err != nil || !fi.Mode().IsRegular() {
+				checks = append(checks, warn(s.Key, detail+": no such file, so git has no global config: "+
+					"no user.name or user.email for commits, and task containers get no GIT_AUTHOR_* or GIT_COMMITTER_*"))
+				continue
+			}
+		}
+		checks = append(checks, pass(s.Key, detail))
+	}
+	return checks
 }

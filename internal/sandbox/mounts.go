@@ -49,6 +49,15 @@ func guards(p config.Paths) []guard {
 		add(s, "the Docker socket")
 	}
 	add(os.Getenv("SSH_AUTH_SOCK"), "the SSH agent's socket ($SSH_AUTH_SOCK)")
+	// Git config may hold credentials (helpers, tokens in URLs).
+	add(os.Getenv("GIT_CONFIG_GLOBAL"), "atl's global git config ($GIT_CONFIG_GLOBAL, the workspace's git_config)")
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		add(filepath.Join(home, ".gitconfig"), "your git config (~/.gitconfig)")
+		add(filepath.Join(home, ".config", "git"), "your git config dir (~/.config/git)")
+	}
+	if x := os.Getenv("XDG_CONFIG_HOME"); filepath.IsAbs(x) {
+		add(filepath.Join(x, "git"), "your git config dir ($XDG_CONFIG_HOME/git)")
+	}
 	add(RunMount, "where a task container has its run dir")
 	for _, k := range []string{"/proc", "/sys", "/dev"} {
 		add(k, "a kernel file system")

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -106,6 +107,7 @@ func (c *Client) run(ctx context.Context, args ...string) (string, error) {
 func (c *Client) runIn(ctx context.Context, stdin string, args ...string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "tmux", c.args(args...)...)
+	cmd.Env = c.serverEnv()
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -120,6 +122,30 @@ func (c *Client) runIn(ctx context.Context, stdin string, args ...string) (strin
 		return strings.TrimSpace(stdout.String()), &Error{Args: args, Stderr: strings.TrimSpace(stderr.String()), Err: err}
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// sessionVars are what a tmux server started from inside a session (a
+// Claude window, a task container's gate) must not take into its global
+// environment, which every window it opens later inherits.
+var sessionVars = []string{"CLAUDECODE", "ATL_SESSION", "ATL_CONTROL_SOCK", "ATL_TASK", "ATL_TASK_DIR", "ATL_PORT_OFFSET"}
+
+// serverEnv is the environment of the tmux commands c runs (a command that
+// starts the server gives it this one): atl's, without sessionVars, and,
+// with a socket name, without TMUX and TMUX_PANE (another server's).
+func (c *Client) serverEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		drop := c.Socket != "" && (k == "TMUX" || k == "TMUX_PANE")
+		for _, v := range sessionVars {
+			drop = drop || k == v
+		}
+		if !drop {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // noServer reports whether err means no tmux server is running on the
@@ -539,12 +565,52 @@ func (c *Client) KillSession(ctx context.Context, name string) error {
 }
 
 // AttachCmd returns the command that attaches the terminal to the named
-// session: switch-client when already inside tmux ($TMUX set), attach-session
-// otherwise. Stdio is left for the caller to wire.
+// session: switch-client when already inside a client of this server
+// ($TMUX names its socket), attach-session otherwise. From inside another
+// server (another workspace's, or the user's own tmux) that is a nested
+// client, so TMUX is removed from its environment (tmux refuses to nest
+// while it is set). Stdio is left for the caller to wire.
 func (c *Client) AttachCmd(name string) *exec.Cmd {
-	verb := "attach-session"
-	if os.Getenv("TMUX") != "" {
-		verb = "switch-client"
+	if os.Getenv("TMUX") == "" {
+		return exec.Command("tmux", c.args("attach-session", "-t", "="+name)...)
 	}
-	return exec.Command("tmux", c.args(verb, "-t", "="+name)...)
+	if c.inside() {
+		return exec.Command("tmux", c.args("switch-client", "-t", "="+name)...)
+	}
+	cmd := exec.Command("tmux", c.args("attach-session", "-t", "="+name)...)
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); k != "TMUX" && k != "TMUX_PANE" {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	return cmd
+}
+
+// inside reports whether $TMUX (set) is a client of c's server: always with
+// no socket name (tmux then picks $TMUX's server), else when $TMUX's
+// socket (its first comma-separated field) is the file SocketPath names.
+func (c *Client) inside() bool {
+	if c.Socket == "" {
+		return true
+	}
+	cur, _, _ := strings.Cut(os.Getenv("TMUX"), ",")
+	a, err := os.Stat(cur)
+	if err != nil {
+		return false
+	}
+	b, err := os.Stat(c.SocketPath())
+	return err == nil && os.SameFile(a, b)
+}
+
+// SocketPath is the path of the socket `tmux -L Socket` uses:
+// $TMUX_TMPDIR (else /tmp)/tmux-<uid>/<Socket>. "" with no socket name.
+func (c *Client) SocketPath() string {
+	if c.Socket == "" {
+		return ""
+	}
+	base := os.Getenv("TMUX_TMPDIR")
+	if base == "" {
+		base = "/tmp"
+	}
+	return filepath.Join(base, fmt.Sprintf("tmux-%d", os.Getuid()), c.Socket)
 }

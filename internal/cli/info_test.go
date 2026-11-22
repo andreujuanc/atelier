@@ -94,7 +94,7 @@ func TestShowNotesTranscript(t *testing.T) {
 	if err := os.WriteFile(transcript, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.Open(filepath.Join(os.Getenv("XDG_DATA_HOME"), "atelier", "atelier.db"))
+	st, err := store.Open(testDB())
 	if err != nil {
 		t.Fatal(err)
 	}

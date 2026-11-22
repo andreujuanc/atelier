@@ -559,8 +559,9 @@ func TestOpen(t *testing.T) {
 		t.Fatalf("live sessions after fresh Open = %+v", live)
 	}
 
-	// Inside tmux the attach command switches clients.
-	t.Setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+	// Inside a client of atl's tmux server the attach command switches
+	// clients.
+	t.Setenv("TMUX", e.app.Tmux.SocketPath()+",1,0")
 	cmd, err = e.app.Open(ctx, "t")
 	if err != nil {
 		t.Fatal(err)

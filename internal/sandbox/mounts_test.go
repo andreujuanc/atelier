@@ -179,3 +179,38 @@ func TestROMountsGuardsResolved(t *testing.T) {
 		t.Errorf("inside the symlinked workspace's real path: %v", err)
 	}
 }
+
+// TestROMountsGitConfig: no git config (it may hold credentials) goes to
+// every task: not $GIT_CONFIG_GLOBAL (a workspace's git_config), nor
+// ~/.gitconfig or ~/.config/git, nor what contains them.
+func TestROMountsGitConfig(t *testing.T) {
+	p, home := mountsEnv(t, true)
+	gc := filepath.Join(t.TempDir(), "ws-git", "gitconfig")
+	for _, f := range []string{gc, filepath.Join(home, ".gitconfig"), filepath.Join(home, ".config", "git", "config")} {
+		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, []byte("[user]\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", gc)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	for path, want := range map[string]string{
+		gc:                                    "is atl's global git config ($GIT_CONFIG_GLOBAL",
+		filepath.Dir(gc):                      "contains atl's global git config",
+		filepath.Join(home, ".gitconfig"):     "is your git config (~/.gitconfig)",
+		filepath.Join(home, ".config", "git"): "is your git config dir (~/.config/git)",
+		filepath.Join(home, ".config", "git", "config"): "lies inside your git config dir",
+		filepath.Join(home, ".config"):                  "contains",
+	} {
+		t.Setenv(MountsVar, path)
+		if got, err := ROMounts(p); err == nil || got != nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %q, %v; want an error with %q", path, got, err, want)
+		}
+	}
+	t.Setenv(MountsVar, home+"/.npmrc-corp")
+	if got, err := ROMounts(p); err != nil || len(got) != 1 {
+		t.Errorf("a good mount: %q, %v", got, err)
+	}
+}

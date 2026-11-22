@@ -47,7 +47,7 @@ func TestTokenPasteAndDoctor(t *testing.T) {
 		t.Fatalf("token --paste: %d %q %q", code, o.String(), e.String())
 	}
 	all.WriteString(o.String() + e.String())
-	file := filepath.Join(root, "state", "atelier-run", "claude-token.json")
+	file := filepath.Join(root, "ws", "run", "claude-token.json")
 	if !strings.Contains(o.String(), "stored in "+file) {
 		t.Errorf("token --paste output: %q", o.String())
 	}

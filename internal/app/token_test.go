@@ -399,7 +399,7 @@ func TestSetupTokenFromScreen(t *testing.T) {
 // session goes.
 func TestSetupTokenInsideTmux(t *testing.T) {
 	e := tokenEnv(t, successScreen(" "+storedTestToken))
-	t.Setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+	t.Setenv("TMUX", e.app.Tmux.SocketPath()+",1,0") // a client of atl's server
 	var attachArgs, ignored []string
 	user := userAtWindow(t, e, &ignored)
 	var opt string

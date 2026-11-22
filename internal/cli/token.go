@@ -32,7 +32,7 @@ func (c *cli) tokenCmd() *cobra.Command {
 			"standard input).",
 		Args: args(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ap, err := c.doctorApp() // the database is not needed
+			ap, err := c.pathsApp() // the database is not needed
 			if err != nil {
 				return err
 			}

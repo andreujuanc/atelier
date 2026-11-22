@@ -52,9 +52,9 @@ func UpstreamSocket() string {
 	return "/var/run/docker.sock"
 }
 
-// maxSocketPath is the longest unix socket path Linux accepts (sun_path
+// MaxSocketPath is the longest unix socket path Linux accepts (sun_path
 // holds 108 bytes including the final NUL).
-const maxSocketPath = 107
+const MaxSocketPath = 107
 
 // Serve runs g on the socket in runDir, and ctl (if not nil) on the control
 // socket there, until ctx ends, the task directory (g.Root) disappears or the
@@ -65,8 +65,8 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 		return err
 	}
 	sock := socketPath(runDir)
-	if len(sock) > maxSocketPath {
-		return fmt.Errorf("gate socket path %s is longer than %d bytes: use a shorter $ATL_WORKSPACE", sock, maxSocketPath)
+	if len(sock) > MaxSocketPath {
+		return fmt.Errorf("gate socket path %s is longer than %d bytes: use a shorter $ATL_WORKSPACE", sock, MaxSocketPath)
 	}
 	lock, err := os.OpenFile(lockPath(runDir), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
