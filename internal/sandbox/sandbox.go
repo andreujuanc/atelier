@@ -30,10 +30,19 @@ import (
 // $ATL_SANDBOX_IMAGE names one: the target "task" of atelier's Dockerfile.
 const DefaultImage = "atelier-task"
 
-// BuildDefaultImage is the command that builds DefaultImage for the user
-// running it, in a checkout of atelier.
+// checkout stands for the path of a checkout of atelier in BuildImages and
+// BuildDefaultImage.
+const checkout = "<atelier checkout>"
+
+// BuildImages is the command that builds the box image and then
+// DefaultImage for the user running it, from any directory: atelier's
+// build-images script.
+const BuildImages = checkout + "/build-images"
+
+// BuildDefaultImage is the command that builds only DefaultImage for the
+// user running it, from any directory.
 const BuildDefaultImage = "docker build --target task -t " + DefaultImage +
-	" --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) ."
+	" --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) " + checkout
 
 // ImageMissing reports whether image is not on the Docker daemon.
 func ImageMissing(ctx context.Context, run Runner, image string) (bool, error) {

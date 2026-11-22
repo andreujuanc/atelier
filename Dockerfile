@@ -1,6 +1,6 @@
 # atelier's two images, built from one file. Build them with your host user so
 # that paths inside the containers match the host (git worktrees store
-# absolute paths):
+# absolute paths). ./build-images builds both, as follows.
 #
 # The box (the last stage, so the default target): atl + claude + tmux + git +
 # gh + docker CLI/compose, where atl itself runs.

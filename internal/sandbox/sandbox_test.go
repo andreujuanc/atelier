@@ -202,7 +202,7 @@ func TestFromEnv(t *testing.T) {
 }
 
 // TestDefaultImage: the default task image is the Dockerfile's task target,
-// not the box image, and its build command builds that target for the user.
+// not the box image, and its build commands build that target for the user.
 func TestDefaultImage(t *testing.T) {
 	if DefaultImage != "atelier-task" {
 		t.Errorf("DefaultImage = %q", DefaultImage)
@@ -213,8 +213,24 @@ func TestDefaultImage(t *testing.T) {
 			t.Errorf("BuildDefaultImage lacks %q: %s", want, BuildDefaultImage)
 		}
 	}
-	if !strings.HasSuffix(BuildDefaultImage, " .") || strings.Contains(BuildDefaultImage, "\n") {
+	// Both work from any directory: they name the checkout, not ".".
+	if !strings.HasSuffix(BuildDefaultImage, " <atelier checkout>") || strings.Contains(BuildDefaultImage, "\n") {
 		t.Errorf("BuildDefaultImage: %q", BuildDefaultImage)
+	}
+	if BuildImages != "<atelier checkout>/build-images" {
+		t.Errorf("BuildImages: %q", BuildImages)
+	}
+	// The script is there, executable, and builds that image by default.
+	path := filepath.Join("..", "..", "build-images")
+	script, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode()&0o111 != 0o111 {
+		t.Errorf("build-images is not executable: %v, %v", fi, err)
+	}
+	if !strings.Contains(string(script), "task=${ATL_SANDBOX_IMAGE:-"+DefaultImage+"}") {
+		t.Errorf("build-images does not build %s by default", DefaultImage)
 	}
 	run := func(_ context.Context, args ...string) (string, error) {
 		if args[len(args)-1] == "gone" {
