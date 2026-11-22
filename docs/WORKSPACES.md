@@ -96,20 +96,23 @@ cleanup.)
 
 ## `atl workspace`
 
-- `atl workspace list [--json]` — every workspace under the root: name, path, open tasks
-  (backlog/active/review) and, when any, sessions waiting. A directory under the root
-  without `atelier.toml` is listed as "not a workspace (no atelier.toml)" so it can be
-  adopted. Marks the current one (if any) with `*`.
+- `atl workspace list [--json]` — every directory under the root: name and path; one
+  without `atelier.toml` is marked "not adopted" so it can be adopted. Marks the current
+  one (if any) with `*`. `--json`: `name`, `path`, `adopted`, `current`. No counts (see
+  Decisions, the plain selector).
 - `atl workspace new <name> [--repos DIR] [--mount PATH]... [--image IMAGE]` — creates
   `$ATL_WORKSPACES/<name>/` with `atelier.toml`, `tasks/ data/ config/ state/`, and the
   repos dir if it is inside the workspace. If the directory exists without `atelier.toml`
-  it is adopted (existing contents are kept). Refuses when `atelier.toml` exists. Values
-  not given as flags are taken from the current environment when set (`ATL_REPOS`,
-  `ATL_SANDBOX_MOUNTS`, `ATL_SANDBOX_IMAGE`, `ATL_SANDBOX_CONTEXT`, `ATL_CONTEXT`), so
-  running it inside an old box writes that box's settings. A directory with
-  `data/atelier.db` (a box's workspace) is adopted outside its box only with the repos
-  known (see Decisions, adoption). Refuses a name whose gate
-  socket path (`<ws>/run/<12 chars>/docker.sock`) would exceed 107 bytes.
+  it is adopted (existing contents are kept), and its box's
+  `.devcontainer/devcontainer.json`, when there is one, is imported (see Decisions,
+  devcontainer import). Refuses when `atelier.toml` exists. Precedence per setting: flags,
+  then the devcontainer.json, then the user's environment (`ATL_REPOS`,
+  `ATL_SANDBOX_MOUNTS`, `ATL_SANDBOX_IMAGE`, `ATL_SANDBOX_CONTEXT`, `ATL_CONTEXT`, so
+  running it inside an old box writes that box's settings), then the defaults. Prints
+  each setting written with its source and each skipped value with the reason. A
+  directory with `data/atelier.db` (a box's workspace) is adopted outside its box only
+  with the repos known (see Decisions, adoption). Refuses a name whose gate socket path
+  (`<ws>/run/<12 chars>/docker.sock`) would exceed 107 bytes.
 - `atl workspace open <name>` — the TUI in that workspace (same as `atl -w <name>`). Without
   a name: the workspace selector, ignoring `$ATL_WORKSPACE` and the current directory.
 
@@ -181,14 +184,15 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   `tmux_socket = "default"` with a comment and prints a note (the box ran its sessions on
   the default server, and on `atl-<name>` Recover would stop them and atl would end Claude
   in their containers). Anywhere else (on the host, from an atl child, in another box) it
-  needs the repos, `--repos` or a user-set `ATL_REPOS` (checked before a repos dir equal
+  needs the repos, `--repos`, `ATL_REPOS` of its devcontainer.json (since the change
+  request after review) or a user-set `ATL_REPOS` (checked before a repos dir equal
   to the default is dropped from the file), and without them refuses with one line
   (`workspace.AdoptDBError`) naming `atl workspace new <name> --repos DIR [--mount PATH]...`
   and the README section; nothing is written. Writing `default` on the host put atl on
   the user's own tmux server (no `-f`, atl's variables in its global environment) and an
   empty `<ws>/repos` dropped the box's clones and mounts.
 - Attaching: `switch-client` only when `$TMUX`'s socket (first comma field) is the same
-  file as this server's socket (`` or `/tmp`, `tmux-<uid>/<name>`), or when no
+  file as this server's socket (`$TMUX_TMPDIR` or `/tmp`, `tmux-<uid>/<name>`), or when no
   socket name is set; otherwise `attach-session` with `TMUX`/`TMUX_PANE` removed (a nested
   client).
 - The default tmux socket of a workspace selected by a path not directly under the root is
@@ -196,8 +200,8 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   symlinks under the root.
 - `atl token` needs a workspace like every other command; only doctor uses an App
   without paths. Doctor warns when `git_config` names a missing file. Sandbox mounts may
-  not be, contain or lie in ``, `~/.gitconfig`, `~/.config/git` (or
-  `/git`).
+  not be, contain or lie in `$GIT_CONFIG_GLOBAL`, `~/.gitconfig`, `~/.config/git` (or
+  `$XDG_CONFIG_HOME/git`).
 - A `--workspace`/`$ATL_WORKSPACE` value with a `/` (or a leading `~`, or `.`/`..`) is a
   path, anything else a name; a path's workspace name is its base name. A relative path
   in the flag is relative to the current directory.
@@ -252,20 +256,64 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   local or under `origin/`, also takes the slug. `TestNewTaskRollback` now makes the second
   worktree fail with an unreadable blob (`breakCheckout`).
 - W3, the selector (`tui.WorkspacePicker`, run by `tui.RunWorkspaces`) lists what
-  `app.ListWorkspaces` returns (`workspace.List` plus `WorkspaceCounts`; `atl workspace
-  list` uses it too). It is shown by `atl` alone on a terminal when `applyWorkspace` fails
-  with `*workspace.NoneError` (any other selection error is printed as before; off a
-  terminal `atl` still prints the help), and by `atl workspace open` without a name and
-  without `-w` (off a terminal: an error naming `atl workspace open <name>`). `-w <name>
-  workspace open` is the same as `workspace open <name>`.
-- The selector's `n` and its adopt (`enter` on a row without `atelier.toml`, then `y`) call
-  `createWorkspace`, the same function as `atl workspace new` (`FillFromEnv` then
-  `workspace.Create`); the notes `Create` returns are shown on the status line. The name is
-  checked as typed (`CheckName`, and not an existing workspace); a directory without
-  `atelier.toml` is announced as adopted (by `n` too). A directory with a database
-  (`WorkspaceInfo.HasDB`) is never adopted from the selector, not even in its box: `enter`
-  and `n` show the `--repos` hint instead, and the CLI's `Create` callback refuses it too
-  (`selectorAdoptable`, against a stale list).
+  `workspace.List` returns, as `atl workspace list` does. It is shown by `atl` alone on a
+  terminal when `applyWorkspace` fails with `*workspace.NoneError` (any other selection
+  error is printed as before; off a terminal `atl` still prints the help), and by `atl
+  workspace open` without a name and without `-w` (off a terminal: an error naming `atl
+  workspace open <name>`). `-w <name> workspace open` is the same as `workspace open
+  <name>`.
+- The plain selector (change request after review): the selector and `atl workspace list`
+  show the name and the path (`~`-abbreviated, dimmed in the selector) and nothing else; a
+  directory without `atelier.toml` is dimmed and marked "not adopted". The per-workspace
+  open-task and waiting-session counts are gone, with `app.ListWorkspaces`,
+  `app.WorkspaceCounts` and `app.WorkspaceInfo` (the read-only opens they did); W2's
+  `openTasks`/`otherWorkspaceTasks` (port offsets) keep `store.OpenReadOnly`. `--json` is
+  `name`, `path`, `adopted`, `current`.
+- The selector creates and adopts through `WorkspaceSelector.Prepare` (`workspace.Prepare`
+  with no flags: the same computation as `atl workspace new <name>`, nothing written) and
+  `Create` (`Plan.Write`, the plan shown). `n` with a new name creates at once; `enter` on
+  a "not adopted" row, or `n` with its name, shows the confirmation view in place of the
+  list: each `PlannedSetting` (`key = value (from source)`), skipped values, warnings and
+  notes, wrapped; `y` writes, `n`/`esc`/`q` cancel, other keys do nothing. A refusal from
+  `Prepare` (`AdoptDBError`: a box's workspace with no repos found) is shown on the status
+  line and nothing is asked. The name is checked as typed (`CheckName`, and not an
+  existing workspace); the plan's notes go on the status line after it is written.
+  `selectorAdoptable` and `WorkspaceInfo.HasDB` are gone: a box's workspace whose
+  devcontainer.json names the repos is adopted from the selector like anywhere else (in
+  its own box, with `tmux_socket = "default"` as on the CLI).
+- Devcontainer import (change request after review): `workspace.Prepare` computes a
+  `Plan` (the `Config` to write, `Settings` with their sources, `Skipped`, `Warnings`,
+  `Notes`) and `Plan.Write` writes it; `Create` is both. When adopting (the directory
+  exists), `<dir>/.devcontainer/devcontainer.json` is read if present: JSONC through a
+  small pre-pass (`//` and `/* */` comments outside strings removed, a comma followed only
+  by whitespace or comments before `}`/`]` dropped) and `encoding/json`; no new
+  dependency. Variables of `containerEnv` and then `remoteEnv` (which wins, as in the
+  box's shells): `ATL_REPOS`, `ATL_SANDBOX_MOUNTS` (`:`-separated), `ATL_SANDBOX_IMAGE`,
+  `ATL_SANDBOX_CONTEXT`, `ATL_CONTEXT`, `ATL_TMUX_SOCKET` become their settings;
+  `ATL_WORKSPACE` is ignored, with a warning when it names another directory (a name
+  compared with the dir's base name, a path by path or `os.SameFile`); `ATL_SANDBOX` other
+  than `docker` warns that it is not carried over; a name matching
+  `KEY|TOKEN|SECRET|PASSWORD` is skipped as a secret (its value never printed or written;
+  the reason names `atl token`); another `ATL_*` is skipped as not a setting; anything
+  else is ignored silently. `${localEnv:VAR}` and `${localEnv:VAR:default}` (the default
+  when VAR is unset or empty) expand from atl's environment; any other `${...}` skips the
+  value with the reason. Mounts (string form `source=…,target=…,type=bind[,readonly]`,
+  with `src`/`dst`/`destination` accepted, or the object form): only a `type=bind` whose
+  target is a container user's `~/.gitconfig` (`/root/.gitconfig`,
+  `/home/<user>/.gitconfig`, or `$HOME/.gitconfig` of atl's environment, since boxes
+  mounted at the host's paths) counts: `git_config` = its source, relative when inside the
+  workspace, nothing when it is `<ws>/gitconfig` (the default; said as skipped). The other
+  mounts (workspace, repos, `~/.claude`, the Docker socket, the files of
+  `ATL_SANDBOX_MOUNTS`) are the box's plumbing. Precedence per key: flags, the
+  devcontainer.json, the user's environment (`FillFromEnv`'s rules: `UserEnv`), the
+  default; recorded as `--repos`/`--mount`/`--image`, `.devcontainer/devcontainer.json`,
+  `$VAR`. A devcontainer.json that does not parse is a warning (nothing taken from it). The
+  `AdoptDBError` check runs after all three sources; `NotWorkspaceError` names the plain
+  `atl workspace new <name>` when the repos are known (devcontainer or user env). A
+  `tmux_socket` with `/` is refused before writing (ReadConfig would refuse the file). The
+  CLI prints each `PlannedSetting`, then `skipped …`, `warning: …` and `note: …` lines on
+  stderr (`atl: ` prefix), with paths `~`-abbreviated and contexts quoted (first 40
+  characters); stdout stays `name<TAB>dir`. `.devcontainer/` is left in place.
 - Last used: `$ATL_WORKSPACES/.last` holds the name of the workspace whose task TUI was
   started last (written, atomically, only for a workspace directly under the root; never
   creates the root; every error ignored). The selector preselects `--preselect` (hidden
@@ -325,9 +373,9 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
 - No new doctor check for host basics: the tool checks (git, tmux ≥ 3.2, claude, gh) and
   the `docker` check (daemon reachable) already cover them.
 - Fix round, README migration: the main path is host-side (in the box finish or close what
-  runs and stop it; on the host `atl workspace new <name> --repos <repos> [--mount
-  <path>]...`; `atl -w <name>` or the selector; resume with `claude --resume`). Adopting
-  in the box (`tmux_socket = "default"`, removed when moving) is described only as the way
+  runs and stop it; on the host `atl workspace new <name>`, which since the change request
+  after review reads the box's devcontainer.json, flags overriding; `atl -w <name>` or the
+  selector; resume with `claude --resume`). Adopting in the box (`tmux_socket = "default"`, removed when moving) is described only as the way
   to upgrade a box in place. It also says to move all workspaces of a host together: a box
   sees only its own workspace under `$ATL_WORKSPACES`. Rootless Docker and Podman are
   stated as unsupported (the gate's upstream is `DOCKER_HOST`'s unix socket or
@@ -345,3 +393,5 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   is refused.
 - Fix round, tests: `workspace.ResetOriginalEnv` (tests only) forgets the snapshot, so
   `TestReexec` compares the exec environment with the one before its own Apply exactly.
+- Change request after review, fixtures: tests name their workspaces `alpha` and `beta`,
+  the docs `personal` and `work` (paths like `~/src/work`, `/home/you`).

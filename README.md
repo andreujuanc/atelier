@@ -77,40 +77,51 @@ passes no file: it runs with your own config.
 ### Moving from a devcontainer box
 
 A box's `devcontainer.json` carries a workspace's settings in mounts and variables; on the
-host they are the workspace's `atelier.toml`, and the rest is not needed:
+host they are the workspace's `atelier.toml`, and `atl workspace new <name>`, run on the
+host on the box's workspace directory, writes it from that file
+(`<workspace>/.devcontainer/devcontainer.json`, read as JSON with comments and trailing
+commas):
 
 | in `devcontainer.json` | on the host |
 |---|---|
-| `ATL_WORKSPACE` | the workspace directory itself (`$ATL_WORKSPACES/<name>`, selected as in [Workspaces](#workspaces)) |
+| `ATL_WORKSPACE` | the workspace directory itself (`$ATL_WORKSPACES/<name>`, selected as in [Workspaces](#workspaces)); a warning when it names another directory |
 | `ATL_REPOS` | `repos` |
 | `ATL_SANDBOX_MOUNTS` | `[sandbox].mounts` (a list) |
-| `ATL_SANDBOX_IMAGE`, `ATL_CONTEXT`, `ATL_SANDBOX_CONTEXT` | `[sandbox].image`, `context`, `[sandbox].context` |
-| `ATL_SANDBOX=docker` | the default: leave it out |
-| `<workspace>/gitconfig` mounted as `~/.gitconfig` | `git_config`; the default already picks up `<workspace>/gitconfig` when it exists |
+| `ATL_SANDBOX_IMAGE`, `ATL_CONTEXT`, `ATL_SANDBOX_CONTEXT`, `ATL_TMUX_SOCKET` | `[sandbox].image`, `context`, `[sandbox].context`, `tmux_socket` |
+| `ATL_SANDBOX=docker` | the default: left out (`off` is not carried over, with a warning) |
+| a file mounted as the container user's `~/.gitconfig` | `git_config` (relative when it is in the workspace); none for `<workspace>/gitconfig`, which the default already picks up |
 | `~/.claude` mounted | not needed: `atl` finds your Claude Code config at the same path on the host |
-| `CLAUDE_CODE_OAUTH_TOKEN` in `containerEnv` | the same variable in the environment you start `atl` in, or the token `atl token` stored in `<workspace>/run/` (still there) |
-| `/var/run/docker.sock` mounted, `--group-add <docker gid>` | your user in the `docker` group |
+| `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` (any variable whose name has `KEY`, `TOKEN`, `SECRET` or `PASSWORD`) | never written: the same variable in the environment you start `atl` in, or the token `atl token` stored in `<workspace>/run/` (still there) |
+| the workspace, the repos, `/var/run/docker.sock` mounted, `--group-add <docker gid>` | not needed: the host's own paths, and your user in the `docker` group |
 | `--security-opt label=disable` | not needed: it was for the box's own bind mounts; task containers are created without it |
+
+The variables are read from `containerEnv` and `remoteEnv` (which wins), with
+`${localEnv:VAR}` and `${localEnv:VAR:default}` expanded from the environment you run `atl`
+in; a value with any other `${...}` (`${containerEnv:...}`, `${containerWorkspaceFolder}`)
+had a meaning only in the box and is skipped. A flag given to `atl workspace new` wins over
+the file, and the file over `ATL_*` variables you set. It prints each setting it writes
+with where it came from (e.g. `repos = ~/src/work (from .devcontainer/devcontainer.json)`)
+and each value it skipped with the reason, and leaves `.devcontainer/` in place.
 
 The tasks, their worktrees, the database and the task containers stay where they are: the
 box used the host's paths, the host's Docker daemon and your user. Steps, for each
 workspace:
 
-1. In the box, finish or close what runs: let running sessions reach a stopping point (or
-   close the tasks you are done with), quit `atl`, and stop the box. Its tmux server goes
-   with it; sessions still running in task containers are ended by the next `atl` that
-   notices their windows gone, and can be resumed.
-2. On the host, adopt the workspace's directory with the box's settings: `atl workspace new
-   <name> --repos <ATL_REPOS> [--mount <path>]...`, a `--mount` for each path of the box's
-   `ATL_SANDBOX_MOUNTS` (and `--image` for its `ATL_SANDBOX_IMAGE`, if any). It keeps the
-   directory's contents and writes `atelier.toml`; `git_config` needs no line (see the
-   table), and a context the box set goes in by hand (`context`, `[sandbox].context`).
-   Without `--repos` (or `ATL_REPOS` set) it refuses: a directory with a database is a
-   box's workspace, and the default repos, `<workspace>/repos`, would leave the box's
-   clones behind.
+1. In the box, close what runs: let running sessions reach a stopping point (or close the
+   tasks you are done with), quit `atl`, and stop the box. Its tmux server goes with it;
+   sessions still running in task containers are ended by the next `atl` that notices
+   their windows gone, and can be resumed.
+2. On the host, `atl workspace new <name>` (or, in the workspace selector, `enter` on the
+   directory, marked "not adopted", which lists the settings it would write and adopts it
+   on `y`). It keeps the directory's contents and writes `atelier.toml` from the box's
+   `devcontainer.json`; `--repos`, `--mount` and `--image` override what it says. A
+   directory with a database is a box's workspace: with no repos found (no `ATL_REPOS` in
+   the file, no `--repos`, no `ATL_REPOS` set) it refuses, since the default repos,
+   `<workspace>/repos`, would leave the box's clones behind, and says to give `--repos`.
 3. Run `atl -w <name>` (or `atl` alone, and pick the workspace in the selector). `atl open`,
    Enter in the TUI, or `atl resume` start the stopped sessions again with `claude
-   --resume`. `atl doctor` should show `$ATL_TMUX_SOCKET = atl-<name> (default)`.
+   --resume`. `atl doctor` should show `$ATL_TMUX_SOCKET = atl-<name> (default)`: the box
+   never set a tmux socket, so on the host the workspace gets a tmux server of its own.
 
 Move all the workspaces of a host together. A box sees only its own workspace under
 `$ATL_WORKSPACES`, so a new task in a box does not avoid the port offsets of the other
@@ -119,7 +130,7 @@ doctor` in a box says that it read no other workspace. While some workspaces sti
 box, two tasks can get the same offset; `atl doctor` on the host warns about such pairs.
 
 To upgrade a box in place instead (a box image with this `atl`), run `atl workspace new
-<name>` in the box once: it adopts the directory with the box's variables and, since the
+<name>` in the box once: it adopts the directory with the box's settings and, since the
 box's sessions run on tmux's default server, writes `tmux_socket = "default"` with a
 comment. Delete that line (and its comment) when you move the workspace to the host: left
 in, `atl` on the host would use your own default tmux server. The box keeps working for a
@@ -150,10 +161,23 @@ config. Before, `~/atelier/workspaces/work/.devcontainer/devcontainer.json`:
 }
 ```
 
-`personal`'s is the same with `personal` for `work` and without the npm config. Step 2 on the host,
-`atl workspace new personal --repos ~/src/personal` and `atl workspace new work --repos
-~/src/work --mount ~/.work.npmrc`, writes these two `atelier.toml` files (`~/` is your
-home; `atl workspace new` writes the absolute paths):
+`personal`'s is the same with `personal` for `work` and without the npm config. Step 2 on
+the host:
+
+```console
+$ atl workspace new personal
+atl: repos = ~/src/personal (from .devcontainer/devcontainer.json)
+atl: skipped the mount on /home/you/.gitconfig: its source is /home/you/atelier/workspaces/personal/gitconfig, which git_config already defaults to
+personal	/home/you/atelier/workspaces/personal
+$ atl workspace new work
+atl: repos = ~/src/work (from .devcontainer/devcontainer.json)
+atl: sandbox.mounts = ~/.work.npmrc (from .devcontainer/devcontainer.json)
+atl: skipped the mount on /home/you/.gitconfig: its source is /home/you/atelier/workspaces/work/gitconfig, which git_config already defaults to
+work	/home/you/atelier/workspaces/work
+```
+
+They write these two `atelier.toml` files (`~/` is your home; `atl workspace new` writes the
+absolute paths):
 
 ```toml
 # ~/atelier/workspaces/personal/atelier.toml
@@ -169,10 +193,9 @@ mounts = ["~/.work.npmrc"]
 ```
 
 Each has its `gitconfig` next to `atelier.toml`, which `atl` uses without a `git_config`
-line. Then, on the host: `atl -w personal` in one terminal and `atl -w work` in another (two tmux
-servers, `atl-personal` and `atl-work`), or `atl` alone for the workspace selector.
-`.devcontainer/` can stay (the box still works) or go.
-
+line. Then, on the host: `atl -w personal` in one terminal and `atl -w work` in another (two
+tmux servers, `atl-personal` and `atl-work`), or `atl` alone for the workspace selector.
+`.devcontainer/` stays (the box still works) until you remove it.
 
 ## Docker image
 
@@ -268,8 +291,8 @@ atl doctor                # tools, the workspace and where each setting came fro
 atl token [--paste]       # sandbox: run claude setup-token and store its token for task sessions (see Sandbox)
 atl                       # TUI (on a terminal), in the selected workspace; with none selected, the workspace selector
 atl -w shop ls            # any command in workspace shop (--workspace; else $ATL_WORKSPACE, else the current directory)
-atl workspace list [--json]          # workspaces under $ATL_WORKSPACES: open tasks, waiting sessions; * the selected one
-atl workspace new shop [--repos DIR] [--mount PATH]... [--image IMAGE]   # create (or adopt) $ATL_WORKSPACES/shop
+atl workspace list [--json]          # workspaces under $ATL_WORKSPACES: name and path; * the selected one
+atl workspace new shop [--repos DIR] [--mount PATH]... [--image IMAGE]   # create (or adopt, reading its .devcontainer/devcontainer.json) $ATL_WORKSPACES/shop
 atl workspace open shop   # the TUI in workspace shop (same as atl -w shop)
 atl workspace open        # the workspace selector, whatever $ATL_WORKSPACE and the current directory say
 ```
@@ -498,7 +521,7 @@ $ATL_WORKSPACES/<name>/
 `atelier.toml` is strict TOML: every key is optional, and an unknown key is an error.
 
 ```toml
-repos = "/home/you/src/shop"   # canonical clones; relative = to the workspace dir; default "repos"
+repos = "/home/you/src/shop"        # canonical clones; relative = to the workspace dir; default "repos"
 git_config = "gitconfig"        # global git config (GIT_CONFIG_GLOBAL); relative = to the workspace dir;
                                 # default "gitconfig" if that file exists, else git's own (~/.gitconfig)
 context = "..."                 # appended to every task session's start context (ATL_CONTEXT)
@@ -590,39 +613,40 @@ clones of its rw repos (see [Notes](#notes)).
 **Commands.**
 
 - `atl workspace list [--json]`: every directory under `$ATL_WORKSPACES` with a valid
-  name, with its open tasks (backlog, active, review) and, when any, its waiting sessions,
-  read from its database read-only; one without `atelier.toml` is listed as "not a
-  workspace (no atelier.toml)". `*` marks the selected one (by `-w`, `$ATL_WORKSPACE` or
-  the current directory).
+  name: its name and path, one without `atelier.toml` marked "not adopted". `*` marks the
+  selected one (by `-w`, `$ATL_WORKSPACE` or the current directory). `--json` gives `name`,
+  `path`, `adopted` and `current` for each.
 - `atl workspace new <name> [--repos DIR] [--mount PATH]... [--image IMAGE]`: makes
   `$ATL_WORKSPACES/<name>/` with `atelier.toml`, `tasks/ data/ config/ state/`, and the
   repos dir when it is inside the workspace. A directory that exists without
-  `atelier.toml` is adopted: its contents are kept. One that has a database
-  (`data/atelier.db`, a box's workspace) is adopted with `--repos` (or `$ATL_REPOS`) only,
-  except in that box: the default repos would leave the box's clones behind (see
-  [Moving from a devcontainer box](#moving-from-a-devcontainer-box)). It refuses when
-  `atelier.toml` exists, and a name whose task gate sockets
-  (`<workspace>/run/<12 chars>/docker.sock`) would not fit the 107 bytes of a socket path. What the flags do not give is taken from
+  `atelier.toml` is adopted: its contents are kept, and the settings of the box in its
+  `.devcontainer/devcontainer.json`, when it has one, are taken (see
+  [Moving from a devcontainer box](#moving-from-a-devcontainer-box)). One that has a
+  database (`data/atelier.db`, a box's workspace) needs its repos, from that file,
+  `--repos` or `$ATL_REPOS`, except in that box: the default repos would leave the box's
+  clones behind. It refuses when `atelier.toml` exists, and a name whose task gate sockets
+  (`<workspace>/run/<12 chars>/docker.sock`) would not fit the 107 bytes of a socket path.
+  Each setting comes from the flags, else the box's `devcontainer.json`, else
   `$ATL_REPOS`, `$ATL_SANDBOX_MOUNTS`, `$ATL_SANDBOX_IMAGE`, `$ATL_SANDBOX_CONTEXT` and
   `$ATL_CONTEXT` when you set them (not when `atl` did, for the workspace it runs in), so
-  run in a box it writes the box's settings. Prints the name and the directory.
+  run in a box it writes the box's settings. It prints each setting it writes with where
+  it came from, and what it skipped, on stderr, then the name and the directory.
 - `atl workspace open <name>`: the TUI in that workspace, as `atl -w <name>`. Without a
   name: the workspace selector, whatever `$ATL_WORKSPACE` and the current directory say
   (with `-w <name>`, that workspace). Both need a terminal.
 
 **The selector.** A full-screen list of every directory under `$ATL_WORKSPACES` with a valid
-name, as `atl workspace list` shows them: the name, the open tasks, the waiting sessions
-(highlighted as the TUI highlights a waiting session) and the path; a directory without
-`atelier.toml` is dimmed as "not a workspace (no atelier.toml)", and one whose database
-cannot be read shows the error. It starts on the workspace whose TUI was opened last
-(recorded in `$ATL_WORKSPACES/.last`; atl ignores it when it cannot read or write it), else
-on the first. Keys: `↑`/`↓` (`k`/`j`) move, `enter` opens the workspace, `n` creates one (type
-its name; `enter` creates it as `atl workspace new <name>` does with no flags, and selects
-it), `/` filters by name, `r` reloads the list, `q` or `ctrl+c` quits. `enter` on a directory
-without `atelier.toml` asks whether to adopt it (`y`), as `atl workspace new <name>` does,
-keeping its contents; one that has a database (a box's workspace) is not adopted from the
-selector, by `enter` or `n`, which say to run `atl workspace new <name> --repos DIR
-[--mount PATH]...` instead. Opening a workspace
+name, as `atl workspace list` shows them: the name and the path (dimmed); a directory
+without `atelier.toml` is dimmed and marked "not adopted". It starts on the workspace whose
+TUI was opened last (recorded in `$ATL_WORKSPACES/.last`; atl ignores it when it cannot
+read or write it), else on the first. Keys: `↑`/`↓` (`k`/`j`) move, `enter` opens the
+workspace, `n` creates one (type its name; `enter` creates it as `atl workspace new <name>`
+does with no flags, and selects it), `/` filters by name, `r` reloads the list, `q` or
+`ctrl+c` quits. `enter` on a directory without `atelier.toml` (or `n` with its name) shows
+what adopting it would write, computed as `atl workspace new <name>` does without flags
+(each setting with where it came from, what it skipped), and nothing is written until `y`
+adopts it; `n` or `esc` cancels. When adopting would be refused (a box's workspace whose
+repos are not found), it says so and how to adopt it instead. Opening a workspace
 replaces the selector with `atl -w <name>`, run in the environment `atl` started with (not
 the one a workspace was applied to), so nothing of one workspace reaches the next. `w` in
 the TUI does the same the other way: once no operation is running, it leaves the TUI and

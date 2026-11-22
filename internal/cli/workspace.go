@@ -13,7 +13,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/tui"
 	"github.com/andreujuanc/atelier/internal/workspace"
 )
@@ -32,27 +31,24 @@ func (c *cli) workspaceCmd() *cobra.Command {
 }
 
 type jsonWorkspace struct {
-	Name      string `json:"name"`
-	Path      string `json:"path"`
-	Workspace bool   `json:"workspace"` // false: no atelier.toml
-	Current   bool   `json:"current"`
-	OpenTasks int    `json:"open_tasks"`
-	Waiting   int    `json:"waiting_sessions"`
-	Error     string `json:"error,omitempty"` // its database could not be read
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Adopted bool   `json:"adopted"` // false: no atelier.toml
+	Current bool   `json:"current"`
 }
 
 func (c *cli) workspaceListCmd() *cobra.Command {
 	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "list [--json]",
-		Short: "Workspaces under $" + workspace.RootVar + ": name, open tasks, waiting sessions, path (* the current one)",
+		Short: "Workspaces under $" + workspace.RootVar + ": name and path (* the current one; directories without atelier.toml marked not adopted)",
 		Args:  args(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			root, err := workspace.Root()
 			if err != nil {
 				return err
 			}
-			entries, err := app.ListWorkspaces(cmd.Context(), root)
+			entries, err := workspace.List(root)
 			if err != nil {
 				return err
 			}
@@ -62,12 +58,7 @@ func (c *cli) workspaceListCmd() *cobra.Command {
 			}
 			out := make([]jsonWorkspace, 0, len(entries))
 			for _, e := range entries {
-				w := jsonWorkspace{Name: e.Name, Path: e.Dir, Workspace: e.Workspace, Current: filepath.Clean(e.Dir) == current,
-					OpenTasks: e.OpenTasks, Waiting: e.Waiting}
-				if e.Err != nil {
-					w.Error = e.Err.Error()
-				}
-				out = append(out, w)
+				out = append(out, jsonWorkspace{Name: e.Name, Path: e.Dir, Adopted: e.Workspace, Current: filepath.Clean(e.Dir) == current})
 			}
 			if asJSON {
 				enc := json.NewEncoder(c.stdout)
@@ -84,19 +75,11 @@ func (c *cli) workspaceListCmd() *cobra.Command {
 				if w.Current {
 					mark = "*"
 				}
-				var what string
-				switch {
-				case !w.Workspace:
-					what = "not a workspace (no " + workspace.File + ")"
-				case w.Error != "":
-					what = "database: " + w.Error
-				default:
-					what = fmt.Sprintf("%d open", w.OpenTasks)
-					if w.Waiting > 0 {
-						what += fmt.Sprintf(", %d waiting", w.Waiting)
-					}
+				fmt.Fprintf(tw, "%s %s\t%s", mark, w.Name, w.Path)
+				if !w.Adopted {
+					fmt.Fprint(tw, "\tnot adopted (no "+workspace.File+")")
 				}
-				fmt.Fprintf(tw, "%s %s\t%s\t%s\n", mark, w.Name, what, w.Path)
+				fmt.Fprintln(tw)
 			}
 			return tw.Flush()
 		},
@@ -111,8 +94,9 @@ func (c *cli) workspaceNewCmd() *cobra.Command {
 	var image string
 	cmd := &cobra.Command{
 		Use: "new <name> [--repos DIR] [--mount PATH]... [--image IMAGE]",
-		Short: "Create workspace <name> (atelier.toml, tasks/ data/ config/ state/), or adopt the directory if it has no atelier.toml; " +
-			"settings not given are taken from $ATL_REPOS, $ATL_SANDBOX_MOUNTS, $ATL_SANDBOX_IMAGE, $ATL_SANDBOX_CONTEXT and $ATL_CONTEXT",
+		Short: "Create workspace <name> (atelier.toml, tasks/ data/ config/ state/), or adopt the directory if it has no atelier.toml " +
+			"(taking the box's settings from its .devcontainer/devcontainer.json); settings not given are taken from $ATL_REPOS, " +
+			"$ATL_SANDBOX_MOUNTS, $ATL_SANDBOX_IMAGE, $ATL_SANDBOX_CONTEXT and $ATL_CONTEXT",
 		Args: args(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
 			name := a[0]
@@ -132,22 +116,42 @@ func (c *cli) workspaceNewCmd() *cobra.Command {
 			}
 			cfg.Repos = strings.TrimSpace(cfg.Repos)
 			cfg.Sandbox = &workspace.SandboxConfig{Image: strings.TrimSpace(image), Mounts: ms}
-			dir, notes, err := createWorkspace(root, name, cfg)
+			p, err := workspace.Create(root, name, cfg)
 			if err != nil {
 				return err
 			}
-			for _, n := range notes {
-				fmt.Fprintf(c.stderr, "atl: note: %s\n", n)
+			for _, l := range planLines(p) {
+				fmt.Fprintf(c.stderr, "atl: %s\n", l)
 			}
-			fmt.Fprintf(c.stdout, "%s\t%s\n", name, dir)
+			fmt.Fprintf(c.stdout, "%s\t%s\n", name, p.Dir)
 			return nil
 		},
 	}
 	f := cmd.Flags()
-	f.StringVar(&cfg.Repos, "repos", "", "the canonical clones (default: $ATL_REPOS if set, else <workspace>/repos; needed to adopt a box's workspace, one with a database, outside that box)")
-	f.StringArrayVar(&mounts, "mount", nil, "a host path every task gets read-only (repeatable; default: $ATL_SANDBOX_MOUNTS)")
-	f.StringVar(&image, "image", "", "the task container image (default: $ATL_SANDBOX_IMAGE, else atelier-task)")
+	f.StringVar(&cfg.Repos, "repos", "", "the canonical clones (default: ATL_REPOS of the adopted directory's .devcontainer/devcontainer.json, "+
+		"else $ATL_REPOS, else <workspace>/repos; needed to adopt a box's workspace, one with a database, when neither has it)")
+	f.StringArrayVar(&mounts, "mount", nil, "a host path every task gets read-only (repeatable; default: from .devcontainer/devcontainer.json, else $ATL_SANDBOX_MOUNTS)")
+	f.StringVar(&image, "image", "", "the task container image (default: from .devcontainer/devcontainer.json, else $ATL_SANDBOX_IMAGE, else atelier-task)")
 	return cmd
+}
+
+// planLines is what `atl workspace new` says about p: each setting written
+// with where it came from, the values skipped, warnings and notes.
+func planLines(p *workspace.Plan) []string {
+	var out []string
+	for _, s := range p.Settings {
+		out = append(out, s.String())
+	}
+	for _, s := range p.Skipped {
+		out = append(out, "skipped "+s)
+	}
+	for _, w := range p.Warnings {
+		out = append(out, "warning: "+w)
+	}
+	for _, n := range p.Notes {
+		out = append(out, "note: "+n)
+	}
+	return out
 }
 
 func (c *cli) workspaceOpenCmd() *cobra.Command {
@@ -184,13 +188,6 @@ func (c *cli) workspaceOpenCmd() *cobra.Command {
 	cmd.Flags().StringVar(&preselect, "preselect", "", "the workspace the selector starts on")
 	_ = cmd.Flags().MarkHidden("preselect")
 	return cmd
-}
-
-// createWorkspace is `atl workspace new`: cfg with what it does not set
-// taken from the environment, then created (or adopted) under root.
-func createWorkspace(root, name string, cfg workspace.Config) (string, []string, error) {
-	workspace.FillFromEnv(&cfg)
-	return workspace.Create(root, name, cfg)
 }
 
 // execProcess replaces this process with another program; tests replace it.
@@ -258,31 +255,15 @@ func (c *cli) selectWorkspace(ctx context.Context, preselect string) error {
 		Root:      root,
 		Home:      home,
 		Preselect: preselect,
-		Load:      func(ctx context.Context) ([]app.WorkspaceInfo, error) { return app.ListWorkspaces(ctx, root) },
-		Create: func(name string) ([]string, error) {
-			if err := selectorAdoptable(root, name); err != nil {
-				return nil, err
-			}
-			_, notes, err := createWorkspace(root, name, workspace.Config{})
-			return notes, err
-		},
+		Load:      func(context.Context) ([]workspace.Entry, error) { return workspace.List(root) },
+		// The same as `atl workspace new <name>` without flags.
+		Prepare: func(name string) (*workspace.Plan, error) { return workspace.Prepare(root, name, workspace.Config{}) },
+		Create:  func(p *workspace.Plan) error { return p.Write() },
 	})
 	if err != nil || name == "" {
 		return err
 	}
 	return c.openChosen(name)
-}
-
-// selectorAdoptable returns why the selector does not create or adopt
-// workspace name: a directory without atelier.toml that has a database (a
-// box's workspace) is adopted only by `atl workspace new` with its repos
-// (the selector has no flags), even in that box.
-func selectorAdoptable(root, name string) error {
-	dir := filepath.Join(root, name)
-	if _, err := os.Lstat(filepath.Join(dir, workspace.File)); errors.Is(err, os.ErrNotExist) && workspace.HasDB(dir) {
-		return &workspace.AdoptDBError{Name: name, Dir: dir}
-	}
-	return nil
 }
 
 // openChosen re-executes atl in workspace name (the selector's choice).

@@ -258,7 +258,7 @@ $out"
 grep -qE "^ok +repos +[$]ATL_REPOS = $ATL_REPOS \(env\)$" <<<"$out" || fail "doctor lacks repos from env:
 $out"
 out="$(atl workspace list)" || fail "atl workspace list failed: $out"
-grep -qE "^\* e2e +0 open +$WS$" <<<"$out" || fail "atl workspace list: $out"
+grep -qE "^\* e2e +$WS$" <<<"$out" || fail "atl workspace list: $out"
 
 # ---- new -------------------------------------------------------------------
 

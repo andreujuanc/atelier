@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -129,24 +128,26 @@ func TestWorkspaces(t *testing.T) {
 		t.Errorf("ls in b's dir: %d %q %q", code, out, errs)
 	}
 
-	// list: the current one marked, open tasks counted.
+	// list: the name and the path, the current one marked, a directory
+	// without atelier.toml marked not adopted; no counts.
 	code, out, _ = atl(t, "workspace", "list")
-	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
-	if code != 0 || len(lines) != 3 || !strings.HasPrefix(lines[0], "  a ") || !strings.Contains(lines[0], "0 open") ||
-		!strings.HasPrefix(lines[1], "* b ") || !strings.Contains(lines[1], "1 open") || !strings.HasSuffix(lines[1], filepath.Join(wsRoot, "b")) ||
-		!strings.HasPrefix(lines[2], "  old ") || !strings.Contains(lines[2], "not a workspace (no atelier.toml)") {
-		t.Errorf("list:\n%s", out)
+	want := "  a    " + filepath.Join(wsRoot, "a") + "\n* b    " + filepath.Join(wsRoot, "b") + "\n  old  " + filepath.Join(wsRoot, "old") + "  not adopted (no atelier.toml)\n"
+	if code != 0 || out != want {
+		t.Errorf("list:\n%s\nwant:\n%s", out, want)
 	}
 	code, out, _ = atl(t, "workspace", "list", "--json")
 	var list []jsonWorkspace
 	if err := json.Unmarshal([]byte(out), &list); code != 0 || err != nil || len(list) != 3 {
 		t.Fatalf("list --json: %d %v\n%s", code, err, out)
 	}
-	if w := list[1]; w.Name != "b" || !w.Current || !w.Workspace || w.OpenTasks != 1 || w.Waiting != 0 || w.Path != filepath.Join(wsRoot, "b") {
+	if w := list[1]; w != (jsonWorkspace{Name: "b", Path: filepath.Join(wsRoot, "b"), Adopted: true, Current: true}) {
 		t.Errorf("b: %+v", w)
 	}
-	if w := list[2]; w.Name != "old" || w.Workspace || w.Current {
+	if w := list[2]; w.Name != "old" || w.Adopted || w.Current {
 		t.Errorf("old: %+v", w)
+	}
+	if strings.Contains(out, "open") || strings.Contains(out, "waiting") {
+		t.Errorf("counts in --json:\n%s", out)
 	}
 
 	// open: the workspace must exist; the TUI needs a terminal.
@@ -358,7 +359,8 @@ func TestWorkspaceAdoptTmux(t *testing.T) {
 		}
 	}
 	repos := filepath.Join(wsRoot, "..", "box-repos")
-	if code, _, errs := atl(t, "workspace", "new", "host", "--repos", repos, "--mount", "/etc/hosts"); code != 0 || errs != "" {
+	if code, _, errs := atl(t, "workspace", "new", "host", "--repos", repos, "--mount", "/etc/hosts"); code != 0 ||
+		errs != "atl: repos = ~/box-repos (from --repos)\natl: sandbox.mounts = /etc/hosts (from --mount)\n" {
 		t.Fatalf("new host --repos: %d %q", code, errs)
 	}
 	toml, _ := os.ReadFile(filepath.Join(host, "atelier.toml"))
@@ -369,7 +371,7 @@ func TestWorkspaceAdoptTmux(t *testing.T) {
 	// $ATL_REPOS set by the user counts as given.
 	mkdb("host2")
 	t.Setenv("ATL_REPOS", repos)
-	if code, _, errs := atl(t, "workspace", "new", "host2"); code != 0 || errs != "" {
+	if code, _, errs := atl(t, "workspace", "new", "host2"); code != 0 || errs != "atl: repos = ~/box-repos (from $ATL_REPOS)\n" {
 		t.Errorf("new host2 with $ATL_REPOS: %d %q", code, errs)
 	}
 	t.Setenv("ATL_REPOS", "")
@@ -486,29 +488,69 @@ func TestReexec(t *testing.T) {
 	}
 }
 
-// TestSelectorAdoptable: the selector's Create refuses a directory without
-// atelier.toml that has a database, even in that directory's box.
-func TestSelectorAdoptable(t *testing.T) {
+// TestWorkspaceAdoptDevcontainer: atl workspace new adopts a box's
+// workspace (it has a database) on the host without flags when its
+// .devcontainer/devcontainer.json names the repos, says what it took from
+// where and what it skipped, and leaves .devcontainer/ in place; a flag
+// wins over it.
+func TestWorkspaceAdoptDevcontainer(t *testing.T) {
 	_, wsRoot := wsEnv(t)
-	box := filepath.Join(wsRoot, "box")
-	if err := os.MkdirAll(filepath.Join(box, "data"), 0o755); err != nil {
+	home := os.Getenv("HOME")
+	dir := filepath.Join(wsRoot, "work")
+	for _, d := range []string{"data", ".devcontainer"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "data", "atelier.db"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(box, "data", "atelier.db"), nil, 0o644); err != nil {
+	dc := `{
+  // the box
+  "mounts": ["source=` + dir + `/gitconfig,target=/home/node/.gitconfig,type=bind,readonly"],
+  "containerEnv": {
+    "ATL_REPOS": "${localEnv:HOME}/src/work",
+    "ATL_SANDBOX_MOUNTS": "${localEnv:HOME}/.work.npmrc",
+    "ATL_SANDBOX_IMAGE": "work-task",
+    "CLAUDE_CODE_OAUTH_TOKEN": "not-for-the-file",
+  },
+}`
+	if err := os.WriteFile(filepath.Join(dir, ".devcontainer", "devcontainer.json"), []byte(dc), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("ATL_WORKSPACE", box)
-	var ae *workspace.AdoptDBError
-	if err := selectorAdoptable(wsRoot, "box"); !errors.As(err, &ae) || ae.Dir != box {
-		t.Errorf("box: %v", err)
+	code, out, errs := atl(t, "workspace", "new", "work", "--image", "flag-task")
+	if code != 0 || out != "work\t"+dir+"\n" {
+		t.Fatalf("new work: %d %q %q", code, out, errs)
 	}
-	if err := selectorAdoptable(wsRoot, "new"); err != nil {
-		t.Errorf("new: %v", err)
+	for _, want := range []string{
+		"atl: repos = ~/src/work (from .devcontainer/devcontainer.json)\n",
+		"atl: sandbox.image = flag-task (from --image)\n",
+		"atl: sandbox.mounts = ~/.work.npmrc (from .devcontainer/devcontainer.json)\n",
+		"atl: skipped CLAUDE_CODE_OAUTH_TOKEN: a secret",
+		"which git_config already defaults to",
+	} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("output lacks %q:\n%s", want, errs)
+		}
 	}
-	if err := os.WriteFile(filepath.Join(box, "atelier.toml"), nil, 0o644); err != nil {
-		t.Fatal(err)
+	if strings.Contains(errs, "not-for-the-file") {
+		t.Errorf("a secret printed:\n%s", errs)
 	}
-	if err := selectorAdoptable(wsRoot, "box"); err != nil {
-		t.Errorf("a workspace already: %v", err)
+	toml, _ := os.ReadFile(filepath.Join(dir, "atelier.toml"))
+	for _, want := range []string{`repos = "` + filepath.Join(home, "src", "work") + `"`, `image = "flag-task"`,
+		`mounts = ["` + filepath.Join(home, ".work.npmrc") + `"]`} {
+		if !strings.Contains(string(toml), want) {
+			t.Errorf("atelier.toml lacks %s:\n%s", want, toml)
+		}
+	}
+	if strings.Contains(string(toml), "not-for-the-file") || strings.Contains(string(toml), "git_config") || strings.Contains(string(toml), "tmux_socket") {
+		t.Errorf("atelier.toml:\n%s", toml)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".devcontainer", "devcontainer.json")); err != nil {
+		t.Errorf(".devcontainer/: %v", err)
+	}
+	_, out, _ = atl(t, "-w", "work", "doctor")
+	if d := doctorDetail(out, "tmux_socket"); d != "$ATL_TMUX_SOCKET = atl-work (default)" {
+		t.Errorf("tmux_socket %q", d)
 	}
 }

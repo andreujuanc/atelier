@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/cursor"
@@ -13,9 +12,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/andreujuanc/atelier/internal/app"
-	"github.com/andreujuanc/atelier/internal/model"
-	"github.com/andreujuanc/atelier/internal/palette"
 	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
@@ -25,12 +21,14 @@ type WorkspaceSelector struct {
 	Root      string // the workspaces root, shown in the title
 	Home      string // the home directory, shown as "~" ("": none)
 	Preselect string // the workspace selected at start (else the first)
-	// Load lists the directories under the root with their counts.
-	Load func(ctx context.Context) ([]app.WorkspaceInfo, error)
-	// Create makes workspace name, or adopts the directory without
-	// atelier.toml, as `atl workspace new <name>` does; it returns notes
-	// on what it decided.
-	Create func(name string) ([]string, error)
+	// Load lists the directories under the root.
+	Load func(ctx context.Context) ([]workspace.Entry, error)
+	// Prepare computes, without writing anything, what `atl workspace new
+	// <name>` writes to create workspace name or adopt the directory
+	// without atelier.toml; an error when it would refuse.
+	Prepare func(name string) (*workspace.Plan, error)
+	// Create writes what Prepare planned.
+	Create func(p *workspace.Plan) error
 }
 
 // RunWorkspaces shows the workspace selector on the terminal and returns
@@ -53,19 +51,17 @@ const (
 	wsNormal wsMode = iota
 	wsFilter
 	wsNew   // the new workspace's name is being typed (n)
-	wsAdopt // enter on a directory without atelier.toml: adopt it? y/n
+	wsAdopt // a directory without atelier.toml: what adopting it writes, y/n
 )
 
 type (
 	wsLoadedMsg struct {
-		rows []app.WorkspaceInfo
+		rows []workspace.Entry
 		err  error
 	}
 	wsCreatedMsg struct {
-		name  string
-		adopt bool
-		notes []string
-		err   error
+		plan *workspace.Plan
+		err  error
 	}
 )
 
@@ -76,7 +72,7 @@ type WorkspacePicker struct {
 
 	width, height int
 
-	rows    []app.WorkspaceInfo
+	rows    []workspace.Entry
 	loaded  bool
 	loading bool
 	loadErr string
@@ -90,7 +86,7 @@ type WorkspacePicker struct {
 	filter      string
 	filterInput textinput.Model
 	nameInput   textinput.Model
-	adopt       string // the directory the adopt question is about
+	adopt       *workspace.Plan // what the adopt confirmation shows
 	creating    bool
 
 	status    string
@@ -128,13 +124,31 @@ func (m *WorkspacePicker) load() tea.Cmd {
 	}
 }
 
-func (m *WorkspacePicker) create(name string, adopt bool) tea.Cmd {
+func (m *WorkspacePicker) create(p *workspace.Plan) tea.Cmd {
 	m.creating = true
 	create := m.s.Create
 	return func() tea.Msg {
-		notes, err := create(name)
-		return wsCreatedMsg{name: name, adopt: adopt, notes: notes, err: err}
+		return wsCreatedMsg{plan: p, err: create(p)}
 	}
+}
+
+// prepare plans workspace name (see WorkspaceSelector.Prepare): a new one
+// is created at once, adopting a directory is asked first, showing what
+// it writes. A refusal (a box's workspace whose repos are not known) is
+// shown on the status line.
+func (m *WorkspacePicker) prepare(name string) tea.Cmd {
+	p, err := m.s.Prepare(name)
+	if err != nil {
+		m.setStatus(firstLine(err.Error()), true)
+		return nil
+	}
+	if !p.Adopt {
+		return m.create(p)
+	}
+	m.nameInput.Blur()
+	m.mode, m.adopt = wsAdopt, p
+	m.setStatus("", false)
+	return nil
 }
 
 // Update implements tea.Model.
@@ -160,26 +174,26 @@ func (m *WorkspacePicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.creating = false
 		if msg.err != nil {
 			if m.mode == wsAdopt {
-				m.mode = wsNormal
+				m.mode, m.adopt = wsNormal, nil
 			}
 			m.setStatus(firstLine(msg.err.Error()), true)
 			return m, nil
 		}
 		verb := "created"
-		if msg.adopt {
+		if msg.plan.Adopt {
 			verb = "adopted"
 		}
-		st := "workspace " + msg.name + " " + verb + " — enter opens it"
-		for _, n := range msg.notes {
+		st := "workspace " + msg.plan.Name + " " + verb + " — enter opens it"
+		for _, n := range msg.plan.Notes {
 			st += "; note: " + n
 		}
 		m.setStatus(st, false)
-		m.mode = wsNormal
+		m.mode, m.adopt = wsNormal, nil
 		m.nameInput.Blur()
 		m.nameInput.SetValue("")
 		m.filter = ""
 		m.filterInput.SetValue("")
-		m.selName = msg.name
+		m.selName = msg.plan.Name
 		return m, m.load()
 	}
 	return m, nil
@@ -202,11 +216,13 @@ func (m *WorkspacePicker) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case wsNew:
 		return m.newKey(msg)
 	case wsAdopt:
-		if key == "y" || key == "Y" {
-			return m.create(m.adopt, true)
+		switch key {
+		case "y", "Y":
+			return m.create(m.adopt)
+		case "n", "N", "esc", "q":
+			m.mode, m.adopt = wsNormal, nil
+			m.setStatus("", false)
 		}
-		m.mode = wsNormal
-		m.setStatus("", false)
 		return nil
 	}
 	// Fast-typed letters may arrive as one event ("jj"): one at a time.
@@ -260,14 +276,8 @@ func (m *WorkspacePicker) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.setStatus("no workspace selected", false)
 			return nil
 		}
-		if !r.Workspace && r.HasDB {
-			m.setStatus(m.adoptDBHint(r), true)
-			return nil
-		}
 		if !r.Workspace {
-			m.mode, m.adopt = wsAdopt, r.Name
-			m.setStatus("", false)
-			return nil
+			return m.prepare(r.Name)
 		}
 		m.chosen = r.Name
 		return tea.Quit
@@ -314,8 +324,7 @@ func (m *WorkspacePicker) newKey(msg tea.KeyMsg) tea.Cmd {
 			m.setStatus(err.Error(), true)
 			return nil
 		}
-		r := m.row(name)
-		return m.create(name, r != nil && !r.Workspace)
+		return m.prepare(name)
 	}
 	m.setStatus("", false)
 	var cmd tea.Cmd
@@ -334,21 +343,11 @@ func (m *WorkspacePicker) checkNew(name string) error {
 	}
 	if r := m.row(name); r != nil && r.Workspace {
 		return fmt.Errorf("workspace %s already exists", name)
-	} else if r != nil && r.HasDB {
-		return errors.New(m.adoptDBHint(r))
 	}
 	return nil
 }
 
-// adoptDBHint is why the selector does not adopt r, a directory without
-// atelier.toml that has a database (a box's workspace), and how to adopt
-// it: with its repos, which the selector does not ask for.
-func (m *WorkspacePicker) adoptDBHint(r *app.WorkspaceInfo) string {
-	return m.abbrev(r.Dir) + " has a database (a box's workspace?): adopt it with `atl workspace new " + r.Name +
-		" --repos DIR [--mount PATH]...` (README: Moving from a devcontainer box)"
-}
-
-func (m *WorkspacePicker) row(name string) *app.WorkspaceInfo {
+func (m *WorkspacePicker) row(name string) *workspace.Entry {
 	for i := range m.rows {
 		if m.rows[i].Name == name {
 			return &m.rows[i]
@@ -384,7 +383,7 @@ func (m *WorkspacePicker) rebuild() {
 	m.clampOffset()
 }
 
-func (m *WorkspacePicker) selected() *app.WorkspaceInfo {
+func (m *WorkspacePicker) selected() *workspace.Entry {
 	if m.sel < 0 || m.sel >= len(m.vis) {
 		return nil
 	}
@@ -433,8 +432,6 @@ func (m *WorkspacePicker) clampOffset() {
 
 // --- view ---
 
-var wsWaitingGlyph = palette.StateLook(model.StateWaiting).Glyph
-
 // abbrev shows p with the home directory as "~".
 func (m *WorkspacePicker) abbrev(p string) string {
 	h := m.s.Home
@@ -444,45 +441,11 @@ func (m *WorkspacePicker) abbrev(p string) string {
 	if p == h {
 		return "~"
 	}
-	if rest, ok := strings.CutPrefix(p, h+string(filepath.Separator)); ok {
-		return "~" + string(filepath.Separator) + rest
+	if rest, ok := strings.CutPrefix(p, h+"/"); ok {
+		return "~/" + rest
 	}
 	return p
 }
-
-// wsCell is part of a row, drawn with a style.
-type wsCell struct {
-	text  string
-	style lipgloss.Style
-	width int // padded to this width (0: as is)
-}
-
-// what returns a row's middle cells (counts, or why it cannot be opened)
-// and their plain width.
-func wsWhat(r app.WorkspaceInfo) []wsCell {
-	switch {
-	case !r.Workspace:
-		return []wsCell{{text: "not a workspace (no " + workspace.File + ")", style: dimStyle}}
-	case r.Err != nil:
-		return []wsCell{{text: "database: " + clean(firstLine(r.Err.Error())), style: errStyle}}
-	}
-	cells := []wsCell{{text: fmt.Sprintf("%d open", r.OpenTasks), style: lipgloss.NewStyle()}}
-	if r.Waiting > 0 {
-		cells = append(cells, wsCell{text: fmt.Sprintf("  %s %d waiting", wsWaitingGlyph, r.Waiting), style: waitStyle})
-	}
-	return cells
-}
-
-func cellsWidth(cs []wsCell) int {
-	n := 0
-	for _, c := range cs {
-		n += ansi.StringWidth(c.text)
-	}
-	return n
-}
-
-// maxWhatWidth caps the middle column (a long database error).
-const maxWhatWidth = 48
 
 // View implements tea.Model.
 func (m *WorkspacePicker) View() string {
@@ -494,7 +457,11 @@ func (m *WorkspacePicker) View() string {
 		trunc(titleStyle.Render("atelier workspaces")+dimStyle.Render("  "+clean(m.abbrev(m.s.Root))), w),
 		"",
 	}
-	lines = append(lines, m.listLines(w, m.listHeight())...)
+	if m.mode == wsAdopt && m.adopt != nil {
+		lines = append(lines, m.adoptLines(w, m.listHeight())...)
+	} else {
+		lines = append(lines, m.listLines(w, m.listHeight())...)
+	}
 	for len(lines) < h-2 {
 		lines = append(lines, "")
 	}
@@ -523,36 +490,38 @@ func (m *WorkspacePicker) listLines(w, h int) []string {
 	if msg != "" {
 		return []string{dimStyle.Render(trunc(msg, w))}
 	}
-	nameW, whatW := 0, 0
+	nameW := 0
 	for _, r := range m.rows {
-		nameW = max(nameW, ansi.StringWidth(r.Name))
-		whatW = max(whatW, cellsWidth(wsWhat(r)))
+		nameW = max(nameW, ansi.StringWidth(clean(r.Name)))
 	}
-	whatW = min(whatW, maxWhatWidth)
 	end := min(m.offset+h, len(m.vis))
 	var out []string
 	for i := m.offset; i < end; i++ {
-		out = append(out, m.rowLine(m.rows[m.vis[i]], i == m.sel, w, nameW, whatW))
+		out = append(out, m.rowLine(m.rows[m.vis[i]], i == m.sel, w, nameW))
 	}
 	return out
 }
 
-// rowLine renders a row: name, counts (or why it is not a workspace), path;
-// the selected one reversed across the width, the waiting count keeping
-// its colour.
-func (m *WorkspacePicker) rowLine(r app.WorkspaceInfo, sel bool, w, nameW, whatW int) string {
+// wsCell is part of a row, drawn with a style.
+type wsCell struct {
+	text  string
+	style lipgloss.Style
+	width int // padded to this width (0: as is)
+}
+
+// rowLine renders a row: the name and the path, dimmed; a directory
+// without atelier.toml dimmed altogether and marked not adopted; the
+// selected one reversed across the width.
+func (m *WorkspacePicker) rowLine(r workspace.Entry, sel bool, w, nameW int) string {
 	base := lipgloss.NewStyle()
 	if !r.Workspace {
 		base = dimStyle
 	}
-	cells := []wsCell{{text: " "}, {text: clean(r.Name), style: base, width: nameW}, {text: "  "}}
-	what := wsWhat(r)
-	if cellsWidth(what) > whatW {
-		what = []wsCell{{text: trunc(what[0].text, whatW), style: what[0].style}}
+	cells := []wsCell{{text: " "}, {text: clean(r.Name), style: base, width: nameW}, {text: "  "},
+		{text: clean(m.abbrev(r.Dir)), style: dimStyle}}
+	if !r.Workspace {
+		cells = append(cells, wsCell{text: "  not adopted", style: dimStyle})
 	}
-	what[len(what)-1].width = whatW - cellsWidth(what[:len(what)-1])
-	cells = append(cells, what...)
-	cells = append(cells, wsCell{text: "  "}, wsCell{text: clean(m.abbrev(r.Dir)), style: dimStyle})
 	var b strings.Builder
 	used := 0
 	padStyle := lipgloss.NewStyle()
@@ -581,6 +550,49 @@ func (m *WorkspacePicker) rowLine(r app.WorkspaceInfo, sel bool, w, nameW, whatW
 	return b.String()
 }
 
+// adoptLines is the adopt confirmation: what adopting the directory
+// writes (each setting and where it came from) and what it skipped, at
+// most h lines.
+func (m *WorkspacePicker) adoptLines(w, h int) []string {
+	if h <= 0 {
+		return nil
+	}
+	p := m.adopt
+	out := []string{
+		trunc(markStyle.Render("Adopt "+clean(m.abbrev(p.Dir))+" as workspace "+clean(p.Name)+"?"), w),
+		dimStyle.Render(trunc("It writes "+workspace.File+" (keeping what is there) with:", w)),
+	}
+	item := func(s string, st lipgloss.Style) {
+		wrapped := strings.Split(ansi.Wrap(clean(s), max(w-4, 1), ""), "\n")
+		for i, l := range wrapped {
+			ind := "    "
+			if i == 0 {
+				ind = "  "
+			}
+			out = append(out, st.Render(trunc(ind+l, w)))
+		}
+	}
+	if len(p.Settings) == 0 {
+		item("no settings: every one at its default", dimStyle)
+	}
+	for _, s := range p.Settings {
+		item(s.String(), lipgloss.NewStyle())
+	}
+	for _, s := range p.Skipped {
+		item("skipped "+s, dimStyle)
+	}
+	for _, s := range p.Warnings {
+		item("warning: "+s, errStyle)
+	}
+	for _, s := range p.Notes {
+		item("note: "+s, markStyle)
+	}
+	if len(out) > h {
+		out = out[:h]
+	}
+	return out
+}
+
 func (m *WorkspacePicker) statusLine(w int) string {
 	switch m.mode {
 	case wsFilter:
@@ -588,12 +600,9 @@ func (m *WorkspacePicker) statusLine(w int) string {
 	case wsNew:
 		return trunc(m.nameInput.View(), w)
 	case wsAdopt:
-		dir := m.adopt
-		if r := m.row(m.adopt); r != nil {
-			dir = m.abbrev(r.Dir)
+		if !m.creating {
+			return trunc(markStyle.Render("Adopt it? y/n"), w)
 		}
-		q := "Adopt " + clean(dir) + " (not a workspace: no " + workspace.File + ")? y/n"
-		return trunc(markStyle.Render(q), w)
 	}
 	switch {
 	case m.creating:
@@ -626,11 +635,11 @@ func (m *WorkspacePicker) helpLine(w int) string {
 				return errStyle.Render(trunc(clean(err.Error()), w))
 			}
 			if r := m.row(name); r != nil && !r.Workspace {
-				s = clean(m.abbrev(r.Dir)) + " exists without " + workspace.File + ": enter adopts it  esc cancel"
+				s = clean(m.abbrev(r.Dir)) + " exists without " + workspace.File + ": enter shows what adopting it writes  esc cancel"
 			}
 		}
 	case wsAdopt:
-		s = "y adopt it as `atl workspace new " + clean(m.adopt) + "` does (writes " + workspace.File + ", keeps what is there)  any other key: cancel"
+		s = "y adopt (as `atl workspace new " + clean(m.adopt.Name) + "` does)  n/esc cancel"
 	default:
 		s = "↑/↓ move  enter open  n new workspace  / filter  r refresh  q quit"
 	}

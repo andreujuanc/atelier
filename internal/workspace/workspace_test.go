@@ -84,7 +84,7 @@ func TestSelectOrder(t *testing.T) {
 	_, _, err := Open("")
 	var none *NoneError
 	if !errors.As(err, &none) || !strings.Contains(err.Error(), "--workspace <name>") ||
-		!strings.Contains(err.Error(), "cd $ATL_WORKSPACES/<name>") || !strings.HasSuffix(err.Error(), "workspaces: beta, alpha") {
+		!strings.Contains(err.Error(), "cd $ATL_WORKSPACES/<name>") || !strings.HasSuffix(err.Error(), "workspaces: alpha, beta") {
 		t.Fatalf("none: %v", err)
 	}
 
@@ -150,11 +150,11 @@ func TestSelectCwd(t *testing.T) {
 		t.Fatal(err)
 	}
 	for dir, want := range map[string]string{
-		alpha:                 "alpha",
+		alpha:              "alpha",
 		deep:               "alpha",
 		link:               "alpha", // the cwd through a symlink
-		root:               "",   // the root itself is no workspace
-		root + "2/alpha":      "",
+		root:               "",      // the root itself is no workspace
+		root + "2/alpha":   "",
 		filepath.Dir(root): "",
 	} {
 		t.Chdir(dir)
@@ -439,7 +439,7 @@ func TestDefaultSocket(t *testing.T) {
 func TestCreate(t *testing.T) {
 	root := env(t)
 	home := os.Getenv("HOME")
-	dir, _, err := Create(root, "beta", Config{})
+	dir, _, err := create(root, "beta", Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +459,7 @@ func TestCreate(t *testing.T) {
 		t.Errorf("repos %+v", s)
 	}
 	// atelier.toml exists: refused, whatever the settings.
-	if _, _, err := Create(root, "beta", Config{Repos: "/x"}); err == nil || !strings.Contains(err.Error(), "already exists") {
+	if _, _, err := create(root, "beta", Config{Repos: "/x"}); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Errorf("existing: %v", err)
 	}
 
@@ -477,7 +477,7 @@ func TestCreate(t *testing.T) {
 	t.Setenv(Var, "old") // in old's box: its $ATL_WORKSPACE, by name
 	c := Config{Sandbox: &SandboxConfig{Image: "img"}}
 	FillFromEnv(&c)
-	_, notes, err := Create(root, "old", c)
+	_, notes, err := create(root, "old", c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,14 +534,17 @@ func TestCreate(t *testing.T) {
 	if c.Repos != "" || c.Sandbox.Image != "" || c.Context == "" {
 		t.Errorf("FillFromEnv took atl's values: %+v %+v", c, c.Sandbox)
 	}
-	if _, notes, err := Create(root, "old2", c); err != nil || len(notes) != 0 {
+	if _, notes, err := create(root, "old2", c); err != nil || len(notes) != 0 {
 		t.Errorf("old2: %q %v", notes, err)
 	}
 	t.Setenv("ATL_TMUX_SOCKET", "")
-	if _, notes, err := Create(root, "old3", Config{}); err != nil || len(notes) != 0 {
+	if _, notes, err := create(root, "old3", Config{}); err != nil || len(notes) != 0 {
 		t.Errorf("old3 (no database): %q %v", notes, err)
 	}
 	t.Setenv(VarsVar, "")
+	for _, k := range []string{"ATL_REPOS", "ATL_SANDBOX_MOUNTS", "ATL_CONTEXT"} {
+		t.Setenv(k, "")
+	}
 
 	// On the host (no $ATL_WORKSPACE, or one atl set, or another
 	// directory's), a directory with a database needs its repos: refused
@@ -560,7 +563,7 @@ func TestCreate(t *testing.T) {
 	} {
 		t.Setenv(Var, ws.val)
 		t.Setenv(VarsVar, ws.vars)
-		_, _, err := Create(root, "box", Config{})
+		_, _, err := create(root, "box", Config{})
 		var ae *AdoptDBError
 		if !errors.As(err, &ae) || !strings.Contains(err.Error(), "`atl workspace new box --repos DIR [--mount PATH]...`") ||
 			!strings.Contains(err.Error(), "Moving from a devcontainer box") || strings.Contains(err.Error(), "\n") {
@@ -574,7 +577,7 @@ func TestCreate(t *testing.T) {
 	}
 	t.Setenv(VarsVar, "")
 	t.Setenv(Var, "")
-	if _, notes, err := Create(root, "box", Config{Repos: "/srv/box"}); err != nil || len(notes) != 0 {
+	if _, notes, err := create(root, "box", Config{Repos: "/srv/box"}); err != nil || len(notes) != 0 {
 		t.Errorf("box with repos: %q %v", notes, err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(box, File)); strings.Contains(string(b), "tmux_socket") || !strings.Contains(string(b), `repos = "/srv/box"`) {
@@ -588,12 +591,12 @@ func TestCreate(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(box2, "data", "atelier.db"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := Create(root, "box2", Config{Repos: filepath.Join(box2, "repos")}); err != nil {
+	if _, _, err := create(root, "box2", Config{Repos: filepath.Join(box2, "repos")}); err != nil {
 		t.Errorf("box2 with its own repos: %v", err)
 	}
 
 	// A repos dir inside the workspace is written relative to it, and made.
-	dir, _, err = Create(root, "in", Config{Repos: filepath.Join(root, "in", "clones")})
+	dir, _, err = create(root, "in", Config{Repos: filepath.Join(root, "in", "clones")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -604,15 +607,15 @@ func TestCreate(t *testing.T) {
 		t.Error(err)
 	}
 
-	if _, _, err := Create(root, "Bad", Config{}); err == nil {
+	if _, _, err := create(root, "Bad", Config{}); err == nil {
 		t.Error("invalid name accepted")
 	}
-	if _, _, err := Create(root, "m", Config{Sandbox: &SandboxConfig{Mounts: []string{"/a:b"}}}); err == nil {
+	if _, _, err := create(root, "m", Config{Sandbox: &SandboxConfig{Mounts: []string{"/a:b"}}}); err == nil {
 		t.Error("mount with ':' accepted")
 	}
 	// The gate socket must fit: <ws>/run/<12>/docker.sock ≤ 107 bytes.
 	long := filepath.Join(root, strings.Repeat("d", 100-len(root)))
-	if _, _, err := Create(long, "w", Config{}); err == nil || !strings.Contains(err.Error(), "too long") {
+	if _, _, err := create(long, "w", Config{}); err == nil || !strings.Contains(err.Error(), "too long") {
 		t.Errorf("long path: %v", err)
 	}
 	if _, err := os.Stat(long); err == nil {
@@ -706,4 +709,13 @@ func TestNotWorkspaceBox(t *testing.T) {
 	if _, err := Load(dir); !errors.As(err, &nw) || strings.Contains(err.Error(), "--repos") || !strings.Contains(err.Error(), "`atl workspace new box`") {
 		t.Errorf("in its box: %v", err)
 	}
+}
+
+// create is Create returning the directory and the notes.
+func create(root, name string, c Config) (string, []string, error) {
+	p, err := Create(root, name, c)
+	if err != nil {
+		return "", nil, err
+	}
+	return p.Dir, p.Notes, nil
 }

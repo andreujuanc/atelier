@@ -20,60 +20,6 @@ import (
 // its writers.
 const readOnlyBusy = 2 * time.Second
 
-// WorkspaceCounts returns the open tasks (backlog, active, review) and the
-// waiting sessions in the database of the workspace in dir
-// (<dir>/data/atelier.db), read read-only; 0, 0 when it has no database.
-func WorkspaceCounts(ctx context.Context, dir string) (open, waiting int, err error) {
-	db := filepath.Join(dir, "data", "atelier.db")
-	if _, err := os.Stat(db); errors.Is(err, os.ErrNotExist) {
-		return 0, 0, nil
-	}
-	st, err := store.OpenReadOnly(db, readOnlyBusy)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer st.Close()
-	tasks, err := st.ListTasks(ctx, model.StatusBacklog, model.StatusActive, model.StatusReview)
-	if err != nil {
-		return 0, 0, err
-	}
-	sessions, err := st.ListSessionsByState(ctx, model.StateWaiting)
-	if err != nil {
-		return 0, 0, err
-	}
-	return len(tasks), len(sessions), nil
-}
-
-// WorkspaceInfo is a directory under the workspaces root (see
-// workspace.List) with, for a workspace, its counts (see WorkspaceCounts).
-type WorkspaceInfo struct {
-	workspace.Entry
-	OpenTasks int
-	Waiting   int
-	Err       error // its database could not be read
-	// HasDB is true when it has a database (data/atelier.db): without
-	// atelier.toml, a devcontainer box's workspace (see workspace.HasDB).
-	HasDB bool
-}
-
-// ListWorkspaces returns the directories under root (workspace.List), each
-// workspace with its open tasks and waiting sessions.
-func ListWorkspaces(ctx context.Context, root string) ([]WorkspaceInfo, error) {
-	entries, err := workspace.List(root)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]WorkspaceInfo, 0, len(entries))
-	for _, e := range entries {
-		w := WorkspaceInfo{Entry: e, HasDB: workspace.HasDB(e.Dir)}
-		if e.Workspace {
-			w.OpenTasks, w.Waiting, w.Err = WorkspaceCounts(ctx, e.Dir)
-		}
-		out = append(out, w)
-	}
-	return out, nil
-}
-
 // openTasks returns the open tasks (backlog, active, review) in database
 // db, read read-only.
 func openTasks(ctx context.Context, db string) ([]model.Task, error) {
