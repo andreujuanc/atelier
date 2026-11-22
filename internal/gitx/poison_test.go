@@ -107,6 +107,7 @@ func newPoisoned(t *testing.T, refusing bool) *poisoned {
 	git(t, p.repo, "worktree", "add", "-q", "-b", "atl/clean", p.clean, "origin/main")
 	git(t, p.repo, "branch", "-q", "spare", "origin/main")
 	git(t, p.repo, "branch", "-q", "spare2", "origin/main")
+	git(t, p.repo, "branch", "-q", "spare3", "origin/main")
 	p.decoy = p.fixture.decoy(t)
 	p.plant(t)
 	// Stat data that no longer matches, same content: `git status` would
@@ -269,6 +270,7 @@ func strsErr(_ []string, err error) error { return err }
 // which setting they name.
 var refuses = map[string]string{
 	"AddWorktree":        "filter.evil.",
+	"AddBranchWorktree":  "filter.evil.",
 	"Diff":               "filter.evil",
 	"PushBranch":         "url." + "DECOY",
 	"FetchOrigin":        "url." + "DECOY",
@@ -358,6 +360,9 @@ var gitxCalls = []struct {
 	}},
 	{"AddWorktree", func(ctx context.Context, p *poisoned) error {
 		return AddWorktree(ctx, p.repo, filepath.Join(p.root, "wt-new"), "atl/new", "origin/main", p.origin)
+	}},
+	{"AddBranchWorktree", func(ctx context.Context, p *poisoned) error {
+		return AddBranchWorktree(ctx, p.repo, filepath.Join(p.root, "wt-spare3"), "spare3", p.origin)
 	}},
 	{"DeleteBranch", func(ctx context.Context, p *poisoned) error { return DeleteBranch(ctx, p.repo, "spare") }},
 	{"DeleteBranchIfAt", func(ctx context.Context, p *poisoned) error {

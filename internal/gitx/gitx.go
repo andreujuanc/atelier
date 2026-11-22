@@ -433,6 +433,23 @@ func RevParse(ctx context.Context, repo, rev string) (string, error) {
 // askpass and ssh command are the user's own here (as for a push), and the
 // LFS server must be the pinned origin's (see lfsHazards).
 func AddWorktree(ctx context.Context, repo, path, branch, startPoint string, origin Origin) error {
+	return addWorktree(ctx, repo, path, origin, func(abs string) []string {
+		return []string{"-b", branch, abs, startPoint}
+	})
+}
+
+// AddBranchWorktree creates a new worktree at path on the existing local
+// branch, with the checks of AddWorktree. git refuses a branch that another
+// worktree has checked out.
+func AddBranchWorktree(ctx context.Context, repo, path, branch string, origin Origin) error {
+	return addWorktree(ctx, repo, path, origin, func(abs string) []string {
+		return []string{abs, branch}
+	})
+}
+
+// addWorktree runs `git worktree add` with what args returns for the
+// absolute path, after the checks of AddWorktree.
+func addWorktree(ctx context.Context, repo, path string, origin Origin, args func(abs string) []string) error {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("add worktree %s: %w", path, err)
@@ -441,8 +458,8 @@ func AddWorktree(ctx context.Context, repo, path, branch, startPoint string, ori
 	if err := checkHazards(ctx, repo, opCheckout, &origin, cfg); err != nil {
 		return err
 	}
-	args := append(cfg, "worktree", "add", "-b", branch, abs, startPoint)
-	_, err = run(ctx, repo, args...)
+	full := append(cfg, "worktree", "add")
+	_, err = run(ctx, repo, append(full, args(abs)...)...)
 	return err
 }
 
