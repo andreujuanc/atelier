@@ -235,6 +235,7 @@ type gateClient struct {
 	root string
 	d    *daemon
 	sock string // the gate's
+	g    *Gate
 }
 
 // newGate serves a Gate for task testID in front of a fake daemon.
@@ -259,7 +260,7 @@ func newGate(t *testing.T) *gateClient {
 	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 	}}}
-	return &gateClient{t: t, http: client, root: root, d: d, sock: sock}
+	return &gateClient{t: t, http: client, root: root, d: d, sock: sock, g: g}
 }
 
 // do sends a request through the gate and returns the status and body.
@@ -676,6 +677,32 @@ func TestGateOwnContainerByLabelsOnly(t *testing.T) {
 		if status, out := c.do(tc.method, "/v1.45"+tc.uri, "{}"); status != http.StatusForbidden {
 			t.Errorf("%s %s: status %d (%s), want 403", tc.method, tc.uri, status, out)
 		}
+	}
+}
+
+// TestGateEndSession: when a session ends, the gate starts the end script
+// for it, detached, in the task's own container by the ID its labels were
+// checked on; the exec is not one the task may then use.
+func TestGateEndSession(t *testing.T) {
+	c := newGate(t)
+	if err := c.g.EndSession(42); err != nil {
+		t.Fatal(err)
+	}
+	var create struct{ Cmd []string }
+	if err := json.Unmarshal([]byte(c.d.body("POST /containers/"+agentID+"/exec")), &create); err != nil ||
+		!slices.Equal(create.Cmd, EndSessionCmd(42)) {
+		t.Errorf("exec create in the own container: %q, %v", create.Cmd, err)
+	}
+	if b := c.d.body("POST /exec/new1/start"); !strings.Contains(b, `"Detach":true`) {
+		t.Errorf("exec start body = %q", b)
+	}
+	if status, _ := c.do("GET", "/exec/new1/json", ""); status != http.StatusForbidden {
+		t.Errorf("the task may use the gate's exec: %d", status)
+	}
+	// No own container: nothing started.
+	c.g.Agent = "missing"
+	if err := c.g.EndSession(43); err == nil {
+		t.Error("EndSession without the own container did not fail")
 	}
 }
 

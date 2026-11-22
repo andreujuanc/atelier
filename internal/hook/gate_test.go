@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,7 +23,10 @@ import (
 
 // gated serves task "fix" of f through a gate's control socket, as its task
 // container sees it, and returns the socket.
-func gated(t *testing.T, f *fixture) string {
+func gated(t *testing.T, f *fixture) string { return gatedWith(t, f, nil) }
+
+// gatedWith is gated with setup run on the task server before it serves.
+func gatedWith(t *testing.T, f *fixture, setup func(*TaskServer)) string {
 	t.Helper()
 	if err := os.MkdirAll(f.p.ClaudeDir("fix"), 0o700); err != nil {
 		t.Fatal(err)
@@ -32,6 +36,9 @@ func gated(t *testing.T, f *fixture) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ts.Close() })
+	if setup != nil {
+		setup(ts)
+	}
 	dir, err := os.MkdirTemp("", "gate") // short: a socket path has at most 107 bytes
 	if err != nil {
 		t.Fatal(err)
@@ -226,6 +233,45 @@ func TestHookThroughGate(t *testing.T) {
 				t.Errorf("hook log through the gate:\n%s\nwant:\n%s", strings.Join(g, "\n"), strings.Join(w, "\n"))
 			}
 		})
+	}
+}
+
+// TestGateSessionEnd: the gate is told each session a SessionEnd records as
+// ended (it then ends what the session leaves running in the container),
+// and nothing for other events or a SessionEnd that matches no session.
+func TestGateSessionEnd(t *testing.T) {
+	f := setup(t)
+	var mu sync.Mutex
+	var ended []int64
+	sock := gatedWith(t, f, func(ts *TaskServer) {
+		ts.OnSessionEnd(func(id int64) {
+			mu.Lock()
+			ended = append(ended, id)
+			mu.Unlock()
+		})
+	})
+	s := f.session(t, model.StateIdle, "")
+	other := f.session(t, model.StateIdle, "")
+	env := map[string]string{"ATL_SESSION": strconv.FormatInt(s.ID, 10)}
+	in := func(event, sid string) string {
+		return hookInput(Input{SessionID: sid, Cwd: f.p.TaskDir("fix"), HookEventName: event, Source: "startup"})
+	}
+	hookVia(t, f, sock, EventSessionStart, in(EventSessionStart, "c1"), env)
+	hookVia(t, f, sock, EventStop, in(EventStop, "c1"), env)
+	hookVia(t, f, sock, EventSessionEnd, in(EventSessionEnd, "nobody"), nil)
+	mu.Lock()
+	if len(ended) != 0 {
+		t.Errorf("told of ended sessions %v before any ended", ended)
+	}
+	mu.Unlock()
+	hookVia(t, f, sock, EventSessionEnd, in(EventSessionEnd, "c1"), env)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ended) != 1 || ended[0] != s.ID || ended[0] == other.ID {
+		t.Errorf("told of ended sessions %v, want [%d]", ended, s.ID)
+	}
+	if got, err := f.st.GetSession(context.Background(), s.ID); err != nil || got.State != model.StateEnded {
+		t.Errorf("session %d: %+v, %v", s.ID, got, err)
 	}
 }
 

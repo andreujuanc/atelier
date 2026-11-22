@@ -113,6 +113,60 @@ func TestSandboxEndsWhatADeadWindowLeft(t *testing.T) {
 	}
 }
 
+// TestSandboxEndsWhatEndedSessionsLeft: wherever atl records a session as
+// ended, what the session left running in the task container goes too: a
+// stopped session that Resume ends (it has no Claude id to resume), and the
+// sessions atl done ends when its teardown then fails and the task, and its
+// container, stay. (The SessionEnd hook's own path is the gate's, see
+// sandbox.Gate.EndSession.)
+func TestSandboxEndsWhatEndedSessionsLeft(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.writeProject(t, "shop", "teardown = 'exit 4'\n[[repos]]\nname = \"api\"\n")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "boxed", Project: "shop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd := &fakeDocker{label: "spec", agent: e.app.sandboxID(task)} // the task's container runs
+	e.app.Sandbox = &sandbox.Config{Image: "task-image"}
+	e.app.Docker = fd.run
+	kills := func(session int64) int {
+		kill := strings.Join(sandbox.KillSessionArgs(fakeContainerID, session), " ")
+		n := 0
+		for _, c := range fd.find("exec") {
+			if strings.Join(c, " ") == kill {
+				n++
+			}
+		}
+		return n
+	}
+	stopped := &model.Session{TaskID: task.ID, State: model.StateStopped}
+	if err := e.app.Store.CreateSession(ctx, stopped); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.app.Resume(ctx, task.Slug); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := e.app.Store.GetSession(ctx, stopped.ID); s.State != model.StateEnded || kills(stopped.ID) != 1 {
+		t.Errorf("Resume ended session %d (%s): %d kills, want 1", stopped.ID, s.State, kills(stopped.ID))
+	}
+
+	idle := &model.Session{TaskID: task.ID, State: model.StateIdle}
+	if err := e.app.Store.CreateSession(ctx, idle); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.app.Done(ctx, task.Slug, false); err == nil || !strings.Contains(err.Error(), "teardown") {
+		t.Fatalf("Done = %v; want the teardown to fail", err)
+	}
+	if s, _ := e.app.Store.GetSession(ctx, idle.ID); s.State != model.StateEnded || kills(idle.ID) != 1 {
+		t.Errorf("Done ended session %d (%s): %d kills, want 1", idle.ID, s.State, kills(idle.ID))
+	}
+	if kills(stopped.ID) != 1 {
+		t.Errorf("an already ended session was ended again")
+	}
+}
+
 // TestSandboxLeavesAContainerNotItsOwn: a container that has the task
 // container's name but not atl's labels (here: a task's, with atelier.agent
 // from its image) is not adopted: the session fails with one line naming

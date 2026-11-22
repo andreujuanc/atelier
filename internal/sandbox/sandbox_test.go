@@ -8,7 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"text/template"
 	"time"
@@ -63,6 +65,96 @@ func TestKillSessionArgs(t *testing.T) {
 	}
 	if n := count("17"); n < 3 || other.ProcessState != nil {
 		t.Errorf("session 17 lost processes: %d left", n)
+	}
+}
+
+// aliveProc reports whether process pid runs (is not gone or a zombie).
+func aliveProc(pid int) bool {
+	st, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	return err == nil && !strings.Contains(string(st), ") Z ")
+}
+
+// TestEndSessionCmd: the script that ends what a session left behind once
+// its Claude is gone. Here the roots, which docker exec starts in a
+// container (parent outside it: PPid 0), are the test's children (the
+// script's third argument), and leftovers are processes of the session
+// whose parent has exited. While a root of the session runs, nothing of it
+// is touched; once its roots are gone, its leftovers end; other sessions
+// are never touched; a root that outlives the wait (a /clear) means the
+// session goes on.
+func TestEndSessionCmd(t *testing.T) {
+	cmd := EndSessionCmd(7)
+	if !slices.Equal(cmd[:2], []string{"sh", "-c"}) || !slices.Equal(cmd[3:], []string{"atl-end-session", "end", "7"}) {
+		t.Fatalf("cmd = %q", cmd[3:])
+	}
+	env := func(session string) []string { return append(os.Environ(), "ATL_SESSION="+session) }
+	root := func(session string) *exec.Cmd { // Claude, say
+		c := exec.Command("sleep", "300")
+		c.Env = env(session)
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Process.Kill(); c.Wait() })
+		return c
+	}
+	leftover := func(session string) int { // a dev server Claude started in the background
+		c := exec.Command("sh", "-c", "sleep 300 > /dev/null 2>&1 & echo $!")
+		c.Env = env(session)
+		out, err := c.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+		return pid
+	}
+	end := func(session string, wait int) *exec.Cmd {
+		c := exec.Command("sh", "-c", cmd[2], "atl-end-session", "end", session, strconv.Itoa(os.Getpid()), strconv.Itoa(wait))
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	claude7, left7 := root("7"), leftover("7")
+	claude17, left17 := root("17"), leftover("17")
+	claude8, left8 := root("8"), leftover("8")
+	time.Sleep(200 * time.Millisecond)
+
+	// Session 8 had a /clear: its Claude outlives the wait.
+	clear8 := end("8", 2)
+	// Session 7 ends: nothing goes while its Claude still runs.
+	end7 := end("7", 30)
+	time.Sleep(1500 * time.Millisecond)
+	if !aliveProc(left7) || claude7.ProcessState != nil {
+		t.Fatal("session 7 was touched while its Claude ran")
+	}
+	claude7.Process.Signal(syscall.SIGTERM) // Claude exits
+	claude7.Wait()
+	done := make(chan error, 1)
+	go func() { done <- end7.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("end script: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the end script did not finish after Claude exited")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if aliveProc(left7) {
+		t.Error("session 7's background process outlived its Claude")
+	}
+	if err := clear8.Wait(); err != nil {
+		t.Fatalf("end script of session 8: %v", err)
+	}
+	for name, pid := range map[string]int{"17's Claude": claude17.Process.Pid, "17's leftover": left17,
+		"8's Claude": claude8.Process.Pid, "8's leftover": left8} {
+		if !aliveProc(pid) {
+			t.Errorf("session %s was ended", name)
+		}
 	}
 }
 

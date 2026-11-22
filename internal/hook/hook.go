@@ -63,6 +63,9 @@ type db struct {
 	// place a transcript path from the task may point into (see
 	// transcriptIn), since atl reads that file later where it runs.
 	claudeDir string
+	// ended, if set, is told each session a SessionEnd set ended (see
+	// TaskServer.OnSessionEnd).
+	ended func(session int64)
 }
 
 // Hook event names handled by atelier.
@@ -445,6 +448,9 @@ func (d db) transition(ctx context.Context, event string, in Input, env func(str
 	}
 	if err := transitionState(ctx, event, in, sess.ID, st, now); err != nil {
 		return sess.TaskID, err
+	}
+	if event == EventSessionEnd && d.ended != nil {
+		d.ended(sess.ID)
 	}
 	return sess.TaskID, recordTranscript(ctx, event, in, sess, st)
 }

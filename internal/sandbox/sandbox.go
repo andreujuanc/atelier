@@ -186,38 +186,82 @@ func ExecArgv(container, workdir string, envKeys, argv []string) []string {
 	return append(out, argv...)
 }
 
-// KillSessionArgs are the docker arguments that end, in the task container
-// (by the full ID Agent found), every process of the session with id
-// session: those whose
-// environment has ATL_SESSION=<session>, which ExecArgv's window passes to
-// Claude and Claude's children inherit. When the docker exec client of a
-// window dies (the window is closed, tmux or the box restarts), dockerd
-// leaves what it started running; this is what stands in for the hangup
-// the window's death used to be. TERM first, KILL after 5 seconds. It runs
-// with plain sh, tr and grep as the container's user, whose processes the
-// session's are: root in the container could not read their
+// sessionScript ends, in a task container, the processes of a session:
+// those whose environment has ATL_SESSION=<session>, which ExecArgv's
+// window passes to Claude and Claude's children inherit (a dev server it
+// started in the background included). TERM first, KILL after 5 seconds.
+// It runs with plain sh, tr and grep as the container's user, whose
+// processes the session's are: root in the container could not read their
 // /proc/<pid>/environ (that takes CAP_SYS_PTRACE, which containers do not
 // have). atl reads nothing of what it prints (the container is the task's).
-func KillSessionArgs(container string, session int64) []string {
-	const script = `s="ATL_SESSION=$1"
-pids() {
+//
+// Arguments: mode (kill or end), session, and for tests the parent PID of
+// a root (default 0) and how long end waits (default 120 seconds).
+//
+// kill ends them all. end is for a session whose Claude is ending: the
+// session's roots, the processes docker exec started for it (their parent
+// is outside the container, so their parent PID reads 0 in it: Claude, the
+// window's command), are waited for to exit, up to the wait; then the rest
+// is ended, unless a root of the session runs again (a resume started it
+// anew). A root that is still there after the wait means the session goes
+// on (a SessionEnd for /clear, or a nested claude): nothing is touched.
+// Processes of other sessions never carry this session's ATL_SESSION.
+const sessionScript = `mode=$1 s="ATL_SESSION=$2" rootppid=${3:-0} wait=${4:-120}
+# scan: the session's processes but this script, one per line, roots as r<pid>
+scan() {
 	for d in /proc/[0-9]*; do
 		p=${d#/proc/}
 		[ "$p" = "$$" ] && continue
-		if tr '\0' '\n' 2> /dev/null < "$d/environ" | grep -qx -- "$s"; then echo "$p"; fi
+		tr '\0' '\n' 2> /dev/null < "$d/environ" | grep -qx -- "$s" || continue
+		if grep -qx "PPid:[[:space:]]*$rootppid" "$d/status" 2> /dev/null; then echo "r$p"; else echo "$p"; fi
 	done
 }
-set -- $(pids)
-[ $# -eq 0 ] && exit 0
-kill -TERM "$@" 2> /dev/null
-for i in 1 2 3 4 5; do
-	sleep 1
-	set -- $(pids)
+if [ "$mode" = end ]; then
+	set -- $(scan | grep '^r' | tr -d r)
+	i=0
+	while [ $# -gt 0 ]; do
+		[ $i -ge "$wait" ] && exit 0
+		sleep 1
+		i=$((i + 1))
+		for p in "$@"; do
+			shift
+			tr '\0' '\n' 2> /dev/null < "/proc/$p/environ" | grep -qx -- "$s" && set -- "$@" "$p"
+		done
+	done
+fi
+i=0
+while :; do
+	l=$(scan)
+	[ "$mode" = end ] && echo "$l" | grep -q '^r' && exit 0
+	set -- $(echo "$l" | tr -d r)
 	[ $# -eq 0 ] && exit 0
-done
-kill -KILL "$@" 2> /dev/null
-exit 0`
-	return []string{"exec", container, "sh", "-c", script, "atl-kill", strconv.FormatInt(session, 10)}
+	case $i in
+	0) kill -TERM "$@" 2> /dev/null ;;
+	5) kill -KILL "$@" 2> /dev/null; exit 0 ;;
+	esac
+	sleep 1
+	i=$((i + 1))
+done`
+
+// KillSessionArgs are the docker arguments that end, in the task container
+// (by the full ID Agent found), every process of the session with id
+// session (sessionScript, mode kill). When the docker exec client of a
+// window dies (the window is closed, tmux or the box restarts), dockerd
+// leaves what it started running; this is what stands in for the hangup
+// the window's death used to be.
+func KillSessionArgs(container string, session int64) []string {
+	return append([]string{"exec", container}, sessionCmd("kill", session)...)
+}
+
+// EndSessionCmd is the command that ends, in the task container, what
+// session left running once its Claude has exited, and nothing while it
+// runs (sessionScript, mode end). The gate starts it, detached, when
+// Claude reports the session's end (SessionEnd), which Claude does before
+// it exits.
+func EndSessionCmd(session int64) []string { return sessionCmd("end", session) }
+
+func sessionCmd(mode string, session int64) []string {
+	return []string{"sh", "-c", sessionScript, "atl-" + mode + "-session", mode, strconv.FormatInt(session, 10)}
 }
 
 // Runner runs the docker CLI with args and returns its trimmed stdout; a

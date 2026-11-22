@@ -78,7 +78,9 @@ const sandboxNote = "Sandbox: this session runs in the task's own container. Run
 	"for the project's image. " +
 	"`docker` and `docker compose` are for services (databases, localstack, ...): mounts must come from the task dir, " +
 	"privileged and host modes are refused, you see only what this task started, and services answer by their compose " +
-	"service name. There are no git credentials here (plain `git push` and `gh` fail): to push the task branch run " +
+	"service name. What this session starts in this container ends with it (a dev server in the background " +
+	"included); what should outlive the session belongs in a Docker service. " +
+	"There are no git credentials here (plain `git push` and `gh` fail): to push the task branch run " +
 	"`atl push`, to update from the remote `atl fetch`."
 
 // renderContext renders the SessionStart task context: plain markdown of

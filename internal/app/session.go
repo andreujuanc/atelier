@@ -164,6 +164,8 @@ func (a *App) Resume(ctx context.Context, ref string) (int, error) {
 			if err := a.Store.SetSessionState(ctx, s.ID, model.StateEnded, a.now()); err != nil {
 				return 0, err
 			}
+			// Its window is gone (it was stopped): nothing of it may run on.
+			a.killSessionProcs(ctx, t, s.ID)
 			continue
 		}
 		stopped = append(stopped, s)
@@ -234,6 +236,11 @@ func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir st
 	if err != nil {
 		if serr := a.Store.SetSessionState(bg, id, restore, a.now()); serr != nil {
 			err = errors.Join(err, serr)
+		}
+		if win != "" {
+			// The window started (its tag could not be set): what it
+			// started in the container goes, as in NewSession.
+			a.killSessionProcs(ctx, t, id)
 		}
 		return "", err
 	}
