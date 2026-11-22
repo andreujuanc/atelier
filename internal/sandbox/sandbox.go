@@ -69,6 +69,9 @@ const labelSpec = "atelier.spec"
 // Config is the workspace's sandbox setting; nil means tasks run next to atl.
 type Config struct {
 	Image string // default task image
+	// Mounts are the host paths every task gets read-only, symlinks
+	// resolved ($ATL_SANDBOX_MOUNTS, see ROMounts; FromEnv leaves it empty).
+	Mounts []string
 }
 
 // FromEnv reads $ATL_SANDBOX and $ATL_SANDBOX_IMAGE. The sandbox is on

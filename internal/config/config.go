@@ -35,7 +35,7 @@ func Resolve() (Paths, error) {
 		return Paths{}, fmt.Errorf("resolve home directory: %w", err)
 	}
 	get := func(env, def string) (string, error) {
-		v := expandHome(os.Getenv(env), home)
+		v := ExpandHome(os.Getenv(env), home)
 		// Per the XDG Base Directory spec, relative XDG_* values are invalid
 		// and must be ignored.
 		if v == "" || (strings.HasPrefix(env, "XDG_") && !filepath.IsAbs(v)) {
@@ -99,7 +99,8 @@ func Resolve() (Paths, error) {
 	return p, nil
 }
 
-func expandHome(p, home string) string {
+// ExpandHome replaces a leading "~" ("~" alone or "~/...") in p with home.
+func ExpandHome(p, home string) string {
 	if p == "~" {
 		return home
 	}
@@ -140,6 +141,11 @@ func (p Paths) taskHash(slug string) string {
 func (p Paths) ClaudeDir(slug string) string {
 	return filepath.Join(p.runRoot(), "claude", p.taskHash(slug))
 }
+
+// RunRoot returns the directory of the run dirs, the task Claude dirs, the
+// origin pins and the stored Claude token: $ATL_WORKSPACE/run, else
+// <StateDir>-run. No task container sees it, only its own entries in it.
+func (p Paths) RunRoot() string { return p.runRoot() }
 
 func (p Paths) runRoot() string {
 	if p.Workspace != "" {
