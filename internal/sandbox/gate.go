@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,8 +31,9 @@ const (
 // Gate is a task's Docker socket. It forwards to the host daemon only what a
 // task may do: everything the task creates is labelled, the task sees and
 // touches only what carries its label, mounts must come from the task's own
-// directory, and every container setting that reaches into the host is
-// refused. A call that is not in gateRoutes is refused.
+// directory (or, read-only, from the paths of $ATL_SANDBOX_MOUNTS), and every
+// container setting that reaches into the host is refused. A call that is
+// not in gateRoutes is refused.
 //
 // Known gap: a task can still swap a mount source for a symlink between the
 // gate's check and the daemon's mount. Closing it needs the task directory on
@@ -46,6 +48,10 @@ type Gate struct {
 	Log        *log.Logger // refusals (and every call if Verbose); nil: discarded
 	Verbose    bool
 	Ident      string // which task and atl binary this gate serves (see Ident); Serve writes it to the run dir
+	// ROMounts are host paths (symlinks resolved, see ROMounts) a mount may
+	// also come from, or from inside, read-only only: a read-write request
+	// is made read-only.
+	ROMounts []string
 
 	once   sync.Once
 	client *http.Client
@@ -905,21 +911,49 @@ func (g *Gate) binds(v any) error {
 		if len(parts) < 2 || len(parts) > 3 {
 			return fmt.Errorf("unreadable mount %q", spec)
 		}
-		src, err := g.source(parts[0])
+		src, ro, err := g.source(parts[0])
 		if err != nil {
 			return err
 		}
+		var opts []string
 		if len(parts) == 3 {
-			for _, opt := range strings.Split(parts[2], ",") {
+			opts = strings.Split(parts[2], ",")
+			for _, opt := range opts {
 				if !oneOf(opt, "ro", "rw", "z", "Z", "nocopy", "cached", "delegated", "consistent") {
 					return fmt.Errorf("mount option %s is not allowed", opt)
 				}
 			}
 		}
 		parts[0] = src
+		if ro {
+			parts = append(parts[:2], strings.Join(g.readOnlyBind(src, opts), ","))
+		}
 		list[i] = strings.Join(parts, ":")
 	}
 	return nil
+}
+
+// readOnlyBind returns the options of a bind of src, a path of ROMounts,
+// made read-only: "ro" and none of "rw", nor "z" or "Z", which would have
+// the daemon relabel src on the host. A change is logged.
+func (g *Gate) readOnlyBind(src string, opts []string) []string {
+	var out []string
+	asked := false
+	for _, opt := range opts {
+		switch opt {
+		case "ro":
+			asked = true
+		case "rw":
+		case "z", "Z":
+			g.logf("note  bind of %s: option %s dropped: a path of $%s is not relabelled", src, opt, MountsVar)
+		default:
+			out = append(out, opt)
+		}
+	}
+	if !asked || slices.Contains(opts, "rw") {
+		g.logf("note  bind of %s made read-only: a path of $%s, which tasks get read-only only", src, MountsVar)
+	}
+	return append(out, "ro")
 }
 
 func (g *Gate) mounts(v any) error {
@@ -937,18 +971,25 @@ func (g *Gate) mounts(v any) error {
 			if !strings.HasPrefix(src, "/") {
 				return fmt.Errorf("unreadable mount source %q", src)
 			}
-			real, err := g.source(src)
+			real, ro, err := g.source(src)
 			if err != nil {
 				return err
 			}
 			m["Source"] = real
+			if ro {
+				g.readOnlyMount(real, m)
+			}
 		case "volume":
 			if opts, _ := m["VolumeOptions"].(map[string]any); opts != nil && !isZero(opts["DriverConfig"]) {
 				return errors.New("volume drivers and driver options are not allowed")
 			}
 			if src != "" {
-				if _, err := g.source(src); err != nil {
+				_, ro, err := g.source(src)
+				if err != nil {
 					return err
+				}
+				if ro { // not a volume name: the daemon refuses it, read-only all the same
+					g.readOnlyMount(src, m)
 				}
 			}
 		case "tmpfs":
@@ -959,34 +1000,61 @@ func (g *Gate) mounts(v any) error {
 	return nil
 }
 
+// readOnlyMount makes m, an entry of HostConfig.Mounts whose source src is
+// a path of ROMounts, read-only, also below (no ReadOnlyNonRecursive). A
+// change is logged.
+func (g *Gate) readOnlyMount(src string, m map[string]any) {
+	if r, _ := m["ReadOnly"].(bool); !r {
+		g.logf("note  mount of %s made read-only: a path of $%s, which tasks get read-only only", src, MountsVar)
+	}
+	m["ReadOnly"] = true
+	if opts, _ := m["BindOptions"].(map[string]any); opts != nil {
+		delete(opts, "ReadOnlyNonRecursive")
+	}
+}
+
 // source checks the left side of a mount and returns what to mount instead:
 // a volume of this task, the gate's own socket in place of the Docker socket
 // (so nested Docker clients stay gated), or a path inside the task directory
-// with its symlinks resolved.
-func (g *Gate) source(src string) (string, error) {
+// with its symlinks resolved. A path that resolves to one of ROMounts, or
+// into one, is allowed too, if it exists (the daemon would create a missing
+// bind source there), with ro true: it must be mounted read-only.
+func (g *Gate) source(src string) (path string, ro bool, err error) {
 	if !strings.HasPrefix(src, "/") {
 		// By name, as the daemon looks it up: exactly, no prefix.
 		_, err := g.owned("volumes", src)
 		if err == errNotFound { // created on the fly by the daemon otherwise, without the label
 			status, out, cerr := g.call("POST", "/volumes/create", map[string]any{"Name": src, "Labels": map[string]string{LabelTask: g.ID}})
 			if cerr != nil || status != http.StatusCreated {
-				return "", fmt.Errorf("cannot create volume %s: %v %s", src, cerr, out)
+				return "", false, fmt.Errorf("cannot create volume %s: %v %s", src, cerr, out)
 			}
-			return src, nil
+			return src, false, nil
 		}
-		return src, err
+		return src, false, err
 	}
 	if oneOf(filepath.Clean(src), "/var/run/docker.sock", "/run/docker.sock") {
-		return g.SocketHost, nil
+		return g.SocketHost, false, nil
 	}
 	real, err := resolveExisting(src)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	if real != g.Root && !strings.HasPrefix(real, g.Root+"/") {
-		return "", fmt.Errorf("mount source %s is outside the task directory", src)
+	if real == g.Root || strings.HasPrefix(real, g.Root+"/") {
+		return real, false, nil
 	}
-	return real, nil
+	for _, m := range g.ROMounts {
+		if real != m && !within(real, m) {
+			continue
+		}
+		if _, err := os.Lstat(real); err != nil {
+			return "", false, fmt.Errorf("mount source %s does not exist", src)
+		}
+		return real, true, nil
+	}
+	if len(g.ROMounts) > 0 {
+		return "", false, fmt.Errorf("mount source %s is outside the task directory and the paths of $%s", src, MountsVar)
+	}
+	return "", false, fmt.Errorf("mount source %s is outside the task directory", src)
 }
 
 // resolveExisting follows the symlinks of the part of path that exists.

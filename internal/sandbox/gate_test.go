@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -239,7 +240,10 @@ type gateClient struct {
 }
 
 // newGate serves a Gate for task testID in front of a fake daemon.
-func newGate(t *testing.T) *gateClient {
+func newGate(t *testing.T) *gateClient { return newGateWith(t, nil) }
+
+// newGateWith is newGate with setup run on the Gate before it serves.
+func newGateWith(t *testing.T, setup func(*Gate)) *gateClient {
 	t.Helper()
 	d, upstream := newDaemon(t)
 	root, err := filepath.EvalSymlinks(t.TempDir())
@@ -249,6 +253,9 @@ func newGate(t *testing.T) *gateClient {
 	// The task's own container is the daemon's "agent" (atl names it
 	// atl-<id>, see ContainerName).
 	g := &Gate{ID: testID, Root: root, SocketHost: "/host/run/docker.sock", Agent: "agent", Upstream: upstream}
+	if setup != nil {
+		setup(g)
+	}
 	sock := filepath.Join(t.TempDir(), "gate.sock")
 	l, err := net.Listen("unix", sock)
 	if err != nil {
@@ -781,6 +788,146 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 	}
 	if b := c.d.body("POST /networks/new1/connect"); !strings.Contains(b, `"`+agentID+`"`) {
 		t.Errorf("the task's own container was not joined to its new network: %q", b)
+	}
+}
+
+// lockedLog is a gate log tests can read while the gate writes it.
+type lockedLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// TestGateReadOnlyMounts: a listed host file, or a path inside a listed
+// directory, may be bind-mounted (Binds, both forms, and Mounts), read-only
+// only: a read-write request is made read-only in what reaches the daemon,
+// and the gate log says so; a task-dir symlink to a listed path is mounted
+// as that path, read-only. Unlisted outside paths, a task-dir symlink to
+// one, a listed directory's parent and a missing path inside a listed
+// directory (the daemon would create it) are still refused.
+func TestGateReadOnlyMounts(t *testing.T) {
+	host, err := filepath.EvalSymlinks(t.TempDir()) // stands for the host's home, say
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(host, "npmrc")
+	certs := filepath.Join(host, "certs")
+	for _, f := range []string{file, filepath.Join(certs, "ca.pem"), filepath.Join(host, "secret")} {
+		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logs := &lockedLog{}
+	c := newGateWith(t, func(g *Gate) {
+		g.ROMounts = []string{file, certs}
+		g.Log = log.New(logs, "", 0)
+	})
+	for _, l := range []struct{ name, target string }{{"tolisted", file}, {"tosecret", filepath.Join(host, "secret")}, {"tohost", host}} {
+		if err := os.Symlink(l.target, filepath.Join(c.root, l.name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// create sends body and returns the HostConfig the daemon got.
+	create := func(body string) (int, string, map[string]any) {
+		t.Helper()
+		c.d.mu.Lock()
+		delete(c.d.bodies, "POST /v1.45/containers/create")
+		c.d.mu.Unlock()
+		status, out := c.do("POST", "/v1.45/containers/create", body)
+		var sent struct{ HostConfig map[string]any }
+		if b := c.d.body("POST /v1.45/containers/create"); b != "" {
+			if err := json.Unmarshal([]byte(b), &sent); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return status, out, sent.HostConfig
+	}
+	binds := func(hc map[string]any) string {
+		list, _ := hc["Binds"].([]any)
+		var out []string
+		for _, b := range list {
+			out = append(out, b.(string))
+		}
+		return strings.Join(out, " ")
+	}
+	for _, tc := range []struct{ in, want string }{
+		{file + ":/x", file + ":/x:ro"},
+		{file + ":/x:rw", file + ":/x:ro"},
+		{file + ":/x:ro", file + ":/x:ro"},
+		{file + ":/x:rw,z", file + ":/x:ro"},
+		{file + ":/x:Z,ro", file + ":/x:ro"},
+		{file + ":/x:cached", file + ":/x:cached,ro"},
+		{certs + "/ca.pem:/etc/ssl/ca.pem", certs + "/ca.pem:/etc/ssl/ca.pem:ro"},
+		{certs + ":/certs:rw", certs + ":/certs:ro"},
+		{c.root + "/tolisted:/x", file + ":/x:ro"},
+		{c.root + "/x:/x:rw,z", c.root + "/x:/x:rw,z"}, // the task dir: as before
+	} {
+		status, out, hc := create(`{"HostConfig":{"Binds":["` + tc.in + `"]}}`)
+		if status != http.StatusCreated || binds(hc) != tc.want {
+			t.Errorf("bind %s: status %d %s, daemon got %q, want %q", tc.in, status, out, binds(hc), tc.want)
+		}
+	}
+	if l := logs.String(); !strings.Contains(l, "note  bind of "+file+" made read-only: a path of $ATL_SANDBOX_MOUNTS") ||
+		!strings.Contains(l, "option z dropped") {
+		t.Errorf("gate log:\n%s", l)
+	}
+
+	for _, ro := range []string{``, `"ReadOnly":false,`, `"ReadOnly":true,`} {
+		status, out, hc := create(`{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + c.root + `/tolisted","Target":"/x",` + ro +
+			`"BindOptions":{"ReadOnlyNonRecursive":true}}]}}`)
+		mounts, _ := hc["Mounts"].([]any)
+		m, _ := func() (map[string]any, bool) {
+			if len(mounts) != 1 {
+				return nil, false
+			}
+			m, ok := mounts[0].(map[string]any)
+			return m, ok
+		}()
+		opts, _ := m["BindOptions"].(map[string]any)
+		if status != http.StatusCreated || m["Source"] != file || m["ReadOnly"] != true || opts["ReadOnlyNonRecursive"] != nil {
+			t.Errorf("mount, %s: status %d %s, daemon got %v", ro, status, out, hc["Mounts"])
+		}
+	}
+	if status, _, hc := create(`{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + certs + `/ca.pem","Target":"/x"}]}}`); status != http.StatusCreated ||
+		!strings.Contains(fmt.Sprint(hc["Mounts"]), "ReadOnly:true") {
+		t.Errorf("mount in a listed dir: %d %v", status, hc["Mounts"])
+	}
+
+	for name, body := range map[string]string{
+		"unlisted outside":          `{"HostConfig":{"Binds":["` + host + `/secret:/x:ro"]}}`,
+		"listed file's dir":         `{"HostConfig":{"Binds":["` + host + `:/x:ro"]}}`,
+		"symlink to unlisted":       `{"HostConfig":{"Binds":["` + c.root + `/tosecret:/x:ro"]}}`,
+		"symlink, listed's parent":  `{"HostConfig":{"Binds":["` + c.root + `/tohost/npmrc/..:/x:ro"]}}`,
+		"missing in a listed dir":   `{"HostConfig":{"Binds":["` + certs + `/new:/x:ro"]}}`,
+		"listed via dotdot outside": `{"HostConfig":{"Binds":["` + certs + `/../secret:/x:ro"]}}`,
+		"mount unlisted":            `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + host + `/secret","Target":"/x","ReadOnly":true}]}}`,
+		"mount symlink unlisted":    `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + c.root + `/tosecret","Target":"/x","ReadOnly":true}]}}`,
+		"listed, bad option":        `{"HostConfig":{"Binds":["` + file + `:/x:ro,rshared"]}}`,
+	} {
+		status, out, hc := create(body)
+		if status != http.StatusForbidden || !strings.Contains(out, "atelier gate:") || hc != nil {
+			t.Errorf("%s: status %d, body %s, daemon got %v; want a refusal", name, status, out, hc)
+		}
+	}
+	if _, out, _ := create(`{"HostConfig":{"Binds":["` + host + `/secret:/x"]}}`); !strings.Contains(out, "outside the task directory and the paths of $ATL_SANDBOX_MOUNTS") {
+		t.Errorf("refusal: %s", out)
+	}
+	if _, out := newGate(t).do("POST", "/v1.45/containers/create", `{"HostConfig":{"Binds":["`+file+`:/x:ro"]}}`); !strings.Contains(out, "is outside the task directory\"") {
+		t.Errorf("without a list: %s", out)
 	}
 }
 
