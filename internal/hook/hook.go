@@ -66,6 +66,9 @@ type db struct {
 	// ended, if set, is told each session a SessionEnd set ended (see
 	// TaskServer.OnSessionEnd).
 	ended func(session int64)
+	// roMounts are, with scope, the host paths the task has read-only
+	// ($ATL_SANDBOX_MOUNTS): its session context names them.
+	roMounts []string
 }
 
 // Hook event names handled by atelier.
@@ -213,7 +216,7 @@ func (d db) handleMain(stdout, stderr io.Writer, env func(string) string, event 
 	}
 	if event == EventSessionStart && taskID != 0 && stdout != nil {
 		sandboxed := d.scope != 0 || env(sandbox.InEnv) != ""
-		if err := writeSessionContext(ctx, stdout, d.st, d.p, taskID, env(envContextVar), sandboxed, now); err != nil {
+		if err := writeSessionContext(ctx, stdout, d.st, d.p, taskID, env(envContextVar), sandboxed, d.roMounts, now); err != nil {
 			logError(d.p, stderr, event, in.SessionID, fmt.Errorf("session context: %w", err))
 		}
 	}

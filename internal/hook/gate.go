@@ -205,6 +205,10 @@ func (s *TaskServer) Close() error { return s.d.st.Close() }
 // session: f must leave a session alone while it runs.
 func (s *TaskServer) OnSessionEnd(f func(session int64)) { s.d.ended = f }
 
+// SetROMounts sets the host paths the task has read-only (the gate's
+// sandbox.Gate.ROMounts), which its sessions' start context names.
+func (s *TaskServer) SetROMounts(paths []string) { s.d.roMounts = paths }
+
 // Gone reports whether the server's task no longer exists (as the id and
 // slug it was opened for).
 func (s *TaskServer) Gone(ctx context.Context) (bool, error) {
