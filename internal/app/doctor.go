@@ -89,13 +89,17 @@ func (a *App) checkSandbox(ctx context.Context) []Check {
 		return []Check{fail(name, err.Error())}
 	}
 	if sb == nil {
-		return []Check{pass(name, "off ($ATL_SANDBOX=off): task sessions run next to atl; this mode is going away")}
+		checks := []Check{pass(name, "off ($ATL_SANDBOX=off): task sessions run next to atl; this mode is going away")}
+		if strings.TrimSpace(os.Getenv(sandbox.MountsVar)) != "" {
+			checks = append(checks, warn(mountsCheck, "$"+sandbox.MountsVar+" is set, but with the sandbox off nothing is mounted"))
+		}
+		return checks
 	}
 	mode := "docker"
 	if strings.TrimSpace(os.Getenv("ATL_SANDBOX")) == "" {
 		mode += " (the default)"
 	}
-	checks := []Check{pass(name, mode+": each task's sessions run in the task's own container")}
+	checks := []Check{pass(name, mode+": each task's sessions run in the task's own container"), a.checkSandboxMounts()}
 	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
 	if ver, err := a.checkDocker(ctx); err != nil {
@@ -120,6 +124,33 @@ func (a *App) checkSandbox(ctx context.Context) []Check {
 	}
 	checks = append(checks, pass("claude config", detail))
 	return checks
+}
+
+const mountsCheck = "sandbox mounts"
+
+// checkSandboxMounts lists the host paths every task gets read-only
+// ($ATL_SANDBOX_MOUNTS, resolved), and fails naming each one that is
+// missing or refused, and why (see sandbox.ROMounts).
+func (a *App) checkSandboxMounts() Check {
+	paths, errs := sandbox.CheckROMounts(a.Paths)
+	if len(errs) > 0 {
+		msgs := make([]string, len(errs))
+		for i, err := range errs {
+			if inner := errors.Unwrap(err); inner != nil {
+				err = inner // without the variable's name, said once
+			}
+			msgs[i] = err.Error()
+		}
+		detail := "$" + sandbox.MountsVar + ": " + strings.Join(msgs, "; ")
+		if len(paths) > 0 {
+			detail += "; the others are fine: " + strings.Join(paths, ", ")
+		}
+		return fail(mountsCheck, detail+" (atl does not start until this is fixed)")
+	}
+	if len(paths) == 0 {
+		return pass(mountsCheck, "none ($"+sandbox.MountsVar+" is unset)")
+	}
+	return pass(mountsCheck, strings.Join(paths, ", ")+": read-only in every task (they must be at the same paths on the host)")
 }
 
 // checkClaudeToken says where the token of sandboxed sessions comes from:

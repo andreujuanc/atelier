@@ -373,7 +373,7 @@ func sandboxEnv(t *testing.T) (*env, *fakeDocker) {
 	e.app.AtlBin = atl
 	e.app.Sandbox = &sandbox.Config{Image: "task-image"}
 	e.app.Docker = fd.run
-	e.app.StartGate = func(string, string, int64, string, string) error { return nil }
+	e.app.StartGate = func(string, string, int64, string, string, []string) error { return nil }
 	return e, fd
 }
 
@@ -526,6 +526,129 @@ func TestSandboxSessionRunsInTaskContainer(t *testing.T) {
 	}
 	if _, err := os.Stat(p.RunDir("boxed")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("run dir left behind: %v", err)
+	}
+}
+
+// TestSandboxReadOnlyMounts: the paths of $ATL_SANDBOX_MOUNTS are in the
+// task container's spec, read-only at the same paths, and the gate is
+// started with them; another list changes the spec's hash, so the container
+// is replaced (no session runs in it), and the same list keeps it.
+func TestSandboxReadOnlyMounts(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	root := filepath.Dir(e.out)
+	file, dir := filepath.Join(root, "host", "npmrc"), filepath.Join(root, "host", "certs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("registry\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var gate [][]string
+	e.app.StartGate = func(_, _ string, _ int64, _, _ string, roMounts []string) error {
+		gate = append(gate, roMounts)
+		return nil
+	}
+	task := e.task(t, "boxed", model.StatusActive, true)
+	ensure := func(mounts ...string) string {
+		t.Helper()
+		e.app.Sandbox.Mounts = mounts
+		if _, err := e.app.ensureSandbox(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+		runs := fd.find("run")
+		return strings.Join(runs[len(runs)-1], " ")
+	}
+
+	run := ensure(file, dir)
+	for _, want := range []string{"--mount type=bind,src=" + file + ",dst=" + file + ",readonly ",
+		"--mount type=bind,src=" + dir + ",dst=" + dir + ",readonly "} {
+		if !strings.Contains(run, want) {
+			t.Errorf("docker run lacks %q:\n%s", want, run)
+		}
+	}
+	if len(gate) != 1 || !slices.Equal(gate[0], []string{file, dir}) {
+		t.Errorf("gate started with %q", gate)
+	}
+
+	hash := func(mounts ...string) string {
+		e.app.Sandbox.Mounts = mounts
+		spec, err := e.app.sandboxSpec(ctx, task)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return spec.Hash()
+	}
+	if h := hash(file, dir); h == hash(file) || h == hash() || hash(file) == hash() || h == hash(dir, file) {
+		t.Error("the spec's hash does not change with the list")
+	}
+
+	ensure(file, dir)
+	if n := len(fd.find("run")); n != 1 {
+		t.Errorf("same list: %d docker run calls, want 1", n)
+	}
+	run = ensure(file)
+	if n, rm := len(fd.find("run")), len(fd.find("rm")); n != 2 || rm != 1 || strings.Contains(run, dir) || !strings.Contains(run, "src="+file+",dst="+file+",readonly") {
+		t.Errorf("another list: %d runs, %d rm, last run:\n%s", n, rm, run)
+	}
+	if !slices.Equal(gate[len(gate)-1], []string{file}) {
+		t.Errorf("gate started with %q", gate)
+	}
+	run = ensure()
+	if strings.Contains(run, "src="+file) {
+		t.Errorf("no list: still mounted:\n%s", run)
+	}
+}
+
+// TestDoctorSandboxMounts: doctor lists the read-only mounts, and fails
+// naming each path that is missing or refused, and why, in one line; with
+// the sandbox off it only warns that the list does nothing.
+func TestDoctorSandboxMounts(t *testing.T) {
+	e, _ := sandboxEnv(t)
+	ctx := context.Background()
+	root := filepath.Dir(e.out)
+	file := filepath.Join(root, "host", "npmrc")
+	for _, d := range []string{filepath.Dir(file), e.app.Paths.Tasks} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(file, []byte("registry\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check := func() Check {
+		t.Helper()
+		for _, c := range e.app.checkSandbox(ctx) {
+			if c.Name == "sandbox mounts" {
+				return c
+			}
+		}
+		t.Fatal("no sandbox mounts check")
+		return Check{}
+	}
+	t.Setenv("ATL_SANDBOX", "docker")
+	t.Setenv("ATL_SANDBOX_MOUNTS", "")
+	if c := check(); c.Level() != "ok" || c.Detail != "none ($ATL_SANDBOX_MOUNTS is unset)" {
+		t.Errorf("unset: %s %q", c.Level(), c.Detail)
+	}
+	t.Setenv("ATL_SANDBOX_MOUNTS", file+":"+filepath.Dir(file))
+	if c := check(); c.Level() != "ok" || c.Detail != file+", "+filepath.Dir(file)+": read-only in every task (they must be at the same paths on the host)" {
+		t.Errorf("good: %s %q", c.Level(), c.Detail)
+	}
+	t.Setenv("ATL_SANDBOX_MOUNTS", file+":/:"+root+"/gone:"+e.app.Paths.Tasks)
+	c := check()
+	for _, want := range []string{"$ATL_SANDBOX_MOUNTS: / is the root directory", root + "/gone does not exist here",
+		e.app.Paths.Tasks + " is the tasks dir", "the others are fine: " + file} {
+		if !strings.Contains(c.Detail, want) {
+			t.Errorf("bad: lacks %q: %s %q", want, c.Level(), c.Detail)
+		}
+	}
+	if c.Level() != "FAIL" || strings.Count(c.Detail, "$ATL_SANDBOX_MOUNTS") != 1 || strings.Contains(c.Detail, "\n") {
+		t.Errorf("bad: %s %q", c.Level(), c.Detail)
+	}
+	t.Setenv("ATL_SANDBOX", "off")
+	if c := check(); c.Level() != "warn" || !strings.Contains(c.Detail, "with the sandbox off nothing is mounted") {
+		t.Errorf("off: %s %q", c.Level(), c.Detail)
 	}
 }
 

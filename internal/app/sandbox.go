@@ -50,8 +50,9 @@ func outsideSandbox(what string) error {
 // here: the task dir; the git database of each rw repo's canonical clone
 // (a worktree keeps its objects and refs there) and each ro repo, read-only;
 // and the task's own Claude config dir (Paths.ClaudeDir, see
-// seedClaudeDir), as $CLAUDE_CONFIG_DIR. The run dir, with the gate's
-// sockets and the atl binary, is at sandbox.RunMount. It does not see the
+// seedClaudeDir), as $CLAUDE_CONFIG_DIR; and the host paths of
+// $ATL_SANDBOX_MOUNTS (sandbox.ROMounts), read-only. The run dir, with the
+// gate's sockets and the atl binary, is at sandbox.RunMount. It does not see the
 // host's Docker socket, the SSH agent, other repos, other tasks, the user's
 // Claude config dir (login, other sessions' transcripts), nor atelier's
 // database, state or config dirs: atl in there (hooks, status line, notes,
@@ -134,6 +135,11 @@ func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, err
 	same(claude, false)
 	spec.Env["CLAUDE_CONFIG_DIR"] = claude
 	spec.Mounts = append(spec.Mounts, sandbox.Mount{Src: a.Paths.RunDir(t.Slug), Dst: sandbox.RunMount, RO: true})
+	// What the workspace gives every task, read-only ($ATL_SANDBOX_MOUNTS,
+	// checked when atl started).
+	for _, m := range a.Sandbox.Mounts {
+		same(m, true)
+	}
 	return spec, nil
 }
 
@@ -226,7 +232,7 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) 
 	if startGate == nil {
 		startGate = sandbox.Start
 	}
-	if err := startGate(a.AtlBin, t.Slug, t.ID, runDir, a.gateLog(t)); err != nil {
+	if err := startGate(a.AtlBin, t.Slug, t.ID, runDir, a.gateLog(t), a.Sandbox.Mounts); err != nil {
 		return "", err
 	}
 	spec, err := a.sandboxSpec(ctx, t)
@@ -259,7 +265,8 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) 
 		return "", fmt.Errorf("task container (image %s): %w", spec.Image, err)
 	}
 	if stale {
-		a.warnf("task %s: its container predates a change (repos, image or atl paths); it is replaced once the task has no running sessions", t.Slug)
+		a.warnf("task %s: its container predates a change (repos, image, atl paths or $%s); it is replaced once the task has no running sessions",
+			t.Slug, sandbox.MountsVar)
 	}
 	return container, nil
 }

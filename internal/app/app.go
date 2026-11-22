@@ -36,7 +36,7 @@ type App struct {
 	Sandbox *sandbox.Config
 	Docker  sandbox.Runner // nil → the docker CLI
 	// StartGate starts a task's gate if none runs; nil → sandbox.Start.
-	StartGate func(atlBin, slug string, taskID int64, runDir, logPath string) error
+	StartGate func(atlBin, slug string, taskID int64, runDir, logPath string, roMounts []string) error
 }
 
 // New resolves paths from the environment, opens the store and returns an
@@ -61,6 +61,11 @@ func New(out io.Writer) (*App, error) {
 	sb, err := sandbox.FromEnv()
 	if err != nil {
 		return nil, err
+	}
+	if sb != nil {
+		if sb.Mounts, err = sandbox.ROMounts(paths); err != nil {
+			return nil, err
+		}
 	}
 	st, err := store.Open(paths.DB)
 	if err != nil {
