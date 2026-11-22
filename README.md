@@ -339,7 +339,7 @@ atl (box)  ── docker exec ──▶  task container atl-<slug>-<hash>   one 
    │                              claude, your tools, the task dir
    └─ atl gate <slug>  ◀── /run/atl/docker.sock ── docker / docker compose in the task
           │  │         ◀── /run/atl/atl.sock ───── atl hook / statusline / note / notes /
-          │  │                                     push / fetch in the task
+          │  │                                     push / fetch, wl-copy in the task
           │  └──▶ atelier's database, hook log     (this task's rows only)
           ▼
      Docker daemon
@@ -390,6 +390,27 @@ starting (Claude would then keep a detached window's 80x24 in a larger terminal)
 window `atl` attaches your terminal to right away (`atl open`, Enter in the TUI) starts
 `docker exec` only once the terminal is attached (or after 10 seconds), and every window
 has `docker exec` send the size once more 1, 3 and 7 seconds after it started.
+
+**Copying.** Claude Code's fullscreen mode selects with the mouse itself and copies on
+release. Next to `atl` it copied through tmux to your terminal's clipboard; a task
+container has neither tmux nor a clipboard tool, so the copy went nowhere. The container
+gets a copy relay instead: `wl-copy` there is `atl` (a link next to it in the run dir,
+first on `PATH`), and sessions run with `WAYLAND_DISPLAY=atl-copy-relay`, without which
+Claude Code would not use `wl-copy`. That names no socket: other Wayland programs in the
+container fail to connect, as without a display. Claude Code takes it for a display,
+though, so for a link or an MCP server's sign-in it tries to open a browser (`xdg-open`,
+which the default image has not), then says it could not and shows the URL.
+`wl-copy` sends the text to the task's gate on `/run/atl/atl.sock`, and the gate puts it
+in a tmux paste buffer and, with `tmux load-buffer -w`, in the clipboard of the terminal
+attached to the task's tmux session (the one used last, if several are), as Claude Code
+did itself in tmux. As before, that takes a terminal that accepts OSC 52 and that tmux
+knows accepts it (tmux assumes so for `xterm*`; add others to `terminal-features`). With
+no terminal on the task's session, nothing is copied. A copy is at most 1 MiB; the gate
+log gets its time and size, never the text. `wl-copy --primary`, which Claude Code runs
+right after with the same text, copies nothing. Scripts in the task can use `wl-copy` too
+(text on standard input or as arguments, `--trim-newline`). The relay only writes:
+`wl-paste` is refused and nothing in the task reads your clipboard (so pasting an image
+from it into a sandboxed Claude does not work; pasting text with your terminal does).
 
 A session that ends normally (Claude exits, the window closes) is ended the same way: what
 it started that still runs in the container (a dev server it put in the background, say)
@@ -593,6 +614,10 @@ What the sandbox does not do yet:
   the Docker socket mounted (localstack, testcontainers) need to be recreated.
 - Notes and transcripts a task writes reach the assistant where `atl` runs (`atl notes`,
   `atl transcript`) as prompt input.
+- A task can write your clipboard (never read it), up to 1 MiB at a time, while a
+  terminal of yours is on its tmux session (see **Copying** above): what runs in the task
+  can plant a command there for you to paste elsewhere, also in place of what you just
+  copied. Read what you paste into a shell.
 - Only the classic image builder goes through the gate (`DOCKER_BUILDKIT=0` is set in the
   task); BuildKit sessions are refused.
 - Tasks can bind any free host port, and there is no network egress policy.
