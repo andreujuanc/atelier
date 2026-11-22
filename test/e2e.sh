@@ -51,7 +51,7 @@ trap cleanup EXIT
 # Build with the caller's environment (Go caches live under the real $HOME).
 step build
 mkdir -p "$W/bin"
-(cd "$ROOT" && go build -o "$W/bin/atl" ./cmd/atl) || fail "go build"
+(cd "$ROOT" && CGO_ENABLED=0 go build -buildmode=exe -o "$W/bin/atl" ./cmd/atl) || fail "go build"
 
 # Isolated environment.
 unset TMUX TMUX_PANE ATL_WORKSPACE ATL_BIN ATL_SESSION ATL_TASK ATL_TASK_DIR ATL_PORT_OFFSET CLAUDE_CONFIG_DIR

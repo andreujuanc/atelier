@@ -51,11 +51,11 @@ type Client struct {
 }
 
 // ServerConfig is the tmux configuration atl starts a server of its own
-// with (see UseConfig): what the box image's /etc/tmux.conf has. tmux out
-// of the way: no status bar, mouse scrolling, Ctrl-q detaches (back to
-// atl), and a terminal with 256 colours and RGB. The copy relay (Copy)
-// needs nothing here: load-buffer -w sends OSC 52 whatever set-clipboard
-// says (checked with tmux 3.5a).
+// with (see UseConfig, which adds the user's file, ServerConfigWith): what
+// the box image's /etc/tmux.conf has. tmux out of the way: no status bar,
+// mouse scrolling, Ctrl-q detaches (back to atl), and a terminal with 256
+// colours and RGB. The copy relay (Copy) needs nothing here: load-buffer -w
+// sends OSC 52 whatever set-clipboard says (checked with tmux 3.5a).
 const ServerConfig = `# Written by atl: tmux reads this file when atl starts this workspace's
 # tmux server. atl rewrites it when it differs; changes here do not last.
 set -g status off
@@ -66,6 +66,39 @@ set -g default-terminal "tmux-256color"
 set -as terminal-features ",*:RGB"
 `
 
+// ServerConfigWith is ServerConfig followed by `source-file -q user`: the
+// user's own settings for atl's server (the workspace's tmux.conf), read
+// last, so they win; -q: a missing file is no error (checked with tmux
+// 3.5a). With user "" it is ServerConfig.
+func ServerConfigWith(user string) string {
+	if user == "" {
+		return ServerConfig
+	}
+	return ServerConfig + "# Yours, if it exists (not rewritten by atl):\nsource-file -q " + sourcePath(user) + "\n"
+}
+
+// sourcePath quotes path, a file name, for source-file in a tmux config:
+// source-file expands glob patterns (glob(3)), so *, ?, [ and \ are
+// escaped with a backslash, and the result is single-quoted (no escapes or
+// variables in there), a ' in it as '"'"'.
+func sourcePath(path string) string {
+	var b strings.Builder
+	b.WriteByte('\'')
+	for _, r := range path {
+		switch r {
+		case '*', '?', '[', '\\':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case '\'':
+			b.WriteString(`'"'"'`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('\'')
+	return b.String()
+}
+
 // DefaultSocket is the socket name of tmux's default server (`tmux -L
 // default` is the server plain `tmux` reaches): the user's own.
 const DefaultSocket = "default"
@@ -75,22 +108,24 @@ const DefaultSocket = "default"
 // else the default one), which is the user's.
 func (c *Client) OwnServer() bool { return c.Socket != "" && c.Socket != DefaultSocket }
 
-// UseConfig makes c start its server with ServerConfig: it writes it to
-// path (atomically, and only when the file's content differs; the parent
-// directory is created) and passes path with -f from then on. A server that
-// already runs keeps the options it has (see ConfigFiles). For a server
-// that is not atl's own (OwnServer) it does nothing: if atl started it,
-// -f would replace the user's tmux.conf (in the box: /etc/tmux.conf, which
-// applies there). When the file cannot be written c is left without -f.
-func (c *Client) UseConfig(path string) error {
+// UseConfig makes c start its server with ServerConfigWith(user): it writes
+// that to path (atomically, and only when the file's content differs; the
+// parent directory is created) and passes path with -f from then on. A
+// server that already runs keeps the options it has (see ConfigFiles). For
+// a server that is not atl's own (OwnServer) it does nothing: if atl
+// started it, -f would replace the user's tmux.conf (in the box:
+// /etc/tmux.conf, which applies there). When the file cannot be written c
+// is left without -f.
+func (c *Client) UseConfig(path, user string) error {
 	if !c.OwnServer() {
 		return nil
 	}
-	if b, err := os.ReadFile(path); err != nil || string(b) != ServerConfig {
+	conf := ServerConfigWith(user)
+	if b, err := os.ReadFile(path); err != nil || string(b) != conf {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return fmt.Errorf("tmux: write its config: %w", err)
 		}
-		if err := gen.WriteAtomic(path, []byte(ServerConfig)); err != nil {
+		if err := gen.WriteAtomic(path, []byte(conf)); err != nil {
 			return fmt.Errorf("tmux: write its config: %w", err)
 		}
 	}
@@ -101,23 +136,31 @@ func (c *Client) UseConfig(path string) error {
 // Config is the file c passes with -f ("" for none).
 func (c *Client) Config() string { return c.config }
 
-// ConfigFiles returns the config files the running server was started with
-// (tmux's #{config_files}: those given with -f, whether or not they
-// existed, else the default ones it found), and whether a server runs.
-func (c *Client) ConfigFiles(ctx context.Context) (files []string, running bool, err error) {
+// ConfigFiles returns the config files the running server was started with,
+// as tmux's #{config_files} lists them, comma-separated (those given with
+// -f, whether or not they existed, else the default ones it found; see
+// ConfigListed), and whether a server runs.
+func (c *Client) ConfigFiles(ctx context.Context) (list string, running bool, err error) {
 	out, err := c.run(ctx, "display-message", "-p", "#{config_files}")
 	if err != nil {
 		if noServer(err) || serverExited(err) {
-			return nil, false, nil
+			return "", false, nil
 		}
-		return nil, false, err
+		return "", false, err
 	}
-	for _, f := range strings.Split(out, ",") {
-		if f != "" {
-			files = append(files, f)
-		}
+	return out, true, nil
+}
+
+// ConfigListed reports whether path is one of the files in list, a
+// #{config_files} value. tmux joins the files with commas without quoting
+// them, so a path with a comma cannot be split out of it: path counts when
+// it is the whole list or a comma-delimited part of it.
+func ConfigListed(list, path string) bool {
+	if path == "" {
+		return false
 	}
-	return files, true, nil
+	return list == path || strings.HasPrefix(list, path+",") || strings.HasSuffix(list, ","+path) ||
+		strings.Contains(list, ","+path+",")
 }
 
 // New returns a client for the server named by $ATL_TMUX_SOCKET. When it is
@@ -581,7 +624,8 @@ var ErrNoClient = errors.New("no terminal is attached to the session")
 // if there are several: load-buffer -w, which sends it to that terminal with
 // the xterm escape sequence (OSC 52) if tmux takes the terminal for one that
 // supports it (its terminfo's Ms, or the clipboard terminal feature; tmux
-// gives xterm* that by default) and set-clipboard is not off. This is what
+// gives xterm* that by default), whatever set-clipboard says (tmux 3.5a
+// sends it with set-clipboard off too, checked). This is what
 // Claude Code does itself when it runs in tmux. Without an attached
 // terminal it returns ErrNoClient (wrapped) and copies nothing: whoever
 // copies does so where the user is looking.

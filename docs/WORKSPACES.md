@@ -106,7 +106,9 @@ cleanup.)
   it is adopted (existing contents are kept). Refuses when `atelier.toml` exists. Values
   not given as flags are taken from the current environment when set (`ATL_REPOS`,
   `ATL_SANDBOX_MOUNTS`, `ATL_SANDBOX_IMAGE`, `ATL_SANDBOX_CONTEXT`, `ATL_CONTEXT`), so
-  running it inside an old box writes that box's settings. Refuses a name whose gate
+  running it inside an old box writes that box's settings. A directory with
+  `data/atelier.db` (a box's workspace) is adopted outside its box only with the repos
+  known (see Decisions, adoption). Refuses a name whose gate
   socket path (`<ws>/run/<12 chars>/docker.sock`) would exceed 107 bytes.
 - `atl workspace open <name>` — the TUI in that workspace (same as `atl -w <name>`). Without
   a name: the workspace selector, ignoring `$ATL_WORKSPACE` and the current directory.
@@ -118,10 +120,11 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
 - **Port offsets**: a new task's offset avoids the offsets of open tasks in *every*
   workspace under the root (their databases are read read-only; an unreadable one is
   skipped with a warning). Doctor warns about open tasks in two workspaces with the same
-  offset.
+  offset, and about two open tasks of this workspace with the same offset (reopen).
 - **Slugs**: a new task's slug gets `-2`, `-3`, … (as for slugs taken in the database)
-  also when its task dir exists on disk, or when branch `atl/<slug>` already exists in
-  the canonical clone of one of its rw repos (locally or as `origin/atl/<slug>`).
+  also when its task dir exists on disk, or when branch `atl/<slug>`, or one below it
+  (`atl/<slug>/x`), already exists in the canonical clone of one of its rw repos (locally
+  or under `origin/`).
 - **Containers, gate sockets, Claude dirs**: already distinct (named by a hash of the task
   dir).
 - **tmux**: each workspace has its own tmux server (`tmux_socket`, default `atl-<name>`),
@@ -131,12 +134,14 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
 ## atl on the host
 
 - The `atl` binary is copied into each task's run dir and runs in task containers, so it
-  must be a static Linux binary: build with `CGO_ENABLED=0`. Doctor checks the running
+  must be a static Linux binary: build with `CGO_ENABLED=0 go build -buildmode=exe`. Doctor
+  checks the running
   binary (ELF, no interpreter) and starting a sandboxed session refuses a dynamic one with
   a line that says how to build it.
 - atl starts its tmux server with a config it generates (`<ws>/state/tmux.conf`, passed
   with `-f`), carrying what the box's `/etc/tmux.conf` had: status off, mouse on,
-  escape-time 10, `C-q` detach-client, `default-terminal tmux-256color`, RGB.
+  escape-time 10, `C-q` detach-client, `default-terminal tmux-256color`, RGB; and last
+  `source-file -q <ws>/tmux.conf`, the user's own settings.
 - Host requirements: tmux ≥ 3.2, git, gh, claude, the Docker CLI with access to the
   daemon (the `docker` group, as the box had via `--group-add`).
 - The box image stays buildable and works (its env wins), but is no longer the way in.
@@ -155,11 +160,13 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
 - "Already set" means set and non-empty, as everywhere else in atl (`config.Resolve`).
 - `ATL_WORKSPACE` itself is always set to the selected dir (the flag wins over the env).
 - What atl sets itself it records in `ATL_WORKSPACE_VARS` as `NAME=<12 hex of sha256 of the
-  value>`, comma-separated. A variable is atl's only while its value still matches; atl's
-  variables are always recomputed from the current `atelier.toml` (same workspace or
-  another, and with no `ATL_WORKSPACE` at all), so `atl -w work` from `personal`'s assistant gets
-  `work`'s values and an edited file reaches children; a value that does not match is the
-  user's and always wins. `atl workspace new` takes only the user's values.
+  value>`, comma-separated. `ATL_WORKSPACE` is recorded too (since the fix round), so an atl
+  started by atl can tell it from one a box set (`Applied.UserVar`, `UserEnv`). A variable
+  is atl's only while its value still matches; atl's variables are always recomputed from
+  the current `atelier.toml` (same workspace or another, and with no `ATL_WORKSPACE` at
+  all), so `atl -w work` from `personal`'s assistant gets `work`'s values and an edited file reaches
+  children; a value that does not match is the user's and always wins. `atl workspace new`
+  takes only the user's values.
 - Every tmux window atl creates (task windows, the assistant, the token window) gets
   `ATL_WORKSPACE`, `ATL_WORKSPACE_VARS` and the setting variables with `-e`, empty when
   unset, except `GIT_CONFIG_GLOBAL`, which is passed only when set: set but empty, git
@@ -167,11 +174,20 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   tmux commands run without `CLAUDECODE`, `ATL_SESSION`, `ATL_CONTROL_SOCK`, `ATL_TASK`,
   `ATL_TASK_DIR`, `ATL_PORT_OFFSET`, and with a socket name without `TMUX`/`TMUX_PANE`, so
   a server atl starts does not take them.
-- Adoption (W1 review): `atl workspace new` on an existing dir with `data/atelier.db`,
-  while `ATL_TMUX_SOCKET` is not the user's, writes `tmux_socket = "default"` with a
-  comment and prints a note: the box ran its sessions on the default server, and on
-  `atl-<name>` Recover would stop them and atl would end Claude in their containers.
-- Attaching: `switch-client` only when ``'s socket (first comma field) is the same
+- Adoption (W1 review, changed in the fix round): `atl workspace new` on an existing dir
+  with `data/atelier.db` (`workspace.HasDB`) is a box's workspace. Only when the user's
+  `$ATL_WORKSPACE` (set, not atl's) resolves to that same dir (same path, or `os.SameFile`)
+  are we inside its box: then, while `ATL_TMUX_SOCKET` is not the user's, it writes
+  `tmux_socket = "default"` with a comment and prints a note (the box ran its sessions on
+  the default server, and on `atl-<name>` Recover would stop them and atl would end Claude
+  in their containers). Anywhere else (on the host, from an atl child, in another box) it
+  needs the repos, `--repos` or a user-set `ATL_REPOS` (checked before a repos dir equal
+  to the default is dropped from the file), and without them refuses with one line
+  (`workspace.AdoptDBError`) naming `atl workspace new <name> --repos DIR [--mount PATH]...`
+  and the README section; nothing is written. Writing `default` on the host put atl on
+  the user's own tmux server (no `-f`, atl's variables in its global environment) and an
+  empty `<ws>/repos` dropped the box's clones and mounts.
+- Attaching: `switch-client` only when `$TMUX`'s socket (first comma field) is the same
   file as this server's socket (`` or `/tmp`, `tmux-<uid>/<name>`), or when no
   socket name is set; otherwise `attach-session` with `TMUX`/`TMUX_PANE` removed (a nested
   client).
@@ -215,9 +231,11 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   or read (not SQLite, locked, `ErrSchemaVersion`) is skipped with a warning on `App.Out`,
   and in doctor's `port offsets` check. This workspace is left out by the resolved
   directory (`EvalSymlinks`) and, as well, by its database file (`os.SameFile`).
-- Doctor's `port offsets` check compares only across workspaces (two open tasks of one
-  workspace with the same offset are not checked; see reopen below) and names the current
-  workspace by its applied name, else the base name of `ATL_WORKSPACE`.
+- Doctor's `port offsets` check compares across workspaces and, since the fix round, also
+  within this one (two open tasks with the same offset, which reopen allows), and names
+  the current workspace by its applied name, else the base name of `ATL_WORKSPACE`. With
+  `Applied.UserVar` (a box) and no other workspace read, its pass says the other
+  workspaces' offsets were not checked (a box mounts only its own workspace).
 - Reopen keeps the task's offset (it never allocated one, not even against its own
   workspace), its slug and its branch: it reuses the kept `atl/<slug>` on purpose and its
   task dir may exist. Rename changes only the title. So neither applies the new checks.
@@ -228,9 +246,11 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   clone: two workspaces with separate clones of one origin would otherwise push to the same
   branch. ro repos do not count. `buildTaskDir` keeps its "task dir already exists" error
   for a dir made between the check and the mkdir. `atl add` is unchanged (an existing
-  `atl/<slug>` still fails it). A branch in the way of `atl/<slug>` as a directory
-  (`atl/<slug>/x`) is not checked; `TestNewTaskRollback` now uses that to make the second
-  worktree fail.
+  `atl/<slug>` still fails it). Fix round: `gitx.RefOrBelowExists` (`for-each-ref --count=1
+  -- <ref>`, whose literal pattern matches the ref and refs below it up to a slash, not
+  `atl/<slug>-2`) replaces `RefExists` there, so a branch `atl/<slug>/x` (D/F conflict),
+  local or under `origin/`, also takes the slug. `TestNewTaskRollback` now makes the second
+  worktree fail with an unreadable blob (`breakCheckout`).
 - W3, the selector (`tui.WorkspacePicker`, run by `tui.RunWorkspaces`) lists what
   `app.ListWorkspaces` returns (`workspace.List` plus `WorkspaceCounts`; `atl workspace
   list` uses it too). It is shown by `atl` alone on a terminal when `applyWorkspace` fails
@@ -240,9 +260,12 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   workspace open` is the same as `workspace open <name>`.
 - The selector's `n` and its adopt (`enter` on a row without `atelier.toml`, then `y`) call
   `createWorkspace`, the same function as `atl workspace new` (`FillFromEnv` then
-  `workspace.Create`, so the `tmux_socket = "default"` rule applies); the notes `Create`
-  returns are shown on the status line. The name is checked as typed (`CheckName`, and not
-  an existing workspace); a directory without `atelier.toml` is announced as adopted.
+  `workspace.Create`); the notes `Create` returns are shown on the status line. The name is
+  checked as typed (`CheckName`, and not an existing workspace); a directory without
+  `atelier.toml` is announced as adopted (by `n` too). A directory with a database
+  (`WorkspaceInfo.HasDB`) is never adopted from the selector, not even in its box: `enter`
+  and `n` show the `--repos` hint instead, and the CLI's `Create` callback refuses it too
+  (`selectorAdoptable`, against a stale list).
 - Last used: `$ATL_WORKSPACES/.last` holds the name of the workspace whose task TUI was
   started last (written, atomically, only for a workspace directly under the root; never
   creates the root; every error ignored). The selector preselects `--preselect` (hidden
@@ -258,12 +281,17 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   CLI then re-executes. The workspace's name is drawn at the right end of the task TUI's
   status line when it fits (there is no header line).
 - W4, tmux config: `tmux.ServerConfig` (the box's `/etc/tmux.conf` settings, under a
-  comment saying atl rewrites the file) is written by `Client.UseConfig(path)` to
+  comment saying atl rewrites the file) is written by `Client.UseConfig(path, user)` to
   `Paths.TmuxConf()` (`<StateDir>/tmux.conf`) when the file's content differs
   (`gen.WriteAtomic`, parent dir created), and then passed with `-f` on every command of
   that client (the existing `config` field; tests still set it to `/dev/null`). tmux reads
   it only when a command starts the server (`new-session`, `start-server`, and
-  `attach-session`, which starts one too: checked), and ignores it otherwise. The App's
+  `attach-session`, which starts one too: checked), and ignores it otherwise. Fix round: the
+  file is `tmux.ServerConfigWith(Paths.UserTmuxConf())`, `ServerConfig` followed by
+  `source-file -q '<ws>/tmux.conf'` (single-quoted, glob characters escaped with `\`, a
+  `'` as `'"'"'`), so the user's own file is read last and wins; `-q` with a missing file
+  is silent (checked with tmux 3.2a, 3.3a and 3.5a, also through a glob-escaped path). No
+  workspace (XDG paths): no hook. The Dockerfile comparison skips that line. The App's
   client comes from `app.NewTmux(paths, out)` (in `app.New` and the CLI's paths-only App);
   a write error is a warning and the client goes without `-f`. Not for tmux's own choice of
   server (no socket name) nor `tmux_socket = "default"` (`Client.OwnServer`): if atl started
@@ -275,7 +303,9 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   off (tmux 3.5a).
 - Doctor's `tmux server` check: for tmux's default server, a pass saying it runs with the
   user's config; otherwise `#{config_files}` of the running server (which lists every
-  `-f` file, existing or not): a warning when the generated file is not among them (an
+  `-f` file, existing or not, joined with commas unquoted: `tmux.ConfigListed` takes the
+  generated file as listed when it is the whole value or a comma-delimited part of it, so a
+  path with a comma works): a warning when the generated file is not among them (an
   older atl or a hand-started server: its options apply after a restart), a pass when it
   is or no server runs. It skips itself when tmux is not installed.
 - W4, static binary: `sandbox.CheckStaticBin(path)`: ELF (else "is not a Linux (ELF)
@@ -283,11 +313,35 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   `PT_INTERP`, no `DT_NEEDED`. Neither the machine nor the OS ABI is compared: the
   Docker daemon's architecture need not be atl's, and `AtlBin` is the running binary
   unless `$ATL_BIN` says otherwise. `sandbox.StaticBinError` is the one-line refusal with
-  `sandbox.BuildStatic`. `App.CheckBin` (nil → `CheckStaticBin`) lets tests inject it: the
-  app test Apps use a stand-in script for atl and set it to accept anything.
+  `sandbox.BuildStatic`, `CGO_ENABLED=0 go build -buildmode=exe -o ~/.local/bin/atl
+  ./cmd/atl`: a PIE (`PT_INTERP`, e.g. from `GOFLAGS=-buildmode=pie`) stays refused, since
+  it needs the loader, which an image need not have; `-buildmode=exe` overrides that
+  GOFLAGS, and the refusal names it as a cause. `App.CheckBin` (nil → `CheckStaticBin`)
+  lets tests inject it: the app test Apps use a stand-in script for atl and set it to accept anything.
   `ensureSandbox` checks right after `checkDocker` (so "cannot reach Docker" stays the first
   thing a session says without a daemon) and before anything is written or started.
   Doctor's `atl binary` check runs only with the sandbox on, on `AtlBin`, else `$ATL_BIN`,
   else the running binary.
 - No new doctor check for host basics: the tool checks (git, tmux ≥ 3.2, claude, gh) and
   the `docker` check (daemon reachable) already cover them.
+- Fix round, README migration: the main path is host-side (in the box finish or close what
+  runs and stop it; on the host `atl workspace new <name> --repos <repos> [--mount
+  <path>]...`; `atl -w <name>` or the selector; resume with `claude --resume`). Adopting
+  in the box (`tmux_socket = "default"`, removed when moving) is described only as the way
+  to upgrade a box in place. It also says to move all workspaces of a host together: a box
+  sees only its own workspace under `$ATL_WORKSPACES`. Rootless Docker and Podman are
+  stated as unsupported (the gate's upstream is `DOCKER_HOST`'s unix socket or
+  `/var/run/docker.sock`, not a context; a rootless daemon remaps the UID, so bind-mounted
+  worktrees are not writable).
+- Fix round, the task TUI's help: the list's keys (`listKeys`; "m edit notes" became "m
+  notes" so that they fit two lines at 80 columns) wrap onto a second line at a two-space
+  gap when they do not fit the width and the terminal has 8 lines or more; the second line
+  is truncated when it does not fit either. The legend follows the keys on their last line
+  when it fits. Only the list (`modeNormal`) wraps; other modes keep one truncated line.
+  `listHeight` and `View` take the help's lines from `helpLines`, and `listLines` keeps
+  the selection visible when the help grew since the offset was set.
+- Fix round, `build-images`: `ATL_BUILD_BOX=0` builds only the task image (the script is
+  configured by variables, its arguments go to `docker build`); a value other than 0 or 1
+  is refused.
+- Fix round, tests: `workspace.ResetOriginalEnv` (tests only) forgets the snapshot, so
+  `TestReexec` compares the exec environment with the one before its own Apply exactly.

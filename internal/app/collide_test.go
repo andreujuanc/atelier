@@ -148,3 +148,51 @@ func TestDoctorPortOffsetClash(t *testing.T) {
 		t.Fatalf("clash: %+v", c)
 	}
 }
+
+// TestDoctorPortOffsetOwn: doctor also warns about two open tasks of this
+// workspace with the same offset (a reopened task keeps its old one).
+func TestDoctorPortOffsetOwn(t *testing.T) {
+	e := newTaskEnv(t)
+	twoWorkspaces(t, e)
+	mkOtherTask(t, e.app.Store, "fix", model.StatusActive, 100)
+	mkOtherTask(t, e.app.Store, "again", model.StatusReview, 100)
+	mkOtherTask(t, e.app.Store, "closed", model.StatusDone, 100)
+	mkOtherTask(t, e.app.Store, "lone", model.StatusActive, 200)
+	c := portCheck(t, e)
+	if !c.Warn || !strings.Contains(c.Detail, "open tasks of this workspace have the same port offset") ||
+		!strings.Contains(c.Detail, "alpha/again and alpha/fix (+100)") || strings.Contains(c.Detail, "closed") ||
+		strings.Contains(c.Detail, "lone") || strings.Contains(c.Detail, "two workspaces") {
+		t.Fatalf("own clash: %+v", c)
+	}
+}
+
+// TestDoctorPortOffsetBox: with $ATL_WORKSPACE the user's (a box) and no
+// other workspace read, doctor says the others' offsets were not checked;
+// not so when atl selected the workspace otherwise.
+func TestDoctorPortOffsetBox(t *testing.T) {
+	e := newTaskEnv(t)
+	root := t.TempDir()
+	t.Setenv("ATL_WORKSPACES", root)
+	e.app.Workspace = &workspace.Applied{Workspace: &workspace.Workspace{Name: "alpha", Dir: e.root}, UserVar: true}
+	c := portCheck(t, e)
+	if c.Warn || !c.OK || !strings.Contains(c.Detail, "0 other workspaces read") ||
+		!strings.Contains(c.Detail, "$ATL_WORKSPACE comes from the environment (a devcontainer box?)") ||
+		!strings.Contains(c.Detail, "their offsets are not checked") {
+		t.Fatalf("box: %+v", c)
+	}
+	e.app.Workspace.UserVar = false
+	if c := portCheck(t, e); strings.Contains(c.Detail, "devcontainer") {
+		t.Fatalf("not a box: %+v", c)
+	}
+}
+
+func portCheck(t *testing.T, e *taskEnv) Check {
+	t.Helper()
+	for _, c := range e.app.Doctor(context.Background()) {
+		if c.Name == "port offsets" {
+			return c
+		}
+	}
+	t.Fatal("no port offsets check")
+	return Check{}
+}

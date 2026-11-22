@@ -144,7 +144,7 @@ func (c *cli) workspaceNewCmd() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.StringVar(&cfg.Repos, "repos", "", "the canonical clones (default: $ATL_REPOS if set, else <workspace>/repos)")
+	f.StringVar(&cfg.Repos, "repos", "", "the canonical clones (default: $ATL_REPOS if set, else <workspace>/repos; needed to adopt a box's workspace, one with a database, outside that box)")
 	f.StringArrayVar(&mounts, "mount", nil, "a host path every task gets read-only (repeatable; default: $ATL_SANDBOX_MOUNTS)")
 	f.StringVar(&image, "image", "", "the task container image (default: $ATL_SANDBOX_IMAGE, else atelier-task)")
 	return cmd
@@ -260,6 +260,9 @@ func (c *cli) selectWorkspace(ctx context.Context, preselect string) error {
 		Preselect: preselect,
 		Load:      func(ctx context.Context) ([]app.WorkspaceInfo, error) { return app.ListWorkspaces(ctx, root) },
 		Create: func(name string) ([]string, error) {
+			if err := selectorAdoptable(root, name); err != nil {
+				return nil, err
+			}
 			_, notes, err := createWorkspace(root, name, workspace.Config{})
 			return notes, err
 		},
@@ -268,6 +271,18 @@ func (c *cli) selectWorkspace(ctx context.Context, preselect string) error {
 		return err
 	}
 	return c.openChosen(name)
+}
+
+// selectorAdoptable returns why the selector does not create or adopt
+// workspace name: a directory without atelier.toml that has a database (a
+// box's workspace) is adopted only by `atl workspace new` with its repos
+// (the selector has no flags), even in that box.
+func selectorAdoptable(root, name string) error {
+	dir := filepath.Join(root, name)
+	if _, err := os.Lstat(filepath.Join(dir, workspace.File)); errors.Is(err, os.ErrNotExist) && workspace.HasDB(dir) {
+		return &workspace.AdoptDBError{Name: name, Dir: dir}
+	}
+	return nil
 }
 
 // openChosen re-executes atl in workspace name (the selector's choice).

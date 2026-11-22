@@ -160,31 +160,49 @@ type Applied struct {
 	*Workspace
 	By       string    // how it was selected
 	Settings []Setting // the values in effect, with their sources
+	// UserVar is true when $ATL_WORKSPACE was the user's when it was
+	// applied (set, and not by atl: see AtlSet), as in a devcontainer box.
+	UserVar bool
 
 	restore map[string]*string // previous values of what Apply changed (nil: unset)
 }
 
 var (
-	snapOnce sync.Once
-	snapshot []string
+	snapMu    sync.Mutex
+	snapTaken bool
+	snapshot  []string
 )
 
 // OriginalEnv returns atl's environment as it was before the first Apply
 // (os.Environ() if nothing was applied), for re-executing atl in another
 // workspace.
 func OriginalEnv() []string {
-	snapOnce.Do(func() { snapshot = os.Environ() })
+	snapMu.Lock()
+	defer snapMu.Unlock()
+	if !snapTaken {
+		snapshot, snapTaken = os.Environ(), true
+	}
 	return append([]string(nil), snapshot...)
+}
+
+// ResetOriginalEnv forgets the snapshot OriginalEnv returns, so that the
+// next OriginalEnv (or Apply) takes it anew. For tests only: they run atl
+// many times in one process.
+func ResetOriginalEnv() {
+	snapMu.Lock()
+	defer snapMu.Unlock()
+	snapshot, snapTaken = nil, false
 }
 
 // Apply sets ws's settings in the environment: $ATL_WORKSPACE to ws.Dir,
 // and each setting's variable unless the user set it. A variable atl set
 // itself (see AtlSet), for this workspace or another, is not the user's:
 // it is set anew from ws. What it sets it records, with a hash of each
-// value, in $ATL_WORKSPACE_VARS.
+// value, in $ATL_WORKSPACE_VARS, $ATL_WORKSPACE too (so that an atl it
+// starts can tell the value from one the user set, see UserVar).
 func Apply(ws *Workspace, by string) (*Applied, error) {
 	OriginalEnv() // take the snapshot first
-	a := &Applied{Workspace: ws, By: by, restore: map[string]*string{}}
+	a := &Applied{Workspace: ws, By: by, UserVar: UserEnv(Var) != "", restore: map[string]*string{}}
 	var rec []string
 	for _, s := range ws.Settings {
 		if cur := os.Getenv(s.Var); cur != "" && !AtlSet(s.Var) {
@@ -202,6 +220,7 @@ func Apply(ws *Workspace, by string) (*Applied, error) {
 	if err := a.set(Var, ws.Dir); err != nil {
 		return a, err
 	}
+	rec = append(rec, Var+"="+valueHash(ws.Dir))
 	if err := a.set(VarsVar, strings.Join(rec, ",")); err != nil {
 		return a, err
 	}

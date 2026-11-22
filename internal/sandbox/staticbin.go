@@ -10,7 +10,10 @@ import (
 
 // BuildStatic is how to build atl as a static Linux binary, the only kind
 // that runs in every task container (InstallBin copies it there).
-const BuildStatic = "CGO_ENABLED=0 go build -o ~/.local/bin/atl ./cmd/atl"
+// -buildmode=exe overrides a GOFLAGS=-buildmode=pie (some distributions set
+// it): a position-independent executable needs the system's program
+// interpreter, which an image need not have (alpine's is musl's).
+const BuildStatic = "CGO_ENABLED=0 go build -buildmode=exe -o ~/.local/bin/atl ./cmd/atl"
 
 // CheckStaticBin returns nil if path is an ELF executable that needs
 // nothing from the system to run: no program interpreter (PT_INTERP) and no
@@ -36,7 +39,7 @@ func CheckStaticBin(path string) error {
 	}
 	for _, p := range f.Progs {
 		if p.Type == elf.PT_INTERP {
-			return fmt.Errorf("%s is dynamically linked (it needs a program interpreter)", path)
+			return fmt.Errorf("%s is dynamically linked (it needs a program interpreter: built with cgo, or as a position-independent executable, e.g. with GOFLAGS=-buildmode=pie)", path)
 		}
 	}
 	libs, err := f.ImportedLibraries()

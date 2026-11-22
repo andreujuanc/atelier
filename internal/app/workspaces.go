@@ -51,6 +51,9 @@ type WorkspaceInfo struct {
 	OpenTasks int
 	Waiting   int
 	Err       error // its database could not be read
+	// HasDB is true when it has a database (data/atelier.db): without
+	// atelier.toml, a devcontainer box's workspace (see workspace.HasDB).
+	HasDB bool
 }
 
 // ListWorkspaces returns the directories under root (workspace.List), each
@@ -62,7 +65,7 @@ func ListWorkspaces(ctx context.Context, root string) ([]WorkspaceInfo, error) {
 	}
 	out := make([]WorkspaceInfo, 0, len(entries))
 	for _, e := range entries {
-		w := WorkspaceInfo{Entry: e}
+		w := WorkspaceInfo{Entry: e, HasDB: workspace.HasDB(e.Dir)}
 		if e.Workspace {
 			w.OpenTasks, w.Waiting, w.Err = WorkspaceCounts(ctx, e.Dir)
 		}
@@ -171,8 +174,9 @@ func (a *App) workspaceName() string {
 
 // slugTaken reports, for a new task with repos, whether slug is taken
 // outside the database: something is at its task dir, or branch
-// atl/<slug> exists in the canonical clone of one of its rw repos, locally
-// or on origin as last fetched.
+// atl/<slug>, or one below it (atl/<slug>/x, which keeps git from creating
+// atl/<slug>), exists in the canonical clone of one of its rw repos,
+// locally or on origin as last fetched.
 func (a *App) slugTaken(ctx context.Context, repos []model.TaskRepo) func(string) (bool, error) {
 	return func(slug string) (bool, error) {
 		if _, err := os.Lstat(a.Paths.TaskDir(slug)); err == nil {
@@ -185,7 +189,7 @@ func (a *App) slugTaken(ctx context.Context, repos []model.TaskRepo) func(string
 				continue
 			}
 			for _, ref := range []string{"refs/heads/atl/" + slug, "refs/remotes/origin/atl/" + slug} {
-				ok, err := gitx.RefExists(ctx, a.Paths.RepoPath(r.Name), ref)
+				ok, err := gitx.RefOrBelowExists(ctx, a.Paths.RepoPath(r.Name), ref)
 				if err != nil {
 					return false, fmt.Errorf("repo %s: %w", r.Name, err)
 				}
@@ -198,9 +202,13 @@ func (a *App) slugTaken(ctx context.Context, repos []model.TaskRepo) func(string
 	}
 }
 
-// checkPortOffsets warns about each open task of this workspace whose port
-// offset an open task of another workspace has too (see
-// otherWorkspaceTasks), and about other workspaces it could not read.
+// checkPortOffsets warns about open tasks of this workspace that share a
+// port offset (a reopened task keeps its old one), about each open task of
+// this workspace whose port offset an open task of another workspace has
+// too (see otherWorkspaceTasks), and about other workspaces it could not
+// read. Run where $ATL_WORKSPACE is the user's (a devcontainer box, which
+// sees only its own workspace) with no other workspace read, it says that
+// the other workspaces' offsets were not checked.
 func (a *App) checkPortOffsets(ctx context.Context) Check {
 	const name = "port offsets"
 	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
@@ -221,13 +229,31 @@ func (a *App) checkPortOffsets(ctx context.Context) Check {
 		return mine[i].Slug < mine[j].Slug
 	})
 	self := a.workspaceName()
-	var clashes []string
+	var own, clashes []string
+	for i := 0; i < len(mine); {
+		j := i + 1
+		for j < len(mine) && mine[j].PortOffset == mine[i].PortOffset {
+			j++
+		}
+		if j-i > 1 {
+			var slugs []string
+			for _, t := range mine[i:j] {
+				slugs = append(slugs, self+"/"+t.Slug)
+			}
+			own = append(own, fmt.Sprintf("%s (+%d)", strings.Join(slugs, " and "), mine[i].PortOffset))
+		}
+		i = j
+	}
 	for _, t := range mine {
 		for _, o := range byOffset[t.PortOffset] {
 			clashes = append(clashes, fmt.Sprintf("%s/%s and %s/%s (+%d)", self, t.Slug, o.Workspace, o.Slug, t.PortOffset))
 		}
 	}
 	var parts []string
+	if len(own) > 0 {
+		parts = append(parts, "open tasks of this workspace have the same port offset (a reopened task keeps its old one), so their ports collide while both run: "+
+			strings.Join(own, "; ")+"; close one of each (a new task gets a free offset)")
+	}
 	if len(clashes) > 0 {
 		parts = append(parts, "open tasks of two workspaces have the same port offset, so their ports collide while both run: "+
 			strings.Join(clashes, "; ")+"; close one of each pair (new tasks avoid both offsets)")
@@ -236,5 +262,10 @@ func (a *App) checkPortOffsets(ctx context.Context) Check {
 	if len(parts) > 0 {
 		return warn(name, strings.Join(parts, "; "))
 	}
-	return pass(name, fmt.Sprintf("no open task shares its offset with one of another workspace (%d other workspaces read)", others.Read))
+	detail := fmt.Sprintf("no two open tasks share an offset, in this workspace or with one of another workspace (%d other workspaces read)", others.Read)
+	if others.Read == 0 && a.Workspace != nil && a.Workspace.UserVar {
+		detail += "; $" + workspace.Var + " comes from the environment (a devcontainer box?), where the other workspaces of this host " +
+			"may not be under $" + workspace.RootVar + ": their offsets are not checked, nor avoided by new tasks"
+	}
+	return pass(name, detail)
 }

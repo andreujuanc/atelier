@@ -16,7 +16,7 @@ func TestTmuxConfig(t *testing.T) {
 	setup(t)
 	conf := filepath.Join(os.Getenv("ATL_WORKSPACE"), "state", "tmux.conf")
 	_, out, _ := atl(t, "doctor")
-	if b, err := os.ReadFile(conf); err != nil || string(b) != tmux.ServerConfig {
+	if b, err := os.ReadFile(conf); err != nil || string(b) != tmux.ServerConfigWith(filepath.Join(os.Getenv("ATL_WORKSPACE"), "tmux.conf")) {
 		t.Fatalf("%s: %q, %v", conf, b, err)
 	}
 	if !strings.Contains(out, "tmux server") || !strings.Contains(out, "-L "+os.Getenv("ATL_TMUX_SOCKET")+", not running: atl starts it with "+conf) {

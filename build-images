@@ -7,15 +7,32 @@
 #   ATL_BOX_IMAGE      name of the box image  (default atelier)
 #   ATL_SANDBOX_IMAGE  name of the task image (default atelier-task; atl reads
 #                      the same variable for the image of task containers)
+#   ATL_BUILD_BOX      0: build only the task image (atl on the host needs
+#                      nothing else); default 1
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 box=${ATL_BOX_IMAGE:-atelier}
 task=${ATL_SANDBOX_IMAGE:-atelier-task}
+build_box=${ATL_BUILD_BOX:-1}
 user=$(id -un)
 uid=$(id -u)
 gid=$(id -g)
 
-docker build -t "$box" --build-arg USERNAME="$user" --build-arg UID="$uid" --build-arg GID="$gid" "$@" "$here"
+case $build_box in
+0 | 1) ;;
+*)
+	echo "build-images: ATL_BUILD_BOX must be 0 or 1, not '$build_box'" >&2
+	exit 2
+	;;
+esac
+
+if [ "$build_box" = 1 ]; then
+	docker build -t "$box" --build-arg USERNAME="$user" --build-arg UID="$uid" --build-arg GID="$gid" "$@" "$here"
+fi
 docker build --target task -t "$task" --build-arg USERNAME="$user" --build-arg UID="$uid" --build-arg GID="$gid" "$@" "$here"
 
-echo "built $box (box) and $task (task image)"
+if [ "$build_box" = 1 ]; then
+	echo "built $box (box) and $task (task image)"
+else
+	echo "built $task (task image)"
+fi

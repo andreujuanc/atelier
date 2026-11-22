@@ -2471,23 +2471,64 @@ func TestSelectedRowSeparator(t *testing.T) {
 func TestLegend(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks()}
 	m, _ := newTest(t, fb)
+	keys := strings.Split(listKeys, "  ")
+	// Wide enough for the keys and the whole legend: one line.
 	m.Update(tea.WindowSizeMsg{Width: 220, Height: 30})
 	lines := strings.Split(plainView(m), "\n")
-	if help := lines[len(lines)-1]; !strings.Contains(help, "● waiting/running/idle  ○ stopped  * uncommitted") || ansi.StringWidth(help) > 220 {
+	if help := lines[len(lines)-1]; !strings.HasPrefix(help, listKeys) || !strings.Contains(help, "● waiting/running/idle  ○ stopped  * uncommitted") ||
+		ansi.StringWidth(help) > 220 || len(lines) != 30 {
 		t.Fatalf("wide help %q", help)
 	}
-	// just too narrow for the stopped mark: the short legend
+	// Just too narrow for the stopped mark: the short legend.
 	m.Update(tea.WindowSizeMsg{Width: ansi.StringWidth(lines[len(lines)-1]) - 1, Height: 30})
 	lines = strings.Split(plainView(m), "\n")
 	if help := lines[len(lines)-1]; !strings.Contains(help, "● waiting/running/idle  * uncommitted") || strings.Contains(help, "stopped") {
 		t.Fatalf("short legend %q", help)
 	}
-	for _, w := range []int{120, 80, 30} {
-		m.Update(tea.WindowSizeMsg{Width: w, Height: 30})
+	// 120 and 80 columns: the keys wrap onto a second line, every one of
+	// them shown; the legend follows when it fits.
+	for _, c := range []struct {
+		w      int
+		legend string
+	}{{120, "● waiting/running/idle  ○ stopped  * uncommitted"}, {80, ""}} {
+		m.Update(tea.WindowSizeMsg{Width: c.w, Height: 30})
 		lines = strings.Split(plainView(m), "\n")
-		if help := lines[len(lines)-1]; strings.Contains(help, "uncommitted") {
-			t.Fatalf("legend at width %d: %q", w, help)
+		if len(lines) != 30 {
+			t.Fatalf("width %d: %d lines", c.w, len(lines))
 		}
+		help := lines[len(lines)-2:]
+		for _, l := range help {
+			if ansi.StringWidth(l) > c.w || strings.Contains(l, "…") {
+				t.Fatalf("width %d: help line %q", c.w, l)
+			}
+		}
+		joined := strings.TrimRight(help[0], " ") + "  " + help[1]
+		if !strings.HasPrefix(joined, listKeys) {
+			t.Fatalf("width %d: keys %q", c.w, help)
+		}
+		for _, k := range keys {
+			if !strings.Contains(help[0], k) && !strings.Contains(help[1], k) {
+				t.Errorf("width %d: %q not shown: %q", c.w, k, help)
+			}
+		}
+		if c.legend != "" && !strings.HasSuffix(help[1], c.legend) {
+			t.Errorf("width %d: no legend: %q", c.w, help)
+		}
+		if c.legend == "" && strings.Contains(help[1], "uncommitted") {
+			t.Errorf("width %d: legend that does not fit: %q", c.w, help)
+		}
+	}
+	// Narrower still: two lines, the second truncated; a short terminal:
+	// one line.
+	m.Update(tea.WindowSizeMsg{Width: 30, Height: 30})
+	lines = strings.Split(plainView(m), "\n")
+	if l := lines[len(lines)-1]; !strings.HasSuffix(l, "…") || ansi.StringWidth(l) > 30 || !strings.HasPrefix(lines[len(lines)-2], "n new  enter open") {
+		t.Fatalf("width 30: %q", lines[len(lines)-2:])
+	}
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 7})
+	lines = strings.Split(plainView(m), "\n")
+	if len(lines) != 7 || !strings.HasPrefix(lines[6], "n new") || strings.HasPrefix(lines[5], "n new") || !strings.HasSuffix(lines[6], "…") {
+		t.Fatalf("height 7: %q", lines)
 	}
 }
 

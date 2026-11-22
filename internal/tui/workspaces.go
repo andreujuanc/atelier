@@ -260,6 +260,10 @@ func (m *WorkspacePicker) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.setStatus("no workspace selected", false)
 			return nil
 		}
+		if !r.Workspace && r.HasDB {
+			m.setStatus(m.adoptDBHint(r), true)
+			return nil
+		}
 		if !r.Workspace {
 			m.mode, m.adopt = wsAdopt, r.Name
 			m.setStatus("", false)
@@ -310,7 +314,8 @@ func (m *WorkspacePicker) newKey(msg tea.KeyMsg) tea.Cmd {
 			m.setStatus(err.Error(), true)
 			return nil
 		}
-		return m.create(name, false)
+		r := m.row(name)
+		return m.create(name, r != nil && !r.Workspace)
 	}
 	m.setStatus("", false)
 	var cmd tea.Cmd
@@ -329,8 +334,18 @@ func (m *WorkspacePicker) checkNew(name string) error {
 	}
 	if r := m.row(name); r != nil && r.Workspace {
 		return fmt.Errorf("workspace %s already exists", name)
+	} else if r != nil && r.HasDB {
+		return errors.New(m.adoptDBHint(r))
 	}
 	return nil
+}
+
+// adoptDBHint is why the selector does not adopt r, a directory without
+// atelier.toml that has a database (a box's workspace), and how to adopt
+// it: with its repos, which the selector does not ask for.
+func (m *WorkspacePicker) adoptDBHint(r *app.WorkspaceInfo) string {
+	return m.abbrev(r.Dir) + " has a database (a box's workspace?): adopt it with `atl workspace new " + r.Name +
+		" --repos DIR [--mount PATH]...` (README: Moving from a devcontainer box)"
 }
 
 func (m *WorkspacePicker) row(name string) *app.WorkspaceInfo {

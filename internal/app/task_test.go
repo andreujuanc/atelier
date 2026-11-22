@@ -303,12 +303,15 @@ func TestNewTaskRollback(t *testing.T) {
 		t.Fatalf("no-origin err = %v", err)
 	}
 
-	// The second worktree cannot be created (branch atl/roll-back/x is in
-	// the way of its branch; an existing atl/roll-back would only change the
-	// slug):
-	// the first worktree, its branch, the task dir and the row are undone.
-	git(t, e.canonical("web"), "branch", "atl/roll-back/x")
+	// The second worktree cannot be created (its checkout fails: a blob is
+	// unreadable; a branch in the way of atl/roll-back would only change
+	// the slug): the worktrees, their branches, the task dir and the row
+	// are undone.
+	web := e.canonical("web")
+	git(t, web, "branch", "keep-me")
+	restore := breakCheckout(t, web, "origin/main:README")
 	_, err := e.app.NewTask(ctx, opts)
+	restore()
 	if err == nil || !strings.Contains(err.Error(), "web") {
 		t.Fatalf("err = %v", err)
 	}
@@ -324,12 +327,17 @@ func TestNewTaskRollback(t *testing.T) {
 	if out, err := exec.Command("git", "-C", e.canonical("api"), "rev-parse", "--verify", "-q", "refs/heads/atl/roll-back").CombinedOutput(); err == nil {
 		t.Fatalf("branch left in api: %s", out)
 	}
-	if git(t, e.canonical("web"), "rev-parse", "--verify", "refs/heads/atl/roll-back/x") == "" {
+	if n := worktreeCount(t, web); n != 1 {
+		t.Fatalf("web has %d worktrees after rollback", n)
+	}
+	if out, err := exec.Command("git", "-C", web, "rev-parse", "--verify", "-q", "refs/heads/atl/roll-back").CombinedOutput(); err == nil {
+		t.Fatalf("branch left in web: %s", out)
+	}
+	if git(t, web, "rev-parse", "--verify", "refs/heads/keep-me") == "" {
 		t.Fatal("pre-existing branch in web must not be deleted")
 	}
 
-	// Once the conflict is gone the same slug works.
-	git(t, e.canonical("web"), "branch", "-D", "atl/roll-back/x")
+	// Once the checkout works the same slug works.
 	task, err := e.app.NewTask(ctx, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -469,6 +477,23 @@ func TestNewTaskBranchExists(t *testing.T) {
 	}
 	if task.Slug != "ro-only" {
 		t.Fatalf("slug %s, want ro-only", task.Slug)
+	}
+
+	// A branch below atl/<slug> (atl/<slug>/x) keeps git from creating
+	// atl/<slug>: taken too, locally or on origin.
+	git(t, lib, "branch", "atl/under/x")
+	git(t, e.seed("api"), "push", "-q", "origin", "HEAD:refs/heads/atl/far/y")
+	for _, c := range []struct{ title, repo, want string }{{"Under", "lib", "under-2"}, {"Far", "api", "far-2"}} {
+		task, err := e.app.NewTask(ctx, NewTaskOpts{Title: c.title, Repos: []RepoArg{{c.repo, model.ModeRW}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if task.Slug != c.want {
+			t.Fatalf("slug %s, want %s", task.Slug, c.want)
+		}
+	}
+	if git(t, lib, "rev-parse", "--verify", "refs/heads/atl/under/x") == "" {
+		t.Fatal("atl/under/x gone")
 	}
 }
 

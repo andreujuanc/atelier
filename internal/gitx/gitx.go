@@ -804,6 +804,24 @@ func LastCommit(ctx context.Context, worktree string) (sha, subject string, when
 	return parts[0], parts[2], time.Unix(secs, 0).UTC(), nil
 }
 
+// RefOrBelowExists reports whether the fully qualified ref (e.g.
+// "refs/heads/atl/x"), or a ref below it as a directory ("refs/heads/atl/x/y",
+// which keeps git from creating ref), exists in repo. It never touches the
+// network. ref must not contain glob characters (for-each-ref would take it
+// for a pattern).
+func RefOrBelowExists(ctx context.Context, repo, ref string) (bool, error) {
+	if strings.ContainsAny(ref, "*?[\\") || !strings.HasPrefix(ref, "refs/") {
+		return false, fmt.Errorf("git for-each-ref: not a plain ref %q", ref)
+	}
+	// A pattern without glob characters matches the ref itself and every
+	// ref below it ("up to a slash"), not refs/heads/atl/x-2.
+	out, err := run(ctx, repo, "for-each-ref", "--count=1", "--format=%(refname)", "--", ref)
+	if err != nil {
+		return false, err
+	}
+	return out != "", nil
+}
+
 // RefExists reports whether the fully qualified ref (e.g.
 // "refs/remotes/origin/atl/x") exists in repo. It never touches the
 // network.

@@ -53,10 +53,15 @@ func FillFromEnv(c *Config) {
 // the current directory); a repos directory inside the workspace is written
 // relative to it, and left out when it is the default.
 //
-// Adopting a directory that has a database while $ATL_TMUX_SOCKET is not
-// the user's, it writes tmux_socket = "default": the atl that used it ran
-// its sessions on tmux's default server, and on atl-<name> it would not
-// see them, so it would take them for stopped and end them.
+// A directory that has a database (data/atelier.db) was a devcontainer
+// box's workspace. Adopted inside that box (the user's $ATL_WORKSPACE is
+// that directory) while $ATL_TMUX_SOCKET is not the user's, it writes
+// tmux_socket = "default": the box's atl ran its sessions on tmux's
+// default server, and on atl-<name> it would not see them, so it would
+// take them for stopped and end them. Anywhere else (on the host) it needs
+// c.Repos, the box's canonical clones, and refuses without them (an
+// *AdoptDBError): the defaults would leave the box's repos and mounts
+// behind.
 //
 // It returns the workspace directory and notes on what it decided.
 func Create(root, name string, c Config) (string, []string, error) {
@@ -71,6 +76,15 @@ func Create(root, name string, c Config) (string, []string, error) {
 		return "", nil, fmt.Errorf("workspace %s already exists (it has %s)", dir, File)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", nil, err
+	}
+	keepTmux := false
+	if HasDB(dir) {
+		switch {
+		case inBoxOf(root, dir):
+			keepTmux = c.TmuxSocket == "" && UserEnv("ATL_TMUX_SOCKET") == ""
+		case strings.TrimSpace(c.Repos) == "":
+			return "", nil, &AdoptDBError{Name: name, Dir: dir}
+		}
 	}
 	home, _ := os.UserHomeDir()
 	repos := filepath.Join(dir, "repos")
@@ -108,7 +122,6 @@ func Create(root, name string, c Config) (string, []string, error) {
 		}
 	}
 	var notes []string
-	keepTmux := c.TmuxSocket == "" && UserEnv("ATL_TMUX_SOCKET") == "" && isFile(filepath.Join(dir, "data", "atelier.db"))
 	if keepTmux {
 		c.TmuxSocket = "default"
 		notes = append(notes, "tmux_socket = \"default\": "+dir+" already has a database, whose sessions run on tmux's default server; "+
@@ -147,6 +160,44 @@ func Create(root, name string, c Config) (string, []string, error) {
 		return "", nil, err
 	}
 	return dir, notes, f.Close()
+}
+
+// HasDB reports whether dir has a database (data/atelier.db), as the
+// workspace of a devcontainer box does.
+func HasDB(dir string) bool { return isFile(filepath.Join(dir, "data", "atelier.db")) }
+
+// inBoxOf reports whether atl runs in the box of the workspace in dir: the
+// user's $ATL_WORKSPACE (not one atl set, see AtlSet) is dir.
+func inBoxOf(root, dir string) bool {
+	v := UserEnv(Var)
+	if v == "" {
+		return false
+	}
+	sel, err := byNameOrPath(root, v, ByEnv)
+	if err != nil {
+		return false
+	}
+	if filepath.Clean(sel.Dir) == filepath.Clean(dir) {
+		return true
+	}
+	a, err1 := os.Stat(sel.Dir)
+	b, err2 := os.Stat(dir)
+	return err1 == nil && err2 == nil && os.SameFile(a, b)
+}
+
+// AdoptDBError is Create's refusal to adopt a directory with a database
+// (a devcontainer box's workspace) without knowing its repos.
+type AdoptDBError struct{ Name, Dir string }
+
+func (e *AdoptDBError) Error() string {
+	return fmt.Sprintf("%s has a database (a devcontainer box's workspace?): adopt it with %s, giving the box's repos and mounts "+
+		"(see \"Moving from a devcontainer box\" in atelier's README)", e.Dir, adoptCommand(e.Dir))
+}
+
+// adoptCommand is the `atl workspace new` command line that adopts dir, a
+// box's workspace.
+func adoptCommand(dir string) string {
+	return strings.TrimSuffix(newCommand(dir), "`") + " --repos DIR [--mount PATH]...`"
 }
 
 // tmuxDefaultComment precedes the tmux_socket = "default" Create writes

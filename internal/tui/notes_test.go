@@ -36,7 +36,7 @@ func TestNotesArea(t *testing.T) {
 	m, _ := newTest(t, fb)
 	selectTask(t, m, "alpha")
 	v := checkView(t, m, 120, 40)
-	if !strings.Contains(v, "m edit notes") {
+	if !strings.Contains(v, "m notes") {
 		t.Fatalf("help lacks m:\n%s", v)
 	}
 	sess := strings.Index(v, "Sessions")

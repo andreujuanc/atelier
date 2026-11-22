@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +18,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
+	"github.com/andreujuanc/atelier/internal/tmux"
 	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
@@ -443,7 +443,7 @@ func (a *App) checkTmuxServer(ctx context.Context) []Check {
 		return []Check{warn(name, sock+": cannot tell which config it runs with: "+err.Error())}
 	case !running:
 		return []Check{pass(name, sock+", not running: atl starts it with "+conf)}
-	case slices.Contains(files, conf):
+	case tmux.ConfigListed(files, conf):
 		return []Check{pass(name, sock+", running with "+conf)}
 	}
 	return []Check{warn(name, sock+" runs without "+conf+" (started before atl wrote it, or by hand): "+

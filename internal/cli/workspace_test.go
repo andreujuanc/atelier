@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -311,17 +313,24 @@ func TestWorkspaceSettings(t *testing.T) {
 	}
 }
 
-// TestWorkspaceAdoptTmux: adopting a directory that has a database while
-// $ATL_TMUX_SOCKET is unset keeps its sessions on tmux's default server.
+// TestWorkspaceAdoptTmux: adopting a directory that has a database (a
+// box's workspace). In that box ($ATL_WORKSPACE is the directory) while
+// $ATL_TMUX_SOCKET is unset it keeps the sessions on tmux's default
+// server; on the host it needs the repos and refuses without them.
 func TestWorkspaceAdoptTmux(t *testing.T) {
 	_, wsRoot := wsEnv(t)
-	old := filepath.Join(wsRoot, "old")
-	if err := os.MkdirAll(filepath.Join(old, "data"), 0o755); err != nil {
-		t.Fatal(err)
+	mkdb := func(name string) string {
+		dir := filepath.Join(wsRoot, name)
+		if err := os.MkdirAll(filepath.Join(dir, "data"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "data", "atelier.db"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
 	}
-	if err := os.WriteFile(filepath.Join(old, "data", "atelier.db"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	old := mkdb("old")
+	t.Setenv("ATL_WORKSPACE", old)
 	code, _, errs := atl(t, "workspace", "new", "old")
 	if code != 0 || !strings.Contains(errs, `atl: note: tmux_socket = "default"`) {
 		t.Fatalf("new old: %d %q", code, errs)
@@ -334,6 +343,37 @@ func TestWorkspaceAdoptTmux(t *testing.T) {
 	if d := doctorDetail(out, "tmux_socket"); d != "$ATL_TMUX_SOCKET = default (atelier.toml)" {
 		t.Errorf("tmux_socket %q", d)
 	}
+	t.Setenv("ATL_WORKSPACE", "")
+
+	// On the host: refused without the repos, nothing written.
+	host := mkdb("host")
+	code, out, errs = atl(t, "workspace", "new", "host")
+	if code != exitErr || out != "" || !strings.Contains(errs, "atl workspace new host --repos DIR [--mount PATH]...") ||
+		!strings.Contains(errs, "Moving from a devcontainer box") {
+		t.Errorf("new host, no repos: %d %q %q", code, out, errs)
+	}
+	for _, p := range []string{"atelier.toml", "repos"} {
+		if _, err := os.Stat(filepath.Join(host, p)); err == nil {
+			t.Errorf("refused adoption made %s", p)
+		}
+	}
+	repos := filepath.Join(wsRoot, "..", "box-repos")
+	if code, _, errs := atl(t, "workspace", "new", "host", "--repos", repos, "--mount", "/etc/hosts"); code != 0 || errs != "" {
+		t.Fatalf("new host --repos: %d %q", code, errs)
+	}
+	toml, _ := os.ReadFile(filepath.Join(host, "atelier.toml"))
+	if strings.Contains(string(toml), "tmux_socket") || !strings.Contains(string(toml), `repos = "`+filepath.Clean(repos)+`"`) ||
+		!strings.Contains(string(toml), `mounts = ["/etc/hosts"]`) {
+		t.Errorf("host atelier.toml:\n%s", toml)
+	}
+	// $ATL_REPOS set by the user counts as given.
+	mkdb("host2")
+	t.Setenv("ATL_REPOS", repos)
+	if code, _, errs := atl(t, "workspace", "new", "host2"); code != 0 || errs != "" {
+		t.Errorf("new host2 with $ATL_REPOS: %d %q", code, errs)
+	}
+	t.Setenv("ATL_REPOS", "")
+
 	// A new workspace (no database) gets its own server.
 	if code, _, errs := atl(t, "workspace", "new", "fresh"); code != 0 || errs != "" {
 		t.Errorf("new fresh: %d %q", code, errs)
@@ -412,6 +452,11 @@ func TestReexec(t *testing.T) {
 	}
 	t.Setenv("ATL_BIN", "/opt/atl")
 
+	// The snapshot is taken at the first Apply of the process: forget the
+	// one an earlier test took.
+	workspace.ResetOriginalEnv()
+	t.Cleanup(workspace.ResetOriginalEnv)
+	before := os.Environ()
 	ws, err := workspace.Load(filepath.Join(wsRoot, "a"))
 	if err != nil {
 		t.Fatal(err)
@@ -421,6 +466,9 @@ func TestReexec(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ap.Undo()
+	if os.Getenv("ATL_WORKSPACE") != ws.Dir {
+		t.Fatalf("not applied: $ATL_WORKSPACE = %q", os.Getenv("ATL_WORKSPACE"))
+	}
 	c := &cli{}
 	if err := c.openChosen("beta"); err != nil {
 		t.Fatal(err)
@@ -428,17 +476,39 @@ func TestReexec(t *testing.T) {
 	if gotBin != "/opt/atl" || strings.Join(gotArgv, " ") != "/opt/atl --workspace beta" {
 		t.Errorf("exec %q %q", gotBin, gotArgv)
 	}
-	for _, kv := range gotEnv {
-		if kv == "ATL_WORKSPACE="+ws.Dir {
-			t.Errorf("the applied workspace leaked into the environment: %s", kv)
-		}
-	}
-	if len(gotEnv) == 0 {
-		t.Error("empty environment")
+	if !slices.Equal(gotEnv, before) {
+		t.Errorf("exec environment is not the one before Apply:\n got %q\nwant %q", gotEnv, before)
 	}
 
 	execProcess = func(string, []string, []string) error { return os.ErrPermission }
 	if err := c.reexec("workspace", "open"); err == nil || !strings.Contains(err.Error(), "run /opt/atl workspace open") {
 		t.Errorf("failed exec: %v", err)
+	}
+}
+
+// TestSelectorAdoptable: the selector's Create refuses a directory without
+// atelier.toml that has a database, even in that directory's box.
+func TestSelectorAdoptable(t *testing.T) {
+	_, wsRoot := wsEnv(t)
+	box := filepath.Join(wsRoot, "box")
+	if err := os.MkdirAll(filepath.Join(box, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(box, "data", "atelier.db"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ATL_WORKSPACE", box)
+	var ae *workspace.AdoptDBError
+	if err := selectorAdoptable(wsRoot, "box"); !errors.As(err, &ae) || ae.Dir != box {
+		t.Errorf("box: %v", err)
+	}
+	if err := selectorAdoptable(wsRoot, "new"); err != nil {
+		t.Errorf("new: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(box, "atelier.toml"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := selectorAdoptable(wsRoot, "box"); err != nil {
+		t.Errorf("a workspace already: %v", err)
 	}
 }

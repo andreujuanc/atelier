@@ -93,7 +93,7 @@ func TestDoctorTmuxServer(t *testing.T) {
 		return checks[0]
 	}
 	c := e.app.Tmux
-	if err := c.UseConfig(e.app.Paths.TmuxConf()); err != nil {
+	if err := c.UseConfig(e.app.Paths.TmuxConf(), e.app.Paths.UserTmuxConf()); err != nil {
 		t.Fatal(err)
 	}
 	if ch := one(); !ch.Warn || !strings.Contains(ch.Detail, "-L "+c.Socket+" runs without "+e.app.Paths.TmuxConf()) {
@@ -122,12 +122,13 @@ func TestDoctorTmuxServer(t *testing.T) {
 func TestNewTmux(t *testing.T) {
 	root := t.TempDir()
 	paths := pathsUnder(root)
+	paths.Workspace = root // its tmux.conf is sourced last
 	t.Setenv("ATL_TMUX_SOCKET", "atl-x")
 	var out bytes.Buffer
 	if c := NewTmux(paths, &out); c.Config() != paths.TmuxConf() || out.Len() != 0 {
 		t.Errorf("config %q, out %q", c.Config(), out.String())
 	}
-	if b, err := os.ReadFile(paths.TmuxConf()); err != nil || string(b) != tmux.ServerConfig {
+	if b, err := os.ReadFile(paths.TmuxConf()); err != nil || string(b) != tmux.ServerConfigWith(filepath.Join(root, "tmux.conf")) {
 		t.Errorf("%s: %q, %v", paths.TmuxConf(), b, err)
 	}
 

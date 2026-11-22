@@ -87,7 +87,7 @@ func TestCheckStaticBin(t *testing.T) {
 		}
 	}
 	for name, want := range map[string]string{
-		"interp":  "is dynamically linked (it needs a program interpreter)",
+		"interp":  "is dynamically linked (it needs a program interpreter: built with cgo, or as a position-independent executable, e.g. with GOFLAGS=-buildmode=pie)",
 		"needed":  "is dynamically linked (it needs libc.so.6)",
 		"object":  "is not an executable",
 		"script":  "is not a Linux (ELF) binary",

@@ -8,35 +8,40 @@ tracks session state in SQLite via Claude Code hooks.
 Requires git, tmux ≥ 3.2, `claude`, `gh` (for `atl pr`), and Docker with the task image:
 each task's Claude sessions run in the task's own container (the [sandbox](#sandbox), on by
 default). `atl` runs on the host (see [Install on the host](#install-on-the-host)): build
-it with `CGO_ENABLED=0 go build -o ~/.local/bin/atl ./cmd/atl`, build the task image with
-`build-images` (see [Docker image](#docker-image)), create a [workspace](#workspaces) with
-`atl workspace new <name>`, then run `atl doctor` in it.
+it with `CGO_ENABLED=0 go build -buildmode=exe -o ~/.local/bin/atl ./cmd/atl`, build the
+task image with `build-images` (see [Docker image](#docker-image)), create a
+[workspace](#workspaces) with `atl workspace new <name>`, then run `atl doctor` in it.
 
 ## Install on the host
 
 **Requirements.** On a Linux host, on `PATH`: tmux ≥ 3.2, git, `gh` (logged in, for `atl
-pr`), `claude` (Claude Code, logged in), and the Docker CLI with access to the daemon: your
-user in the `docker` group (as the box had it with `--group-add`), or a daemon your user
-owns. Go builds `atl`. Pushing and fetching use your own SSH agent, `~/.ssh` and git
-credentials, as any git on the host does.
+pr`), `claude` (Claude Code, logged in), and the Docker CLI with access to the system's
+Docker daemon: your user in the `docker` group (as the box had it with `--group-add`).
+Rootless Docker and Podman are not supported: the gate forwards a task's Docker requests to
+the daemon whose unix socket `DOCKER_HOST` names (else `/var/run/docker.sock`), not to a
+Docker context, and a rootless daemon maps your user to another UID in containers, so a
+task could not write its bind-mounted worktrees. Go builds `atl`. Pushing and fetching use
+your own SSH agent, `~/.ssh` and git credentials, as any git on the host does.
 
 **Build.** From the checkout:
 
 ```bash
-CGO_ENABLED=0 go build -o ~/.local/bin/atl ./cmd/atl
+CGO_ENABLED=0 go build -buildmode=exe -o ~/.local/bin/atl ./cmd/atl
 ```
 
 `atl` must be a static Linux binary: it is copied into each task's run dir and runs in the
 task's container too (hooks, the status line, `wl-copy`), whatever that container's image
 has. `CGO_ENABLED=0` makes it one; a plain `go build` on a host with a C compiler links
-against the host's C library. `atl doctor` checks the binary (an ELF file with no program
-interpreter and no shared libraries), and starting a sandboxed session with any other (a
-dynamically linked one, or not a Linux binary at all) fails with one line that gives the
-command above.
+against the host's C library. `-buildmode=exe` overrides a `GOFLAGS=-buildmode=pie` (some
+distributions set it): a position-independent build needs the system's program interpreter,
+which an image need not have (alpine's is musl's). `atl doctor` checks the binary (an ELF
+file with no program interpreter and no shared libraries), and starting a sandboxed session
+with any other (a dynamically linked one, a PIE, or not a Linux binary at all) fails with
+one line that gives the command above.
 
 **Task image.** `build-images` (see [Docker image](#docker-image)) builds the task image
 `atelier-task` that task containers run, and the box image, which atl on the host does not
-need (`docker build --target task …`, shown there, builds only the task image).
+need: `ATL_BUILD_BOX=0 build-images` builds only the task image.
 
 **First workspace.**
 
@@ -59,11 +64,15 @@ under [Workspaces](#workspaces)); without one git reads your `~/.gitconfig`.
 there do not last) with what the box's `/etc/tmux.conf` has: no status bar, mouse on,
 `escape-time` 10, **Ctrl-q** bound to detach-client, `default-terminal` `tmux-256color` and
 RGB colour for every terminal (`terminal-features ",*:RGB"`). Neither `/etc/tmux.conf` nor
-your `~/.tmux.conf` is read by that server. tmux reads the file only when the server
+your `~/.tmux.conf` is read by that server. Your own settings for it go in
+`<workspace>/tmux.conf`, a file `atl` never writes: the generated file ends with
+`source-file -q <workspace>/tmux.conf`, so tmux reads it last (its settings win; a missing
+file is no error), e.g. `source-file ~/.tmux.conf` to have your usual config there too
+(keep Ctrl-q free: it returns to the TUI). tmux reads these files only when the server
 starts: one that already runs keeps its options until it restarts (after its last session
-has ended), and `atl doctor` warns when the running server was started without it. With
-`tmux_socket = "default"` `atl` uses tmux's default server, yours, and passes no file: it
-runs with your own config.
+has ended), and `atl doctor` warns when the running server was started without the
+generated file. With `tmux_socket = "default"` `atl` uses tmux's default server, yours, and
+passes no file: it runs with your own config.
 
 ### Moving from a devcontainer box
 
@@ -87,24 +96,35 @@ The tasks, their worktrees, the database and the task containers stay where they
 box used the host's paths, the host's Docker daemon and your user. Steps, for each
 workspace:
 
-1. In the box, run `atl workspace new <name>` once. It adopts `$ATL_WORKSPACES/<name>` (the
-   box's `ATL_WORKSPACE` when that is under `~/atelier/workspaces`), keeping its contents.
-   It writes `atelier.toml` from the box's variables, and `tmux_socket = "default"` with a
-   comment, since the box's sessions run on tmux's default server there. Check the file
-   (for `git_config`, see the table).
-2. Finish or close what runs: let running sessions reach a stopping point, quit `atl`, and
-   stop the box. Its tmux server goes with it; sessions still running in task containers
-   are ended by the next `atl` that notices their windows gone, and can be resumed.
-3. Delete the `tmux_socket` line (with its comment) from `atelier.toml`, so the workspace
-   gets a tmux server of its own, `atl-<name>`. Left in, `atl` on the host would use your
-   own default tmux server.
-4. Run `atl` on the host in the workspace (`atl -w <name>`, or from its directory). `atl
-   open`, Enter in the TUI, or `atl resume` start the stopped sessions again with `claude
+1. In the box, finish or close what runs: let running sessions reach a stopping point (or
+   close the tasks you are done with), quit `atl`, and stop the box. Its tmux server goes
+   with it; sessions still running in task containers are ended by the next `atl` that
+   notices their windows gone, and can be resumed.
+2. On the host, adopt the workspace's directory with the box's settings: `atl workspace new
+   <name> --repos <ATL_REPOS> [--mount <path>]...`, a `--mount` for each path of the box's
+   `ATL_SANDBOX_MOUNTS` (and `--image` for its `ATL_SANDBOX_IMAGE`, if any). It keeps the
+   directory's contents and writes `atelier.toml`; `git_config` needs no line (see the
+   table), and a context the box set goes in by hand (`context`, `[sandbox].context`).
+   Without `--repos` (or `ATL_REPOS` set) it refuses: a directory with a database is a
+   box's workspace, and the default repos, `<workspace>/repos`, would leave the box's
+   clones behind.
+3. Run `atl -w <name>` (or `atl` alone, and pick the workspace in the selector). `atl open`,
+   Enter in the TUI, or `atl resume` start the stopped sessions again with `claude
    --resume`. `atl doctor` should show `$ATL_TMUX_SOCKET = atl-<name> (default)`.
 
-The box keeps working for a workspace that is not moved yet (its variables win over
-`atelier.toml`); do not run `atl` for one workspace in the box and on the host at the same
-time.
+Move all the workspaces of a host together. A box sees only its own workspace under
+`$ATL_WORKSPACES`, so a new task in a box does not avoid the port offsets of the other
+workspaces (on the host, `atl` reads every workspace's database, a box's too), and `atl
+doctor` in a box says that it read no other workspace. While some workspaces still run in a
+box, two tasks can get the same offset; `atl doctor` on the host warns about such pairs.
+
+To upgrade a box in place instead (a box image with this `atl`), run `atl workspace new
+<name>` in the box once: it adopts the directory with the box's variables and, since the
+box's sessions run on tmux's default server, writes `tmux_socket = "default"` with a
+comment. Delete that line (and its comment) when you move the workspace to the host: left
+in, `atl` on the host would use your own default tmux server. The box keeps working for a
+workspace that is not moved yet (its variables win over `atelier.toml`); do not run `atl`
+for one workspace in the box and on the host at the same time.
 
 **Example.** Two workspaces, `personal` and `work`: `work` also gives every task a private npm
 config. Before, `~/atelier/workspaces/work/.devcontainer/devcontainer.json`:
@@ -130,9 +150,10 @@ config. Before, `~/atelier/workspaces/work/.devcontainer/devcontainer.json`:
 }
 ```
 
-`personal`'s is the same with `personal` for `work` and without the npm config. After the steps
-above, the two `atelier.toml` files (`~/` is your home; `atl workspace new` writes the
-absolute paths it found):
+`personal`'s is the same with `personal` for `work` and without the npm config. Step 2 on the host,
+`atl workspace new personal --repos ~/src/personal` and `atl workspace new work --repos
+~/src/work --mount ~/.work.npmrc`, writes these two `atelier.toml` files (`~/` is your
+home; `atl workspace new` writes the absolute paths):
 
 ```toml
 # ~/atelier/workspaces/personal/atelier.toml
@@ -168,11 +189,12 @@ path/to/atelier/build-images
 ```
 
 It builds the checkout it is in, for the user running it: the box image `atelier`, then
-the task image `atelier-task`. It stops at the first failure and prints the two names at
-the end. `ATL_BOX_IMAGE` and `ATL_SANDBOX_IMAGE` (the variable `atl` reads for the task
-image) name them otherwise, e.g. `ATL_BOX_IMAGE=atelier-next build-images` to try a new box
-image beside the one in use. Its arguments go to both `docker build` calls (e.g.
-`build-images --no-cache`). What it runs, in the checkout:
+the task image `atelier-task`. It stops at the first failure and prints the names of what it
+built at the end. `ATL_BOX_IMAGE` and `ATL_SANDBOX_IMAGE` (the variable `atl` reads for the
+task image) name them otherwise, e.g. `ATL_BOX_IMAGE=atelier-next build-images` to try a new box
+image beside the one in use. `ATL_BUILD_BOX=0` builds only the task image (all `atl` on the
+host needs). Its arguments go to both `docker build` calls (e.g. `build-images --no-cache`).
+What it runs, in the checkout (the first command only without `ATL_BUILD_BOX=0`):
 
 ```bash
 docker build -t atelier \
@@ -242,7 +264,7 @@ atl notes fix-login --clear            # clear the notes
 atl assistant [fix-login] # the atelier assistant (one Claude session for all tasks); attach
 atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
 atl cancel fix-login [--force]
-atl doctor                # tools, the workspace and where each setting came from, dirs, database, port offsets shared with another workspace, the tmux server's config, sandbox mode (static atl binary, Docker, image, token); repos whose config atl refuses to run git with
+atl doctor                # tools, the workspace and where each setting came from, dirs, database, port offsets shared by two open tasks (in this workspace or across workspaces), the tmux server's config, sandbox mode (static atl binary, Docker, image, token); repos whose config atl refuses to run git with
 atl token [--paste]       # sandbox: run claude setup-token and store its token for task sessions (see Sandbox)
 atl                       # TUI (on a terminal), in the selected workspace; with none selected, the workspace selector
 atl -w shop ls            # any command in workspace shop (--workspace; else $ATL_WORKSPACE, else the current directory)
@@ -350,9 +372,10 @@ nothing is left). When that slug is taken, the task gets the first free of `<slu
 `<slug>-3`, … (the base cut, without a trailing `-`, so the result stays within 40
 characters). A slug is taken when a task of the workspace has it (open or closed), when
 something is at its task dir `$ATL_TASKS/<slug>` (left as it is), or when branch
-`atl/<slug>` exists in the canonical clone of one of the new task's rw repos, as a local
-branch or as `origin/atl/<slug>` after the fetch (`atl new` never takes over a branch it
-did not make). After that the slug never changes: `atl add` of a rw repo whose canonical
+`atl/<slug>`, or a branch below it such as `atl/<slug>/x` (which keeps git from creating
+`atl/<slug>`), exists in the canonical clone of one of the new task's rw repos, as a local
+branch or under `origin/` after the fetch (`atl new` never takes over a branch it did not
+make). After that the slug never changes: `atl add` of a rw repo whose canonical
 clone already has `atl/<slug>` fails and keeps that branch, and reopening a task (below)
 uses its kept `atl/<slug>` on purpose.
 
@@ -469,6 +492,7 @@ $ATL_WORKSPACES/<name>/
   run/          gate sockets, task Claude dirs, origin pins, the stored Claude token
   repos/        canonical clones (unless repos names another directory)
   gitconfig     optional: the global git config of atl and all it runs
+  tmux.conf     optional: your settings for its tmux server (see Install on the host)
 ```
 
 `atelier.toml` is strict TOML: every key is optional, and an unknown key is an error.
@@ -537,13 +561,14 @@ where it came from: `env`, `atelier.toml` or `default` (a context by its size).
 `atl` never touches your own tmux server. To attach by hand: `tmux -L atl-<name> attach -t
 atl-<slug>`. `tmux_socket = "default"` is tmux's default server, which `atl` used before
 workspaces; sessions running there are not seen from `atl-<name>`, and `atl` would take
-them for stopped and end them. So `atl workspace new` adopting a directory that already
-has a database, while `ATL_TMUX_SOCKET` is not set, writes `tmux_socket = "default"` with
-a comment, and says so: remove that line once no session runs on the old server (e.g.
-when moving `atl` to the host, see
-[Moving from a devcontainer box](#moving-from-a-devcontainer-box)). Opening a task from
-inside a client of another tmux server (another workspace's, or your own) attaches a
-nested client; from inside this workspace's server it switches the client. `atl` starts a
+them for stopped and end them. So `atl workspace new` run in a box, adopting that box's own
+workspace (its `ATL_WORKSPACE`) while `ATL_TMUX_SOCKET` is not set, writes `tmux_socket =
+"default"` with a comment, and says so: remove that line once no session runs on the old
+server (e.g. when moving `atl` to the host, see
+[Moving from a devcontainer box](#moving-from-a-devcontainer-box)). Anywhere else it never
+writes it. Opening a task from inside a client of another tmux server (another
+workspace's, or your own) attaches a nested client; from inside this workspace's server it
+switches the client. `atl` starts a
 server of its own with the settings it writes to `state/tmux.conf`, and tmux's default
 server with your own config (see **tmux settings** under
 [Install on the host](#install-on-the-host)).
@@ -572,9 +597,12 @@ clones of its rw repos (see [Notes](#notes)).
 - `atl workspace new <name> [--repos DIR] [--mount PATH]... [--image IMAGE]`: makes
   `$ATL_WORKSPACES/<name>/` with `atelier.toml`, `tasks/ data/ config/ state/`, and the
   repos dir when it is inside the workspace. A directory that exists without
-  `atelier.toml` is adopted: its contents are kept. It refuses when `atelier.toml` exists,
-  and a name whose task gate sockets (`<workspace>/run/<12 chars>/docker.sock`) would not
-  fit the 107 bytes of a socket path. What the flags do not give is taken from
+  `atelier.toml` is adopted: its contents are kept. One that has a database
+  (`data/atelier.db`, a box's workspace) is adopted with `--repos` (or `$ATL_REPOS`) only,
+  except in that box: the default repos would leave the box's clones behind (see
+  [Moving from a devcontainer box](#moving-from-a-devcontainer-box)). It refuses when
+  `atelier.toml` exists, and a name whose task gate sockets
+  (`<workspace>/run/<12 chars>/docker.sock`) would not fit the 107 bytes of a socket path. What the flags do not give is taken from
   `$ATL_REPOS`, `$ATL_SANDBOX_MOUNTS`, `$ATL_SANDBOX_IMAGE`, `$ATL_SANDBOX_CONTEXT` and
   `$ATL_CONTEXT` when you set them (not when `atl` did, for the workspace it runs in), so
   run in a box it writes the box's settings. Prints the name and the directory.
@@ -592,7 +620,9 @@ on the first. Keys: `↑`/`↓` (`k`/`j`) move, `enter` opens the workspace, `n`
 its name; `enter` creates it as `atl workspace new <name>` does with no flags, and selects
 it), `/` filters by name, `r` reloads the list, `q` or `ctrl+c` quits. `enter` on a directory
 without `atelier.toml` asks whether to adopt it (`y`), as `atl workspace new <name>` does,
-keeping its contents and the `tmux_socket = "default"` rule above. Opening a workspace
+keeping its contents; one that has a database (a box's workspace) is not adopted from the
+selector, by `enter` or `n`, which say to run `atl workspace new <name> --repos DIR
+[--mount PATH]...` instead. Opening a workspace
 replaces the selector with `atl -w <name>`, run in the environment `atl` started with (not
 the one a workspace was applied to), so nothing of one workspace reaches the next. `w` in
 the TUI does the same the other way: once no operation is running, it leaves the TUI and
@@ -642,7 +672,11 @@ is closed, and reopening a task gives it its old one back, even when another ope
 it by then. Two workspaces creating a task at the same moment can still pick the same
 offset; `atl doctor` warns about every open task that has the same offset as an open task
 of another workspace, naming both (`personal/fix-login and work/api-docs (+300)`): close one of
-them (new tasks avoid both offsets).
+them (new tasks avoid both offsets). It also warns about two open tasks of this workspace
+with the same offset (`personal/fix-login and personal/old-task (+300)`, after a reopen). A
+devcontainer box sees only its own workspace under `$ATL_WORKSPACES`, so there the other
+workspaces' offsets are not avoided, and doctor says it read none (see
+[Moving from a devcontainer box](#moving-from-a-devcontainer-box)).
 
 ## Sandbox
 
@@ -731,13 +765,15 @@ which the default image has not), then says it could not and shows the URL.
 in a tmux paste buffer and, with `tmux load-buffer -w`, in the clipboard of the terminal
 attached to the task's tmux session (the one used last, if several are), as Claude Code
 did itself in tmux. As before, that takes a terminal that accepts OSC 52 and that tmux
-knows accepts it (tmux assumes so for `xterm*`; add others to `terminal-features`). With
-no terminal on the task's session, nothing is copied. A copy is at most 1 MiB; the gate
-log gets its time and size, never the text. `wl-copy --primary`, which Claude Code runs
-right after with the same text, copies nothing. Scripts in the task can use `wl-copy` too
-(text on standard input or as arguments, `--trim-newline`). The relay only writes:
-`wl-paste` is refused and nothing in the task reads your clipboard (so pasting an image
-from it into a sandboxed Claude does not work; pasting text with your terminal does).
+knows accepts it (tmux assumes so for `xterm*`; add others to `terminal-features`),
+whatever tmux's `set-clipboard` says: `load-buffer -w` sends the text with it `off` too
+(checked with tmux 3.5a). With no terminal on the task's session, nothing is copied. A
+copy is at most 1 MiB; the gate log gets its time and size, never the text.
+`wl-copy --primary`, which Claude Code runs right after with the same text, copies nothing.
+Scripts in the task can use `wl-copy` too (text on standard input or as arguments,
+`--trim-newline`). The relay only writes: `wl-paste` is refused and nothing in the task
+reads your clipboard (so pasting an image from it into a sandboxed Claude does not work;
+pasting text with your terminal does).
 
 A session that ends normally (Claude exits, the window closes) is ended the same way: what
 it started that still runs in the container (a dev server it put in the background, say)

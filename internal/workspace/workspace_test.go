@@ -311,7 +311,7 @@ func TestApply(t *testing.T) {
 	}
 	for k, want := range map[string]string{
 		Var: alpha, "ATL_REPOS": "/srv/repos", "ATL_CONTEXT": "from file", "ATL_TMUX_SOCKET": "atl-alpha", "ATL_SANDBOX_IMAGE": "img",
-		VarsVar: "ATL_CONTEXT=" + valueHash("from file") + ",ATL_TMUX_SOCKET=" + valueHash("atl-alpha") + ",ATL_SANDBOX_IMAGE=" + valueHash("img"),
+		VarsVar: "ATL_CONTEXT=" + valueHash("from file") + ",ATL_TMUX_SOCKET=" + valueHash("atl-alpha") + ",ATL_SANDBOX_IMAGE=" + valueHash("img") + ",ATL_WORKSPACE=" + valueHash(alpha),
 	} {
 		if got := os.Getenv(k); got != want {
 			t.Errorf("$%s = %q, want %q", k, got, want)
@@ -474,14 +474,15 @@ func TestCreate(t *testing.T) {
 	t.Setenv("ATL_REPOS", "~/src")
 	t.Setenv("ATL_SANDBOX_MOUNTS", "~/.npmrc:/etc/hosts")
 	t.Setenv("ATL_CONTEXT", "box rules\nline 2")
+	t.Setenv(Var, "old") // in old's box: its $ATL_WORKSPACE, by name
 	c := Config{Sandbox: &SandboxConfig{Image: "img"}}
 	FillFromEnv(&c)
 	_, notes, err := Create(root, "old", c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// It had a database and $ATL_TMUX_SOCKET is unset: its sessions stay
-	// on tmux's default server.
+	// It had a database, atl runs in its box and $ATL_TMUX_SOCKET is
+	// unset: its sessions stay on tmux's default server.
 	if len(notes) != 1 || !strings.Contains(notes[0], `tmux_socket = "default"`) {
 		t.Errorf("notes %q", notes)
 	}
@@ -516,6 +517,7 @@ func TestCreate(t *testing.T) {
 
 	// Not with $ATL_TMUX_SOCKET the user's, nor without a database; values
 	// atl set for another workspace are not taken.
+	t.Setenv(Var, filepath.Join(root, "old2")) // in old2's box, by path
 	t.Setenv("ATL_TMUX_SOCKET", "box")
 	t.Setenv("ATL_SANDBOX_IMAGE", "theirs")
 	t.Setenv(VarsVar, "ATL_SANDBOX_IMAGE="+valueHash("theirs")+",ATL_REPOS="+valueHash("~/src"))
@@ -538,6 +540,56 @@ func TestCreate(t *testing.T) {
 	t.Setenv("ATL_TMUX_SOCKET", "")
 	if _, notes, err := Create(root, "old3", Config{}); err != nil || len(notes) != 0 {
 		t.Errorf("old3 (no database): %q %v", notes, err)
+	}
+	t.Setenv(VarsVar, "")
+
+	// On the host (no $ATL_WORKSPACE, or one atl set, or another
+	// directory's), a directory with a database needs its repos: refused
+	// without them, writing nothing; with them adopted on atl-<name>.
+	box := filepath.Join(root, "box")
+	if err := os.MkdirAll(filepath.Join(box, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(box, "data", "atelier.db"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, ws := range []struct{ val, vars string }{
+		{"", ""},
+		{box, Var + "=" + valueHash(box)}, // atl's: an atl child on the host
+		{filepath.Join(root, "old"), ""},  // another box
+	} {
+		t.Setenv(Var, ws.val)
+		t.Setenv(VarsVar, ws.vars)
+		_, _, err := Create(root, "box", Config{})
+		var ae *AdoptDBError
+		if !errors.As(err, &ae) || !strings.Contains(err.Error(), "`atl workspace new box --repos DIR [--mount PATH]...`") ||
+			!strings.Contains(err.Error(), "Moving from a devcontainer box") || strings.Contains(err.Error(), "\n") {
+			t.Errorf("$%s=%q %q: %v", Var, ws.val, ws.vars, err)
+		}
+		for _, p := range []string{File, "repos", "tasks"} {
+			if _, err := os.Stat(filepath.Join(box, p)); err == nil {
+				t.Errorf("refused adoption made %s", p)
+			}
+		}
+	}
+	t.Setenv(VarsVar, "")
+	t.Setenv(Var, "")
+	if _, notes, err := Create(root, "box", Config{Repos: "/srv/box"}); err != nil || len(notes) != 0 {
+		t.Errorf("box with repos: %q %v", notes, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(box, File)); strings.Contains(string(b), "tmux_socket") || !strings.Contains(string(b), `repos = "/srv/box"`) {
+		t.Errorf("box atelier.toml:\n%s", b)
+	}
+	// The default repos dir, given explicitly, counts as given.
+	box2 := filepath.Join(root, "box2")
+	if err := os.MkdirAll(filepath.Join(box2, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(box2, "data", "atelier.db"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Create(root, "box2", Config{Repos: filepath.Join(box2, "repos")}); err != nil {
+		t.Errorf("box2 with its own repos: %v", err)
 	}
 
 	// A repos dir inside the workspace is written relative to it, and made.
@@ -595,5 +647,63 @@ func TestLast(t *testing.T) {
 	}
 	if es, _ := List(root); len(es) != 0 {
 		t.Errorf("listed %v", es)
+	}
+}
+
+// TestApplyUserVar: Applied.UserVar says whether $ATL_WORKSPACE was the
+// user's (a box's), not one atl set; atl records its own value.
+func TestApplyUserVar(t *testing.T) {
+	root := env(t)
+	alpha := mk(t, root, "alpha", "")
+	ws, _ := Load(alpha)
+	a, err := Apply(ws, ByCwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.UserVar || !AtlSet(Var) || UserEnv(Var) != "" {
+		t.Errorf("none set: UserVar %v, AtlSet %v", a.UserVar, AtlSet(Var))
+	}
+	b, err := Apply(ws, ByEnv) // an atl started by atl
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.UserVar {
+		t.Error("atl's own $ATL_WORKSPACE taken for the user's")
+	}
+	b.Undo()
+	a.Undo()
+	t.Setenv(Var, alpha) // a box's
+	c, err := Apply(ws, ByEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Undo()
+	if !c.UserVar {
+		t.Error("the user's $ATL_WORKSPACE not taken for the user's")
+	}
+}
+
+// TestNotWorkspaceBox: selecting a directory without atelier.toml that has
+// a database says to adopt it with its repos, except in its own box.
+func TestNotWorkspaceBox(t *testing.T) {
+	root := env(t)
+	dir := filepath.Join(root, "box")
+	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(dir)
+	var nw *NotWorkspaceError
+	if !errors.As(err, &nw) || strings.Contains(err.Error(), "--repos") {
+		t.Errorf("no database: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "data", "atelier.db"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); !errors.As(err, &nw) || !strings.Contains(err.Error(), "`atl workspace new box --repos DIR [--mount PATH]...`") {
+		t.Errorf("database: %v", err)
+	}
+	t.Setenv(Var, "box")
+	if _, err := Load(dir); !errors.As(err, &nw) || strings.Contains(err.Error(), "--repos") || !strings.Contains(err.Error(), "`atl workspace new box`") {
+		t.Errorf("in its box: %v", err)
 	}
 }

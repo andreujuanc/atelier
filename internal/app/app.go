@@ -101,7 +101,7 @@ func atlBinary() (string, error) {
 // to out and the server starts with tmux's own config.
 func NewTmux(paths config.Paths, out io.Writer) *tmux.Client {
 	c := tmux.New()
-	if err := c.UseConfig(paths.TmuxConf()); err != nil && out != nil {
+	if err := c.UseConfig(paths.TmuxConf(), paths.UserTmuxConf()); err != nil && out != nil {
 		fmt.Fprintf(out, "warning: %v\n", err)
 	}
 	return c

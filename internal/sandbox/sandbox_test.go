@@ -775,3 +775,47 @@ func TestInstallBin(t *testing.T) {
 		t.Errorf("bin has %d entries, want atl and its two links", len(entries))
 	}
 }
+
+// TestBuildImagesScript: build-images builds the box, then the task image,
+// with its arguments passed on; ATL_BUILD_BOX=0 builds only the task image,
+// and another value is refused. A fake docker records the calls.
+func TestBuildImagesScript(t *testing.T) {
+	script, err := filepath.Abs(filepath.Join("..", "..", "build-images"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	log := filepath.Join(bin, "log")
+	fake := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + log + "\n"
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(box string) ([]string, string, error) {
+		os.Remove(log)
+		cmd := exec.Command("sh", script, "--no-cache")
+		cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "ATL_BOX_IMAGE=", "ATL_SANDBOX_IMAGE=", "ATL_BUILD_BOX="+box)
+		out, err := cmd.CombinedOutput()
+		b, _ := os.ReadFile(log)
+		var calls []string
+		for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+			if l != "" {
+				calls = append(calls, l)
+			}
+		}
+		return calls, string(out), err
+	}
+	calls, out, err := run("")
+	if err != nil || len(calls) != 2 || !strings.HasPrefix(calls[0], "build -t atelier ") || !strings.HasPrefix(calls[1], "build --target task -t atelier-task ") ||
+		!strings.Contains(calls[0], " --no-cache ") || !strings.Contains(calls[1], " --no-cache ") || !strings.Contains(out, "built atelier (box) and atelier-task (task image)") {
+		t.Errorf("default: %q %q %v", calls, out, err)
+	}
+	calls, out, err = run("0")
+	if err != nil || len(calls) != 1 || !strings.HasPrefix(calls[0], "build --target task -t atelier-task ") ||
+		strings.TrimSpace(out) != "built atelier-task (task image)" {
+		t.Errorf("ATL_BUILD_BOX=0: %q %q %v", calls, out, err)
+	}
+	calls, out, err = run("no")
+	if err == nil || len(calls) != 0 || !strings.Contains(out, "ATL_BUILD_BOX must be 0 or 1") {
+		t.Errorf("ATL_BUILD_BOX=no: %q %q %v", calls, out, err)
+	}
+}

@@ -192,6 +192,10 @@ type Workspace struct {
 type NotWorkspaceError struct{ Name, Dir string }
 
 func (e *NotWorkspaceError) Error() string {
+	if root, err := Root(); err == nil && HasDB(e.Dir) && !inBoxOf(root, e.Dir) {
+		return fmt.Sprintf("%s is not a workspace (no %s) and has a database (a devcontainer box's workspace?): adopt it with %s, "+
+			"giving the box's repos and mounts (see \"Moving from a devcontainer box\" in atelier's README)", e.Dir, File, adoptCommand(e.Dir))
+	}
 	return fmt.Sprintf("%s is not a workspace (no %s): adopt it with %s", e.Dir, File, newCommand(e.Dir))
 }
 

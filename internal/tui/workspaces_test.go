@@ -396,7 +396,8 @@ func TestSwitchWorkspaceKey(t *testing.T) {
 	m, _ = newTest(t, fb)
 	m.workspace = "alpha"
 	lines := strings.Split(plainView(m), "\n")
-	if st := lines[len(lines)-2]; !strings.HasSuffix(st, "workspace alpha") || ansi.StringWidth(st) != 120 {
+	// The status line, above the help (two lines at 120 columns).
+	if st := lines[len(lines)-3]; !strings.HasSuffix(st, "workspace alpha") || ansi.StringWidth(st) != 120 {
 		t.Errorf("status line %q", st)
 	}
 	op := press(m, "s")
@@ -431,5 +432,41 @@ func TestSwitchWorkspaceKey(t *testing.T) {
 	key(m, "w")
 	if m.switching || m.filter != "w" {
 		t.Fatalf("w in the filter: switching %v filter %q", m.switching, m.filter)
+	}
+}
+
+// TestWorkspacePickerBoxDir: a directory without atelier.toml that has a
+// database (a box's workspace) is not adopted by the selector, by enter or
+// by n: it says how to adopt it with its repos. n on a directory without
+// one says it adopted it.
+func TestWorkspacePickerBoxDir(t *testing.T) {
+	box := wsRow("box", false, 0, 0)
+	box.HasDB = true
+	f := &fakeWorkspaces{rows: append(sampleWorkspaces(), box)}
+	m := newWSTest(t, f, "box")
+	m.Update(tea.WindowSizeMsg{Width: 200, Height: 20})
+	const hint = "~/atelier/workspaces/box has a database (a box's workspace?): adopt it with `atl workspace new box --repos DIR [--mount PATH]...` (README: Moving from a devcontainer box)"
+	if wsKey(m, "enter") || m.mode != wsNormal || len(f.created) != 0 || !strings.Contains(wsView(m), hint) {
+		t.Fatalf("enter on box: mode %v, created %v\n%s", m.mode, f.created, wsView(m))
+	}
+	wsKey(m, "y") // no question was asked
+	if len(f.created) != 0 {
+		t.Fatalf("y after the hint created %v", f.created)
+	}
+	wsKey(m, "n")
+	typeWS(m, "box")
+	if v := wsView(m); !strings.Contains(v, hint) {
+		t.Errorf("typing box:\n%s", v)
+	}
+	if wsKey(m, "enter") || len(f.created) != 0 || m.mode != wsNew {
+		t.Fatalf("n box: created %v, mode %v", f.created, m.mode)
+	}
+	wsKey(m, "esc")
+
+	wsKey(m, "n")
+	typeWS(m, "old")
+	wsKey(m, "enter")
+	if len(f.created) != 1 || !strings.Contains(wsView(m), "workspace old adopted — enter opens it") {
+		t.Errorf("n old: created %v\n%s", f.created, wsView(m))
 	}
 }
