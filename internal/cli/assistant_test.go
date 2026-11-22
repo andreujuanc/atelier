@@ -19,7 +19,7 @@ func TestAssistantArgs(t *testing.T) {
 	if code != exitErr || !strings.Contains(errs, "nope") {
 		t.Errorf("unknown task: %d %q", code, errs)
 	}
-	if _, err := os.Stat(filepath.Join(root, "data", "atelier", "assistant")); err == nil {
+	if _, err := os.Stat(filepath.Join(root, "ws", "data", "assistant")); err == nil {
 		t.Error("assistant dir created for an unknown task")
 	}
 	if code, out, _ := atl(t, "--help"); code != 0 || !strings.Contains(out, "assistant") {

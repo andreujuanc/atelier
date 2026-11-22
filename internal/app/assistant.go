@@ -96,7 +96,7 @@ func (a *App) Assistant(ctx context.Context, taskRef string) (attach *exec.Cmd, 
 		Session: AssistantSession,
 		Name:    AssistantWindow,
 		Dir:     dir,
-		Env:     map[string]string{"ATL_ASSISTANT": "1"},
+		Env:     a.windowEnv(map[string]string{"ATL_ASSISTANT": "1"}),
 		Argv:    assistantArgv(hasClaudeConversation(dir), prompt),
 	}); err != nil {
 		return nil, "", fmt.Errorf("assistant: %w", err)

@@ -706,6 +706,11 @@ func (c *cli) gateCmd() *cobra.Command {
 		Hidden: true,
 		Args:   args(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
+			// atl starts it with the workspace applied ($ATL_WORKSPACE a
+			// path); a name works too.
+			if err := c.applyWorkspace(); err != nil {
+				return err
+			}
 			p, err := config.Resolve()
 			if err != nil {
 				return err

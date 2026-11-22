@@ -67,7 +67,7 @@ func TestResolveOverrides(t *testing.T) {
 
 func TestResolveWorkspace(t *testing.T) {
 	home := t.TempDir()
-	ws := filepath.Join(t.TempDir(), "ed")
+	ws := filepath.Join(t.TempDir(), "beta")
 	if err := os.Mkdir(ws, 0o755); err != nil {
 		t.Fatal(err)
 	}

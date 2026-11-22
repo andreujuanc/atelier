@@ -928,6 +928,40 @@ func TestLastCommitAndRefExists(t *testing.T) {
 	}
 }
 
+// TestRefOrBelowExists: a ref counts, and so does one below it as a
+// directory (which keeps git from creating it); a sibling with the same
+// prefix does not.
+func TestRefOrBelowExists(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	want := func(ref string, exp bool) {
+		t.Helper()
+		if ok, err := RefOrBelowExists(ctx, f.repo, ref); err != nil || ok != exp {
+			t.Errorf("RefOrBelowExists(%s) = %v, %v; want %v", ref, ok, err, exp)
+		}
+	}
+	want("refs/heads/atl/s", false)
+	git(t, f.repo, "branch", "atl/s-2")
+	want("refs/heads/atl/s", false)
+	git(t, f.repo, "branch", "atl/s/x")
+	want("refs/heads/atl/s", true)
+	want("refs/heads/atl/s/x", true)
+	want("refs/heads/atl/t", false)
+	git(t, f.repo, "branch", "atl/t")
+	want("refs/heads/atl/t", true)
+	want("refs/remotes/origin/atl/s", false)
+	git(t, f.repo, "update-ref", "refs/remotes/origin/atl/s/y", "HEAD")
+	want("refs/remotes/origin/atl/s", true)
+	for _, bad := range []string{"refs/heads/atl/*", "atl/s", "refs/heads/[a]"} {
+		if _, err := RefOrBelowExists(ctx, f.repo, bad); err == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+	if _, err := RefOrBelowExists(ctx, filepath.Join(f.root, "nope"), "refs/heads/atl/s"); err == nil {
+		t.Error("missing repo: no error")
+	}
+}
+
 func TestUniqueCommits(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)

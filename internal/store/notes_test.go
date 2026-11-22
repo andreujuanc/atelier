@@ -417,11 +417,11 @@ func TestMigrationV4FromV3(t *testing.T) {
 		t.Fatalf("migrated task = %+v", old)
 	}
 	nt := &model.Task{Slug: "prod", Title: "Prod", Status: model.StatusActive, Base: model.BaseDefault}
-	if err := s.CreateTaskAutoPort(ctx, nt); err != nil {
+	if err := s.CreateTaskAutoPort(ctx, nt, Avoid{}); err != nil {
 		t.Fatal(err)
 	}
 	nt = &model.Task{Slug: "auto", Title: "Auto", Status: model.StatusActive, Base: model.BaseAuto}
-	if err := s.CreateTaskAutoPort(ctx, nt); err != nil {
+	if err := s.CreateTaskAutoPort(ctx, nt, Avoid{}); err != nil {
 		t.Fatal(err)
 	}
 	list, err := s.ListTasks(ctx)

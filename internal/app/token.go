@@ -227,6 +227,7 @@ func (a *App) runTokenWindow(ctx context.Context, attach func(*exec.Cmd) error) 
 		Session: TokenSession,
 		Name:    tokenWindow,
 		Dir:     dir,
+		Env:     a.windowEnv(nil),
 		Argv:    []string{"sh", "-c", tokenScript},
 	})
 	kill := func() {

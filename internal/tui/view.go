@@ -124,7 +124,8 @@ func (m *Model) View() string {
 	if w <= 0 || h <= 0 {
 		return ""
 	}
-	bodyH := h - 2
+	help := m.helpLines(w)
+	bodyH := h - 1 - len(help)
 	if bodyH < 0 {
 		bodyH = 0
 	}
@@ -169,7 +170,7 @@ func (m *Model) View() string {
 		body = append(body, "")
 	}
 	body = body[:bodyH]
-	lines := append(body, m.statusLine(w), m.helpLine(w))
+	lines := append(append(body, m.statusLine(w)), help...)
 	if len(lines) > h {
 		lines = lines[len(lines)-h:]
 	}
@@ -202,12 +203,17 @@ func (m *Model) listLines(w, h int) []string {
 		}
 		return []string{dimStyle.Render(trunc(msg, w))}
 	}
-	end := m.offset + h
+	off := m.offset
+	if m.selIdx >= off+h {
+		// the help took a line since the offset was set (see helpLines)
+		off = m.selIdx - h + 1
+	}
+	end := off + h
 	if end > len(m.rows) {
 		end = len(m.rows)
 	}
 	var out []string
-	for i := m.offset; i < end; i++ {
+	for i := off; i < end; i++ {
 		out = append(out, m.rowLine(m.rows[i], i == m.selIdx, w))
 	}
 	return out
@@ -410,6 +416,13 @@ func (m *Model) statusLine(w int) string {
 	if s == "" && m.filter != "" {
 		s = dimStyle.Render("filter: /" + clean(m.filter) + "  (esc clears)")
 	}
+	// The workspace's name at the right, when it fits.
+	if ws := clean(m.workspace); ws != "" {
+		tag := "workspace " + ws
+		if pad := w - ansi.StringWidth(s) - ansi.StringWidth(tag); pad >= 2 {
+			return s + strings.Repeat(" ", pad) + dimStyle.Render(tag)
+		}
+	}
 	return trunc(s, w)
 }
 
@@ -482,6 +495,40 @@ func baseSuffix(branch string) string {
 	return dimStyle.Render("  ← " + clean(branch))
 }
 
+// listKeys is the help of the task list: its keys.
+const listKeys = "n new  enter open  s session  r resume  a add repo  m notes  t rename  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  w workspace  q quit"
+
+// helpLines is the help under the status line: one line, but the task
+// list's keys wrap onto a second one when they do not fit the width (and
+// the terminal has 8 lines or more), at a two-space gap between keys. The
+// legend (see legends) follows the keys on their last line when it fits.
+func (m *Model) helpLines(w int) []string {
+	if m.mode != modeNormal || m.height < 8 || ansi.StringWidth(listKeys) <= w {
+		return []string{m.helpLine(w)}
+	}
+	keys := strings.Split(listKeys, "  ")
+	n := 1 // keys on the first line: as many as fit, at least one
+	for n < len(keys) && ansi.StringWidth(strings.Join(keys[:n+1], "  ")) <= w {
+		n++
+	}
+	lines := []string{strings.Join(keys[:n], "  ")}
+	if n < len(keys) {
+		lines = append(lines, strings.Join(keys[n:], "  ")) // truncated when it does not fit either
+	}
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = dimStyle.Render(trunc(l, w))
+	}
+	last := lines[len(lines)-1]
+	for _, l := range legends {
+		if ansi.StringWidth(last)+2+ansi.StringWidth(l) <= w {
+			out[len(out)-1] = dimStyle.Render(last+"  ") + l
+			break
+		}
+	}
+	return out
+}
+
 func (m *Model) helpLine(w int) string {
 	var s string
 	switch m.mode {
@@ -521,7 +568,7 @@ func (m *Model) helpLine(w int) string {
 	case modeConfirm:
 		s = "space tick/untick  enter confirm (box ticked)  esc/n cancel"
 	default:
-		s = "n new  enter open  s session  r resume  a add repo  m edit notes  t rename  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  q quit"
+		s = listKeys
 		for _, l := range legends {
 			if ansi.StringWidth(s)+2+ansi.StringWidth(l) <= w {
 				return dimStyle.Render(s+"  ") + l

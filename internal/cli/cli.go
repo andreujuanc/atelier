@@ -19,8 +19,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/sandbox"
-	"github.com/andreujuanc/atelier/internal/tmux"
-	"github.com/andreujuanc/atelier/internal/tui"
+	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
 // Exit codes.
@@ -58,7 +57,11 @@ func Execute() int {
 type cli struct {
 	stdout, stderr io.Writer
 	app            *app.App
-	recovered      bool            // startup Recover already ran
+	recovered      bool   // startup Recover already ran
+	wsFlag         string // --workspace
+	ws             *workspace.Applied
+	wsErr          error
+	wsDone         bool            // applyWorkspace ran
 	ctx            context.Context // the invocation's context (for Recover)
 }
 
@@ -77,10 +80,14 @@ func (c *cli) App() (*app.App, error) {
 // TUI runs its own Recover at start and every few seconds).
 func (c *cli) openApp() (*app.App, error) {
 	if c.app == nil {
+		if err := c.applyWorkspace(); err != nil {
+			return nil, err
+		}
 		a, err := app.New(c.stderr)
 		if err != nil {
 			return nil, err
 		}
+		a.Workspace = c.ws
 		c.app = a
 	}
 	return c.app, nil
@@ -105,16 +112,32 @@ func (c *cli) recoverOnce(a *app.App) {
 }
 
 // doctorApp returns an App for doctor, which must work even when the
-// database cannot be opened.
+// database cannot be opened, and without a workspace: then the App has no
+// paths and only WorkspaceErr, which only doctor can use.
 func (c *cli) doctorApp() (*app.App, error) {
 	if c.app != nil {
 		return c.app, nil
+	}
+	if err := c.applyWorkspace(); err != nil {
+		return &app.App{Out: c.stderr, Now: time.Now, WorkspaceErr: err}, nil
+	}
+	return c.pathsApp()
+}
+
+// pathsApp returns an App with the workspace applied and its paths, but
+// without the database (atl token).
+func (c *cli) pathsApp() (*app.App, error) {
+	if c.app != nil {
+		return c.app, nil
+	}
+	if err := c.applyWorkspace(); err != nil {
+		return nil, err
 	}
 	p, err := config.Resolve()
 	if err != nil {
 		return nil, err
 	}
-	return &app.App{Paths: p, Tmux: tmux.New(), Out: c.stderr, Now: time.Now}, nil
+	return &app.App{Paths: p, Tmux: app.NewTmux(p, c.stderr), Out: c.stderr, Now: time.Now, Workspace: c.ws}, nil
 }
 
 // run is runIn with an empty stdin.
@@ -129,6 +152,8 @@ func runIn(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 		if c.app != nil {
 			c.app.Close()
 		}
+		// Only for tests, which run atl many times in one process.
+		c.ws.Undo()
 	}()
 	root := c.rootCmd()
 	root.SetArgs(args)
@@ -207,25 +232,50 @@ func (c *cli) rootCmd() *cobra.Command {
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			return insideContainer(cmd)
 		},
-		// With no subcommand: the TUI on a terminal, else the help.
+		// With no subcommand: the TUI on a terminal (the workspace
+		// selector when no workspace is selected), else the help.
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if !isTerminal(os.Stdin) || !isTerminal(c.stdout) {
 				return cmd.Help()
 			}
-			ap, err := c.openApp()
-			if err != nil {
+			if err := c.applyWorkspace(); err != nil {
+				var none *workspace.NoneError
+				if errors.As(err, &none) {
+					return c.selectWorkspace(cmd.Context(), "")
+				}
 				return err
 			}
-			return tui.RunContext(cmd.Context(), ap)
+			return c.runTUI(cmd.Context())
 		},
 	}
 	root.CompletionOptions.HiddenDefaultCmd = true
+	root.PersistentFlags().StringVarP(&c.wsFlag, "workspace", "w", "", "the workspace: a name under $"+workspace.RootVar+" or a path (default: $"+workspace.Var+", else the one the current directory is in)")
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	root.AddCommand(
 		c.newCmd(), c.addCmd(), c.reposCmd(), c.lsCmd(), c.openCmd(), c.sessionCmd(), c.resumeCmd(), c.statusCmd(), c.renameCmd(),
 		c.diffCmd(), c.prCmd(), c.finishCmd("done"), c.finishCmd("cancel"), c.doctorCmd(), c.hookCmd(), c.statuslineCmd(), c.gateCmd(),
 		c.remoteCmd(true), c.remoteCmd(false), c.tokenCmd(),
-		c.showCmd(), c.transcriptCmd(), c.noteCmd(), c.notesCmd(), c.assistantCmd(),
+		c.showCmd(), c.transcriptCmd(), c.noteCmd(), c.notesCmd(), c.assistantCmd(), c.workspaceCmd(),
 	)
 	return root
+}
+
+// applyWorkspace selects the workspace (--workspace, $ATL_WORKSPACE, the
+// current directory) and applies it to the environment, once, before
+// anything reads the environment for paths. In a task container it does
+// nothing: atl there talks to the task's gate and never opens a workspace.
+func (c *cli) applyWorkspace() error {
+	if c.wsDone {
+		return c.wsErr
+	}
+	c.wsDone = true
+	if sandbox.Inside() {
+		return nil
+	}
+	ws, by, err := workspace.Open(c.wsFlag)
+	if err == nil {
+		c.ws, err = workspace.Apply(ws, by)
+	}
+	c.wsErr = err
+	return err
 }

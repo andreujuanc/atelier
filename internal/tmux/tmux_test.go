@@ -21,6 +21,17 @@ var sockSeq atomic.Int64
 // at cleanup. It skips if tmux is not installed.
 func testClient(t *testing.T) *Client {
 	t.Helper()
+	c := freshClient(t)
+	c.config = os.DevNull
+	startServer(t, c, nil)
+	return c
+}
+
+// freshClient returns a client on a fresh, isolated tmux socket, with no
+// server yet and no config set (a server it starts is killed at cleanup).
+// It skips if tmux is not installed.
+func freshClient(t *testing.T) *Client {
+	t.Helper()
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed")
 	}
@@ -39,9 +50,7 @@ func testClient(t *testing.T) *Client {
 		}
 		_ = os.Remove(filepath.Join(tmp, fmt.Sprintf("tmux-%d", os.Getuid()), sock))
 	})
-	c := &Client{Socket: sock, config: os.DevNull}
-	startServer(t, c, nil)
-	return c
+	return &Client{Socket: sock}
 }
 
 // startServer starts c's server with -f /dev/null (so neither /etc/tmux.conf
@@ -391,15 +400,51 @@ func TestAttachCmd(t *testing.T) {
 	if got, want := c.AttachCmd("atl-x").Args, []string{"tmux", "-L", "s1", "attach-session", "-t", "=atl-x"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("outside tmux: %v, want %v", got, want)
 	}
-	t.Setenv("TMUX", "/tmp/tmux-1000/default,123,0")
-	if got, want := c.AttachCmd("atl-x").Args, []string{"tmux", "-L", "s1", "switch-client", "-t", "=atl-x"}; !reflect.DeepEqual(got, want) {
-		t.Errorf("inside tmux: %v, want %v", got, want)
+	// Inside another server (another workspace's, or the user's own): a
+	// nested attach-session, without TMUX.
+	t.Setenv("TMUX", "/nonexistent/tmux-1000/default,123,0")
+	t.Setenv("TMUX_PANE", "%1")
+	cmd := c.AttachCmd("atl-x")
+	if got, want := cmd.Args, []string{"tmux", "-L", "s1", "attach-session", "-t", "=atl-x"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("inside another tmux server: %v, want %v", got, want)
 	}
+	if len(cmd.Env) == 0 {
+		t.Error("nested attach without its environment")
+	}
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "TMUX=") || strings.HasPrefix(kv, "TMUX_PANE=") {
+			t.Errorf("nested attach env has %s", kv)
+		}
+	}
+	// No socket name: tmux picks $TMUX's server.
 	if got, want := (&Client{}).AttachCmd("atl-x").Args, []string{"tmux", "switch-client", "-t", "=atl-x"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("default socket: %v, want %v", got, want)
 	}
 	if cmd := c.AttachCmd("atl-x"); cmd.Stdin != nil || cmd.Stdout != nil || cmd.Stderr != nil {
 		t.Error("AttachCmd must not wire stdio")
+	}
+}
+
+// TestAttachCmdSameServer: inside a client of the client's own server
+// ($TMUX names its socket), switch-client; inside another, attach-session.
+func TestAttachCmdSameServer(t *testing.T) {
+	c := testClient(t)
+	sock := c.SocketPath()
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("SocketPath %s: %v", sock, err)
+	}
+	t.Setenv("TMUX", sock+",123,0")
+	cmd := c.AttachCmd("atl-x")
+	if got, want := cmd.Args, c.args("switch-client", "-t", "=atl-x"); !reflect.DeepEqual(got[1:], want) {
+		t.Errorf("inside this server: %v, want %v", got, want)
+	}
+	if cmd.Env != nil {
+		t.Error("switch-client with an environment of its own")
+	}
+	other := testClient(t)
+	t.Setenv("TMUX", other.SocketPath()+",1,0")
+	if got := c.AttachCmd("atl-x").Args; !reflect.DeepEqual(got[1:], c.args("attach-session", "-t", "=atl-x")) {
+		t.Errorf("inside another server: %v", got)
 	}
 }
 
@@ -553,5 +598,35 @@ func TestSelectWindow(t *testing.T) {
 	}
 	if err := c.SelectWindow(ctx, "@9999"); err == nil {
 		t.Error("SelectWindow of a missing window succeeded")
+	}
+}
+
+// TestServerEnv: a tmux server atl starts does not take a session's
+// variables, nor, on a named socket, another server's TMUX.
+func TestServerEnv(t *testing.T) {
+	t.Setenv("ATL_SESSION", "3")
+	t.Setenv("CLAUDECODE", "1")
+	t.Setenv("ATL_TASK", "x")
+	t.Setenv("TMUX", "/tmp/tmux-1/default,1,0")
+	t.Setenv("ATL_WORKSPACE", "/w")
+	has := func(env []string, k string) bool {
+		for _, kv := range env {
+			if strings.HasPrefix(kv, k+"=") {
+				return true
+			}
+		}
+		return false
+	}
+	env := (&Client{Socket: "s"}).serverEnv()
+	for _, k := range []string{"ATL_SESSION", "CLAUDECODE", "ATL_TASK", "TMUX"} {
+		if has(env, k) {
+			t.Errorf("server env has %s", k)
+		}
+	}
+	if !has(env, "ATL_WORKSPACE") {
+		t.Error("server env lacks ATL_WORKSPACE")
+	}
+	if !has((&Client{}).serverEnv(), "TMUX") {
+		t.Error("without a socket name TMUX picks the server; it must stay")
 	}
 }

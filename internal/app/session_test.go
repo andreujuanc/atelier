@@ -92,7 +92,7 @@ exec sleep 300
 	t.Cleanup(func() { st.Close() })
 	e := &env{
 		app: &App{Paths: paths, Store: st, Tmux: &tmux.Client{Socket: sock}, Out: &bytes.Buffer{},
-			Now: time.Now, AtlBin: "/usr/bin/atl"},
+			Now: time.Now, AtlBin: "/usr/bin/atl", CheckBin: anyBin},
 		out:  out,
 		sock: sock,
 	}
@@ -559,8 +559,9 @@ func TestOpen(t *testing.T) {
 		t.Fatalf("live sessions after fresh Open = %+v", live)
 	}
 
-	// Inside tmux the attach command switches clients.
-	t.Setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+	// Inside a client of atl's tmux server the attach command switches
+	// clients.
+	t.Setenv("TMUX", e.app.Tmux.SocketPath()+",1,0")
 	cmd, err = e.app.Open(ctx, "t")
 	if err != nil {
 		t.Fatal(err)

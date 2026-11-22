@@ -299,6 +299,9 @@ var gitxCalls = []struct {
 	{"RefExists", func(ctx context.Context, p *poisoned) error {
 		return boolErr(RefExists(ctx, p.repo, "refs/remotes/origin/main"))
 	}},
+	{"RefOrBelowExists", func(ctx context.Context, p *poisoned) error {
+		return boolErr(RefOrBelowExists(ctx, p.repo, "refs/remotes/origin/atl/task"))
+	}},
 	{"UniqueCommits", func(ctx context.Context, p *poisoned) error { return intErr(UniqueCommits(ctx, p.repo, "atl/task")) }},
 	{"UniqueCommitsAt", func(ctx context.Context, p *poisoned) error {
 		tip, err := RevParse(ctx, p.repo, "atl/task")

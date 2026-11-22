@@ -19,6 +19,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
 	"github.com/andreujuanc/atelier/internal/tmux"
+	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
 // App holds everything a command needs.
@@ -37,6 +38,15 @@ type App struct {
 	Docker  sandbox.Runner // nil → the docker CLI
 	// StartGate starts a task's gate if none runs; nil → sandbox.Start.
 	StartGate func(atlBin, slug string, taskID int64, runDir, logPath string, roMounts []string) error
+	// CheckBin checks that AtlBin can run in a task container; nil →
+	// sandbox.CheckStaticBin.
+	CheckBin func(path string) error
+
+	// Workspace is the workspace the CLI applied (nil when none was, as
+	// in a task container); WorkspaceErr why none could be (doctor reports
+	// it and checks only the tools).
+	Workspace    *workspace.Applied
+	WorkspaceErr error
 }
 
 // New resolves paths from the environment, opens the store and returns an
@@ -52,11 +62,9 @@ func New(out io.Writer) (*App, error) {
 	if err := hook.CheckEnvContext(); err != nil {
 		return nil, err
 	}
-	bin := os.Getenv("ATL_BIN")
-	if bin == "" {
-		if bin, err = os.Executable(); err != nil {
-			return nil, fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
-		}
+	bin, err := atlBinary()
+	if err != nil {
+		return nil, err
 	}
 	sb, err := sandbox.FromEnv()
 	if err != nil {
@@ -71,7 +79,32 @@ func New(out io.Writer) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &App{Paths: paths, Store: st, Tmux: tmux.New(), Out: out, Now: time.Now, AtlBin: bin, Sandbox: sb}, nil
+	return &App{Paths: paths, Store: st, Tmux: NewTmux(paths, out), Out: out, Now: time.Now, AtlBin: bin, Sandbox: sb}, nil
+}
+
+// atlBinary is the atl binary hooks run and task containers get: $ATL_BIN,
+// else the running one.
+func atlBinary() (string, error) {
+	if bin := os.Getenv("ATL_BIN"); bin != "" {
+		return bin, nil
+	}
+	bin, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
+	}
+	return bin, nil
+}
+
+// NewTmux returns the client for atl's tmux server ($ATL_TMUX_SOCKET), which
+// starts it with the config atl generates (Paths.TmuxConf, see
+// tmux.Client.UseConfig). When that file cannot be written a warning goes
+// to out and the server starts with tmux's own config.
+func NewTmux(paths config.Paths, out io.Writer) *tmux.Client {
+	c := tmux.New()
+	if err := c.UseConfig(paths.TmuxConf(), paths.UserTmuxConf()); err != nil && out != nil {
+		fmt.Fprintf(out, "warning: %v\n", err)
+	}
+	return c
 }
 
 // Close closes the store.
@@ -147,6 +180,21 @@ func (a *App) roPaths(t *model.Task) []string {
 		if r.Mode == model.ModeRO {
 			out = append(out, a.Paths.RepoPath(r.Name))
 		}
+	}
+	return out
+}
+
+// windowEnv is env, the -e of a tmux window atl creates, with the
+// workspace's variables (workspace.WindowEnv) when atl runs in one: a
+// window inherits the tmux server's environment from when the server
+// started, which need not be this workspace's or current. env wins.
+func (a *App) windowEnv(env map[string]string) map[string]string {
+	if a.Workspace == nil {
+		return env
+	}
+	out := workspace.WindowEnv()
+	for k, v := range env {
+		out[k] = v
 	}
 	return out
 }

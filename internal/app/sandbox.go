@@ -192,6 +192,20 @@ func dockerUnreachable(err error) error {
 		strings.Join(strings.Fields(err.Error()), " "))
 }
 
+// checkAtlBin refuses an atl binary that cannot run in a task container
+// (it is copied there, see sandbox.InstallBin): one line that says how to
+// build one that can.
+func (a *App) checkAtlBin(path string) error {
+	check := a.CheckBin
+	if check == nil {
+		check = sandbox.CheckStaticBin
+	}
+	if err := check(path); err != nil {
+		return sandbox.StaticBinError(err)
+	}
+	return nil
+}
+
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
@@ -204,10 +218,14 @@ func fileExists(path string) bool {
 // task container's name but is not atl's own (sandbox.Agent) is an error,
 // and left alone. A new container gets its Claude dir seeded first
 // (seedClaudeDir). Without a Docker daemon (checked first: without one,
-// `atl token` would not help) or a token for Claude Code (claudeAuth)
-// nothing is started.
+// `atl token` would not help), an atl binary that runs in the container (a
+// static Linux one, see checkAtlBin) or a token for Claude Code
+// (claudeAuth) nothing is started.
 func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) {
 	if _, err := a.checkDocker(ctx); err != nil {
+		return "", err
+	}
+	if err := a.checkAtlBin(a.AtlBin); err != nil {
 		return "", err
 	}
 	if _, err := a.claudeAuth(); err != nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/project"
+	"github.com/andreujuanc/atelier/internal/store"
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
 
@@ -186,8 +187,10 @@ func checkRepo(ctx context.Context, name, path string) error {
 
 // NewTask creates a task: validates the inputs, fetches every rw repo and
 // records its base branch (see NewTaskOpts.Base and resolveBase) and that
-// branch's commit on origin, inserts the task row
-// (allocating slug and port offset atomically), creates the task dir with a
+// branch's commit on origin, inserts the task row (allocating slug and port
+// offset atomically: the slug also free of task dirs and atl/<slug>
+// branches, see slugTaken; the offset also free of the open tasks of other
+// workspaces, see otherWorkspaceTasks), creates the task dir with a
 // worktree per rw repo on branch atl/<slug> starting at that commit, and
 // writes CLAUDE.md and .claude/settings.json. Any failure up to this point
 // after the insert rolls everything back. Then, once the task exists, the
@@ -250,7 +253,18 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 		Base:        base,
 		Repos:       repos,
 	}
-	if err := a.Store.CreateTaskAutoPort(ctx, t); err != nil {
+	// The port offset also avoids the open tasks of the other workspaces
+	// (they share the host's ports); the slug also avoids task dirs and
+	// atl/<slug> branches already there.
+	others := a.otherWorkspaceTasks(ctx)
+	for _, w := range others.Warnings {
+		a.warnf("%s", w)
+	}
+	avoid := store.Avoid{SlugTaken: a.slugTaken(ctx, repos)}
+	for _, o := range others.Tasks {
+		avoid.PortOffsets = append(avoid.PortOffsets, o.PortOffset)
+	}
+	if err := a.Store.CreateTaskAutoPort(ctx, t, avoid); err != nil {
 		return nil, err
 	}
 	if err := a.populateTaskDir(ctx, t); err != nil {

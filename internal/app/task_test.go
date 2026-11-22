@@ -44,6 +44,9 @@ func TestMain(m *testing.M) {
 		// (sessions run next to atl) and doctor must say the same, as with
 		// ATL_SANDBOX=off; the sandbox tests set what they need.
 		"ATL_SANDBOX": "off",
+		// No other workspaces (the developer's real ones would shift the
+		// port offsets); the cross-workspace tests set their own root.
+		"ATL_WORKSPACES": filepath.Join(dir, "workspaces"),
 	} {
 		os.Setenv(k, v)
 	}
@@ -80,7 +83,7 @@ func newTaskEnv(t *testing.T) *taskEnv {
 	t.Cleanup(func() { st.Close() })
 	return &taskEnv{
 		app: &App{Paths: paths, Store: st, Tmux: &tmux.Client{Socket: sock}, Out: &bytes.Buffer{},
-			Now: time.Now, AtlBin: "/usr/local/bin/atl"},
+			Now: time.Now, AtlBin: "/usr/local/bin/atl", CheckBin: anyBin},
 		root: root,
 		sock: sock,
 	}
@@ -300,10 +303,15 @@ func TestNewTaskRollback(t *testing.T) {
 		t.Fatalf("no-origin err = %v", err)
 	}
 
-	// The second worktree cannot be created (its branch already exists):
-	// the first worktree, its branch, the task dir and the row are undone.
-	git(t, e.canonical("web"), "branch", "atl/roll-back")
+	// The second worktree cannot be created (its checkout fails: a blob is
+	// unreadable; a branch in the way of atl/roll-back would only change
+	// the slug): the worktrees, their branches, the task dir and the row
+	// are undone.
+	web := e.canonical("web")
+	git(t, web, "branch", "keep-me")
+	restore := breakCheckout(t, web, "origin/main:README")
 	_, err := e.app.NewTask(ctx, opts)
+	restore()
 	if err == nil || !strings.Contains(err.Error(), "web") {
 		t.Fatalf("err = %v", err)
 	}
@@ -319,12 +327,17 @@ func TestNewTaskRollback(t *testing.T) {
 	if out, err := exec.Command("git", "-C", e.canonical("api"), "rev-parse", "--verify", "-q", "refs/heads/atl/roll-back").CombinedOutput(); err == nil {
 		t.Fatalf("branch left in api: %s", out)
 	}
-	if git(t, e.canonical("web"), "rev-parse", "--verify", "refs/heads/atl/roll-back") == "" {
+	if n := worktreeCount(t, web); n != 1 {
+		t.Fatalf("web has %d worktrees after rollback", n)
+	}
+	if out, err := exec.Command("git", "-C", web, "rev-parse", "--verify", "-q", "refs/heads/atl/roll-back").CombinedOutput(); err == nil {
+		t.Fatalf("branch left in web: %s", out)
+	}
+	if git(t, web, "rev-parse", "--verify", "refs/heads/keep-me") == "" {
 		t.Fatal("pre-existing branch in web must not be deleted")
 	}
 
-	// Once the conflict is gone the same slug works.
-	git(t, e.canonical("web"), "branch", "-D", "atl/roll-back")
+	// Once the checkout works the same slug works.
 	task, err := e.app.NewTask(ctx, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -387,6 +400,9 @@ func TestNewTaskRollbackHookFailure(t *testing.T) {
 	}
 }
 
+// TestNewTaskDirExists: a slug whose task dir path is taken on disk (by a
+// directory or anything else) gets the next suffix; what is there is left
+// alone.
 func TestNewTaskDirExists(t *testing.T) {
 	e := newTaskEnv(t)
 	e.addRepo(t, "api", "main")
@@ -398,19 +414,86 @@ func TestNewTaskDirExists(t *testing.T) {
 	if err := os.WriteFile(keep, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := e.app.NewTask(context.Background(), NewTaskOpts{Title: "Taken", Repos: []RepoArg{{"api", model.ModeRW}}})
-	want := "task dir " + dir + " already exists; remove it or choose another title"
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Fatalf("err = %v, want %q", err, want)
+	if err := os.WriteFile(e.app.Paths.TaskDir("taken-2"), nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if !exists(keep) {
+	task, err := e.app.NewTask(context.Background(), NewTaskOpts{Title: "Taken", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Slug != "taken-3" || task.Branch != "atl/taken-3" {
+		t.Fatalf("task = %+v", task)
+	}
+	if !exists(keep) || exists(filepath.Join(dir, "api")) {
 		t.Fatal("existing task dir was touched")
 	}
-	if n := countRows(t, e); n != 0 {
+	if fi, err := os.Lstat(e.app.Paths.TaskDir("taken-2")); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("the file in the way was touched: %v", err)
+	}
+	if !exists(e.app.Paths.WorktreePath("taken-3", "api")) {
+		t.Fatal("no worktree")
+	}
+	if n := countRows(t, e); n != 1 {
 		t.Fatalf("%d rows", n)
 	}
-	if n := worktreeCount(t, e.canonical("api")); n != 1 {
-		t.Fatalf("%d worktrees", n)
+}
+
+// TestNewTaskBranchExists: a slug whose branch atl/<slug> exists in the
+// canonical clone of one of the task's rw repos (locally, or on origin as
+// fetched) gets the next suffix; the branch is not touched. A branch in a
+// repo the task has ro does not count.
+func TestNewTaskBranchExists(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "lib", "main")
+	api, lib := e.canonical("api"), e.canonical("lib")
+	git(t, lib, "branch", "atl/local")
+	localTip := git(t, lib, "rev-parse", "atl/local")
+	git(t, e.seed("api"), "push", "-q", "origin", "HEAD:refs/heads/atl/remote")
+	git(t, api, "branch", "atl/ro-only")
+
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Local", Repos: []RepoArg{{"api", model.ModeRW}, {"lib", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Slug != "local-2" {
+		t.Fatalf("slug %s, want local-2", task.Slug)
+	}
+	if got := git(t, lib, "rev-parse", "atl/local"); got != localTip {
+		t.Fatalf("atl/local moved: %s", got)
+	}
+	task, err = e.app.NewTask(ctx, NewTaskOpts{Title: "Remote", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Slug != "remote-2" { // the fetch brought origin/atl/remote
+		t.Fatalf("slug %s, want remote-2", task.Slug)
+	}
+	task, err = e.app.NewTask(ctx, NewTaskOpts{Title: "Ro only", NoFetch: true,
+		Repos: []RepoArg{{"api", model.ModeRO}, {"lib", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Slug != "ro-only" {
+		t.Fatalf("slug %s, want ro-only", task.Slug)
+	}
+
+	// A branch below atl/<slug> (atl/<slug>/x) keeps git from creating
+	// atl/<slug>: taken too, locally or on origin.
+	git(t, lib, "branch", "atl/under/x")
+	git(t, e.seed("api"), "push", "-q", "origin", "HEAD:refs/heads/atl/far/y")
+	for _, c := range []struct{ title, repo, want string }{{"Under", "lib", "under-2"}, {"Far", "api", "far-2"}} {
+		task, err := e.app.NewTask(ctx, NewTaskOpts{Title: c.title, Repos: []RepoArg{{c.repo, model.ModeRW}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if task.Slug != c.want {
+			t.Fatalf("slug %s, want %s", task.Slug, c.want)
+		}
+	}
+	if git(t, lib, "rev-parse", "--verify", "refs/heads/atl/under/x") == "" {
+		t.Fatal("atl/under/x gone")
 	}
 }
 

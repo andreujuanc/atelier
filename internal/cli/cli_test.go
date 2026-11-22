@@ -53,7 +53,8 @@ func git(t *testing.T, dir string, args ...string) {
 	}
 }
 
-// setup points every atelier path at a temp dir and creates repo "api"
+// setup points every atelier path at a temp dir, with workspace ws in it
+// ($ATL_WORKSPACE, with an empty atelier.toml), and creates repo "api"
 // (bare origin with default branch main, canonical clone in $ATL_REPOS).
 func setup(t *testing.T) string {
 	t.Helper()
@@ -61,19 +62,27 @@ func setup(t *testing.T) string {
 	sock := fmt.Sprintf("atlcli-%d", os.Getpid())
 	t.Cleanup(func() { _ = exec.Command("tmux", "-L", sock, "kill-server").Run() })
 	for k, v := range map[string]string{
-		"HOME":            root,
-		"ATL_WORKSPACE":   "", // never the developer's real workspace
-		"ATL_CONTEXT":     "",
-		"TMUX":            "",
-		"ATL_REPOS":       filepath.Join(root, "repos"),
-		"ATL_TASKS":       filepath.Join(root, "tasks"),
-		"XDG_DATA_HOME":   filepath.Join(root, "data"),
-		"XDG_STATE_HOME":  filepath.Join(root, "state"),
-		"XDG_CONFIG_HOME": filepath.Join(root, "config"),
-		"ATL_BIN":         "/usr/local/bin/atl",
-		"ATL_TMUX_SOCKET": sock,
+		"HOME":               root,
+		"ATL_WORKSPACE":      filepath.Join(root, "ws"), // never the developer's real workspace
+		"ATL_WORKSPACES":     filepath.Join(root, "workspaces"),
+		"ATL_WORKSPACE_VARS": "",
+		"ATL_CONTEXT":        "",
+		"TMUX":               "",
+		"ATL_REPOS":          filepath.Join(root, "repos"),
+		"ATL_TASKS":          filepath.Join(root, "tasks"),
+		"XDG_DATA_HOME":      filepath.Join(root, "data"),
+		"XDG_STATE_HOME":     filepath.Join(root, "state"),
+		"XDG_CONFIG_HOME":    filepath.Join(root, "config"),
+		"ATL_BIN":            "/usr/local/bin/atl",
+		"ATL_TMUX_SOCKET":    sock,
 	} {
 		t.Setenv(k, v)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "ws"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "ws", "atelier.toml"), nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
 	origin, seed := filepath.Join(root, "origin.git"), filepath.Join(root, "seed")
 	for _, d := range []string{origin, seed, filepath.Join(root, "repos")} {
@@ -88,6 +97,9 @@ func setup(t *testing.T) string {
 	git(t, filepath.Join(root, "repos"), "clone", "-q", origin, "api")
 	return root
 }
+
+// testDB is the database of the workspace setup made.
+func testDB() string { return filepath.Join(os.Getenv("ATL_WORKSPACE"), "data", "atelier.db") }
 
 func atl(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
@@ -448,7 +460,7 @@ func TestStartupRecover(t *testing.T) {
 	if code, _, errs := atl(t, "new", "rec", "--repo", "api", "--no-fetch"); code != 0 {
 		t.Fatalf("new: %d %s", code, errs)
 	}
-	st, err := store.Open(filepath.Join(os.Getenv("XDG_DATA_HOME"), "atelier", "atelier.db"))
+	st, err := store.Open(testDB())
 	if err != nil {
 		t.Fatal(err)
 	}

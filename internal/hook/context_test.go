@@ -521,7 +521,7 @@ func TestRenderContextEnv(t *testing.T) {
 // TestRenderSandboxContext: a sandboxed session is told to use a repo's own
 // container setup, and the note leaves room under the cap for the rest.
 func TestRenderSandboxContext(t *testing.T) {
-	p := config.Paths{Tasks: "/home/someone/atelier/workspaces/me/tasks", Repos: "/home/someone/atelier/workspaces/me/repos"}
+	p := config.Paths{Tasks: "/home/someone/atelier/workspaces/alpha/tasks", Repos: "/home/someone/atelier/workspaces/alpha/repos"}
 	task := model.Task{Slug: "shop-checkout-fix", Title: "Fix the checkout total rounding", Status: model.StatusActive,
 		Branch: "atl/shop-checkout-fix", PortOffset: 300,
 		Repos: []model.TaskRepo{{Name: "shop-api", Mode: model.ModeRW, BaseBranch: "main"},
@@ -557,7 +557,7 @@ func TestRenderSandboxContext(t *testing.T) {
 // read-only; a long list is cut, saying how many more; the line never takes
 // the notes' useful part.
 func TestRenderSandboxMounts(t *testing.T) {
-	p := config.Paths{Tasks: "/home/someone/atelier/workspaces/me/tasks", Repos: "/home/someone/atelier/workspaces/me/repos"}
+	p := config.Paths{Tasks: "/home/someone/atelier/workspaces/alpha/tasks", Repos: "/home/someone/atelier/workspaces/alpha/repos"}
 	task := model.Task{Slug: "shop-checkout-fix", Title: "Fix the checkout total rounding", Status: model.StatusActive,
 		Branch: "atl/shop-checkout-fix", PortOffset: 300,
 		Repos: []model.TaskRepo{{Name: "shop-api", Mode: model.ModeRW, BaseBranch: "main"},

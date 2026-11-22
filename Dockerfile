@@ -2,20 +2,21 @@
 # that paths inside the containers match the host (git worktrees store
 # absolute paths). ./build-images builds both, as follows.
 #
-# The box (the last stage, so the default target): atl + claude + tmux + git +
-# gh + docker CLI/compose, where atl itself runs.
-#
-#   docker build -t atelier \
-#     --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
-#
 # The default task image: what a task's sessions run in (the sandbox, on
-# unless ATL_SANDBOX=off).
+# unless ATL_SANDBOX=off). atl on the host needs only this one.
 # claude, git, docker CLI/compose, Node.js LTS with npm and corepack, and
 # everyday tools. No other language: a project brings its own in its image,
 # or a task installs it. No atl (it is mounted into task containers) and no
 # tmux.
 #
 #   docker build --target task -t atelier-task \
+#     --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+#
+# The box (the last stage, so the default target), optional: atl + claude +
+# tmux + git + gh + docker CLI/compose, to run atl itself in a container
+# (the older way; README "Install on the host" is the primary one).
+#
+#   docker build -t atelier \
 #     --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 #
 # Docker's legacy builder (DOCKER_BUILDKIT=0) builds every stage up to the
@@ -110,6 +111,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep tmux out of the way: no status bar, mouse scrolling, Ctrl-q returns to atl.
+# The same settings atl writes for a tmux server of its own (internal/tmux
+# ServerConfig, <workspace>/state/tmux.conf): keep the two in step. This file
+# applies to tmux's default server (tmux_socket = "default").
 RUN printf '%s\n' \
         'set -g status off' \
         'set -g mouse on' \
