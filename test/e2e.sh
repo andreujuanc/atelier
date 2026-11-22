@@ -473,4 +473,31 @@ expect_eq "status after cancel" "$(task_field second-task status)" "cancelled"
 [[ ! -e "$ATL_TASKS/second-task/api" ]] || fail "second-task worktree still exists"
 expect_eq "worktrees of api" "$(git -C "$ATL_REPOS/api" worktree list --porcelain | grep -c '^worktree ')" "1"
 
+# ---- reopen ----------------------------------------------------------------
+
+# An open status brings a closed task back: api on the branch cancel kept,
+# docs (pushed, so cancel deleted its branch) on a new one from origin's.
+step reopen
+S="$ATL_TASKS/second-task"
+rm -f "$E2E_OUT/setup-second-task"
+out="$(atl status second-task active 2>&1)" || fail "atl status (reopen) failed: $out"
+[[ "$out" == *"repo docs: branch atl/second-task is gone here; made again from origin/atl/second-task"* ]] ||
+	fail "reopen did not say where docs' branch came from: $out"
+[[ "$out" != *"warning"* ]] || fail "reopen warned: $out"
+expect_eq "status after reopen" "$(task_field second-task status)" "active"
+expect_eq "reopened api branch" "$(git -C "$S/api" rev-parse --abbrev-ref HEAD)" "atl/second-task"
+expect_eq "reopened api commit" "$(git -C "$S/api" log -1 --format=%s)" "unpushed work"
+expect_eq "reopened docs branch" "$(git -C "$S/docs" rev-parse --abbrev-ref HEAD)" "atl/second-task"
+expect_eq "reopened docs commit" "$(git -C "$S/docs" log -1 --format=%s)" "docs change"
+[[ -f "$S/CLAUDE.md" && -f "$S/.claude/settings.json" ]] || fail "reopen did not write CLAUDE.md and settings.json"
+expect_eq "setup after reopen" "$(cat "$E2E_OUT/setup-second-task")" "100"
+out="$(atl session second-task)" || fail "atl session after reopen failed: $out"
+has_cid2() { [[ -n "$(sess_field second-task claude_session_id)" ]]; }
+wait_for "SessionStart hook in the reopened task" has_cid2
+out="$(atl cancel second-task 2>&1)" || fail "atl cancel (after reopen) failed: $out"
+[[ "$out" == *"kept branch atl/second-task in api (1 unpushed commit(s))"* &&
+	"$out" == *"deleted branch atl/second-task in docs"* ]] || fail "atl cancel (after reopen) branch messages: $out"
+[[ ! -e "$S" ]] || fail "second-task dir still exists"
+expect_eq "worktrees of api after the second cancel" "$(git -C "$ATL_REPOS/api" worktree list --porcelain | grep -c '^worktree ')" "1"
+
 echo "E2E OK"
