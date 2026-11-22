@@ -151,3 +151,47 @@ func TestUpgradeTaskRepo(t *testing.T) {
 		t.Errorf("closed task err = %v", err)
 	}
 }
+
+func TestReopenTask(t *testing.T) {
+	s, _ := openTest(t)
+	ctx := context.Background()
+	task := mkTask(t, s, "fix", model.StatusDone, 0,
+		model.TaskRepo{Name: "api", Mode: model.ModeRW, BaseBranch: "main", BaseCommit: "abc"},
+		model.TaskRepo{Name: "lib", Mode: model.ModeRW, BaseBranch: "main", BaseCommit: "abc"},
+		model.TaskRepo{Name: "docs", Mode: model.ModeRO})
+	before, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Not an open status, or a repo that is not rw: nothing changes.
+	if err := s.ReopenTask(ctx, task.ID, model.StatusCancelled, nil); err == nil {
+		t.Fatal("reopened as cancelled")
+	}
+	bad := []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "dev", BaseCommit: "def"}, {Name: "docs", BaseBranch: "x"}}
+	if err := s.ReopenTask(ctx, task.ID, model.StatusActive, bad); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ro repo err = %v", err)
+	}
+	if g, _ := s.GetTask(ctx, task.ID); g.Status != model.StatusDone || !reflect.DeepEqual(g.Repos, before.Repos) {
+		t.Fatalf("failed reopen changed the task: %+v", g)
+	}
+
+	rebased := model.TaskRepo{Name: "lib", Mode: model.ModeRW, BaseBranch: "dev", BaseCommit: "def"}
+	if err := s.ReopenTask(ctx, task.ID, model.StatusReview, []model.TaskRepo{rebased}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []model.TaskRepo{before.Repos[0], rebased, before.Repos[2]}
+	if got.Status != model.StatusReview || !reflect.DeepEqual(got.Repos, want) {
+		t.Fatalf("task = %+v\nwant repos %+v", got, want)
+	}
+	if err := s.ReopenTask(ctx, task.ID, model.StatusActive, nil); !errors.Is(err, ErrTaskOpen) {
+		t.Fatalf("open task err = %v", err)
+	}
+	if err := s.ReopenTask(ctx, 9999, model.StatusActive, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown task err = %v", err)
+	}
+}
