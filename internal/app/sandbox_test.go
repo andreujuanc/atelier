@@ -56,6 +56,59 @@ func TestSandboxStoredTokenFirstSession(t *testing.T) {
 	}
 }
 
+// TestSandboxOpenWaitsForTheTerminal: a session atl attaches the terminal
+// to right after the launch (atl open, the TUI's Enter) starts docker exec
+// only once a client is on the task's tmux session, so that Claude starts
+// at the terminal's size; one nobody attaches to (atl session) at once.
+func TestSandboxOpenWaitsForTheTerminal(t *testing.T) {
+	e, _ := sandboxEnv(t)
+	ctx := context.Background()
+	task := e.task(t, "boxed", model.StatusActive, true)
+	s, err := e.app.NewSession(ctx, "boxed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s.ID)
+	if cmd := e.tmux(t, "display-message", "-p", "-t", s.TmuxTarget, "#{pane_start_command}"); !strings.Contains(cmd, "atl-window detached docker exec") {
+		t.Errorf("window command of atl session: %s", cmd)
+	}
+
+	if _, err := e.app.OpenNew(ctx, "boxed"); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := e.app.Store.ListSessions(ctx, task.ID)
+	if err != nil || len(sessions) != 2 {
+		t.Fatalf("sessions: %v, %v", sessions, err)
+	}
+	opened := sessions[0]
+	if sessions[1].ID > opened.ID {
+		opened = sessions[1]
+	}
+	if cmd := e.tmux(t, "display-message", "-p", "-t", opened.TmuxTarget, "#{pane_start_command}"); !strings.Contains(cmd, "atl-window attach docker exec") {
+		t.Errorf("window command of atl open: %s", cmd)
+	}
+	argv := filepath.Join(e.out, "argv-"+strconv.FormatInt(opened.ID, 10))
+	time.Sleep(700 * time.Millisecond)
+	if _, err := os.Stat(argv); err == nil {
+		t.Fatal("claude started before the terminal attached")
+	}
+	// The terminal: a control-mode client, which needs none.
+	client := exec.Command("tmux", "-L", e.sock, "-C", "attach-session", "-t", "=atl-boxed")
+	stdin, err := client.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stdin.Close(); _ = client.Process.Kill(); _ = client.Wait() })
+	attached := time.Now()
+	e.argv(t, opened.ID)
+	if d := time.Since(attached); d > 3*time.Second {
+		t.Errorf("claude started %v after the terminal attached", d)
+	}
+}
+
 // TestSandboxEndsWhatADeadWindowLeft: when a session's window is gone
 // (closed, or tmux or the box restarted) its docker exec client is gone,
 // not what it started in the container. Recover, which also runs when atl

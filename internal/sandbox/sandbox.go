@@ -186,6 +186,54 @@ func ExecArgv(container, workdir string, envKeys, argv []string) []string {
 	return append(out, argv...)
 }
 
+// windowScript runs, where atl runs, as the command of a session's tmux
+// window: it starts docker exec (its arguments after the first) so that
+// the terminal size Claude sees in the task container is right from its
+// first frame and follows every change of the window's size.
+//
+// docker exec -t reads the window's size when it creates the exec, sends it
+// once more right after the start, and only then listens for SIGWINCH: a
+// resize in between is lost for good, and Claude keeps a detached window's
+// 80x24 in a larger terminal until the next resize. atl attaching the
+// terminal right after it created the window (atl open, the TUI's Enter)
+// lands there often. So:
+//   - with $1 = attach (an attach follows), it waits, up to 10 seconds,
+//     for a client on the window's tmux session before it starts docker
+//     exec, which then reads the size the window has with that client;
+//   - a helper sends docker exec SIGWINCH 1, 3 and 7 seconds after it
+//     started, which makes it send the window's current size again: a
+//     resize during its start (a client attaching from elsewhere then) is
+//     made good. The helper holds none of the window's terminal, and ends
+//     with docker exec (the hangup the window's end brings) or at the first
+//     signal that finds it gone.
+//
+// It needs sh, tmux, sleep and kill, where atl runs.
+const windowScript = `if [ "$1" = attach ]; then
+	i=0
+	while [ $i -lt 100 ]; do
+		n=$(tmux display-message -p -t "$TMUX_PANE" '#{session_attached}' 2> /dev/null) || break
+		[ "${n:-0}" = 0 ] || break
+		sleep 0.1 2> /dev/null || { sleep 1; i=$((i + 9)); }
+		i=$((i + 1))
+	done
+fi
+shift
+pid=$$
+(for d in 1 2 4; do sleep $d; kill -WINCH $pid || exit 0; done) < /dev/null > /dev/null 2>&1 &
+exec "$@"`
+
+// WindowArgv wraps exec, the docker exec command of ExecArgv, as the
+// command of a session's tmux window (see windowScript). attach says that
+// atl attaches a terminal to the window's tmux session right after it is
+// created: docker exec then waits for that client.
+func WindowArgv(attach bool, exec []string) []string {
+	mode := "detached"
+	if attach {
+		mode = "attach"
+	}
+	return append([]string{"sh", "-c", windowScript, "atl-window", mode}, exec...)
+}
+
 // sessionScript ends, in a task container, the processes of a session:
 // those whose environment has ATL_SESSION=<session>, which ExecArgv's
 // window passes to Claude and Claude's children inherit (a dev server it

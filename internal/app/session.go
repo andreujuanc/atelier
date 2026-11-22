@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
 
@@ -26,6 +27,21 @@ func ClaudeArgv(roPaths []string, resumeID string) []string {
 }
 
 func windowName(id int64) string { return fmt.Sprintf("claude-%d", id) }
+
+type attachKey struct{}
+
+// attaching marks ctx as that of a launch the caller attaches a terminal
+// to right after (Open, OpenNew, OpenSession): a sandboxed window then
+// waits for that client before it starts docker exec (see
+// sandbox.WindowArgv), so that Claude starts at the terminal's size.
+func attaching(ctx context.Context) context.Context {
+	return context.WithValue(ctx, attachKey{}, true)
+}
+
+func attachFollows(ctx context.Context) bool {
+	v, _ := ctx.Value(attachKey{}).(bool)
+	return v
+}
 
 // checkLaunchable refuses closed tasks and tasks whose dir is missing, and
 // returns the task dir.
@@ -73,7 +89,9 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 		// environment: set from atl's own (current) one, or the stored
 		// token, on tmux's standard input, in the same tmux call that
 		// creates the window, and the server if none runs yet.
-		argv = a.sandboxArgv(container, dir, env, auth, argv)
+		// The window starts docker exec so that Claude has the window's
+		// size from its first frame on (sandbox.WindowArgv).
+		argv = sandbox.WindowArgv(attachFollows(ctx), a.sandboxArgv(container, dir, env, auth, argv))
 	}
 	return a.Tmux.NewWindow(ctx, tmux.WindowSpec{
 		Session:   tmux.SessionName(t.Slug),
@@ -267,6 +285,7 @@ func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir st
 // (remain-on-exit) windows does not count, so a crashed claude is relaunched
 // rather than attached to.
 func (a *App) Open(ctx context.Context, ref string) (*exec.Cmd, error) {
+	ctx = attaching(ctx)
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
 		return nil, err

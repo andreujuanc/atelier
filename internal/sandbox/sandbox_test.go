@@ -280,6 +280,122 @@ func TestExecArgv(t *testing.T) {
 	}
 }
 
+// windowEnv runs WindowArgv(attach, cmd) with sh, as tmux would, with a
+// fake tmux on PATH that logs its arguments to dir/tmux.log and answers
+// the contents of dir/attached (exit 1 if there is no such file).
+func windowEnv(t *testing.T, attach bool, cmd string) (dir string, run *exec.Cmd) {
+	t.Helper()
+	dir = t.TempDir()
+	fake := "#!/bin/sh\necho \"$*\" >> " + dir + "/tmux.log\nexec cat " + dir + "/attached 2> /dev/null\n"
+	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	argv := WindowArgv(attach, []string{"sh", "-c", cmd})
+	run = exec.Command(argv[0], argv[1:]...)
+	run.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "TMUX_PANE=%7", "OUT="+dir)
+	return dir, run
+}
+
+func waitForFile(t *testing.T, path string, within time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+func TestWindowArgv(t *testing.T) {
+	for _, c := range []struct {
+		attach bool
+		mode   string
+	}{{true, "attach"}, {false, "detached"}} {
+		got := WindowArgv(c.attach, []string{"docker", "exec", "-it", "x"})
+		if !slices.Equal(got[:2], []string{"sh", "-c"}) || !slices.Equal(got[3:], []string{"atl-window", c.mode, "docker", "exec", "-it", "x"}) {
+			t.Errorf("WindowArgv(%v) = %q", c.attach, got)
+		}
+	}
+}
+
+// TestWindowScriptWaitsForAttach: with an attach to follow, docker exec
+// starts only once the window's tmux session has a client; then at once.
+func TestWindowScriptWaitsForAttach(t *testing.T) {
+	dir, run := windowEnv(t, true, `touch "$OUT/started"; echo "$@" > "$OUT/args"`)
+	if err := os.WriteFile(filepath.Join(dir, "attached"), []byte("0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- run.Wait() }()
+	if waitForFile(t, filepath.Join(dir, "started"), 700*time.Millisecond) {
+		t.Fatal("started before a client attached")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "attached"), []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !waitForFile(t, filepath.Join(dir, "started"), 2*time.Second) {
+		t.Fatal("did not start once a client attached")
+	}
+	if err := <-done; err != nil {
+		t.Errorf("exit: %v", err)
+	}
+	log, _ := os.ReadFile(filepath.Join(dir, "tmux.log"))
+	if first, _, _ := strings.Cut(string(log), "\n"); first != "display-message -p -t %7 #{session_attached}" {
+		t.Errorf("tmux called with: %q", log)
+	}
+}
+
+// TestWindowScriptStartsAtOnce: without an attach to follow, or when tmux
+// cannot answer, docker exec starts at once; its exit status is the
+// window's.
+func TestWindowScriptStartsAtOnce(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		attach bool
+		answer bool // the fake tmux answers "0" (else it fails)
+	}{{"detached", false, true}, {"attach, tmux fails", true, false}} {
+		t.Run(c.name, func(t *testing.T) {
+			dir, run := windowEnv(t, c.attach, `exit 3`)
+			if c.answer {
+				if err := os.WriteFile(filepath.Join(dir, "attached"), []byte("0\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			start := time.Now()
+			err := run.Run()
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) || ee.ExitCode() != 3 {
+				t.Errorf("exit: %v", err)
+			}
+			if d := time.Since(start); d > 700*time.Millisecond {
+				t.Errorf("took %v", d)
+			}
+			log, _ := os.ReadFile(filepath.Join(dir, "tmux.log"))
+			if !c.attach && len(log) > 0 {
+				t.Errorf("tmux called without an attach to wait for: %q", log)
+			}
+		})
+	}
+}
+
+// TestWindowScriptResendsSize: docker exec gets SIGWINCH after its start,
+// so that it sends the window's size once more.
+func TestWindowScriptResendsSize(t *testing.T) {
+	dir, run := windowEnv(t, false, `trap 'echo winch >> "$OUT/winch"' WINCH; i=0; while [ $i -lt 45 ]; do sleep 0.1; i=$((i + 1)); done`)
+	if err := run.Run(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "winch"))
+	if n := strings.Count(string(b), "winch"); n != 2 {
+		t.Errorf("SIGWINCH %d times in 4.5 s, want 2 (at 1 and 3 s)", n)
+	}
+}
+
 // script is a Runner answering from a list of (prefix → output, error).
 type script struct {
 	calls   []string

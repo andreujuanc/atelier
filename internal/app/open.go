@@ -173,6 +173,7 @@ func (a *App) OpenOrChoose(ctx context.Context, ref string) (*exec.Cmd, []Sessio
 // returns the command that attaches to the task's tmux session with the new
 // window selected.
 func (a *App) OpenNew(ctx context.Context, ref string) (*exec.Cmd, error) {
+	ctx = attaching(ctx)
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -200,6 +201,7 @@ func (a *App) OpenNew(ctx context.Context, ref string) (*exec.Cmd, error) {
 // cannot find from the task dir (resumableHere) or whose transcript file is
 // gone, and closed tasks (for resuming).
 func (a *App) OpenSession(ctx context.Context, ref string, sessionID int64) (*exec.Cmd, error) {
+	ctx = attaching(ctx)
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
 		return nil, err
