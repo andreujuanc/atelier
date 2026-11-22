@@ -295,6 +295,7 @@ per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; re
 | `ATL_SANDBOX` | unset (on) — each task's sessions run in the task's own container (see [Sandbox](#sandbox)); unset, empty and `docker` mean on, `off` switches it off (going away), anything else is an error |
 | `ATL_SANDBOX_IMAGE` | `atelier-task` — the task container image, unless the task's project names one (see [Docker image](#docker-image)) |
 | `ATL_SANDBOX_CONTEXT` | unset — what sandboxed sessions get in place of `ATL_CONTEXT` (same limit) |
+| `ATL_SANDBOX_MOUNTS` | unset — host files and directories every task gets read-only, `:`-separated absolute paths like `PATH` (`~/` is your home); see **Host files for every task** under [Sandbox](#sandbox) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | unset — with the sandbox on, the token (`claude setup-token`) that sandboxed sessions log in with; when set it wins over the one `atl token` stored |
 | `ANTHROPIC_API_KEY` | unset — with the sandbox on, an API key for sandboxed sessions instead of a token (also wins over the stored one) |
 
@@ -347,7 +348,8 @@ atl (box)  ── docker exec ──▶  task container atl-<slug>-<hash>   one 
 A task container sees, at the same paths as `atl`: the task dir; the git database
 (`.git`) of each rw repo's clone, which the worktree needs and which every task with that
 repo rw shares (so such tasks can reach each other, see the first item of what the sandbox
-does not do yet); each ro repo, read-only; and the task's own Claude Code config dir (see
+does not do yet); each ro repo, read-only; the task's own Claude Code config dir (see
+below); and what `ATL_SANDBOX_MOUNTS` lists, read-only (see **Host files for every task**
 below). It does not see the Docker socket, the SSH agent, other repos, other tasks' dirs,
 your Claude Code config dir (login, settings,
 other sessions' transcripts), nor atelier's database, state dir (hook log, gate logs) or
@@ -370,8 +372,9 @@ always this task's. Hook errors go to `hook.log` where `atl` runs, as before. A 
 gate cannot be reached fails open with the error on stderr (an oversized `PreToolUse`
 input is still refused). For `atl notes` and `atl note` the task must be the container's
 own (`$ATL_TASK`); every other `atl` command says in one line that it does not work in a
-task container. A gate started by an older `atl` binary, or for a task that was deleted
-since, is replaced the next time `atl` starts a session in the task.
+task container. A gate started by an older `atl` binary, with another `ATL_SANDBOX_MOUNTS`,
+or for a task that was deleted since, is replaced the next time `atl` starts a session in
+the task.
 
 The tmux window of a session runs `docker exec` into the container, so everything else
 (session states, crash recovery, resume, the picker) works as before. When the window dies
@@ -484,8 +487,9 @@ The default image has Node.js and no other language (see [Docker image](#docker-
 repo with its own container setup (a `.devcontainer`, compose files, or one its docs or
 `CLAUDE.md` describe) is built, tested and run in that setup, with `docker` and `docker
 compose` through the gate (see **Docker** below); the session's start context tells it so.
-When that setup asks for something the gate refuses (a mount from outside the task dir such
-as `~/.npmrc`, a privileged service, a Dockerfile that needs BuildKit), the session does not
+When that setup asks for something the gate refuses (a mount from outside the task dir, such
+as `~/.npmrc` when `ATL_SANDBOX_MOUNTS` does not list it, a privileged service, a Dockerfile
+that needs BuildKit), the session does not
 edit the repo: it overrides that part with a file in the task dir (for compose, an override
 file passed with `-f`) and tells you what it overrode. The project's `image` is for repos
 without such a setup, or for tools Claude should have next to it: a project that needs Go,
@@ -512,7 +516,8 @@ log in `gate-<slug>.log` next to `hook.log`) forwards only what a task may do:
   create, an inspect) is between its check and Docker's answer, so Docker never makes the
   container a fresh volume of that name without the label, and a delete never reaches
   another task's volume that took the name in between;
-- bind mounts must come from the task dir (symlinks resolved); a mount of
+- bind mounts must come from the task dir (symlinks resolved), or, read-only only, from what
+  `ATL_SANDBOX_MOUNTS` lists (see **Host files for every task** below); a mount of
   `/var/run/docker.sock` becomes a mount of the gate's socket, so tools that drive Docker
   themselves (localstack, testcontainers) stay inside the same rules;
 - privileged mode, host network/PID/IPC, added capabilities, devices, security options,
@@ -539,6 +544,34 @@ included), not by its name.
 
 `atl done`/`atl cancel` remove what the task left on the daemon (containers, networks,
 volumes).
+
+**Host files for every task.** Some repos need a file from your host to build, such as an
+`.npmrc` with the credentials of a private npm registry. `ATL_SANDBOX_MOUNTS` lists such
+files and directories: absolute paths separated by `:`, like `PATH` (empty entries are
+ignored, `~/` is your home directory), e.g. `ATL_SANDBOX_MOUNTS=~/.eldorado.npmrc`. Every
+task's container has each of them read-only, at the same path, and the gate lets a container
+the task creates bind-mount one, or a path inside a listed directory, read-only only: a
+request to mount it read-write (a compose file's `~/.npmrc:/home/node/.npmrc` without
+`:ro`, say) is made read-only, which the gate log notes, and the relabel options `z`/`Z` are
+dropped. Every task can read what is listed, whatever its file permissions say (a task may
+be root in its own container), and so can whatever runs in it: list only what you would
+hand to any task. Read-only stops writes, not reads, and not connecting to a socket that
+sits in a listed directory.
+
+`atl` resolves each path's symlinks once, when it starts, and uses the result everywhere.
+It can only check the box: Docker resolves bind-mount sources on the host, so each path
+must exist at the same path there too (as the workspace and repos do), or the task's
+container cannot be created. `atl` refuses to start, in one line that names the path and the
+rule, when a path is not absolute, does not exist, is not a file or directory, has a comma
+or quote in it (docker's `--mount` cannot take one), is `/`, or is, contains or lies inside
+what the sandbox keeps from tasks: the workspace (without one, atelier's data, state and
+config dirs), the run dir (gate sockets, task Claude dirs, origin pins, the stored token),
+`ATL_REPOS`, the tasks dir, your Claude Code config dir, the Docker socket, the SSH agent's
+socket, `/proc`, `/sys` or `/dev`. `atl doctor` lists the paths and names each one that is
+missing or refused, and why. A sandboxed session's start context names them in one line
+(cut, saying how many more, when the list is long). A changed list reaches a task the next
+time a session starts in it: its gate is replaced then, and its container too once no
+session runs in it (as after `atl add`).
 
 What the sandbox does not do yet:
 
@@ -568,14 +601,17 @@ What the sandbox does not do yet:
   fetching go through `atl push`/`atl fetch` (see Git below), and `atl pr` runs where
   `atl` runs.
 
-It needs a token for Claude Code (above), the workspace and repos at the same paths for
-`atl` and the Docker daemon, and a workspace path short enough for the gate's socket
+It needs a token for Claude Code (above), the workspace, the repos and what
+`ATL_SANDBOX_MOUNTS` lists at the same paths for `atl` and the Docker daemon, and a
+workspace path short enough for the gate's socket
 (`<workspace>/run/<12 chars>/docker.sock`, at most 107 bytes). `atl doctor` reports the
-mode and checks the daemon, the image and the token.
+mode and checks the daemon, the image, the token and `ATL_SANDBOX_MOUNTS`.
 
 **Session context.** A sandboxed session's start context has a built-in note on the
 sandbox (a repo's own container setup first, else tools run here; what the Docker gate
-refuses and how to override a repo's setup for it; `atl push`/`atl fetch` for git).
+refuses and how to override a repo's setup for it; `atl push`/`atl fetch` for git), and a
+line that names what `ATL_SANDBOX_MOUNTS` lists; that line gives way to the notes when room
+is short.
 `ATL_CONTEXT` is *not* passed to task containers: it describes the place `atl` runs in,
 and rules for a shared box ("run everything through docker", "never mount ...")
 contradict a task's own container. Put
