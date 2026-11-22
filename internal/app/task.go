@@ -318,75 +318,117 @@ func resolveBase(ctx context.Context, name, path, base string) (branch, commit s
 }
 
 // populateTaskDir creates the task dir, worktrees and generated files for a
-// freshly inserted task. On failure it undoes everything, including the
-// task row, and returns the original error.
-func (a *App) populateTaskDir(ctx context.Context, t *model.Task) (err error) {
-	dir := a.Paths.TaskDir(t.Slug)
-	var created []model.TaskRepo // worktrees (and branches) this call made
-	madeDir := false
-	defer func() {
-		if err == nil {
-			return
+// freshly inserted task (buildTaskDir, each rw repo on a new task branch at
+// its base commit). On failure it undoes everything, including the task
+// row, and returns the original error.
+func (a *App) populateTaskDir(ctx context.Context, t *model.Task) error {
+	var plan []rwCheckout
+	for _, r := range t.Repos {
+		if r.Mode == model.ModeRW {
+			plan = append(plan, rwCheckout{Repo: r, Start: r.BaseCommit})
 		}
-		bg := context.WithoutCancel(ctx)
+	}
+	if _, err := a.buildTaskDir(ctx, t, plan, false); err != nil {
+		if rerr := a.Store.DeleteTask(context.WithoutCancel(ctx), t.ID); rerr != nil {
+			a.warnf("rollback: delete task row %s: %v", t.Slug, rerr)
+		}
+		return err
+	}
+	return nil
+}
+
+// rwCheckout says how buildTaskDir puts the worktree of rw repo Repo in
+// place: Keep, it is there already; Existing, on the task branch the
+// canonical clone has; otherwise on a new task branch starting at Start.
+type rwCheckout struct {
+	Repo     model.TaskRepo
+	Start    string
+	Existing bool
+	Keep     bool
+}
+
+// buildTaskDir puts in place what an open task t has on disk: the task dir,
+// a worktree on t.Branch per entry of plan, and the generated CLAUDE.md and
+// .claude/settings.json. The task dir must not exist yet unless dirMayExist.
+// On failure it undoes what it made (worktrees, the branches it created, the
+// task dir if it made it) and returns the error. On success it returns that
+// undo, for a caller whose next step fails; generated files it wrote into a
+// task dir it did not make are left.
+func (a *App) buildTaskDir(ctx context.Context, t *model.Task, plan []rwCheckout, dirMayExist bool) (undo func(), err error) {
+	dir := a.Paths.TaskDir(t.Slug)
+	type made struct {
+		name, wt string
+		branch   bool // the branch too
+	}
+	var created []made
+	madeDir := false
+	rollback := func() {
 		for i := len(created) - 1; i >= 0; i-- {
-			r := created[i]
-			repo := a.Paths.RepoPath(r.Name)
-			if rerr := gitx.RemoveWorktree(bg, repo, a.Paths.WorktreePath(t.Slug, r.Name), true); rerr != nil {
-				a.warnf("rollback: remove worktree %s: %v", r.Name, rerr)
-			}
-			if rerr := gitx.DeleteBranch(bg, repo, t.Branch); rerr != nil {
-				a.warnf("rollback: delete branch %s in %s: %v", t.Branch, r.Name, rerr)
-			}
+			c := created[i]
+			a.undoWorktree(ctx, c.name, c.wt, t.Branch, true, c.branch)
 		}
 		if madeDir {
 			if rerr := os.RemoveAll(dir); rerr != nil {
 				a.warnf("rollback: remove %s: %v", dir, rerr)
 			}
 		}
-		if rerr := a.Store.DeleteTask(bg, t.ID); rerr != nil {
-			a.warnf("rollback: delete task row %s: %v", t.Slug, rerr)
+	}
+	defer func() {
+		if err != nil {
+			rollback()
 		}
 	}()
 
 	if err := os.MkdirAll(a.Paths.Tasks, 0o755); err != nil {
-		return fmt.Errorf("create tasks dir: %w", err)
+		return nil, fmt.Errorf("create tasks dir: %w", err)
 	}
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("task dir %s already exists; remove it or choose another title", dir)
-		}
-		return fmt.Errorf("create task dir: %w", err)
+	if err := os.Mkdir(dir, 0o755); err == nil {
+		madeDir = true
+	} else if !errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("create task dir: %w", err)
+	} else if !dirMayExist {
+		return nil, fmt.Errorf("task dir %s already exists; remove it or choose another title", dir)
+	} else if fi, lerr := os.Lstat(dir); lerr != nil || !fi.IsDir() {
+		return nil, fmt.Errorf("task dir %s is there but not a directory; remove it first", dir)
 	}
-	madeDir = true
-	for _, r := range t.Repos {
-		if r.Mode != model.ModeRW {
+	for _, c := range plan {
+		if c.Keep {
 			continue
 		}
-		wt := a.Paths.WorktreePath(t.Slug, r.Name)
-		repo := a.Paths.RepoPath(r.Name)
+		name := c.Repo.Name
+		wt := a.Paths.WorktreePath(t.Slug, name)
+		repo := a.Paths.RepoPath(name)
 		_, berr := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
 		branchExisted := berr == nil
-		if err := a.addWorktree(ctx, r.Name, repo, wt, t.Branch, r.BaseCommit); err != nil {
-			if !branchExisted {
-				// git may have created the branch (and worktree) before
-				// failing, e.g. when the checkout fails: undo them too.
-				bg := context.WithoutCancel(ctx)
-				_ = gitx.RemoveWorktree(bg, repo, wt, true)
-				if _, rerr := gitx.RevParse(bg, repo, "refs/heads/"+t.Branch); rerr == nil {
-					if derr := gitx.DeleteBranch(bg, repo, t.Branch); derr != nil {
-						a.warnf("rollback: delete branch %s in %s: %v", t.Branch, r.Name, derr)
-					}
-				}
-			}
-			return fmt.Errorf("repo %s: %w", r.Name, err)
+		var err error
+		if c.Existing {
+			err = a.addBranchWorktree(ctx, name, repo, wt, t.Branch)
+		} else {
+			err = a.addWorktree(ctx, name, repo, wt, t.Branch, c.Start)
 		}
-		created = append(created, r)
+		if err != nil {
+			// git may have created the branch (and worktree) before failing,
+			// e.g. when the checkout fails: undo only what this call
+			// verifiably created. "already exists" means git refused up
+			// front and whatever is there belongs to someone else.
+			if !strings.Contains(err.Error(), "already exists") {
+				_, werr := os.Lstat(wt)
+				_, nberr := gitx.RevParse(context.WithoutCancel(ctx), repo, "refs/heads/"+t.Branch)
+				createdWT, createdBr := werr == nil, !branchExisted && nberr == nil
+				// A missing worktree is only pruned.
+				a.undoWorktree(ctx, name, wt, t.Branch, createdWT || !branchExisted, createdBr)
+			}
+			return nil, fmt.Errorf("repo %s: %w", name, err)
+		}
+		created = append(created, made{name, wt, !branchExisted})
 	}
 	if err := gen.WriteClaudeMD(dir, *t, a.repoInfos(t)); err != nil {
-		return err
+		return nil, err
 	}
-	return gen.WriteSettings(dir, a.hookBin())
+	if err := gen.WriteSettings(dir, a.hookBin()); err != nil {
+		return nil, err
+	}
+	return rollback, nil
 }
 
 // taskProject loads the task's project, or returns nil if it has none.
@@ -555,7 +597,10 @@ func (a *App) Get(ctx context.Context, ref string) (*TaskView, error) {
 	return v, nil
 }
 
-// SetStatus changes a task's status with no other side effects.
+// SetStatus changes a task's status. Between open statuses, between closed
+// ones (done ↔ cancelled) and from open to closed it changes nothing else
+// (closing with cleanup is Done/Cancel). From closed to open it reopens the
+// task (see reopen).
 func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error {
 	if !st.Valid() {
 		return fmt.Errorf("invalid status %q", st)
@@ -564,7 +609,136 @@ func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error 
 	if err != nil {
 		return err
 	}
-	return a.Store.SetTaskStatus(ctx, t.ID, st)
+	if t.Status.Open() || !st.Open() {
+		return a.Store.SetTaskStatus(ctx, t.ID, st)
+	}
+	return a.reopen(ctx, t.ID, st)
+}
+
+// reopen brings closed task id back to the state a new task has, and then
+// sets its status to the open status to; under the per-task lock, like
+// finish. For each rw repo it makes the worktree on the task branch
+// (buildTaskDir): on the local branch if the canonical clone still has it
+// (done/cancel keep a branch with unpushed commits); else, after a fetch,
+// on a new one from origin/<branch> if origin has it; else on a new one
+// from the task's base (as NewTask and AddRepo do, see resolveBase), with a
+// warning that the task's earlier commits are not on it, and that base is
+// recorded. A worktree that is still there is kept. ro repos need their
+// canonical clone only. It also clears what is left of the task's sandbox
+// (see removeSandbox), writes CLAUDE.md and the settings and runs the
+// project's setup in each new worktree (a failure is a warning). If a step
+// fails, what this call made is undone, the task stays closed and the error
+// says what failed.
+func (a *App) reopen(ctx context.Context, id int64, to model.Status) error {
+	if err := outsideSandbox("reopen a task"); err != nil {
+		return err
+	}
+	unlock, err := a.lockTask(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	t, err := a.Store.GetTask(ctx, id)
+	if err != nil {
+		return err
+	}
+	if t.Status.Open() { // reopened meanwhile
+		return a.Store.SetTaskStatus(ctx, t.ID, to)
+	}
+	fail := func(err error) error {
+		return fmt.Errorf("reopen task %s: %w (it stays %s)", t.Slug, err, t.Status)
+	}
+	if t.Branch == "" {
+		t.Branch = "atl/" + t.Slug
+	}
+	for _, r := range t.Repos {
+		if err := checkRepo(ctx, r.Name, a.Paths.RepoPath(r.Name)); err != nil {
+			return fail(err)
+		}
+	}
+	plan, rebased, err := a.reopenPlan(ctx, t)
+	if err != nil {
+		return fail(err)
+	}
+	// What closing the task could not remove (Docker did not answer, say):
+	// a container left from before would have the old task dir mounted.
+	if a.Sandbox != nil || fileExists(a.Paths.RunDir(t.Slug)) {
+		a.removeSandbox(ctx, t)
+	}
+	undo, err := a.buildTaskDir(ctx, t, plan, true)
+	if err != nil {
+		return fail(err)
+	}
+	made := map[string]bool{}
+	for _, c := range plan {
+		made[c.Repo.Name] = !c.Keep
+	}
+	if err := a.runSetup(ctx, t, func(r model.TaskRepo) bool { return made[r.Name] }); err != nil {
+		a.warnf("setup for task %s failed (task reopened): %v", t.Slug, err)
+	}
+	if err := a.Store.ReopenTask(ctx, t.ID, to, rebased); err != nil {
+		undo()
+		return fail(err)
+	}
+	return nil
+}
+
+// reopenPlan decides how reopen puts back the worktree of each rw repo of
+// closed task t (see reopen). For a repo that starts again from the task's
+// base it sets the new base in t.Repos and returns the repo in rebased.
+func (a *App) reopenPlan(ctx context.Context, t *model.Task) (plan []rwCheckout, rebased []model.TaskRepo, err error) {
+	for i := range t.Repos {
+		r := &t.Repos[i]
+		if r.Mode != model.ModeRW {
+			continue
+		}
+		repo := a.Paths.RepoPath(r.Name)
+		wt := a.Paths.WorktreePath(t.Slug, r.Name)
+		if _, err := os.Lstat(wt); err == nil {
+			// Closed with its worktree in place (`atl status`, or one that
+			// could not be removed): kept if it is one of the repo's clone.
+			if err := gitx.CheckWorktree(ctx, wt, repo); err != nil {
+				return nil, nil, fmt.Errorf("repo %s: %w; remove it first", r.Name, err)
+			}
+			plan = append(plan, rwCheckout{Repo: *r, Keep: true})
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("repo %s: %w", r.Name, err)
+		}
+		local, err := gitx.RefExists(ctx, repo, "refs/heads/"+t.Branch)
+		if err != nil {
+			return nil, nil, fmt.Errorf("repo %s: %w", r.Name, err)
+		}
+		if local {
+			plan = append(plan, rwCheckout{Repo: *r, Existing: true})
+			continue
+		}
+		fmt.Fprintf(a.out(), "fetching %s...\n", r.Name)
+		if err := a.fetchOrigin(ctx, r.Name, repo); err != nil {
+			a.warnf("repo %s: fetch: %v; going by origin's branches as last fetched", r.Name, err)
+		}
+		remote, err := gitx.RefExists(ctx, repo, "refs/remotes/origin/"+t.Branch)
+		if err != nil {
+			return nil, nil, fmt.Errorf("repo %s: %w", r.Name, err)
+		}
+		if remote {
+			tip, err := gitx.RevParse(ctx, repo, "refs/remotes/origin/"+t.Branch)
+			if err != nil {
+				return nil, nil, fmt.Errorf("repo %s: %w", r.Name, err)
+			}
+			fmt.Fprintf(a.out(), "repo %s: branch %s is gone here; made again from origin/%s\n", r.Name, t.Branch, t.Branch)
+			plan = append(plan, rwCheckout{Repo: *r, Start: tip})
+			continue
+		}
+		if r.BaseBranch, r.BaseCommit, err = resolveBase(ctx, r.Name, repo, t.Base); err != nil {
+			return nil, nil, err
+		}
+		a.warnf("repo %s: branch %s is gone, here and on origin; it starts again from origin/%s, without the task's earlier commits",
+			r.Name, t.Branch, r.BaseBranch)
+		plan = append(plan, rwCheckout{Repo: *r, Start: r.BaseCommit})
+		rebased = append(rebased, *r)
+	}
+	return plan, rebased, nil
 }
 
 // Rename changes a task's title (any status) and returns the updated task.

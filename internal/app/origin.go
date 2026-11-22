@@ -162,6 +162,16 @@ func (a *App) addWorktree(ctx context.Context, name, repo, wt, branch, start str
 	return a.noteRefusal(name, "git worktree add", err)
 }
 
+// addBranchWorktree is gitx.AddBranchWorktree for repo name (canonical
+// clone at repo), with its pinned origin.
+func (a *App) addBranchWorktree(ctx context.Context, name, repo, wt, branch string) error {
+	o, _, err := a.pinOrigin(ctx, name, repo)
+	if err == nil {
+		err = gitx.AddBranchWorktree(ctx, repo, wt, branch, o)
+	}
+	return a.noteRefusal(name, "git worktree add", err)
+}
+
 // noteRefusal makes sure the user hears of a git command atl refused to run
 // (err is a *gitx.RefusedError: a setting in the repo's own config would
 // have made git run a program or go elsewhere): a warning on Out, and a

@@ -234,6 +234,10 @@ func testPoisonedRepoApp(t *testing.T, refusing bool) {
 			return err
 		}, ""},
 		{"Done --force", func() error { _, err := e.app.Done(ctx, task.Slug, true); return err }, ""},
+		// The pushed branch was deleted: it is made again from origin's.
+		{"Reopen (fetch, worktree add)", func() error {
+			return e.app.SetStatus(ctx, task.Slug, model.StatusActive)
+		}, "filter.evil."},
 	}
 	// With refusing: Diff refuses (filter); fetches are fine (pushInsteadOf
 	// only rewrites push URLs, but -c cannot remove it: every transport

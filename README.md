@@ -73,7 +73,7 @@ atl open fix-login --session 3   # open that session: select it if live, else cl
 atl open fix-login --new  # start a new Claude session and attach to it
 atl session fix-login     # start another Claude session (window) in the task
 atl resume fix-login      # after a crash/reboot: relaunch stopped sessions with claude --resume
-atl status fix-login review
+atl status fix-login review      # done/cancelled → backlog/active/review reopens the task (worktrees, CLAUDE.md, setup)
 atl rename fix-login Fix the login page   # title only: slug, branch atl/<slug>, tmux session and dirs keep the old name
 atl diff fix-login        # git diff of each rw repo vs its base commit (paged on a TTY)
 atl push [fix-login] [--repo api] [--force]  # push atl/<slug> of each rw repo to origin (--force: with lease); task defaults to $ATL_TASK
@@ -199,6 +199,15 @@ refs only, no fetch), e.g. after you pushed it or when it has no commits of its 
 uncommitted changes, never unpushed commits. They also refuse, even with `--force`, while a
 worktree's HEAD has commits no branch, remote-tracking ref or tag reaches (a detached HEAD
 or a rebase in progress): put them on a branch first.
+
+Setting a done or cancelled task back to an open status (`atl status <task> active`, TUI
+`1`-`3`) reopens it: the task dir, CLAUDE.md and settings come back, and each rw worktree is
+made again on `atl/<slug>`, from the kept local branch, else from `origin/atl/<slug>`, else
+(with a warning: the old commits are not on it) as a new branch from the task's base; the
+project's setup runs again. Nothing is resumed on its own: `enter` starts a new session, or
+offers the past ones whose transcript is still there. If a step fails, nothing is left
+behind and the task stays closed. Moving to done or cancelled with `atl status` (TUI `4`/`5`)
+only changes the status; `atl done`/`atl cancel` (TUI `d`/`c`) do the cleanup above.
 
 `atl show` also prints each session's title (from its transcript; `--json`: `title`,
 `""` when none). It never touches the network: "pushed" means the local remote-tracking ref
