@@ -135,6 +135,8 @@ func (m *Model) View() string {
 		body = m.sessPick.lines(w, bodyH, m.now())
 	} else if m.mode == modeForm && m.form != nil {
 		body = m.formLines(w, bodyH)
+	} else if m.mode == modeConfirm && m.confirm != nil {
+		body = m.confirm.lines(w, bodyH)
 	} else if m.mode == modeNotes && w < minSplitWidth {
 		// Too narrow for the split: the details pane (with the editor)
 		// takes the whole body while editing.
@@ -377,14 +379,6 @@ func orDash(s string) string {
 func (m *Model) statusLine(w int) string {
 	var s string
 	switch {
-	case m.mode == modeConfirm && m.confirm != nil:
-		c := m.confirm
-		if c.dirty != "" {
-			s = "F force " + c.verb + ", any other key aborts — " + errStyle.Render(clean(c.dirty))
-		} else {
-			s = fmt.Sprintf("%s %s? y/N", c.verb, clean(c.slug))
-		}
-		return trunc(s, w)
 	case m.mode == modeFilter:
 		return trunc(m.filterInput.View(), w)
 	case m.mode == modeNotes && m.notes != nil && m.notes.ask != askNone:
@@ -417,6 +411,66 @@ func (m *Model) statusLine(w int) string {
 		s = dimStyle.Render("filter: /" + clean(m.filter) + "  (esc clears)")
 	}
 	return trunc(s, w)
+}
+
+// confirmWrap is the widest the done/cancel dialog's text runs.
+const confirmWrap = 72
+
+// lines renders the done/cancel dialog in the body (width w, height h).
+func (c *confirmState) lines(w, h int) []string {
+	if w <= 0 || h <= 0 {
+		return nil
+	}
+	ww := w
+	if ww > confirmWrap {
+		ww = confirmWrap
+	}
+	wrap := func(s string, st lipgloss.Style) []string {
+		var out []string
+		for _, l := range strings.Split(ansi.Wrap(s, ww, ""), "\n") {
+			out = append(out, st.Render(trunc(strings.TrimRight(l, " "), w)))
+		}
+		return out
+	}
+	head := "Mark " + clean(c.slug) + " done?"
+	if c.verb == "cancel" {
+		head = "Cancel " + clean(c.slug) + "?"
+	}
+	blocks := [][]string{
+		wrap(head, titleStyle),
+		wrap("This deletes the task's worktrees and its task dir. Files that are not committed "+
+			"cannot be recovered. Commits stay on the task branch.", lipgloss.NewStyle()),
+	}
+	if c.dirty {
+		blocks = append(blocks, wrap("There are uncommitted changes. They will be deleted.", errStyle))
+	}
+	box := "[ ] Delete them"
+	if c.ticked {
+		box = "[x] Delete them"
+	}
+	last := []string{trunc(box, w)}
+	if c.unticked {
+		last = append(last, wrap("Tick the box with space to confirm.", markStyle)...)
+	}
+	blocks = append(blocks, last)
+	join := func(sep bool) []string {
+		var out []string
+		for i, b := range blocks {
+			if sep && i > 0 {
+				out = append(out, "")
+			}
+			out = append(out, b...)
+		}
+		return out
+	}
+	out := join(true)
+	if len(out) > h {
+		out = join(false)
+	}
+	if len(out) > h {
+		out = out[len(out)-h:] // keep the box visible on very short terminals
+	}
+	return out
 }
 
 // baseSuffix shows the origin branch a rw repo's task branch started from
@@ -465,7 +519,7 @@ func (m *Model) helpLine(w int) string {
 		}
 		s = "new title for " + clean(m.renameSlug) + " (slug, branch and dirs stay)  enter save  esc cancel"
 	case modeConfirm:
-		s = ""
+		s = "space tick/untick  enter confirm (box ticked)  esc/n cancel"
 	default:
 		s = "n new  enter open  s session  r resume  a add repo  m edit notes  t rename  d done  c cancel  p pr  D diff  A assistant  1-5 status  / filter  q quit"
 		for _, l := range legends {

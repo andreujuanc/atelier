@@ -99,7 +99,7 @@ atl                       # TUI (on a terminal)
 TUI keys: `n` new task, `enter` open (see below), `s` new session, `r` resume, `a` add repos to the
 selected task, `m` edit the selected task's notes in place (see [Notes](#notes)), `t` rename
 the selected task (an input prefilled with its title; `enter` saves, `esc` cancels), `d` done,
-`c` cancel, `p` pr, `D` diff, `A` assistant (about the selected task), `1`-`5` status,
+`c` cancel (both ask first, see below), `p` pr, `D` diff, `A` assistant (about the selected task), `1`-`5` status,
 `/` filter (matches the slug or the title), `q` quit (while operations are running it
 waits for them and then quits; `ctrl+c` again forces it; meanwhile `n`, `t`, `a`, `d`, `c`
 and `/` are refused so no input is lost). The task list shows each task's title
@@ -201,6 +201,15 @@ refs only, no fetch), e.g. after you pushed it or when it has no commits of its 
 uncommitted changes, never unpushed commits. They also refuse, even with `--force`, while a
 worktree's HEAD has commits no branch, remote-tracking ref or tag reaches (a detached HEAD
 or a rebase in progress): put them on a branch first.
+
+In the TUI, `d` and `c` open a dialog that says the task's worktrees and task dir are
+deleted, that files that are not committed cannot be recovered and that commits stay on the
+task branch. When a rw worktree has uncommitted changes it says so, and that they will be
+deleted. To confirm, tick `[ ] Delete them` with `space`, then press `enter`; `esc` or `n`
+closes the dialog and nothing happens. There is no separate force step: a dialog that showed
+uncommitted changes closes the task as `--force` does. If changes appear after a dialog
+that did not show any, the close is refused and the dialog comes back with them. Other
+refusals are shown in the status line.
 
 Setting a done or cancelled task back to an open status (`atl status <task> active`, TUI
 `1`-`3`) reopens it: the task dir, CLAUDE.md and settings come back, and each rw worktree is

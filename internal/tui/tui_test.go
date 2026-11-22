@@ -34,6 +34,8 @@ type fakeBackend struct {
 	tasks    []app.TaskView
 	calls    []call
 	doneErr  error // returned by Done/Cancel when force is false
+	forceErr error // returned by Done/Cancel when force is true
+	getErr   error // returned by Get
 	projects []string
 	newTask  *model.Task
 	// repos is AvailableRepos' result; projRepos ProjectRepos' per project.
@@ -85,13 +87,19 @@ func (f *fakeBackend) List(ctx context.Context) ([]app.TaskView, error) {
 
 func (f *fakeBackend) Get(ctx context.Context, ref string) (*app.TaskView, error) {
 	f.rec("Get", ref)
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	for _, t := range f.tasks {
 		if t.Task.Slug == ref {
 			v := t
 			for _, r := range t.Task.Repos {
 				rs := app.RepoStatus{Name: r.Name, Mode: r.Mode, BaseBranch: r.BaseBranch, Dirty: r.Name == "dirtyrepo"}
-				if r.Name == "gonerepo" {
+				switch r.Name {
+				case "gonerepo":
 					rs.Err = "missing"
+				case "brokenrepo":
+					rs.Err = "git status: exit status 128"
 				}
 				v.RepoStatus = append(v.RepoStatus, rs)
 			}
@@ -173,6 +181,9 @@ func (f *fakeBackend) Done(ctx context.Context, ref string, force bool) (*model.
 	if !force && f.doneErr != nil {
 		return nil, f.doneErr
 	}
+	if force && f.forceErr != nil {
+		return nil, f.forceErr
+	}
 	return &model.Task{Slug: ref, Status: model.StatusDone}, nil
 }
 
@@ -180,6 +191,9 @@ func (f *fakeBackend) Cancel(ctx context.Context, ref string, force bool) (*mode
 	f.rec("Cancel", ref, force)
 	if !force && f.doneErr != nil {
 		return nil, f.doneErr
+	}
+	if force && f.forceErr != nil {
+		return nil, f.forceErr
 	}
 	return &model.Task{Slug: ref, Status: model.StatusCancelled}, nil
 }
@@ -629,54 +643,235 @@ func TestStatusKeys(t *testing.T) {
 	}
 }
 
-func TestDoneConfirm(t *testing.T) {
+const dirtyLine = "There are uncommitted changes. They will be deleted."
+
+// TestDoneDialog: d/c check the task, then open a dialog that only space
+// (tick) and enter confirm; a clean task closes without force.
+func TestDoneDialog(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks()}
 	m, _ := newTest(t, fb)
+	gets := fb.count("Get")
 	key(m, "d")
-	if !strings.Contains(plainView(m), "done beta? y/N") {
-		t.Fatalf("no prompt:\n%s", plainView(m))
+	if fb.count("Get") != gets+1 || fb.last("Get").args[0] != "beta" {
+		t.Fatalf("no dirty check: %+v", fb.calls)
 	}
-	key(m, "n")
-	if fb.count("Done") != 0 || m.mode != modeNormal {
-		t.Fatal("n should abort")
+	v := plainView(m)
+	for _, want := range []string{"Mark beta done?", "This deletes the task's worktrees and its task dir.",
+		"cannot be recovered. Commits stay on the task branch.", "[ ] Delete them", "esc/n cancel"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("dialog misses %q:\n%s", want, v)
+		}
 	}
-	key(m, "d")
-	key(m, "y")
+	if m.mode != modeConfirm || strings.Contains(v, dirtyLine) {
+		t.Fatalf("clean dialog: mode %d\n%s", m.mode, v)
+	}
+	// enter with the box unticked, and a stray y, do nothing
+	key(m, "enter")
+	if fb.count("Done") != 0 || m.mode != modeConfirm || !strings.Contains(plainView(m), "Tick the box with space to confirm.") {
+		t.Fatalf("enter unticked: mode %d\n%s", m.mode, plainView(m))
+	}
+	for _, k := range []string{"y", "Y", "F", "x", "q"} {
+		key(m, k)
+	}
+	if fb.count("Done") != 0 || m.mode != modeConfirm {
+		t.Fatalf("stray keys: mode %d calls %+v", m.mode, fb.calls)
+	}
+	// space toggles the box
+	key(m, " ")
+	if !strings.Contains(plainView(m), "[x] Delete them") || strings.Contains(plainView(m), "Tick the box") {
+		t.Fatalf("not ticked:\n%s", plainView(m))
+	}
+	key(m, " ")
+	key(m, "enter")
+	if fb.count("Done") != 0 || !strings.Contains(plainView(m), "[ ] Delete them") {
+		t.Fatal("untick did not stick")
+	}
+	key(m, " ")
+	key(m, "enter")
 	c := fb.last("Done")
-	if c == nil || c.args[0] != "beta" || c.args[1] != false {
-		t.Fatalf("done call %+v", c)
+	if c == nil || c.args[0] != "beta" || c.args[1] != false || fb.count("Done") != 1 {
+		t.Fatalf("done call %+v", fb.calls)
 	}
+	if m.mode != modeNormal || m.status != "beta done" {
+		t.Fatalf("after done: mode %d status %q", m.mode, m.status)
+	}
+
+	// esc and n close the dialog, also with the box ticked
+	for _, k := range []string{"esc", "n"} {
+		key(m, "d")
+		key(m, " ")
+		key(m, k)
+		if m.mode != modeNormal || m.confirm != nil || fb.count("Done") != 1 || !strings.Contains(m.status, "aborted") {
+			t.Fatalf("%s: mode %d status %q", k, m.mode, m.status)
+		}
+	}
+
+	// c: the same dialog, worded for cancel
 	key(m, "c")
-	key(m, "y")
-	if c := fb.last("Cancel"); c == nil || c.args[0] != "beta" {
+	if v := plainView(m); !strings.Contains(v, "Cancel beta?") || !strings.Contains(v, "[ ] Delete them") {
+		t.Fatalf("cancel dialog:\n%s", v)
+	}
+	key(m, " ")
+	key(m, "enter")
+	if c := fb.last("Cancel"); c == nil || c.args[0] != "beta" || c.args[1] != false {
 		t.Fatalf("cancel call %+v", c)
 	}
 }
 
-func TestDoneDirtyForce(t *testing.T) {
+// TestDoneDialogLines pins the dialog's text, clean and dirty.
+func TestDoneDialogLines(t *testing.T) {
+	text := []string{
+		"This deletes the task's worktrees and its task dir. Files that are not",
+		"committed cannot be recovered. Commits stay on the task branch.",
+	}
+	plain := func(ls []string) []string {
+		out := make([]string, len(ls))
+		for i, l := range ls {
+			out[i] = ansi.Strip(l)
+		}
+		return out
+	}
+	c := &confirmState{verb: "done", id: 2, slug: "beta"}
+	want := append(append([]string{"Mark beta done?", ""}, text...), "", "[ ] Delete them")
+	if got := plain(c.lines(80, 20)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("clean dialog:\n%s", strings.Join(got, "\n"))
+	}
+	c = &confirmState{verb: "cancel", id: 2, slug: "beta", dirty: true, unticked: true}
+	want = append(append([]string{"Cancel beta?", ""}, text...), "", dirtyLine, "",
+		"[ ] Delete them", "Tick the box with space to confirm.")
+	lines := c.lines(80, 20)
+	if got := plain(lines); !reflect.DeepEqual(got, want) {
+		t.Fatalf("dirty dialog:\n%s", strings.Join(got, "\n"))
+	}
+	if lines[5] != errStyle.Render(dirtyLine) {
+		t.Fatalf("warning line not in the error style: %q", lines[5])
+	}
+	c.ticked, c.unticked = true, false
+	// too short for all of it: the blank lines go first, then the top
+	want = []string{"There are uncommitted changes.", "They will be deleted.", "[x] Delete them"}
+	if got := plain(c.lines(30, 3)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("short dialog:\n%s", strings.Join(got, "\n"))
+	}
+}
+
+// TestDoneDialogDirty: uncommitted changes add the warning line, and
+// confirming that dialog closes with force.
+func TestDoneDialogDirty(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	fb.tasks[1].Task.Repos = append(fb.tasks[1].Task.Repos, model.TaskRepo{Name: "dirtyrepo", Mode: model.ModeRW})
+	m, _ := newTest(t, fb)
+	for _, k := range []string{"d", "c"} {
+		key(m, k)
+		v := plainView(m)
+		if m.mode != modeConfirm || !strings.Contains(v, dirtyLine) || !strings.Contains(v, "[ ] Delete them") {
+			t.Fatalf("%s: dirty dialog:\n%s", k, v)
+		}
+		closes := fb.count("Done") + fb.count("Cancel")
+		key(m, "enter")
+		key(m, "y")
+		if fb.count("Done")+fb.count("Cancel") != closes || m.mode != modeConfirm {
+			t.Fatalf("%s: closed without the box ticked", k)
+		}
+		key(m, " ")
+		key(m, "enter")
+	}
+	if c := fb.last("Done"); c == nil || c.args[1] != true || fb.count("Done") != 1 {
+		t.Fatalf("done not forced: %+v", fb.calls)
+	}
+	if c := fb.last("Cancel"); c == nil || c.args[1] != true || fb.count("Cancel") != 1 {
+		t.Fatalf("cancel not forced: %+v", fb.calls)
+	}
+
+	// a refusal force does not override is shown as an error
+	fb.forceErr = errors.New("task beta: api: HEAD has 1 commit(s) not on any branch (detached HEAD or rebase in progress); put them on a branch first")
+	key(m, "d")
+	key(m, " ")
+	key(m, "enter")
+	if m.mode != modeNormal || m.confirm != nil || !m.statusErr || !strings.Contains(m.status, "not on any branch") {
+		t.Fatalf("forced refusal: mode %d status %q", m.mode, m.status)
+	}
+
+	// a repo whose state cannot be told: no warning line, no force
+	fb.forceErr = nil
+	fb.tasks[1].Task.Repos = append(fb.tasks[1].Task.Repos, model.TaskRepo{Name: "brokenrepo", Mode: model.ModeRW})
+	key(m, "d")
+	if strings.Contains(plainView(m), dirtyLine) {
+		t.Fatalf("unknown state shown as dirty:\n%s", plainView(m))
+	}
+	key(m, " ")
+	key(m, "enter")
+	if c := fb.last("Done"); c == nil || c.args[1] != false {
+		t.Fatalf("unknown state forced: %+v", c)
+	}
+
+	// Get fails: the same
+	fb.getErr = errors.New("database is locked")
+	key(m, "c")
+	if m.mode != modeConfirm || strings.Contains(plainView(m), dirtyLine) {
+		t.Fatalf("Get error: mode %d\n%s", m.mode, plainView(m))
+	}
+	key(m, " ")
+	key(m, "enter")
+	if c := fb.last("Cancel"); c == nil || c.args[1] != false {
+		t.Fatalf("Get error forced: %+v", c)
+	}
+}
+
+// TestDoneDialogRefused: a clean dialog's close refused for uncommitted
+// changes opens the dialog again with the warning line and the box
+// unticked; only confirming that one forces.
+func TestDoneDialogRefused(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks(), doneErr: errors.New("task beta has uncommitted changes in api; commit or stash them, or use --force to discard")}
 	m, _ := newTest(t, fb)
 	key(m, "d")
-	key(m, "y")
-	if m.mode != modeConfirm || !strings.Contains(plainView(m), "F force") {
-		t.Fatalf("no force prompt:\n%s", plainView(m))
+	if strings.Contains(plainView(m), dirtyLine) {
+		t.Fatal("clean task shown dirty")
 	}
-	key(m, "F")
-	c := fb.last("Done")
-	if c == nil || c.args[1] != true || fb.count("Done") != 2 {
+	key(m, " ")
+	key(m, "enter")
+	v := plainView(m)
+	if fb.count("Done") != 1 || fb.last("Done").args[1] != false {
+		t.Fatalf("calls %+v", fb.calls)
+	}
+	if m.mode != modeConfirm || m.confirm == nil || !m.confirm.dirty || m.confirm.ticked ||
+		!strings.Contains(v, dirtyLine) || !strings.Contains(v, "[ ] Delete them") || !strings.Contains(v, "uncommitted changes in api") {
+		t.Fatalf("refusal did not reopen the dialog: mode %d\n%s", m.mode, v)
+	}
+	key(m, "enter")
+	key(m, "y")
+	if fb.count("Done") != 1 {
+		t.Fatal("reopened dialog closed without the box ticked")
+	}
+	key(m, " ")
+	key(m, "enter")
+	if c := fb.last("Done"); c == nil || c.args[1] != true || fb.count("Done") != 2 || m.mode != modeNormal {
 		t.Fatalf("force call %+v", fb.calls)
 	}
-	// any other key aborts
-	key(m, "d")
-	key(m, "y")
-	key(m, "x")
-	if fb.count("Done") != 3 || m.mode != modeNormal {
-		t.Fatal("x should abort the force")
+
+	// esc on the reopened dialog: nothing more runs
+	key(m, "c")
+	key(m, " ")
+	key(m, "enter")
+	key(m, "esc")
+	if fb.count("Cancel") != 1 || m.mode != modeNormal {
+		t.Fatalf("esc on the reopened dialog: %+v", fb.calls)
 	}
-	// non-dirty error: shown, no force prompt
+
+	// changes left by teardown count as such a refusal too
+	fb.doneErr = errors.New("task beta: repo api: worktree has changes after teardown (exit status 128); re-run with --force to discard them")
+	key(m, "d")
+	key(m, " ")
+	key(m, "enter")
+	if m.mode != modeConfirm || !m.confirm.dirty {
+		t.Fatalf("teardown changes: mode %d", m.mode)
+	}
+	key(m, "esc")
+
+	// other refusals: shown as errors, no dialog
 	fb.doneErr = errors.New("kill tmux session: boom")
 	key(m, "d")
-	key(m, "y")
+	key(m, " ")
+	key(m, "enter")
 	if m.mode != modeNormal || !m.statusErr || !strings.Contains(m.status, "boom") {
 		t.Fatalf("error not shown: %q", m.status)
 	}
@@ -1279,7 +1474,9 @@ func TestSmallSizes(t *testing.T) {
 		key(m, "esc")
 		key(m, "d")
 		check(s[0], s[1])
-		key(m, "x")
+		key(m, "enter") // unticked: the hint
+		check(s[0], s[1])
+		key(m, "esc")
 	}
 	m.Update(tea.WindowSizeMsg{Width: 30, Height: 10})
 	if strings.Contains(plainView(m), "│") {
@@ -1548,8 +1745,9 @@ func TestDirtyRefusalQueued(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks(), doneErr: errors.New("task beta has uncommitted changes in api")}
 	m, _ := newTest(t, fb)
 	key(m, "d")
-	done := press(m, "y") // Done runs in the background…
-	key(m, "n")           // …while the user opens the form
+	key(m, " ")
+	done := press(m, "enter") // Done runs in the background…
+	key(m, "n")               // …while the user opens the form
 	typeText(m, "half typed")
 	m.Update(done())
 	if m.mode != modeForm || m.form == nil || m.form.inputs[fieldTitle].Value() != "half typed" {
@@ -1559,10 +1757,10 @@ func TestDirtyRefusalQueued(t *testing.T) {
 		t.Fatal("typed form not kept in lastForm")
 	}
 	key(m, "esc")
-	if m.mode != modeConfirm || m.confirm == nil || m.confirm.dirty == "" || !strings.Contains(plainView(m), "F force") {
+	if m.mode != modeConfirm || m.confirm == nil || !m.confirm.dirty || m.confirm.ticked || !strings.Contains(plainView(m), dirtyLine) {
 		t.Fatalf("queued refusal not shown: mode %d\n%s", m.mode, plainView(m))
 	}
-	key(m, "x") // abort
+	key(m, "esc")
 	if m.mode != modeNormal {
 		t.Fatal("abort")
 	}
@@ -1574,7 +1772,8 @@ func TestDirtyRefusalQueued(t *testing.T) {
 
 	// filter mode: queued until the filter closes
 	key(m, "c")
-	cancelCmd := press(m, "y")
+	key(m, " ")
+	cancelCmd := press(m, "enter")
 	key(m, "/")
 	typeText(m, "be")
 	m.Update(cancelCmd())
@@ -1582,12 +1781,31 @@ func TestDirtyRefusalQueued(t *testing.T) {
 		t.Fatalf("refusal switched mode from filter: %d", m.mode)
 	}
 	key(m, "enter")
-	if m.mode != modeConfirm || m.confirm.verb != "cancel" {
+	if m.mode != modeConfirm || m.confirm.verb != "cancel" || !m.confirm.dirty {
 		t.Fatalf("queued cancel refusal not shown: %d", m.mode)
 	}
-	key(m, "F")
+	key(m, " ")
+	key(m, "enter")
 	if c := fb.last("Cancel"); c == nil || c.args[1] != true {
 		t.Fatalf("force cancel: %+v", c)
+	}
+
+	// the dirty check's result is queued the same way
+	fb.doneErr = nil
+	check := press(m, "d")
+	key(m, "/")
+	m.Update(check())
+	if m.mode != modeFilter || m.confirm != nil {
+		t.Fatalf("check result switched mode from filter: %d", m.mode)
+	}
+	key(m, "esc")
+	if m.mode != modeConfirm || m.confirm.verb != "done" || m.confirm.dirty {
+		t.Fatalf("queued dialog not shown: %d", m.mode)
+	}
+	key(m, " ")
+	key(m, "enter")
+	if c := fb.last("Done"); c == nil || c.args[1] != false {
+		t.Fatalf("done: %+v", c)
 	}
 }
 
