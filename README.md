@@ -353,6 +353,13 @@ process there with the session's `ATL_SESSION`, Claude's children included) when
 notices the window gone, which it checks when it starts, and again right before it resumes
 the session.
 
+Claude in the container gets the window's size from `docker exec`, which reads it when it
+starts and then follows the window's resizes, but loses one that comes while it is still
+starting (Claude would then keep a detached window's 80x24 in a larger terminal). So a
+window `atl` attaches your terminal to right away (`atl open`, Enter in the TUI) starts
+`docker exec` only once the terminal is attached (or after 10 seconds), and every window
+has `docker exec` send the size once more 1, 3 and 7 seconds after it started.
+
 A session that ends normally (Claude exits, the window closes) is ended the same way: what
 it started that still runs in the container (a dev server it put in the background, say)
 is ended once Claude is gone. The gate does it when Claude's `SessionEnd` hook records the
