@@ -24,10 +24,10 @@ func TestCheckAssistantArgs(t *testing.T) {
 		{"transcript", "alpha", "--tail", "30"}, {"repos"}, {"repos", "--help"}, {"diff", "alpha"},
 		{"new", "Fix", "login", "--project", "shop", "--repo", "api:rw", "-m", "why"}, {"new", "x", "-p", "shop"},
 		{"add", "alpha", "docs:ro"}, {"status", "alpha", "review"}, {"session", "alpha"}, {"resume", "alpha"},
-		{"pr", "alpha"}, {"done", "alpha"}, {"cancel", "alpha"}, {"note", "alpha", "waiting", "on", "review", "--author", "assistant"},
+		{"pr", "alpha"}, {"note", "alpha", "waiting", "on", "review", "--author", "assistant"},
 		{"note", "alpha", "x", "--author=assistant"}, {"note", "--author", "assistant", "alpha", "x"},
 		{"notes", "alpha"}, {"notes", "alpha", "--set"}, {"notes", "alpha", "--clear"}, {"rename", "alpha", "New", "title"},
-		{"doctor"}, {"help"}, {"help", "open"}, {"ls", "-h"}, {"ls", "--help"}, {"done", "--help"},
+		{"doctor"}, {"help"}, {"help", "open"}, {"help", "done"}, {"ls", "-h"}, {"ls", "--help"}, {"status", "alpha", "done"},
 	} {
 		if err := CheckAssistantArgs(args); err != nil {
 			t.Errorf("%q refused: %v", args, err)
@@ -39,6 +39,10 @@ func TestCheckAssistantArgs(t *testing.T) {
 	}{
 		{nil, "TUI"},
 		{[]string{"open", "alpha"}, "select the task and press Enter"},
+		// Closing a task removes its worktrees: the user's.
+		{[]string{"done", "alpha"}, "removes the task's worktrees"},
+		{[]string{"cancel", "alpha"}, "removes the task's worktrees"},
+		{[]string{"done", "--help"}, "removes the task's worktrees"},
 		{[]string{"assistant"}, "does not run for the assistant"},
 		{[]string{"token"}, "does not run for the assistant"},
 		{[]string{"token", "--paste"}, "does not run for the assistant"},
@@ -204,8 +208,8 @@ func TestControlAtlForTheAssistant(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "exit"), []byte("3"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if code, ran, out, _ := ask([]string{"done", "alpha"}, ""); code != 3 || !ran || out != "out\n" {
-		t.Errorf("failing done: %d %v %q", code, ran, out)
+	if code, ran, out, _ := ask([]string{"pr", "alpha"}, ""); code != 3 || !ran || out != "out\n" {
+		t.Errorf("failing pr: %d %v %q", code, ran, out)
 	}
 	if got := read("stdin"); got != "" {
 		t.Errorf("stdin without a body: %q", got)
@@ -230,7 +234,7 @@ func TestControlAtlForTheAssistant(t *testing.T) {
 
 	l := logs.String()
 	for _, want := range []string{"run   atl notes (for the assistant)", "done  atl notes (for the assistant): exit 0",
-		"done  atl done (for the assistant): exit 3", "deny  atl request: --force"} {
+		"done  atl pr (for the assistant): exit 3", "deny  atl request: --force"} {
 		if !strings.Contains(l, want) {
 			t.Errorf("log lacks %q:\n%s", want, l)
 		}
@@ -322,7 +326,7 @@ func TestControlAtlResolved(t *testing.T) {
 // any other command the request is refused before anything runs.
 func TestControlAtlBody(t *testing.T) {
 	dir, sock, _ := assistantLab(t, "/home/you/atelier/workspaces/personal", fakeResolve)
-	for _, args := range [][]string{{"ls"}, {"notes", "alpha"}, {"notes", "alpha", "--clear"}, {"note", "alpha", "x", "--author", "assistant"}, {"done", "alpha"}} {
+	for _, args := range [][]string{{"ls"}, {"notes", "alpha"}, {"notes", "alpha", "--clear"}, {"note", "alpha", "x", "--author", "assistant"}, {"pr", "alpha"}} {
 		var out, errb bytes.Buffer
 		code, ran, err := Ask(sock, ControlRequest{Op: OpAtl, Args: args}, []byte("text"), &out, &errb, 0)
 		if err != nil || code != 2 || ran || !strings.Contains(errb.String(), "standard input is only for atl notes --set") {

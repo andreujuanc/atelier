@@ -37,10 +37,11 @@ func AssistantID(assistantDir string) string { return ID(assistantSlug, assistan
 func InAssistant() bool { return Inside() && os.Getenv(AssistantEnv) != "" }
 
 // AssistantCommands are the atl commands the assistant's gate runs for it,
-// in its workspace (see CheckAssistantArgs).
+// in its workspace (see CheckAssistantArgs). Not done and cancel: they
+// remove a task's worktrees, which the user does from the TUI or a terminal.
 var AssistantCommands = []string{
 	"ls", "show", "transcript", "repos", "diff", "new", "add", "status", "session", "resume",
-	"pr", "done", "cancel", "note", "notes", "rename", "doctor", "help",
+	"pr", "note", "notes", "rename", "doctor", "help",
 }
 
 // MaxAssistantArgs bounds the arguments of one OpAtl request.
@@ -62,9 +63,9 @@ var ErrAssistantOpen = errors.New("atl open attaches a terminal and does not run
 //     group of short flags, --workspace, --workspace=<x>): the gate picks
 //     the workspace, its own;
 //   - any spelling of --force (-f, in a group too, --force, --force=<x>):
-//     on done and cancel it discards uncommitted work, which the user does
-//     from the TUI or a terminal; no other command the assistant may run
-//     has it;
+//     no command the assistant may run has it (done and cancel, where it
+//     discards uncommitted work, are the user's);
+//   - done and cancel: they remove the task's worktrees;
 //   - --author with any value but assistant (--author <x>, --author=<x>),
 //     and atl note without --author assistant: the assistant writes no note
 //     that reads as the user's;
@@ -129,6 +130,9 @@ func CheckAssistantArgs(args []string) error {
 	switch {
 	case sub == "open":
 		return ErrAssistantOpen
+	case sub == "done" || sub == "cancel":
+		return errors.New("atl " + sub + " removes the task's worktrees and does not run for the assistant: " +
+			"ask the user to close the task in the atl TUI (d done, c cancel) or with atl " + sub + " <task> in a terminal")
 	case strings.HasPrefix(sub, "-"):
 		return fmt.Errorf("flag %s before the command is not accepted: put the command first (help: atl help <command>, or atl <command> --help)", sub)
 	case sub == "repos":

@@ -397,14 +397,16 @@ func TestAssistantClaudeMDInContainer(t *testing.T) {
 		}
 	}
 	for _, want := range []string{"container of your own", "no repos", "no worktrees", "`atl diff`", "no Docker",
-		"`atl open <task>` in a terminal; you cannot run it", "select it and press Enter", "`--force` is refused here",
-		"`--workspace` (`-w`) and `--force` (`-f`)"} {
+		"`atl open <task>` in a terminal; you cannot run it", "select it and press Enter",
+		"`atl done` and `atl cancel` do not run here", "(`d` done, `c` cancel)",
+		"`atl done`, `atl cancel`, `--workspace` (`-w`) and `--force` (`-f`)"} {
 		if !strings.Contains(box, want) {
 			t.Errorf("container text lacks %q", want)
 		}
 	}
-	if strings.Contains(box, "`resume`, `open`, `pr`") || strings.Contains(box, "glance at `git log`") {
-		t.Error("container text offers atl open or git in worktrees")
+	if strings.Contains(box, "`resume`, `open`, `pr`") || strings.Contains(box, "glance at `git log`") ||
+		strings.Contains(box, "- `atl done <task>` — finish") || strings.Contains(box, "`pr`, `done`, `cancel`") {
+		t.Error("container text offers atl open, done/cancel or git in worktrees")
 	}
 	dir := filepath.Join(t.TempDir(), "assistant")
 	if err := WriteAssistantFiles(dir, "/run/atl/bin/atl", true); err != nil {

@@ -506,3 +506,7 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   process. `CheckAssistantArgs` refuses `--author <x>`/`--author=<x>` for any x but
   `assistant` (each occurrence), and `atl note` without `--author assistant` (the default
   author is the user, so that is refused too, beyond the brief).
+- W5, after the user's call: the assistant's gate does not run `atl done` or `atl cancel`
+  (they remove a task's worktrees); it refuses them with a line that says to close the task
+  in the TUI (`d`/`c`) or the CLI. `atl status <task> done` stays allowed: it only changes
+  the status. One assistant per workspace stays (the user's choice: keep workspaces apart).

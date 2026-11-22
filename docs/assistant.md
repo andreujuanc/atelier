@@ -63,7 +63,7 @@ A request runs only if both checks pass:
 | output | 16 MiB (stdout and stderr together), then cut |
 
 Allowed: `ls`, `show`, `transcript`, `repos`, `diff`, `new`, `add`, `status`, `session`,
-`resume`, `pr`, `done`, `cancel`, `note`, `notes`, `rename`, `doctor`, `help`. Help is
+`resume`, `pr`, `note`, `notes`, `rename`, `doctor`, `help`. Help is
 `atl help <command>` or `atl <command> --help`.
 
 Refused, with a one-line reason:
@@ -73,9 +73,10 @@ Refused, with a one-line reason:
 | any other command | not on the list |
 | a flag first (`atl --help …`, `atl -h …`) | cobra may take the next argument as its value and run what follows |
 | `atl open` | attaches a terminal: open the task in the TUI or with `atl open <task>` in a terminal |
+| `atl done`, `atl cancel` | they remove the task's worktrees: close tasks yourself (TUI `d`/`c`, or the CLI) |
 | `atl repos pin` (`repos` with any argument) | accepting a changed origin URL is your decision |
 | `-w` / `--workspace` in any spelling | the workspace is the gate's own |
-| `-f` / `--force` in any spelling | on `done`/`cancel` it discards uncommitted work: do it yourself |
+| `-f` / `--force` in any spelling | no allowed command has it |
 | `--author` other than `assistant` (`--author user`, `--author=user`), or `atl note` without `--author assistant` | its notes must not read as yours |
 
 Text that looks like one of those flags is refused too.
@@ -88,7 +89,7 @@ the edit is refused.
 | rule | commands |
 |---|---|
 | allowed | `atl ls`, `show`, `transcript`, `repos`, `help`; Read, Grep, Glob (the old `atl --help *` rule is removed) |
-| ask first | `atl new`, `add`, `status`, `session`, `resume`, `pr`, `done`, `cancel`, `note`, `notes`, `open`, `rename` (all of `atl notes`: it reads notes with `atl show <task> --notes`) |
+| ask first | `atl new`, `add`, `status`, `session`, `resume`, `pr`, `note`, `notes`, `rename` (all of `atl notes`: it reads notes with `atl show <task> --notes`); `done`, `cancel`, `open` too, which only matters with the sandbox off (its gate refuses them) |
 | denied | `git commit`/`push`/`checkout`/`reset`/`rebase`/`merge`/`stash`/…, `rm`, `mv`, `cp`, `sed -i`, `tee` |
 | hook | Edit/Write/MultiEdit/NotebookEdit outside its dir, or on its own `CLAUDE.md`, `.mcp.json`, `.claude/`: blocked (fails closed) |
 
