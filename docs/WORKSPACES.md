@@ -145,8 +145,9 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   with `-f`), carrying what the box's `/etc/tmux.conf` had: status off, mouse on,
   escape-time 10, `C-q` detach-client, `default-terminal tmux-256color`, RGB; and last
   `source-file -q <ws>/tmux.conf`, the user's own settings.
-- Host requirements: tmux ≥ 3.2, git, gh, claude, the Docker CLI with access to the
-  daemon (the `docker` group, as the box had via `--group-add`).
+- Host requirements: tmux ≥ 3.2, git, gh, the Docker CLI with access to the
+  daemon (the `docker` group, as the box had via `--group-add`). Since W5 not claude: with
+  the sandbox on, task sessions, the assistant and `atl token` run it in containers.
 - The box image stays buildable and works (its env wins), but is no longer the way in.
 
 ## Milestones
@@ -157,6 +158,7 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
 | W2 | collisions: cross-workspace port offsets, slug suffix for dir/branch, doctor warning | done |
 | W3 | workspace selector TUI (`atl` with none selected), switch workspace from the TUI | done |
 | W4 | host mode: generated tmux.conf, static-binary check, README install-on-host + migration from devcontainers | done |
+| W5 | no Claude Code on the host: the assistant in its own container behind its own gate (allowlisted atl commands), `atl token` in a throwaway container, doctor without claude, build without Go | done |
 
 ## Decisions
 
@@ -395,3 +397,112 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   `TestReexec` compares the exec environment with the one before its own Apply exactly.
 - Change request after review, fixtures: tests name their workspaces `alpha` and `beta`,
   the docs `personal` and `work` (paths like `~/src/work`, `/home/you`).
+- W5, the assistant's container: one per workspace, sandbox ID `sandbox.AssistantID(dir)` =
+  `_assistant-<6 hex of the assistant dir>` (container `atl-_assistant-…`). Slugs are
+  `[a-z0-9-]` (`model.Slugify`), so no task ID (`<slug>-<6 hex>`) can be it; the name is in
+  `ReservedName`'s pattern, so no task can create or rename a container to it. It carries
+  `atelier.agent=<id>` and is found, reused, started and replaced through the same
+  `sandbox.Agent`/`Ensure` as a task's. `App.assistantSpec`: the workspace's task image
+  (`Sandbox.Image`, never a project's), `--user uid:gid`, workdir the assistant dir; mounts
+  exactly the assistant dir (rw), `Paths.AssistantClaudeDir()` (`<run root>/claude/assistant`,
+  rw, `CLAUDE_CONFIG_DIR`, seeded by `seedClaudeDirAt`, the old `seedClaudeDir` made generic)
+  and `Paths.AssistantRunDir()` (`<run root>/assistant`) at `/run/atl` read-only; env `HOME`,
+  `LANG`/`LC_ALL`/`TZ`, `ATL_SANDBOX_ID`, `ATL_ASSISTANT=1` (`sandbox.AssistantEnv`) and the
+  host's `ATL_CONTEXT`; no `DOCKER_HOST`, no git identity, no `ATL_CONTAINER`. Both new dirs
+  are names no task's hash (12 hex) can take. `ensureAssistantSandbox` runs on every `atl
+  assistant` (also when the window is alive, so a dead gate comes back): Docker, static
+  binary, token (one line each, as `ensureSandbox`), `InstallBin`, the gate, then `Ensure`
+  with busy = the assistant window is alive (a changed spec warns and waits for the window
+  to close). The window is `sandbox.WindowArgv(true, sandboxArgv(...))` with
+  `ATL_ASSISTANT` passed by name and the token in `GlobalEnv`, as a task session.
+  `--continue` is decided from the assistant's Claude dir with the sandbox on. atl never
+  removes the container (README says `docker rm -f` it); doctor does not list it.
+- W5, the assistant's gate: `atl gate --assistant` (`assistantGate`), started by
+  `sandbox.StartAssistant` (the old `Start` split into `start(args, ident, ...)`), ident
+  `AssistantIdent(workspace, bin)`, so another binary or workspace replaces it; injected in
+  tests as `App.StartAssistantGate`. Its log is `gate-_assistant.log`, not the brief's
+  `gate-assistant.log`, which is the log of a task with slug `assistant`. `Gate.NoDocker`
+  refuses every Docker request (the socket stays: `Serve` and `Alive` use it). Its `Control`
+  has `Workspace` set (fixed at start; a task's gate has it empty and refuses `OpAtl` as
+  "not served by this gate"), `Task` = `hook.AssistantServer` (only `AssistantGuard`;
+  other hook events exit 0, every other task op exits 2) and `Copy` to the `atl_assistant`
+  tmux session.
+- W5, `OpAtl` (`ControlRequest.Args`, the body is stdin, at most 1 MiB):
+  `sandbox.CheckAssistantArgs` allows `ls show transcript repos diff new add status session
+  resume pr done cancel note notes rename doctor help` and a leading `--help`/`-h`; refuses
+  no command (the TUI), any other command (`open` with `ErrAssistantOpen`, the TUI/terminal
+  hint), a flag before the command, `repos` with any positional argument (`repos pin`
+  re-pins an origin: the user's decision; beyond the brief), and anywhere in the line (also
+  after `--`, since a flag may take `--` as its value) `--workspace`, `--workspace=…`,
+  `--force`, `--force=…` and any single-dash group containing `w` or `f` (`-w`, `-wx`, `-fw`;
+  so `-mwhy` is refused too, which costs nothing: `-m why` works). `--force` is refused on
+  every command, not only done/cancel (none of the others has it). NUL or invalid UTF-8 in
+  an argument is refused. The gate runs `exec <Atl> -w <Workspace> <args>` with
+  `controlEnv()` (now also without `ATL_ASSISTANT`), stdout and stderr apart, together
+  capped at 16 MiB (`outputLimit`, then "output cut"), the push timeout (10 minutes) and
+  hang-up cancellation (`Control.run`, shared with push/fetch). The log gets `run   atl <cmd>
+  (for the assistant)` / `done … exit N` and refusals; never stdin or other arguments.
+- W5, atl in the assistant's container: `runIn` sends every command line but `hook` and
+  `statusline` (main.go's fast path) to the gate when `sandbox.InAssistant()` (`ATL_SANDBOX_ID`
+  and `ATL_ASSISTANT` set), before cobra parses anything: the gate is the only judge. Stdin is
+  read (to the end, at most 1 MiB) only when an argument is `--set` or `--set=…`: another
+  command may run with a stdin that never ends. A task container that sets `ATL_ASSISTANT`
+  itself only reaches its own gate, which refuses `OpAtl`. `atl hook` in any container now
+  goes through the gate, `AssistantGuard` included (a task's gate refused it already;
+  `viaGate` sends landings for it too and fails closed when the gate does not answer).
+  `AssistantGuard` also checks `Input.landings`: each must be an allowed path.
+- W5, generated files: `gen.WriteAssistantFiles(dir, atlBin, inContainer)` and
+  `AssistantClaudeMD(inContainer)`; the host text is unchanged, the container text replaces
+  a few passages (`inContainerMD`): no repos/worktrees/Docker, tasks through `atl show`/`atl
+  diff`/`atl transcript`, `atl open` → the TUI or a terminal, `open` dropped from the
+  confirm list, `--workspace`/`--force` refused. The permission rules are unchanged; the
+  guard hook runs `/run/atl/bin/atl` (`hookBin`).
+- W5, `atl token`: with the sandbox on (`sandbox.FromEnv` in the CLI; `pathsApp` stays
+  sandbox-less) the window runs `tokenContainerScript` with `docker run --rm -it --name
+  atl-token-<6 random hex> --user uid:gid -e TERM -e LANG <Sandbox.Image> claude setup-token`
+  (a name, beyond the brief, so that `docker rm -f` can end a container whose client died
+  with the window: with `-t` docker does not proxy the hangup). The script waits for the
+  attached client and re-sends the size (SIGWINCH to the pane's process group) like
+  `WindowArgv`, since Claude Code breaks the token at the width it sees. Docker and the
+  default image are checked first (one line each). Sandbox off: the old script, unchanged.
+- W5, doctor: with `sandbox.FromEnv()` on, the `claude` tool check is replaced by a pass
+  "not needed on the host: sessions and the assistant run Claude in containers", with
+  "(found: <version>)" when it is installed; off (or an invalid `ATL_SANDBOX`), required.
+- W5, build: the Dockerfile's `build` stage now passes `-buildmode=exe` explicitly (it was
+  the default there); README's main way is `docker build --target build` + `docker cp
+  /out/atl`, and `sandbox.StaticBinError` points at it.
+- W5 security review fixes. (1) `CheckAssistantArgs` accepted a leading `--help`/`-h`; cobra's
+  `Find` does not know the help flag yet (it is added at execute time), so it takes the next
+  argument as that flag's value: `--help --help=false token --paste` ran `token` (and
+  `workspace new`, `repos pin`, `gate`, `push`, `open`), `token --paste` reading a token of
+  the container's choosing from the request body. Now any first argument starting with `-`
+  is refused (help is `atl help <cmd>` or `<cmd> --help`), and the gate also resolves the
+  exact argv it will exec (`-w <ws>` included) with atl's own command tree,
+  `Control.Resolve` = `cli.resolveAtl` (a fresh `rootCmd()`, `InitDefaultHelpCmd`,
+  `InitDefaultCompletionCmd`, `Find`, as `ExecuteC` does): its `CommandPath` must pass
+  `sandbox.AssistantCommandPath` (`atl <allowed>`; `atl repos pin` is not). Both checks
+  must pass; a gate without `Resolve` refuses `OpAtl`. A non-empty body is refused unless
+  the resolved command is `atl notes` with `--set` true (flags parsed by cobra, `--help`
+  off). The allow rule `Bash(atl --help *)`, which ran such lines without a prompt, became
+  `Bash(atl help *)`; the old rule and its colon form are retired (removed from existing
+  settings). (2) At most `maxAtlRunning` = 3 atl commands run for the assistant at once;
+  one more is refused at once (a buffered channel, no queue). (3) The launch lock moved
+  from the container-writable `<assistant dir>/.launch.lock` to `<state dir>/assistant.lock`;
+  `lockFile` opens with `O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK` and refuses anything but a regular
+  file. (4) With the sandbox off, `quarantineAssistant` moves `CLAUDE.local.md`,
+  `.mcp.json`, `.claude/settings.local.json`, `.claude/{skills,agents,commands}` (all of
+  `.claude` when it is not a plain directory) to `<state dir>/assistant-quarantine/<UTC
+  time>/` before every host launch, renames only (symlinks moved, never followed), one
+  warning. Also `.claude/settings.json` when it differs from what atl writes afresh
+  (`foreignAssistantSettings`: `gen.WriteAssistantFiles` into a temp dir, bytes compared;
+  not a regular file counts as foreign), so atl writes it from scratch instead of merging
+  hooks and allow rules the container added; sandbox on: merged as before. (5) `atl token` runs `docker run
+  --pull=never` and checks that any task image (not only the default) is on the daemon:
+  the token is minted by the image's own claude.
+- W5 red-team fixes: the run slot of an atl request is released as soon as the process has
+  exited, before the exit status is written, and each reply write of the atl op has a
+  deadline (`Control.WriteTimeout`, default 30 s); after a failed write the rest is
+  dropped (`replyWriter.broken`), so a client that never reads cannot hold a slot or the
+  process. `CheckAssistantArgs` refuses `--author <x>`/`--author=<x>` for any x but
+  `assistant` (each occurrence), and `atl note` without `--author assistant` (the default
+  author is the user, so that is refused too, beyond the brief).
