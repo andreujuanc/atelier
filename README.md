@@ -7,16 +7,161 @@ tracks session state in SQLite via Claude Code hooks.
 
 Requires git, tmux ≥ 3.2, `claude`, `gh` (for `atl pr`), and Docker with the task image:
 each task's Claude sessions run in the task's own container (the [sandbox](#sandbox), on by
-default). Build with `go build -o ~/bin/atl ./cmd/atl`, create a [workspace](#workspaces)
-with `atl workspace new <name>`, then run `atl doctor` in it.
+default). `atl` runs on the host (see [Install on the host](#install-on-the-host)): build
+it with `CGO_ENABLED=0 go build -o ~/.local/bin/atl ./cmd/atl`, build the task image with
+`build-images` (see [Docker image](#docker-image)), create a [workspace](#workspaces) with
+`atl workspace new <name>`, then run `atl doctor` in it.
+
+## Install on the host
+
+**Requirements.** On a Linux host, on `PATH`: tmux ≥ 3.2, git, `gh` (logged in, for `atl
+pr`), `claude` (Claude Code, logged in), and the Docker CLI with access to the daemon: your
+user in the `docker` group (as the box had it with `--group-add`), or a daemon your user
+owns. Go builds `atl`. Pushing and fetching use your own SSH agent, `~/.ssh` and git
+credentials, as any git on the host does.
+
+**Build.** From the checkout:
+
+```bash
+CGO_ENABLED=0 go build -o ~/.local/bin/atl ./cmd/atl
+```
+
+`atl` must be a static Linux binary: it is copied into each task's run dir and runs in the
+task's container too (hooks, the status line, `wl-copy`), whatever that container's image
+has. `CGO_ENABLED=0` makes it one; a plain `go build` on a host with a C compiler links
+against the host's C library. `atl doctor` checks the binary (an ELF file with no program
+interpreter and no shared libraries), and starting a sandboxed session with any other (a
+dynamically linked one, or not a Linux binary at all) fails with one line that gives the
+command above.
+
+**Task image.** `build-images` (see [Docker image](#docker-image)) builds the task image
+`atelier-task` that task containers run, and the box image, which atl on the host does not
+need (`docker build --target task …`, shown there, builds only the task image).
+
+**First workspace.**
+
+```bash
+atl workspace new shop --repos ~/src/shop   # ~/atelier/workspaces/shop/atelier.toml
+cd ~/atelier/workspaces/shop                   # or: atl -w shop …, or ATL_WORKSPACE=shop
+atl doctor                                     # tools, workspace, settings, atl binary, Docker, task image, token
+atl token                                      # once per workspace: the token sandboxed sessions log in with
+atl                                            # the TUI
+```
+
+Run `atl` in a plain terminal or inside your own tmux: opening a task attaches to the
+workspace's own tmux server (a nested client from inside yours), and **Ctrl-q** returns to
+the TUI either way (unless your own tmux binds Ctrl-q itself). A `gitconfig` file in the
+workspace is the global git config of `atl` and everything it runs (see **git_config**
+under [Workspaces](#workspaces)); without one git reads your `~/.gitconfig`.
+
+**tmux settings.** `atl` starts each workspace's tmux server (`tmux -L atl-<name>`) with
+`-f <workspace>/state/tmux.conf`, a file it writes (and rewrites when it differs, so edits
+there do not last) with what the box's `/etc/tmux.conf` has: no status bar, mouse on,
+`escape-time` 10, **Ctrl-q** bound to detach-client, `default-terminal` `tmux-256color` and
+RGB colour for every terminal (`terminal-features ",*:RGB"`). Neither `/etc/tmux.conf` nor
+your `~/.tmux.conf` is read by that server. tmux reads the file only when the server
+starts: one that already runs keeps its options until it restarts (after its last session
+has ended), and `atl doctor` warns when the running server was started without it. With
+`tmux_socket = "default"` `atl` uses tmux's default server, yours, and passes no file: it
+runs with your own config.
+
+### Moving from a devcontainer box
+
+A box's `devcontainer.json` carries a workspace's settings in mounts and variables; on the
+host they are the workspace's `atelier.toml`, and the rest is not needed:
+
+| in `devcontainer.json` | on the host |
+|---|---|
+| `ATL_WORKSPACE` | the workspace directory itself (`$ATL_WORKSPACES/<name>`, selected as in [Workspaces](#workspaces)) |
+| `ATL_REPOS` | `repos` |
+| `ATL_SANDBOX_MOUNTS` | `[sandbox].mounts` (a list) |
+| `ATL_SANDBOX_IMAGE`, `ATL_CONTEXT`, `ATL_SANDBOX_CONTEXT` | `[sandbox].image`, `context`, `[sandbox].context` |
+| `ATL_SANDBOX=docker` | the default: leave it out |
+| `<workspace>/gitconfig` mounted as `~/.gitconfig` | `git_config`; the default already picks up `<workspace>/gitconfig` when it exists |
+| `~/.claude` mounted | not needed: `atl` finds your Claude Code config at the same path on the host |
+| `CLAUDE_CODE_OAUTH_TOKEN` in `containerEnv` | the same variable in the environment you start `atl` in, or the token `atl token` stored in `<workspace>/run/` (still there) |
+| `/var/run/docker.sock` mounted, `--group-add <docker gid>` | your user in the `docker` group |
+| `--security-opt label=disable` | not needed: it was for the box's own bind mounts; task containers are created without it |
+
+The tasks, their worktrees, the database and the task containers stay where they are: the
+box used the host's paths, the host's Docker daemon and your user. Steps, for each
+workspace:
+
+1. In the box, run `atl workspace new <name>` once. It adopts `$ATL_WORKSPACES/<name>` (the
+   box's `ATL_WORKSPACE` when that is under `~/atelier/workspaces`), keeping its contents.
+   It writes `atelier.toml` from the box's variables, and `tmux_socket = "default"` with a
+   comment, since the box's sessions run on tmux's default server there. Check the file
+   (for `git_config`, see the table).
+2. Finish or close what runs: let running sessions reach a stopping point, quit `atl`, and
+   stop the box. Its tmux server goes with it; sessions still running in task containers
+   are ended by the next `atl` that notices their windows gone, and can be resumed.
+3. Delete the `tmux_socket` line (with its comment) from `atelier.toml`, so the workspace
+   gets a tmux server of its own, `atl-<name>`. Left in, `atl` on the host would use your
+   own default tmux server.
+4. Run `atl` on the host in the workspace (`atl -w <name>`, or from its directory). `atl
+   open`, Enter in the TUI, or `atl resume` start the stopped sessions again with `claude
+   --resume`. `atl doctor` should show `$ATL_TMUX_SOCKET = atl-<name> (default)`.
+
+The box keeps working for a workspace that is not moved yet (its variables win over
+`atelier.toml`); do not run `atl` for one workspace in the box and on the host at the same
+time.
+
+**Example.** Two workspaces, `personal` and `work`: `work` also gives every task a private npm
+config. Before, `~/atelier/workspaces/work/.devcontainer/devcontainer.json`:
+
+```jsonc
+{
+  "image": "atelier",
+  "runArgs": ["--group-add", "<gid of the docker group>", "--security-opt", "label=disable"],
+  "mounts": [
+    "source=${localEnv:HOME}/atelier/workspaces/work,target=${localEnv:HOME}/atelier/workspaces/work,type=bind",
+    "source=${localEnv:HOME}/src/work,target=${localEnv:HOME}/src/work,type=bind",
+    "source=${localEnv:HOME}/atelier/workspaces/work/gitconfig,target=${localEnv:HOME}/.gitconfig,type=bind,readonly",
+    "source=${localEnv:HOME}/.claude,target=${localEnv:HOME}/.claude,type=bind",
+    "source=${localEnv:HOME}/.work.npmrc,target=${localEnv:HOME}/.work.npmrc,type=bind,readonly",
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+  ],
+  "containerEnv": {
+    "ATL_WORKSPACE": "${localEnv:HOME}/atelier/workspaces/work",
+    "ATL_REPOS": "${localEnv:HOME}/src/work",
+    "ATL_SANDBOX": "docker",
+    "ATL_SANDBOX_MOUNTS": "${localEnv:HOME}/.work.npmrc"
+  }
+}
+```
+
+`personal`'s is the same with `personal` for `work` and without the npm config. After the steps
+above, the two `atelier.toml` files (`~/` is your home; `atl workspace new` writes the
+absolute paths it found):
+
+```toml
+# ~/atelier/workspaces/personal/atelier.toml
+repos = "~/src/personal"
+```
+
+```toml
+# ~/atelier/workspaces/work/atelier.toml
+repos = "~/src/work"
+
+[sandbox]
+mounts = ["~/.work.npmrc"]
+```
+
+Each has its `gitconfig` next to `atelier.toml`, which `atl` uses without a `git_config`
+line. Then, on the host: `atl -w personal` in one terminal and `atl -w work` in another (two tmux
+servers, `atl-personal` and `atl-work`), or `atl` alone for the workspace selector.
+`.devcontainer/` can stay (the box still works) or go.
+
 
 ## Docker image
 
-The `Dockerfile` builds an image with `atl`, `claude`, `tmux`, `git` and `gh`, so nothing
-needs to be installed on the host, and a second one, its `task` target, for task
-containers (the [sandbox](#sandbox), on by default). Both are built for your host user, so
-paths inside the containers match the host (git worktrees store absolute paths). One
-command builds both, from any directory:
+The `Dockerfile` builds two images, both for your host user, so paths inside the
+containers match the host (git worktrees store absolute paths): the task image, its `task`
+target, which task containers run (the [sandbox](#sandbox), on by default), and the box,
+an image with `atl`, `claude`, `tmux`, `git` and `gh` that runs `atl` itself in a
+container. The box is optional, the older way in: `atl`
+[on the host](#install-on-the-host) needs only the task image. One command builds both,
+from any directory:
 
 ```bash
 path/to/atelier/build-images
@@ -51,11 +196,16 @@ picks another Node.js line. With
 Docker's legacy builder, building the box builds this stage too (every stage before the
 target is built; cached afterwards).
 
-Run it with `docker run -it atelier` (plus your mounts). The container starts a plain
-shell, not tmux: run `atl` there, press Enter on a task to open Claude full screen, and
-press **Ctrl-q** to go back to the TUI (Claude keeps running in tmux). Don't start `atl`
-inside a tmux session in the container: Ctrl-q would then detach that tmux client instead
-of returning to the TUI.
+**The box (optional).** Run it with `docker run -it atelier` plus your mounts, as a
+devcontainer does (see [Moving from a devcontainer box](#moving-from-a-devcontainer-box)
+for what they are and what replaces them on the host). Its `/etc/tmux.conf` has the
+settings `atl` on the host writes for its tmux servers (see **tmux settings** under
+[Install on the host](#install-on-the-host)). The container starts a plain shell, not
+tmux: run `atl` there, press Enter on a task to open Claude full screen, and press
+**Ctrl-q** to go back to the TUI (Claude keeps running in tmux). Don't start `atl` inside a
+tmux session in the container: Ctrl-q would then detach that tmux client instead of
+returning to the TUI.
+
 Claude's own status line, under its prompt, shows which task you are in (see
 [Status line](#status-line)).
 
@@ -92,7 +242,7 @@ atl notes fix-login --clear            # clear the notes
 atl assistant [fix-login] # the atelier assistant (one Claude session for all tasks); attach
 atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
 atl cancel fix-login [--force]
-atl doctor                # tools, the workspace and where each setting came from, dirs, database, port offsets shared with another workspace, sandbox mode (Docker, image, token); repos whose config atl refuses to run git with
+atl doctor                # tools, the workspace and where each setting came from, dirs, database, port offsets shared with another workspace, the tmux server's config, sandbox mode (static atl binary, Docker, image, token); repos whose config atl refuses to run git with
 atl token [--paste]       # sandbox: run claude setup-token and store its token for task sessions (see Sandbox)
 atl                       # TUI (on a terminal), in the selected workspace; with none selected, the workspace selector
 atl -w shop ls            # any command in workspace shop (--workspace; else $ATL_WORKSPACE, else the current directory)
@@ -315,7 +465,7 @@ $ATL_WORKSPACES/<name>/
   tasks/        task dirs and worktrees (unless ATL_TASKS is set)
   data/         atelier.db, assistant/
   config/       projects/<name>.toml
-  state/        hook.log
+  state/        hook.log, gate logs, tmux.conf (see Install on the host)
   run/          gate sockets, task Claude dirs, origin pins, the stored Claude token
   repos/        canonical clones (unless repos names another directory)
   gitconfig     optional: the global git config of atl and all it runs
@@ -390,9 +540,13 @@ workspaces; sessions running there are not seen from `atl-<name>`, and `atl` wou
 them for stopped and end them. So `atl workspace new` adopting a directory that already
 has a database, while `ATL_TMUX_SOCKET` is not set, writes `tmux_socket = "default"` with
 a comment, and says so: remove that line once no session runs on the old server (e.g.
-when moving `atl` to the host). Opening a task from inside a client of another tmux server
-(another workspace's, or your own) attaches a nested client; from inside this
-workspace's server it switches the client.
+when moving `atl` to the host, see
+[Moving from a devcontainer box](#moving-from-a-devcontainer-box)). Opening a task from
+inside a client of another tmux server (another workspace's, or your own) attaches a
+nested client; from inside this workspace's server it switches the client. `atl` starts a
+server of its own with the settings it writes to `state/tmux.conf`, and tmux's default
+server with your own config (see **tmux settings** under
+[Install on the host](#install-on-the-host)).
 
 **git_config.** With `GIT_CONFIG_GLOBAL` set, git reads that file instead of
 `~/.gitconfig`, for `atl` and everything it runs: who commits (`user.name` and
@@ -798,11 +952,13 @@ What the sandbox does not do yet:
   fetching go through `atl push`/`atl fetch` (see Git below), and `atl pr` runs where
   `atl` runs.
 
-It needs a token for Claude Code (above), the workspace, the repos and what
-`ATL_SANDBOX_MOUNTS` lists at the same paths for `atl` and the Docker daemon, and a
-workspace path short enough for the gate's socket
+It needs a static Linux `atl` binary, a token for Claude Code (above), the workspace, the
+repos and what `ATL_SANDBOX_MOUNTS` lists at the same paths for `atl` and the Docker
+daemon, and a workspace path short enough for the gate's socket
 (`<workspace>/run/<12 chars>/docker.sock`, at most 107 bytes). `atl doctor` reports the
-mode and checks the daemon, the image, the token and `ATL_SANDBOX_MOUNTS`.
+mode and checks the `atl` binary (a static Linux one, see
+[Install on the host](#install-on-the-host)), the daemon, the image, the token and
+`ATL_SANDBOX_MOUNTS`.
 
 **Session context.** A sandboxed session's start context has a built-in note on the
 sandbox (a repo's own container setup first, else tools run here; what the Docker gate

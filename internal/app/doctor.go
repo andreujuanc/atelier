@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,6 +76,7 @@ func (a *App) Doctor(ctx context.Context) []Check {
 		a.checkPortOffsets(ctx),
 		a.checkStateDir(),
 	)
+	checks = append(checks, a.checkTmuxServer(ctx)...)
 	checks = append(checks, a.checkRepoConfigs(ctx)...)
 	if os.Getenv("ATL_CONTEXT") != "" || os.Getenv(hook.SandboxContextVar) != "" {
 		checks = append(checks, checkEnvContext())
@@ -106,7 +108,7 @@ func (a *App) checkSandbox(ctx context.Context) []Check {
 	if strings.TrimSpace(os.Getenv("ATL_SANDBOX")) == "" {
 		mode += " (the default)"
 	}
-	checks := []Check{pass(name, mode+": each task's sessions run in the task's own container"), a.checkSandboxMounts()}
+	checks := []Check{pass(name, mode+": each task's sessions run in the task's own container"), a.checkAtlBinary(), a.checkSandboxMounts()}
 	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
 	if ver, err := a.checkDocker(ctx); err != nil {
@@ -407,4 +409,60 @@ func workspaceChecks(w *workspace.Applied) []Check {
 		checks = append(checks, pass(s.Key, detail))
 	}
 	return checks
+}
+
+// checkTmuxServer says which config atl's tmux server starts with: the one
+// atl generates (Paths.TmuxConf) for a server of its own, the user's for
+// tmux's default server. A running server of atl's own that was started
+// without it (by an older atl, or by hand) keeps its options until it
+// restarts: a warning.
+func (a *App) checkTmuxServer(ctx context.Context) []Check {
+	const name = "tmux server"
+	c := a.Tmux
+	if c == nil {
+		return nil
+	}
+	if !c.OwnServer() {
+		what := "tmux's default server (tmux_socket = \"default\")"
+		if c.Socket == "" {
+			what = "the server tmux picks ($TMUX's, else the default one)"
+		}
+		return []Check{pass(name, what+": it runs with your own tmux config, not atl's")}
+	}
+	sock, conf := "-L "+c.Socket, c.Config()
+	if conf == "" {
+		return []Check{warn(name, sock+": atl could not write "+a.Paths.TmuxConf()+", so tmux starts it with your own config")}
+	}
+	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
+	defer cancel()
+	files, running, err := c.ConfigFiles(ctx)
+	switch {
+	case errors.Is(err, exec.ErrNotFound):
+		return nil // the tmux check says so
+	case err != nil:
+		return []Check{warn(name, sock+": cannot tell which config it runs with: "+err.Error())}
+	case !running:
+		return []Check{pass(name, sock+", not running: atl starts it with "+conf)}
+	case slices.Contains(files, conf):
+		return []Check{pass(name, sock+", running with "+conf)}
+	}
+	return []Check{warn(name, sock+" runs without "+conf+" (started before atl wrote it, or by hand): "+
+		"atl's tmux settings (no status bar, mouse, Ctrl-q to return to atl) apply once it restarts, after its last session has ended")}
+}
+
+// checkAtlBinary checks that the atl binary task containers get is a
+// static Linux one (see checkAtlBin).
+func (a *App) checkAtlBinary() Check {
+	const name = "atl binary"
+	bin := a.AtlBin
+	if bin == "" {
+		var err error
+		if bin, err = atlBinary(); err != nil {
+			return fail(name, err.Error())
+		}
+	}
+	if err := a.checkAtlBin(bin); err != nil {
+		return fail(name, err.Error())
+	}
+	return pass(name, bin+": a static Linux binary (copied into each task's container)")
 }

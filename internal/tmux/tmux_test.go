@@ -21,6 +21,17 @@ var sockSeq atomic.Int64
 // at cleanup. It skips if tmux is not installed.
 func testClient(t *testing.T) *Client {
 	t.Helper()
+	c := freshClient(t)
+	c.config = os.DevNull
+	startServer(t, c, nil)
+	return c
+}
+
+// freshClient returns a client on a fresh, isolated tmux socket, with no
+// server yet and no config set (a server it starts is killed at cleanup).
+// It skips if tmux is not installed.
+func freshClient(t *testing.T) *Client {
+	t.Helper()
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed")
 	}
@@ -39,9 +50,7 @@ func testClient(t *testing.T) *Client {
 		}
 		_ = os.Remove(filepath.Join(tmp, fmt.Sprintf("tmux-%d", os.Getuid()), sock))
 	})
-	c := &Client{Socket: sock, config: os.DevNull}
-	startServer(t, c, nil)
-	return c
+	return &Client{Socket: sock}
 }
 
 // startServer starts c's server with -f /dev/null (so neither /etc/tmux.conf

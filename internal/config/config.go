@@ -173,6 +173,10 @@ func (p Paths) ClaudeToken() string {
 // HookLog returns StateDir/hook.log.
 func (p Paths) HookLog() string { return filepath.Join(p.StateDir, "hook.log") }
 
+// TmuxConf returns StateDir/tmux.conf, the config atl starts its tmux
+// server with (tmux.Client.UseConfig).
+func (p Paths) TmuxConf() string { return filepath.Join(p.StateDir, "tmux.conf") }
+
 // RefusalLog returns StateDir/refused.log, where atl records the git
 // commands it refused to run because of a repo's config.
 func (p Paths) RefusalLog() string { return filepath.Join(p.StateDir, "refused.log") }

@@ -1,6 +1,6 @@
 # Workspaces and atl on the host — design
 
-Status: in progress (task `atelier-in-host`). Milestones and their state are at the end.
+Status: done (task `atelier-in-host`). Milestones and their state are at the end.
 
 ## Why
 
@@ -148,7 +148,7 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
 | W1 | workspace package, atelier.toml, selection, `atl workspace list/new/open`, env apply, per-workspace tmux socket, git_config, doctor + README | done |
 | W2 | collisions: cross-workspace port offsets, slug suffix for dir/branch, doctor warning | done |
 | W3 | workspace selector TUI (`atl` with none selected), switch workspace from the TUI | done |
-| W4 | host mode: generated tmux.conf, static-binary check, README install-on-host + migration from devcontainers | |
+| W4 | host mode: generated tmux.conf, static-binary check, README install-on-host + migration from devcontainers | done |
 
 ## Decisions
 
@@ -257,3 +257,37 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   a switch. `RunContext` returns `tui.ErrSwitchWorkspace` after the usual shutdown; the
   CLI then re-executes. The workspace's name is drawn at the right end of the task TUI's
   status line when it fits (there is no header line).
+- W4, tmux config: `tmux.ServerConfig` (the box's `/etc/tmux.conf` settings, under a
+  comment saying atl rewrites the file) is written by `Client.UseConfig(path)` to
+  `Paths.TmuxConf()` (`<StateDir>/tmux.conf`) when the file's content differs
+  (`gen.WriteAtomic`, parent dir created), and then passed with `-f` on every command of
+  that client (the existing `config` field; tests still set it to `/dev/null`). tmux reads
+  it only when a command starts the server (`new-session`, `start-server`, and
+  `attach-session`, which starts one too: checked), and ignores it otherwise. The App's
+  client comes from `app.NewTmux(paths, out)` (in `app.New` and the CLI's paths-only App);
+  a write error is a warning and the client goes without `-f`. Not for tmux's own choice of
+  server (no socket name) nor `tmux_socket = "default"` (`Client.OwnServer`): if atl started
+  the user's default server, `-f` would replace their config (the box's `/etc/tmux.conf`
+  keeps applying there). The gate's copy-relay client gets no `-f` (it never starts a
+  server). A test checks `ServerConfig` against the Dockerfile's printf lines.
+- The copy relay needs nothing in the config: `load-buffer -w` sent OSC 52 to an attached
+  `xterm-256color` client with `set-clipboard` external (the default) and also with it
+  off (tmux 3.5a).
+- Doctor's `tmux server` check: for tmux's default server, a pass saying it runs with the
+  user's config; otherwise `#{config_files}` of the running server (which lists every
+  `-f` file, existing or not): a warning when the generated file is not among them (an
+  older atl or a hand-started server: its options apply after a restart), a pass when it
+  is or no server runs. It skips itself when tmux is not installed.
+- W4, static binary: `sandbox.CheckStaticBin(path)`: ELF (else "is not a Linux (ELF)
+  binary", also for an empty file), type `ET_EXEC` or `ET_DYN` (static-pie), no
+  `PT_INTERP`, no `DT_NEEDED`. Neither the machine nor the OS ABI is compared: the
+  Docker daemon's architecture need not be atl's, and `AtlBin` is the running binary
+  unless `$ATL_BIN` says otherwise. `sandbox.StaticBinError` is the one-line refusal with
+  `sandbox.BuildStatic`. `App.CheckBin` (nil → `CheckStaticBin`) lets tests inject it: the
+  app test Apps use a stand-in script for atl and set it to accept anything.
+  `ensureSandbox` checks right after `checkDocker` (so "cannot reach Docker" stays the first
+  thing a session says without a daemon) and before anything is written or started.
+  Doctor's `atl binary` check runs only with the sandbox on, on `AtlBin`, else `$ATL_BIN`,
+  else the running binary.
+- No new doctor check for host basics: the tool checks (git, tmux ≥ 3.2, claude, gh) and
+  the `docker` check (daemon reachable) already cover them.

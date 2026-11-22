@@ -92,7 +92,7 @@ exec sleep 300
 	t.Cleanup(func() { st.Close() })
 	e := &env{
 		app: &App{Paths: paths, Store: st, Tmux: &tmux.Client{Socket: sock}, Out: &bytes.Buffer{},
-			Now: time.Now, AtlBin: "/usr/bin/atl"},
+			Now: time.Now, AtlBin: "/usr/bin/atl", CheckBin: anyBin},
 		out:  out,
 		sock: sock,
 	}

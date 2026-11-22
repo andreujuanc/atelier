@@ -19,7 +19,6 @@ import (
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/sandbox"
-	"github.com/andreujuanc/atelier/internal/tmux"
 	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
@@ -138,7 +137,7 @@ func (c *cli) pathsApp() (*app.App, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &app.App{Paths: p, Tmux: tmux.New(), Out: c.stderr, Now: time.Now, Workspace: c.ws}, nil
+	return &app.App{Paths: p, Tmux: app.NewTmux(p, c.stderr), Out: c.stderr, Now: time.Now, Workspace: c.ws}, nil
 }
 
 // run is runIn with an empty stdin.

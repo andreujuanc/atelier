@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/andreujuanc/atelier/internal/gen"
 )
 
 // TagOption is the window user option holding the atelier session id.
@@ -40,7 +42,82 @@ const launchTimeout = 10 * time.Second
 type Client struct {
 	Socket string // "" → tmux's own choice ($TMUX's server, else default); else `tmux -L Socket`
 
-	config string // if set, passed as -f (tests: keep tmux.conf out of a server they start)
+	// config, if set, is passed as -f on every command: tmux reads it (and
+	// neither /etc/tmux.conf nor the user's) only when that command starts
+	// the server (new-session, attach-session, start-server), and ignores
+	// it otherwise. UseConfig sets it to the file atl generates; tests set
+	// it to /dev/null.
+	config string
+}
+
+// ServerConfig is the tmux configuration atl starts a server of its own
+// with (see UseConfig): what the box image's /etc/tmux.conf has. tmux out
+// of the way: no status bar, mouse scrolling, Ctrl-q detaches (back to
+// atl), and a terminal with 256 colours and RGB. The copy relay (Copy)
+// needs nothing here: load-buffer -w sends OSC 52 whatever set-clipboard
+// says (checked with tmux 3.5a).
+const ServerConfig = `# Written by atl: tmux reads this file when atl starts this workspace's
+# tmux server. atl rewrites it when it differs; changes here do not last.
+set -g status off
+set -g mouse on
+set -g escape-time 10
+bind -n C-q detach-client
+set -g default-terminal "tmux-256color"
+set -as terminal-features ",*:RGB"
+`
+
+// DefaultSocket is the socket name of tmux's default server (`tmux -L
+// default` is the server plain `tmux` reaches): the user's own.
+const DefaultSocket = "default"
+
+// OwnServer reports whether c names a server of atl's own: a socket name
+// other than DefaultSocket. With no name tmux picks the server ($TMUX's,
+// else the default one), which is the user's.
+func (c *Client) OwnServer() bool { return c.Socket != "" && c.Socket != DefaultSocket }
+
+// UseConfig makes c start its server with ServerConfig: it writes it to
+// path (atomically, and only when the file's content differs; the parent
+// directory is created) and passes path with -f from then on. A server that
+// already runs keeps the options it has (see ConfigFiles). For a server
+// that is not atl's own (OwnServer) it does nothing: if atl started it,
+// -f would replace the user's tmux.conf (in the box: /etc/tmux.conf, which
+// applies there). When the file cannot be written c is left without -f.
+func (c *Client) UseConfig(path string) error {
+	if !c.OwnServer() {
+		return nil
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != ServerConfig {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("tmux: write its config: %w", err)
+		}
+		if err := gen.WriteAtomic(path, []byte(ServerConfig)); err != nil {
+			return fmt.Errorf("tmux: write its config: %w", err)
+		}
+	}
+	c.config = path
+	return nil
+}
+
+// Config is the file c passes with -f ("" for none).
+func (c *Client) Config() string { return c.config }
+
+// ConfigFiles returns the config files the running server was started with
+// (tmux's #{config_files}: those given with -f, whether or not they
+// existed, else the default ones it found), and whether a server runs.
+func (c *Client) ConfigFiles(ctx context.Context) (files []string, running bool, err error) {
+	out, err := c.run(ctx, "display-message", "-p", "#{config_files}")
+	if err != nil {
+		if noServer(err) || serverExited(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	for _, f := range strings.Split(out, ",") {
+		if f != "" {
+			files = append(files, f)
+		}
+	}
+	return files, true, nil
 }
 
 // New returns a client for the server named by $ATL_TMUX_SOCKET. When it is

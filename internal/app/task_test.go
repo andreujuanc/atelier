@@ -83,7 +83,7 @@ func newTaskEnv(t *testing.T) *taskEnv {
 	t.Cleanup(func() { st.Close() })
 	return &taskEnv{
 		app: &App{Paths: paths, Store: st, Tmux: &tmux.Client{Socket: sock}, Out: &bytes.Buffer{},
-			Now: time.Now, AtlBin: "/usr/local/bin/atl"},
+			Now: time.Now, AtlBin: "/usr/local/bin/atl", CheckBin: anyBin},
 		root: root,
 		sock: sock,
 	}
