@@ -161,7 +161,7 @@ func missingImage(image, from string) error {
 func missingImageDetail(image, from string) string {
 	if image == sandbox.DefaultImage {
 		return image + " is not on the Docker daemon (each task's sessions run in a container made from it); " +
-			"build it in a checkout of atelier with: " + sandbox.BuildDefaultImage
+			"build it with " + sandbox.BuildImages + " (it builds the box image too), or only it with: " + sandbox.BuildDefaultImage
 	}
 	return image + " (from " + from + ") is not on the Docker daemon and could not be pulled; build or pull it"
 }

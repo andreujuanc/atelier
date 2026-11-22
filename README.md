@@ -12,23 +12,30 @@ default). Build with `go build -o ~/bin/atl ./cmd/atl`, then run `atl doctor`.
 ## Docker image
 
 The `Dockerfile` builds an image with `atl`, `claude`, `tmux`, `git` and `gh`, so nothing
-needs to be installed on the host. Build it with your host user, so paths inside the
-container match the host (git worktrees store absolute paths):
+needs to be installed on the host, and a second one, its `task` target, for task
+containers (the [sandbox](#sandbox), on by default). Both are built for your host user, so
+paths inside the containers match the host (git worktrees store absolute paths). One
+command builds both, from any directory:
+
+```bash
+path/to/atelier/build-images
+```
+
+It builds the checkout it is in, for the user running it: the box image `atelier`, then
+the task image `atelier-task`. It stops at the first failure and prints the two names at
+the end. `ATL_BOX_IMAGE` and `ATL_SANDBOX_IMAGE` (the variable `atl` reads for the task
+image) name them otherwise, e.g. `ATL_BOX_IMAGE=atelier-next build-images` to try a new box
+image beside the one in use. Its arguments go to both `docker build` calls (e.g.
+`build-images --no-cache`). What it runs, in the checkout:
 
 ```bash
 docker build -t atelier \
   --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
-```
-
-Task containers (the [sandbox](#sandbox), on by default) use a second image from the same
-file, the `task` target, built for your user the same way:
-
-```bash
 docker build --target task -t atelier-task \
   --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 ```
 
-It is lean on purpose: Claude Code, git, the Docker CLI with the compose plugin, Node.js
+The task image is lean on purpose: Claude Code, git, the Docker CLI with the compose plugin, Node.js
 (the current LTS line, 26, from nodejs.org) with npm and corepack, and curl, jq, ripgrep,
 unzip, zip, xz, less, procps, openssh-client and ca-certificates, with a UTF-8 locale
 (`C.UTF-8`); not `atl` (it is mounted into task containers), tmux or gh. There is no other
@@ -36,7 +43,8 @@ language and no compiler (no Go, Python or C toolchain): those come from the pro
 `image` (see [Projects](#projects); e.g. one built `FROM atelier-task`), or the task
 installs them itself, and what is installed by hand lasts only until the task's container
 is replaced (see [Sandbox](#sandbox)). As the ordinary user, `npm install -g` installs
-into `~/.local`, on `PATH`. `--build-arg NODE_MAJOR=…` picks another Node.js line. With
+into `~/.local`, on `PATH`. `--build-arg NODE_MAJOR=…` (an argument of `build-images` too)
+picks another Node.js line. With
 Docker's legacy builder, building the box builds this stage too (every stage before the
 target is built; cached afterwards).
 
