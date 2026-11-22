@@ -23,14 +23,19 @@ func pidPath(runDir string) string    { return filepath.Join(runDir, "gate.pid")
 func lockPath(runDir string) string   { return filepath.Join(runDir, "gate.lock") }
 func identPath(runDir string) string  { return filepath.Join(runDir, "gate.ident") }
 
-// Ident names what a gate serves: the task (database id) and the atl binary
-// it runs (size and modification time of bin). A gate that answers with
+// Ident names what a gate serves: the task (database id), the atl binary
+// it runs (size and modification time of bin) and the paths it lets the
+// task mount read-only (Gate.ROMounts, by a hash). A gate that answers with
 // another ident is replaced by Start: it serves a task that was deleted
-// meanwhile, or runs code older than the atl in the task container.
-func Ident(taskID int64, bin string) string {
+// meanwhile, runs code older than the atl in the task container, or has
+// another list of $ATL_SANDBOX_MOUNTS.
+func Ident(taskID int64, bin string, roMounts []string) string {
 	s := fmt.Sprintf("task %d", taskID)
 	if fi, err := os.Stat(bin); err == nil {
 		s += fmt.Sprintf(", atl %d bytes %d", fi.Size(), fi.ModTime().UnixNano())
+	}
+	if len(roMounts) > 0 {
+		s += ", read-only mounts " + shortHash(strings.Join(roMounts, "\x00"), 16)
 	}
 	return s
 }
@@ -112,6 +117,9 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 	}
 	if g.Log != nil {
 		g.Log.Printf("gate %s on %s, mounts allowed under %s", g.ID, sock, g.Root)
+		if len(g.ROMounts) > 0 {
+			g.Log.Printf("gate %s: and, read-only only, from $%s: %s", g.ID, MountsVar, strings.Join(g.ROMounts, ", "))
+		}
 	}
 
 	srv := &http.Server{Handler: g}
@@ -151,14 +159,16 @@ func Alive(runDir string) bool {
 }
 
 // Start makes sure a gate for task taskID serves runDir: if none answers, it
-// starts `<atlBin> gate <slug> --task-id <taskID>` as a detached process (it
-// outlives this atl, like the tmux server) logging to logPath, and waits
-// until it answers. A gate that answers for another task or from another
-// atl binary (see Ident) is stopped and replaced first.
-func Start(atlBin, slug string, taskID int64, runDir, logPath string) error {
+// starts `<atlBin> gate <slug> [--ro-mount <path>]... --task-id <taskID>`
+// as a detached process (it outlives this atl, like the tmux server) logging
+// to logPath, and waits until it answers. roMounts are the paths of
+// $ATL_SANDBOX_MOUNTS (see ROMounts). A gate that answers for another task,
+// from another atl binary or with other roMounts (see Ident) is stopped and
+// replaced first.
+func Start(atlBin, slug string, taskID int64, runDir, logPath string, roMounts []string) error {
 	if Alive(runDir) {
 		cur, _ := os.ReadFile(identPath(runDir))
-		if strings.TrimSpace(string(cur)) == Ident(taskID, atlBin) {
+		if strings.TrimSpace(string(cur)) == Ident(taskID, atlBin, roMounts) {
 			return nil
 		}
 		Stop(runDir)
@@ -175,7 +185,11 @@ func Start(atlBin, slug string, taskID int64, runDir, logPath string) error {
 		return err
 	}
 	defer logFile.Close()
-	cmd := exec.Command(atlBin, "gate", slug, "--task-id", strconv.FormatInt(taskID, 10))
+	args := []string{"gate", slug}
+	for _, m := range roMounts {
+		args = append(args, "--ro-mount", m)
+	}
+	cmd := exec.Command(atlBin, append(args, "--task-id", strconv.FormatInt(taskID, 10))...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}

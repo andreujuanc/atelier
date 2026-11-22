@@ -318,6 +318,47 @@ func TestSandboxSetting(t *testing.T) {
 	}
 }
 
+// TestSandboxMountsSetting: with the sandbox on, a bad $ATL_SANDBOX_MOUNTS
+// keeps atl from starting, in one line that names the path and the rule it
+// broke, and doctor fails on it; a good one starts; with the sandbox off it
+// is not checked.
+func TestSandboxMountsSetting(t *testing.T) {
+	root := setup(t)
+	t.Setenv("ATL_SANDBOX_ID", "")
+	t.Setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
+	t.Setenv("ATL_SANDBOX", "docker")
+	host := t.TempDir()
+	file := filepath.Join(host, "npmrc")
+	if err := os.WriteFile(file, []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for v, want := range map[string]string{
+		"/":                         "atl: $ATL_SANDBOX_MOUNTS: / is the root directory: every task would get the whole host\n",
+		file + ":relative/x":        "atl: $ATL_SANDBOX_MOUNTS: relative/x is not an absolute path\n",
+		file + ":" + host + "/gone": "atl: $ATL_SANDBOX_MOUNTS: " + host + "/gone does not exist here (it must exist here and at the same path on the host)\n",
+		filepath.Join(root, "repos"): "atl: $ATL_SANDBOX_MOUNTS: " + filepath.Join(root, "repos") + " is the repos dir ($ATL_REPOS), " +
+			filepath.Join(root, "repos") + ", which the sandbox keeps from tasks\n",
+	} {
+		t.Setenv("ATL_SANDBOX_MOUNTS", v)
+		if code, out, errs := atl(t, "ls"); code != 1 || out != "" || errs != want {
+			t.Errorf("ls with %q: %d %q %q; want %q", v, code, out, errs, want)
+		}
+		if code, out, _ := atl(t, "doctor"); code != 1 || doctorLevel(out, "sandbox") != "ok" || !strings.Contains(out, "FAIL  sandbox mounts") {
+			t.Errorf("doctor with %q: %d\n%s", v, code, out)
+		}
+	}
+	// ~ is the home dir (root here; host is next to it).
+	t.Setenv("ATL_SANDBOX_MOUNTS", "~/../"+filepath.Base(host)+"/npmrc:")
+	if code, _, errs := atl(t, "ls"); code != 0 {
+		t.Errorf("ls with a good list: %d %q", code, errs)
+	}
+	t.Setenv("ATL_SANDBOX", "off")
+	t.Setenv("ATL_SANDBOX_MOUNTS", "/")
+	if code, _, errs := atl(t, "ls"); code != 0 {
+		t.Errorf("ls, sandbox off: %d %q", code, errs)
+	}
+}
+
 func TestSessionsSummary(t *testing.T) {
 	ss := func(states ...model.SessionState) []model.Session {
 		var out []model.Session

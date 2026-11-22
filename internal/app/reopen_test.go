@@ -327,7 +327,7 @@ func TestReopenSandboxed(t *testing.T) {
 	e.app.AtlBin = atl
 	e.app.Sandbox = &sandbox.Config{Image: "task-image"}
 	e.app.Docker = fd.run
-	e.app.StartGate = func(string, string, int64, string, string) error { return nil }
+	e.app.StartGate = func(string, string, int64, string, string, []string) error { return nil }
 
 	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "boxed", Repos: []RepoArg{{"api", model.ModeRW}}})
 	if err != nil {

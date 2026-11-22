@@ -697,8 +697,9 @@ func (c *cli) statuslineCmd() *cobra.Command {
 // detached, when it launches a session in a sandboxed task.
 func (c *cli) gateCmd() *cobra.Command {
 	var taskID int64
+	var roMounts []string
 	cmd := &cobra.Command{
-		Use:    "gate <slug> --task-id ID",
+		Use:    "gate <slug> [--ro-mount PATH]... --task-id ID",
 		Short:  "Serve a sandboxed task's Docker socket and atl requests (internal)",
 		Hidden: true,
 		Args:   args(cobra.ExactArgs(1)),
@@ -713,6 +714,12 @@ func (c *cli) gateCmd() *cobra.Command {
 			}
 			if taskID <= 0 {
 				return usagef("--task-id is required")
+			}
+			// atl checked them (sandbox.ROMounts); the same rules again.
+			for _, m := range roMounts {
+				if err := sandbox.CheckROMount(p, m); err != nil {
+					return fmt.Errorf("--ro-mount: %w", err)
+				}
 			}
 			dir := p.TaskDir(slug)
 			root, err := filepath.EvalSymlinks(dir)
@@ -742,8 +749,10 @@ func (c *cli) gateCmd() *cobra.Command {
 				Upstream:   sandbox.UpstreamSocket(),
 				Log:        sandbox.NewLogger(),
 				Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
-				Ident:      sandbox.Ident(taskID, bin),
+				Ident:      sandbox.Ident(taskID, bin, roMounts),
+				ROMounts:   roMounts,
 			}
+			ts.SetROMounts(roMounts)
 			// A session ended (Claude exits): what it left running in the
 			// container goes once Claude is gone.
 			ts.OnSessionEnd(func(session int64) {
@@ -776,6 +785,7 @@ func (c *cli) gateCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().Int64Var(&taskID, "task-id", 0, "the task's database id (must still have this slug)")
+	cmd.Flags().StringArrayVar(&roMounts, "ro-mount", nil, "a host path of $"+sandbox.MountsVar+" (resolved) the task may bind-mount, read-only only")
 	return cmd
 }
 
