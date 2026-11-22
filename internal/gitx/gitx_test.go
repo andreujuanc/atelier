@@ -345,6 +345,29 @@ func TestAddWorktree(t *testing.T) {
 	}
 }
 
+func TestAddBranchWorktree(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, base := f.addWorktree(t, ctx, "y")
+	if err := RemoveWorktree(ctx, f.repo, wt, true); err != nil {
+		t.Fatal(err)
+	}
+	again := filepath.Join(f.root, "wt-again")
+	if err := AddBranchWorktree(ctx, f.repo, again, "atl/y", to(f.origin)); err != nil {
+		t.Fatal(err)
+	}
+	if br, err := CurrentBranch(ctx, again); err != nil || br != "atl/y" {
+		t.Fatalf("branch = %q, %v", br, err)
+	}
+	if head, err := HeadCommit(ctx, again); err != nil || head != base {
+		t.Fatalf("head = %q, %v; want %s", head, err, base)
+	}
+	// A branch checked out in another worktree is refused.
+	if err := AddBranchWorktree(ctx, f.repo, filepath.Join(f.root, "wt-twice"), "atl/y", to(f.origin)); err == nil {
+		t.Fatal("checked out atl/y in a second worktree")
+	}
+}
+
 func TestDeleteBranch(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
