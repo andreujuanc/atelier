@@ -181,7 +181,9 @@ func (s Spec) runArgs(hash string) []string {
 // container, named by the full ID Ensure returned (not by its name, which
 // is only checked there), in workdir. The variables named in envKeys are
 // passed on from the window's environment. The atl binary of the run dir
-// comes first on PATH, so `atl` in the container is the atl that made it.
+// comes first on PATH, so `atl` in the container is the atl that made it,
+// and so does its wl-copy, the copy relay, which $WAYLAND_DISPLAY (set to
+// CopyDisplay) makes Claude Code use (see CopyMain).
 //
 // docker's default detach sequence starts with ctrl-p, which it then holds
 // back until the next key; an unlikely sequence keeps ctrl-p usable.
@@ -194,7 +196,7 @@ func ExecArgv(container, workdir string, envKeys, argv []string) []string {
 			out = append(out, "-e", k)
 		}
 	}
-	out = append(out, container, "sh", "-c", `PATH=`+filepath.Dir(InBin)+`:$PATH exec "$@"`, "atl-exec")
+	out = append(out, container, "sh", "-c", `PATH=`+filepath.Dir(InBin)+`:$PATH WAYLAND_DISPLAY=`+CopyDisplay+` exec "$@"`, "atl-exec")
 	return append(out, argv...)
 }
 
@@ -500,7 +502,40 @@ func Cleanup(ctx context.Context, run Runner, id string) error {
 // InstallBin copies the atl binary src to <runDir>/bin/atl unless that copy
 // is already the same file (size and modification time). The copy replaces
 // the old one atomically, so a running container sees the new binary too.
+// Next to it go the links that make atl the copy relay's tools in the
+// container (wl-copy, wl-paste: see CopyMain). The run dir is atl's: the
+// task container has it read-only.
 func InstallBin(src, runDir string) error {
+	if err := installBin(src, runDir); err != nil {
+		return err
+	}
+	for _, name := range copyTools {
+		if err := linkAtl(filepath.Join(runDir, "bin", name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// linkAtl makes path a symlink to atl in its own directory, replacing
+// whatever is there atomically, unless it is one already.
+func linkAtl(path string) error {
+	if target, err := os.Readlink(path); err == nil && target == "atl" {
+		return nil
+	}
+	tmp := path + ".tmp"
+	os.Remove(tmp)
+	if err := os.Symlink("atl", tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func installBin(src, runDir string) error {
 	dst := filepath.Join(runDir, "bin", "atl")
 	sfi, err := os.Stat(src)
 	if err != nil {

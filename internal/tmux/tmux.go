@@ -469,6 +469,52 @@ func (c *Client) SetBuffer(ctx context.Context, text string) error {
 	return nil
 }
 
+// ErrNoClient is returned by Copy when no terminal is attached to the
+// session.
+var ErrNoClient = errors.New("no terminal is attached to the session")
+
+// Copy puts text in a new automatic paste buffer and in the clipboard of the
+// terminal attached to the named session (exact name), the one active last
+// if there are several: load-buffer -w, which sends it to that terminal with
+// the xterm escape sequence (OSC 52) if tmux takes the terminal for one that
+// supports it (its terminfo's Ms, or the clipboard terminal feature; tmux
+// gives xterm* that by default) and set-clipboard is not off. This is what
+// Claude Code does itself when it runs in tmux. Without an attached
+// terminal it returns ErrNoClient (wrapped) and copies nothing: whoever
+// copies does so where the user is looking.
+//
+// The text reaches tmux on its standard input, never on a command line, and
+// is in no error.
+func (c *Client) Copy(ctx context.Context, session string, text []byte) error {
+	if len(text) == 0 {
+		return errors.New("tmux: copy: nothing to copy")
+	}
+	out, err := c.run(ctx, "list-clients", "-t", "="+session, "-F", "#{client_activity} #{client_name}")
+	if err != nil {
+		if noSession(err) {
+			return fmt.Errorf("tmux: copy: session %s: %w", session, ErrNoClient)
+		}
+		return fmt.Errorf("tmux: copy: %w", err)
+	}
+	client, last := "", int64(-1)
+	for _, line := range strings.Split(out, "\n") {
+		act, name, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || name == "" {
+			continue
+		}
+		if n, err := strconv.ParseInt(act, 10, 64); err == nil && n > last {
+			client, last = name, n
+		}
+	}
+	if client == "" {
+		return fmt.Errorf("tmux: copy: session %s: %w", session, ErrNoClient)
+	}
+	if _, err := c.runIn(ctx, string(text), "load-buffer", "-w", "-t", client, "-"); err != nil {
+		return fmt.Errorf("tmux: copy to the terminal of session %s: %w", session, err)
+	}
+	return nil
+}
+
 // PrefixKey returns the server's prefix key for display, e.g. "Ctrl-b";
 // "Ctrl-b" if it cannot be read.
 func (c *Client) PrefixKey(ctx context.Context) string {

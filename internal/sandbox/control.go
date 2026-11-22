@@ -29,7 +29,9 @@ import (
 //   - push and fetch: the gate runs `atl push` or `atl fetch` for its own task
 //     (named by database id and slug), with at most a repo name and --force;
 //   - hook, statusline, note and notes: the gate answers them itself (Task),
-//     on its own task's rows only.
+//     on its own task's rows only;
+//   - copy: the gate puts the body in the user's clipboard (Copy), through
+//     the terminal attached to its own task's tmux session (see CopyMain).
 //
 // Protocol: the client sends the request as one line of JSON, followed by
 // exactly req.Body bytes (the hook's or status line's input, a note's text).
@@ -52,6 +54,7 @@ const (
 	OpStatusLine = "statusline" // `atl statusline`
 	OpNote       = "note"       // `atl note`: append a line to the task's notes
 	OpNotes      = "notes"      // `atl notes`: print, replace or clear them
+	OpCopy       = "copy"       // wl-copy (atl, see CopyMain): put the body in the user's clipboard
 )
 
 // Landing is a tool target of a PreToolUse hook as the task container
@@ -118,9 +121,19 @@ func maxBody(op string) int64 {
 		return MaxHookBody
 	case OpStatusLine, OpNote, OpNotes:
 		return 1 << 20
+	case OpCopy:
+		return MaxCopy
 	}
 	return 0
 }
+
+// MaxCopy bounds what a task can put in the user's clipboard at once: 1 MiB,
+// far more than a selection on a screen, and little enough for tmux to hold
+// (each copy is a paste buffer there too).
+const MaxCopy = 1 << 20
+
+// copyTimeout bounds putting one copy in the clipboard (two tmux commands).
+const copyTimeout = 10 * time.Second
 
 // bodyTimeout bounds reading a request's body.
 const bodyTimeout = 30 * time.Second
@@ -136,9 +149,15 @@ type Control struct {
 	Task    Task          // answers the task operations; nil: refused
 	Log     *log.Logger   // requests and refusals; nil: discarded
 	Timeout time.Duration // push and fetch; 0 → controlTimeout
+	// Copy puts text in the user's clipboard where atl runs (for the gate:
+	// through the terminal attached to the task's own tmux session, see
+	// tmux.Client.Copy); nil: copy is refused. The text comes from the task:
+	// it only ever goes to Copy, as bytes, and is never logged.
+	Copy func(ctx context.Context, text []byte) error
 
 	bigOnce sync.Once
 	big     chan struct{} // slots for bodies over bigBody
+	copyMu  sync.Mutex    // one copy at a time: in the order they came, one tmux at a time
 }
 
 // bigBody is the body size above which a request waits for one of
@@ -199,9 +218,9 @@ func (c *Control) check(req ControlRequest) error {
 	notFor := func(what string) error { return fmt.Errorf("%s is not for %s", what, req.Op) }
 	remote := req.Op == OpPush || req.Op == OpFetch
 	switch req.Op {
-	case OpPush, OpFetch, OpHook, OpStatusLine, OpNote, OpNotes:
+	case OpPush, OpFetch, OpHook, OpStatusLine, OpNote, OpNotes, OpCopy:
 	default:
-		return fmt.Errorf("unknown operation %q (a task may ask for push, fetch, hook, statusline, note or notes)", req.Op)
+		return fmt.Errorf("unknown operation %q (a task may ask for push, fetch, hook, statusline, note, notes or copy)", req.Op)
 	}
 	switch {
 	case req.Repo != "" && !remote:
@@ -312,6 +331,10 @@ func (c *Control) handle(conn net.Conn) {
 		refuse(err.Error())
 		return
 	}
+	if req.Op == OpCopy {
+		c.copy(conn, in, out, req, refuse)
+		return
+	}
 	if req.Op != OpPush && req.Op != OpFetch {
 		c.task(conn, in, out, req, refuse)
 		return
@@ -390,6 +413,40 @@ func (c *Control) task(conn net.Conn, in *bufio.Reader, out *replyWriter, req Co
 	conn.SetReadDeadline(time.Time{})
 	code := c.Task.Do(req, body, out, stderrWriter{out})
 	out.exit(code, req.Op)
+}
+
+// copy reads the body of a copy (at most MaxCopy bytes, which check saw to)
+// and has c.Copy put it in the user's clipboard. The log gets the time, the
+// task and the size, never the text; an error of Copy is tmux's, which does
+// not echo its input.
+func (c *Control) copy(conn net.Conn, in *bufio.Reader, out *replyWriter, req ControlRequest, refuse func(string)) {
+	if c.Copy == nil {
+		refuse(req.Op + " is not served by this gate")
+		return
+	}
+	conn.SetReadDeadline(time.Now().Add(bodyTimeout))
+	text := make([]byte, req.Body)
+	if _, err := io.ReadFull(in, text); err != nil {
+		refuse("request body cut short")
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
+	if len(text) == 0 {
+		out.exit(0, req.Op) // nothing to copy
+		return
+	}
+	c.copyMu.Lock()
+	defer c.copyMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), copyTimeout)
+	defer cancel()
+	if err := c.Copy(ctx, text); err != nil {
+		c.logf("fail  copy of %d bytes for %s: %v", len(text), c.Slug, err)
+		fmt.Fprintf(stderrWriter{out}, "atelier gate: copy: %v\n", err)
+		out.exit(1, req.Op)
+		return
+	}
+	c.logf("copy  %d bytes for %s to the clipboard", len(text), c.Slug)
+	out.exit(0, req.Op)
 }
 
 // controlEnv is the environment of a command the gate runs: its own, minus

@@ -31,8 +31,13 @@ SOCK="atl-e2e-$$"
 export TMUX_TMPDIR="$W/t" # keeps the isolated server's socket inside $W
 mkdir -p "$TMUX_TMPDIR"
 
+OUTER="$SOCK-outer" # the copy relay's terminal (see "copy relay")
+GATE_PID=
+
 cleanup() {
 	local rc=$?
+	if [[ -n $GATE_PID ]]; then kill "$GATE_PID" 2>/dev/null || true; fi
+	tmux -L "$OUTER" kill-server >/dev/null 2>&1 || true
 	tmux -L "$SOCK" kill-server >/dev/null 2>&1 || true
 	if [[ $rc -ne 0 && -n "${KEEP_E2E:-}" ]]; then
 		echo "keeping $W" >&2
@@ -328,6 +333,53 @@ out="$(printf '{"session_id":"nope","cwd":"%s"}' "$ATL_TASKS/second-task" | NO_C
 expect_eq "status line by cwd" "$out" "● Second task"
 out="$(printf 'not json' | ATL_TASK=fix-login atl statusline 2>&1)" || fail "atl statusline (bad input) exit code"
 expect_eq "status line on bad input" "$out" ""
+
+# ---- copy relay ------------------------------------------------------------
+
+# In a task container wl-copy is atl, linked as wl-copy next to it; it asks
+# the task's gate, which puts the text in the clipboard of the terminal on
+# the task's tmux session (load-buffer -w: OSC 52). The gate runs here as atl
+# starts it, without Docker (only its Docker socket would need the daemon);
+# the terminal is a pane of a second tmux server that takes OSC 52
+# (set-clipboard on), and atl's server takes any terminal for one that does.
+step "copy relay"
+mkdir -p "$W/relay"
+for tool in wl-copy wl-paste; do ln -s "$W/bin/atl" "$W/relay/$tool"; done
+# Reading the clipboard is refused, and prints nothing.
+out="$(printf 'x' | ATL_SANDBOX_ID=e2e "$W/relay/wl-paste" 2>/dev/null)" && fail "wl-paste succeeded"
+expect_eq "wl-paste output" "$out" ""
+atl gate fix-login --task-id "$(task_field fix-login id)" >"$E2E_OUT/gate.log" 2>&1 &
+GATE_PID=$!
+ctl_sock() { find "$XDG_STATE_HOME" -name atl.sock -type s 2>/dev/null | head -n1; }
+gate_up() { [[ -n "$(ctl_sock)" ]]; }
+wait_for "the gate's control socket" gate_up
+CTL="$(ctl_sock)"
+relay() { ATL_SANDBOX_ID=e2e ATL_CONTROL_SOCK="$CTL" "$W/relay/wl-copy" "$@"; }
+TEXT='echo "copied from a task" \
+  --flag=x'
+rc=0
+printf '%s' "$TEXT" | relay 2>"$E2E_OUT/wl-copy.err" || rc=$?
+expect_eq "wl-copy without a terminal on the session: exit code" "$rc" "1"
+grep -q "no terminal is attached" "$E2E_OUT/wl-copy.err" || fail "wl-copy without a terminal: $(cat "$E2E_OUT/wl-copy.err")"
+tm set-option -as terminal-features ',*:clipboard'
+tmux -L "$OUTER" -f /dev/null new-session -d -s term "env -u TMUX tmux -L $SOCK attach-session -t =atl-fix-login" \; \
+	set-option -g set-clipboard on || fail "start the terminal's tmux server"
+attached() { [[ -n "$(tm list-clients -t =atl-fix-login -F '#{client_name}')" ]]; }
+wait_for "a terminal on atl-fix-login" attached
+before="$(tm list-buffers | wc -l)"
+printf '%s' "$TEXT" | relay || fail "wl-copy failed"
+printf '%s' "$TEXT" | relay --primary || fail "wl-copy --primary failed"
+expect_eq "tmux paste buffer" "$(tm show-buffer)" "$TEXT"
+expect_eq "paste buffers added (the primary selection is not copied again)" "$(($(tm list-buffers | wc -l) - before))" "1"
+clipboard() { [[ "$(tmux -L "$OUTER" show-buffer 2>/dev/null)" == "$TEXT" ]]; }
+wait_for "the copy in the terminal's clipboard" clipboard
+grep -qF "copy  ${#TEXT} bytes for fix-login to the clipboard" "$E2E_OUT/gate.log" || fail "gate log lacks the copy: $(cat "$E2E_OUT/gate.log")"
+if grep -qF "copied from a task" "$E2E_OUT/gate.log"; then fail "the gate logged the copied text"; fi
+kill "$GATE_PID"
+wait "$GATE_PID" 2>/dev/null || true
+GATE_PID=
+tmux -L "$OUTER" kill-server
+rm -rf "$(dirname "$CTL")" # as before the gate: no run dir, nothing for atl done to clean up
 
 # ---- crash recovery + resume -----------------------------------------------
 

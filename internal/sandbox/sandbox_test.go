@@ -289,7 +289,7 @@ func TestSpecRunArgs(t *testing.T) {
 func TestExecArgv(t *testing.T) {
 	got := ExecArgv(oldID, "/tasks/t", []string{"ATL_TASK", "TERM"}, []string{"claude", "--resume", "x"})
 	want := []string{"docker", "exec", "-it", "--detach-keys", "ctrl-^,ctrl-^,ctrl-^", "-w", "/tasks/t", "-e", "ATL_TASK", "-e", "COLORFGBG", "-e", "COLORTERM",
-		"-e", "NO_COLOR", "-e", "TERM", oldID, "sh", "-c", `PATH=/run/atl/bin:$PATH exec "$@"`, "atl-exec",
+		"-e", "NO_COLOR", "-e", "TERM", oldID, "sh", "-c", `PATH=/run/atl/bin:$PATH WAYLAND_DISPLAY=atl-copy-relay exec "$@"`, "atl-exec",
 		"claude", "--resume", "x"}
 	if !slices.Equal(got, want) {
 		t.Errorf("ExecArgv:\n got %q\nwant %q", got, want)
@@ -745,5 +745,33 @@ func TestInstallBin(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(dst); string(b) != "version two" {
 		t.Errorf("copy = %q", b)
+	}
+	// The copy relay's tools are links to it, also put back when something
+	// else is in their place.
+	links := func() {
+		t.Helper()
+		for _, name := range []string{"wl-copy", "wl-paste"} {
+			path := filepath.Join(run, "bin", name)
+			if target, err := os.Readlink(path); err != nil || target != "atl" {
+				t.Errorf("%s: link to %q, %v; want a link to atl", name, target, err)
+			}
+			if b, _ := os.ReadFile(path); string(b) != "version two" {
+				t.Errorf("%s reads %q, want the atl copy", name, b)
+			}
+		}
+	}
+	links()
+	if err := os.Remove(filepath.Join(run, "bin", "wl-copy")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(run, "bin", "wl-copy"), []byte("other"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := InstallBin(src, run); err != nil {
+		t.Fatal(err)
+	}
+	links()
+	if entries, _ := os.ReadDir(filepath.Join(run, "bin")); len(entries) != 3 {
+		t.Errorf("bin has %d entries, want atl and its two links", len(entries))
 	}
 }
