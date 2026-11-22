@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -17,7 +18,7 @@ func TestCreateTaskAutoPort(t *testing.T) {
 
 	task := &model.Task{Slug: "fix", Title: "Fix", Status: model.StatusBacklog,
 		Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "main", BaseCommit: "abc"}}}
-	if err := s.CreateTaskAutoPort(ctx, task); err != nil {
+	if err := s.CreateTaskAutoPort(ctx, task, Avoid{}); err != nil {
 		t.Fatal(err)
 	}
 	if task.ID == 0 || task.Slug != "fix-2" || task.Branch != "atl/fix-2" || task.PortOffset != 100 || task.CreatedAt.IsZero() {
@@ -33,7 +34,7 @@ func TestCreateTaskAutoPort(t *testing.T) {
 
 	// Validation failures leave the task untouched.
 	bad := &model.Task{Slug: "x", Status: "nope"}
-	if err := s.CreateTaskAutoPort(ctx, bad); err == nil || bad.ID != 0 {
+	if err := s.CreateTaskAutoPort(ctx, bad, Avoid{}); err == nil || bad.ID != 0 {
 		t.Fatalf("invalid status: err=%v task=%+v", err, bad)
 	}
 }
@@ -55,7 +56,7 @@ func TestCreateTaskAutoPortConcurrent(t *testing.T) {
 			}
 			defer st.Close()
 			tasks[i] = &model.Task{Slug: "same", Title: "Same", Status: model.StatusActive}
-			errs[i] = st.CreateTaskAutoPort(context.Background(), tasks[i])
+			errs[i] = st.CreateTaskAutoPort(context.Background(), tasks[i], Avoid{})
 		}(i)
 	}
 	wg.Wait()
@@ -98,5 +99,80 @@ func TestDeleteTask(t *testing.T) {
 	}
 	if err := s.DeleteTask(ctx, task.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second delete: %v", err)
+	}
+}
+
+// TestCreateTaskAutoPortAvoid: offsets reserved elsewhere (other
+// workspaces) are skipped along with this database's open ones, and slugs
+// SlugTaken reports get the next suffix, within the 40-char limit.
+func TestCreateTaskAutoPortAvoid(t *testing.T) {
+	s, _ := openTest(t)
+	ctx := context.Background()
+	mkTask(t, s, "fix", model.StatusActive, 100)
+	outside := map[string]bool{"fix-2": true, "new": true}
+	var asked []string
+	avoid := Avoid{PortOffsets: []int{0, 200, 200, 500}, SlugTaken: func(slug string) (bool, error) {
+		asked = append(asked, slug)
+		return outside[slug], nil
+	}}
+	task := &model.Task{Slug: "fix", Title: "Fix", Status: model.StatusActive}
+	if err := s.CreateTaskAutoPort(ctx, task, avoid); err != nil {
+		t.Fatal(err)
+	}
+	if task.Slug != "fix-3" || task.Branch != "atl/fix-3" || task.PortOffset != 300 {
+		t.Fatalf("got %+v", task)
+	}
+	// "fix" is taken in the database: SlugTaken is not asked about it.
+	if strings.Join(asked, ",") != "fix-2,fix-3" {
+		t.Fatalf("SlugTaken asked %v", asked)
+	}
+	task = &model.Task{Slug: "new", Title: "New", Status: model.StatusActive}
+	if err := s.CreateTaskAutoPort(ctx, task, avoid); err != nil {
+		t.Fatal(err)
+	}
+	if task.Slug != "new-2" || task.PortOffset != 400 {
+		t.Fatalf("got %+v", task)
+	}
+	long := strings.Repeat("a", 39) + "b"
+	outside[long] = true
+	task = &model.Task{Slug: long, Title: "Long", Status: model.StatusActive}
+	if err := s.CreateTaskAutoPort(ctx, task, avoid); err != nil {
+		t.Fatal(err)
+	}
+	if task.Slug != strings.Repeat("a", 38)+"-2" || task.PortOffset != 600 {
+		t.Fatalf("got %+v", task)
+	}
+
+	// A SlugTaken error aborts the insert.
+	boom := errors.New("boom")
+	bad := &model.Task{Slug: "other", Title: "Other", Status: model.StatusActive}
+	err := s.CreateTaskAutoPort(ctx, bad, Avoid{SlugTaken: func(string) (bool, error) { return false, boom }})
+	if !errors.Is(err, boom) || bad.ID != 0 {
+		t.Fatalf("err = %v, task %+v", err, bad)
+	}
+	if _, err := s.GetTaskBySlug(ctx, "other"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("inserted anyway: %v", err)
+	}
+}
+
+func TestNextPortOffsetReserved(t *testing.T) {
+	s, _ := openTest(t)
+	ctx := context.Background()
+	mkTask(t, s, "a", model.StatusActive, 100)
+	mkTask(t, s, "b", model.StatusDone, 200)
+	for _, tc := range []struct {
+		reserved []int
+		want     int
+	}{
+		{nil, 0},
+		{[]int{0}, 200},
+		{[]int{0, 200}, 300},
+		{[]int{100, 300}, 0},
+		{[]int{0, 250}, 200}, // not a multiple of 100: never a candidate anyway
+	} {
+		got, err := s.NextPortOffset(ctx, tc.reserved...)
+		if err != nil || got != tc.want {
+			t.Errorf("NextPortOffset(%v) = %d, %v; want %d", tc.reserved, got, err, tc.want)
+		}
 	}
 }

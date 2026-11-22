@@ -55,12 +55,27 @@ func (s *Store) CreateTask(ctx context.Context, t *model.Task) error {
 	return tx.Commit()
 }
 
+// Avoid is what CreateTaskAutoPort keeps clear of besides this database's
+// own tasks.
+type Avoid struct {
+	// PortOffsets are offsets in use elsewhere (the open tasks of other
+	// workspaces).
+	PortOffsets []int
+	// SlugTaken, if not nil, reports whether a candidate slug is taken
+	// outside the database (its task dir or branch exists, say). It is
+	// called inside the write transaction for each candidate the database
+	// leaves free; an error aborts the insert.
+	SlugTaken func(slug string) (bool, error)
+}
+
 // CreateTaskAutoPort inserts t and its repos like CreateTask, but first
-// allocates, inside the same BEGIN IMMEDIATE transaction, the lowest free
-// port offset (as NextPortOffset) and a unique slug derived from t.Slug (as
-// UniqueSlug), so concurrent callers never get the same slug or offset. It
-// sets t.ID, t.Slug, t.Branch ("atl/"+slug), t.PortOffset and timestamps.
-func (s *Store) CreateTaskAutoPort(ctx context.Context, t *model.Task) error {
+// allocates, inside the same BEGIN IMMEDIATE transaction, the lowest port
+// offset free of this database's open tasks and of avoid.PortOffsets (as
+// NextPortOffset) and a unique slug derived from t.Slug (as UniqueSlug,
+// also skipping the slugs avoid.SlugTaken reports), so concurrent callers
+// on this database never get the same slug or offset. It sets t.ID,
+// t.Slug, t.Branch ("atl/"+slug), t.PortOffset and timestamps.
+func (s *Store) CreateTaskAutoPort(ctx context.Context, t *model.Task, avoid Avoid) error {
 	if err := validateTask(t); err != nil {
 		return err
 	}
@@ -69,11 +84,11 @@ func (s *Store) CreateTaskAutoPort(ctx context.Context, t *model.Task) error {
 		return err
 	}
 	defer tx.Rollback()
-	slug, err := uniqueSlug(ctx, tx, t.Slug)
+	slug, err := uniqueSlug(ctx, tx, t.Slug, avoid.SlugTaken)
 	if err != nil {
 		return err
 	}
-	port, err := nextPortOffset(ctx, tx)
+	port, err := nextPortOffset(ctx, tx, avoid.PortOffsets)
 	if err != nil {
 		return err
 	}
@@ -421,17 +436,24 @@ const maxSlugLen = 40
 // base-2, base-3, ... Results never exceed 40 chars: base is trimmed (along
 // with any trailing "-") to make room for the suffix.
 func (s *Store) UniqueSlug(ctx context.Context, base string) (string, error) {
-	return uniqueSlug(ctx, s.db, base)
+	return uniqueSlug(ctx, s.db, base, nil)
 }
 
-func uniqueSlug(ctx context.Context, q querier, base string) (string, error) {
+// uniqueSlug is UniqueSlug within q; a slug for which also (if not nil)
+// returns true is taken too.
+func uniqueSlug(ctx context.Context, q querier, base string, also func(string) (bool, error)) (string, error) {
 	taken := func(slug string) (bool, error) {
 		var one int
 		err := q.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE slug = ?`, slug).Scan(&one)
-		if errors.Is(err, sql.ErrNoRows) {
+		switch {
+		case err == nil:
+			return true, nil
+		case !errors.Is(err, sql.ErrNoRows):
+			return false, err
+		case also == nil:
 			return false, nil
 		}
-		return err == nil, err
+		return also(slug)
 	}
 	c := trimSlug(base, maxSlugLen)
 	for i := 1; ; i++ {
@@ -458,12 +480,12 @@ func trimSlug(slug string, n int) string {
 }
 
 // NextPortOffset returns the lowest multiple of 100 (from 0) not used by an
-// open (backlog/active/review) task.
-func (s *Store) NextPortOffset(ctx context.Context) (int, error) {
-	return nextPortOffset(ctx, s.db)
+// open (backlog/active/review) task and not in reserved.
+func (s *Store) NextPortOffset(ctx context.Context, reserved ...int) (int, error) {
+	return nextPortOffset(ctx, s.db, reserved)
 }
 
-func nextPortOffset(ctx context.Context, q querier) (int, error) {
+func nextPortOffset(ctx context.Context, q querier, reserved []int) (int, error) {
 	var open []any
 	for _, st := range model.AllStatuses {
 		if st.Open() {
@@ -477,6 +499,9 @@ func nextPortOffset(ctx context.Context, q querier) (int, error) {
 	}
 	defer rows.Close()
 	used := map[int]bool{}
+	for _, off := range reserved {
+		used[off] = true
+	}
 	for rows.Next() {
 		var off int
 		if err := rows.Scan(&off); err != nil {

@@ -72,6 +72,7 @@ func (a *App) Doctor(ctx context.Context) []Check {
 		a.checkTasksDir(),
 		a.checkReposDir(),
 		a.checkDB(ctx),
+		a.checkPortOffsets(ctx),
 		a.checkStateDir(),
 	)
 	checks = append(checks, a.checkRepoConfigs(ctx)...)

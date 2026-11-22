@@ -120,7 +120,7 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   offset.
 - **Slugs**: a new task's slug gets `-2`, `-3`, … (as for slugs taken in the database)
   also when its task dir exists on disk, or when branch `atl/<slug>` already exists in
-  the canonical clone of one of its rw repos.
+  the canonical clone of one of its rw repos (locally or as `origin/atl/<slug>`).
 - **Containers, gate sockets, Claude dirs**: already distinct (named by a hash of the task
   dir).
 - **tmux**: each workspace has its own tmux server (`tmux_socket`, default `atl-<name>`),
@@ -145,7 +145,7 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
 | | | state |
 |---|---|---|
 | W1 | workspace package, atelier.toml, selection, `atl workspace list/new/open`, env apply, per-workspace tmux socket, git_config, doctor + README | done |
-| W2 | collisions: cross-workspace port offsets, slug suffix for dir/branch, doctor warning | |
+| W2 | collisions: cross-workspace port offsets, slug suffix for dir/branch, doctor warning | done |
 | W3 | workspace selector TUI (`atl` with none selected), switch workspace from the TUI | |
 | W4 | host mode: generated tmux.conf, static-binary check, README install-on-host + migration from devcontainers | |
 
@@ -201,3 +201,32 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
 - The README drops the XDG rows and "without a workspace" paths (the CLI always runs in a
   workspace); `config.Resolve` keeps its XDG branch. CLI tests and `test/e2e.sh` now run in
   a workspace (e2e creates it with `atl workspace new`).
+- W2, port offsets: `store.CreateTaskAutoPort(ctx, t, store.Avoid{PortOffsets, SlugTaken})`
+  (and `NextPortOffset(ctx, reserved...)`): the app passes in what lies outside the
+  database; allocation and insert stay one `BEGIN IMMEDIATE` transaction. The other
+  databases are read with `store.OpenReadOnly` (busy timeout 2 s) before that transaction.
+  There is no lock across workspaces: two workspaces creating a task at the same instant
+  can pick the same offset; doctor's warning covers it.
+- The "other workspaces" are every directory under the root with a valid workspace name and
+  a `data/atelier.db`, with or without `atelier.toml` (an old box not yet adopted still
+  binds host ports). One without a database has no tasks and is skipped silently (a fresh
+  workspace would otherwise warn on every `atl new`); one whose database cannot be opened
+  or read (not SQLite, locked, `ErrSchemaVersion`) is skipped with a warning on `App.Out`,
+  and in doctor's `port offsets` check. This workspace is left out by the resolved
+  directory (`EvalSymlinks`) and, as well, by its database file (`os.SameFile`).
+- Doctor's `port offsets` check compares only across workspaces (two open tasks of one
+  workspace with the same offset are not checked; see reopen below) and names the current
+  workspace by its applied name, else the base name of `ATL_WORKSPACE`.
+- Reopen keeps the task's offset (it never allocated one, not even against its own
+  workspace), its slug and its branch: it reuses the kept `atl/<slug>` on purpose and its
+  task dir may exist. Rename changes only the title. So neither applies the new checks.
+- W2, slugs: `slugTaken` is called inside the transaction for each candidate the database
+  leaves free: `Lstat` of `$ATL_TASKS/<slug>` (anything there counts, not only a
+  directory), then `gitx.RefExists` for `refs/heads/atl/<slug>` and also
+  `refs/remotes/origin/atl/<slug>` (after `atl new`'s fetch) in each rw repo's canonical
+  clone: two workspaces with separate clones of one origin would otherwise push to the same
+  branch. ro repos do not count. `buildTaskDir` keeps its "task dir already exists" error
+  for a dir made between the check and the mkdir. `atl add` is unchanged (an existing
+  `atl/<slug>` still fails it). A branch in the way of `atl/<slug>` as a directory
+  (`atl/<slug>/x`) is not checked; `TestNewTaskRollback` now uses that to make the second
+  worktree fail.

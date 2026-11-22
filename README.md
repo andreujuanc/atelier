@@ -92,7 +92,7 @@ atl notes fix-login --clear            # clear the notes
 atl assistant [fix-login] # the atelier assistant (one Claude session for all tasks); attach
 atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
 atl cancel fix-login [--force]
-atl doctor                # tools, the workspace and where each setting came from, dirs, database, sandbox mode (Docker, image, token); repos whose config atl refuses to run git with
+atl doctor                # tools, the workspace and where each setting came from, dirs, database, port offsets shared with another workspace, sandbox mode (Docker, image, token); repos whose config atl refuses to run git with
 atl token [--paste]       # sandbox: run claude setup-token and store its token for task sessions (see Sandbox)
 atl                       # TUI (on a terminal), in the selected workspace
 atl -w shop ls            # any command in workspace shop (--workspace; else $ATL_WORKSPACE, else the current directory)
@@ -189,6 +189,18 @@ title over 200 characters, which the input shows cut. The slug never changes, so
 it (or the id) to refer to the task. An open task's generated `CLAUDE.md` is rewritten with
 the new title; if its task dir is gone (the task is being closed) nothing is recreated and
 the rename only warns.
+
+`atl new` (TUI `n`) derives the task's slug from the title: lowercase, each run of
+characters other than `a-z` and `0-9` becomes one `-`, at most 40 characters (`task` if
+nothing is left). When that slug is taken, the task gets the first free of `<slug>-2`,
+`<slug>-3`, … (the base cut, without a trailing `-`, so the result stays within 40
+characters). A slug is taken when a task of the workspace has it (open or closed), when
+something is at its task dir `$ATL_TASKS/<slug>` (left as it is), or when branch
+`atl/<slug>` exists in the canonical clone of one of the new task's rw repos, as a local
+branch or as `origin/atl/<slug>` after the fetch (`atl new` never takes over a branch it
+did not make). After that the slug never changes: `atl add` of a rw repo whose canonical
+clone already has `atl/<slug>` fails and keeps that branch, and reopening a task (below)
+uses its kept `atl/<slug>` on purpose.
 
 `<task>` is a slug, numeric id, or unique slug prefix. atelier pushes only when asked:
 push `atl/<slug>` (yourself, or with `atl push`) before `atl pr`. `atl push` pushes
@@ -384,6 +396,13 @@ file itself), `insteadOf` rules, credential helpers. Without it git uses its own
 `atl doctor` warns when `git_config` names a file that does not exist. Neither it nor
 `~/.gitconfig` or `~/.config/git` can be an `ATL_SANDBOX_MOUNTS` path.
 
+**Between workspaces.** All workspaces share the Docker daemon, the host's ports and, when
+their `repos` are the same directory, canonical clones. Task containers and gate sockets
+are named by a hash of the task dir, so those of two workspaces never meet. A new task's
+port offset avoids the offsets of the open tasks of every other workspace (see
+[Environment](#environment)), and its slug avoids `atl/<slug>` branches already in the
+clones of its rw repos (see [Notes](#notes)).
+
 **Commands.**
 
 - `atl workspace list [--json]`: every directory under `$ATL_WORKSPACES` with a valid
@@ -432,8 +451,21 @@ not set; a variable set in the environment wins over the file (see
 came from, and every path it resolved.
 
 Claude windows and scripts get `ATL_TASK`, `ATL_TASK_DIR`, `ATL_PORT_OFFSET`
-(0, 100, 200… unique per open task) plus the project's `env`; scripts also get
+(0, 100, 200…, see below) plus the project's `env`; scripts also get
 `ATL_REPO`, `ATL_WORKTREE`, `ATL_BRANCH`.
+
+**Port offset.** `atl new` gives the task the lowest multiple of 100 (from 0) that no open
+task (backlog, active or review) has, in this workspace or in any other: every workspace
+binds the same host's ports. The other workspaces are the directories under
+`$ATL_WORKSPACES` with a workspace name and a `data/atelier.db`, with or without
+`atelier.toml`; their databases are only read. One that cannot be read (locked for more
+than 2 seconds, not a database, written by an `atl` with another schema version) is
+skipped with a warning, and its offsets are not avoided. The offset is kept until the task
+is closed, and reopening a task gives it its old one back, even when another open task has
+it by then. Two workspaces creating a task at the same moment can still pick the same
+offset; `atl doctor` warns about every open task that has the same offset as an open task
+of another workspace, naming both (`personal/fix-login and work/api-docs (+300)`): close one of
+them (new tasks avoid both offsets).
 
 ## Sandbox
 
