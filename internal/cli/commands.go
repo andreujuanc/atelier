@@ -21,6 +21,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/sandbox"
+	"github.com/andreujuanc/atelier/internal/tmux"
 )
 
 func (c *cli) newCmd() *cobra.Command {
@@ -693,7 +694,8 @@ func (c *cli) statuslineCmd() *cobra.Command {
 // gateCmd serves a task's gated Docker socket (see sandbox.Gate) and its
 // control socket (sandbox.Control): push and fetch, and the hooks, status
 // line and notes of the task's container, which it answers itself from the
-// database (hook.TaskServer) for this one task only. atl starts it itself,
+// database (hook.TaskServer) for this one task only, and the copy relay
+// (sandbox.CopyMain) to the terminal on this task's tmux session. atl starts it itself,
 // detached, when it launches a session in a sandboxed task.
 func (c *cli) gateCmd() *cobra.Command {
 	var taskID int64
@@ -781,6 +783,10 @@ func (c *cli) gateCmd() *cobra.Command {
 				}
 			}()
 			ctl := &sandbox.Control{Slug: slug, TaskID: taskID, Atl: bin, Task: ts, Log: g.Log}
+			// The copy relay (wl-copy in the container): to the terminal
+			// attached to this task's tmux session, on atl's tmux server.
+			tc, session := tmux.New(), tmux.SessionName(slug)
+			ctl.Copy = func(ctx context.Context, text []byte) error { return tc.Copy(ctx, session, text) }
 			return sandbox.Serve(ctx, g, ctl, runDir)
 		},
 	}
