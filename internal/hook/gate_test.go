@@ -292,6 +292,16 @@ func TestHookThroughGateContext(t *testing.T) {
 	if r.code != 0 || r.stderr != "" || f.get(t, s.ID).ClaudeSessionID != "c1" {
 		t.Errorf("result %+v, row %+v", r, f.get(t, s.ID))
 	}
+	if strings.Contains(ctx, mountsHead) {
+		t.Errorf("a mounts line without mounts:\n%s", ctx)
+	}
+
+	// The gate's read-only host paths are named, after the sandbox note.
+	sock = gatedWith(t, f, func(ts *TaskServer) { ts.SetROMounts([]string{"/home/u/.npmrc-corp", "/etc/corp-ca"}) })
+	r = hookVia(t, f, sock, EventSessionStart, in, map[string]string{"ATL_SESSION": itoa(s.ID)})
+	if ctx := sessionStartContext(t, r.stdout); !strings.Contains(ctx, sandboxNote+"\n"+mountsHead+"/home/u/.npmrc-corp, /etc/corp-ca\n") {
+		t.Errorf("context lacks the mounts line:\n%s", ctx)
+	}
 }
 
 // snapshot renders everything of task "other" in f: its row, notes and

@@ -40,8 +40,8 @@ type sessionStartOutput struct {
 // writeSessionContext builds the task context for task id and writes it to
 // w as one SessionStart JSON object. envText is the raw ATL_CONTEXT value
 // (may be empty). Nothing is written on error.
-func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p config.Paths, taskID int64, envText string, sandboxed bool, now time.Time) error {
-	text, err := sessionContext(ctx, st, p, taskID, envText, sandboxed, now)
+func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p config.Paths, taskID int64, envText string, sandboxed bool, roMounts []string, now time.Time) error {
+	text, err := sessionContext(ctx, st, p, taskID, envText, sandboxed, roMounts, now)
 	if err != nil {
 		return err
 	}
@@ -58,7 +58,7 @@ func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p co
 
 // sessionContext loads task id and its notes (one task query, one repos
 // query, one notes query) and renders them.
-func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID int64, envText string, sandboxed bool, now time.Time) (string, error) {
+func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID int64, envText string, sandboxed bool, roMounts []string, now time.Time) (string, error) {
 	t, err := st.GetTask(ctx, taskID)
 	if err != nil {
 		return "", err
@@ -67,7 +67,7 @@ func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID
 	if err != nil {
 		return "", err
 	}
-	return renderSandboxContext(*t, notes, p, envText, sandboxed, now), nil
+	return renderSandboxContext(*t, notes, p, envText, sandboxed, roMounts, now), nil
 }
 
 // sandboxNote tells a session that runs in the task's own container (see
@@ -82,7 +82,7 @@ const sandboxNote = "Sandbox: you run in the task's own container. " +
 	"Docker gate: bind mounts only from the task dir; no privileged or host modes; classic builder only " +
 	"(DOCKER_BUILDKIT=0 is set); you see only this task's containers, networks, volumes; " +
 	"services answer by compose service name. " +
-	"If a setup needs something refused (a ~/.npmrc mount, privileged, BuildKit-only syntax), don't edit " +
+	"If a setup needs something refused (a host file mount, privileged, BuildKit-only syntax), don't edit " +
 	"the repo: override it with a file in the task dir (compose: an extra `-f` file) and tell the user " +
 	"what you overrode. " +
 	"What this session starts here ends with it (background dev servers too); what should outlive it " +
@@ -97,12 +97,54 @@ const sandboxNote = "Sandbox: you run in the task's own container. " +
 // are the newest), cut at a line start (or a rune boundary when one line
 // is too long) after a truncation marker.
 func renderContext(t model.Task, notes string, p config.Paths, envText string, now time.Time) string {
-	return renderSandboxContext(t, notes, p, envText, false, now)
+	return renderSandboxContext(t, notes, p, envText, false, nil, now)
+}
+
+// mountsLineMax bounds the line that names the host paths a sandboxed task
+// has read-only (see mountsLine).
+const mountsLineMax = 240
+
+// mountsHead starts the line that names the host paths a sandboxed task has
+// read-only ($ATL_SANDBOX_MOUNTS): at the same paths in its container, and
+// bind-mountable, read-only only, through its gate.
+const mountsHead = "Host paths here read-only (your containers may bind-mount them, read-only): "
+
+// mountsLine returns the line (with its newline) that names paths, at most
+// limit bytes long: as many paths as fit, in order, then how many more; ""
+// when not even their number fits, or there are none.
+func mountsLine(paths []string, limit int) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	for n := len(paths); n >= 0; n-- {
+		names := make([]string, n)
+		for i, p := range paths[:n] {
+			names[i] = oneLine(p)
+		}
+		list := strings.Join(names, ", ")
+		switch rest := len(paths) - n; {
+		case n == 0:
+			list = fmt.Sprintf("%d, not listed here", rest)
+		case rest > 0:
+			list += fmt.Sprintf(" and %d more", rest)
+		}
+		if line := mountsHead + list + "\n"; len(line) <= limit {
+			return line
+		}
+	}
+	return ""
+}
+
+// notesMarker is the line before notes that were cut from the start.
+func notesMarker(slug string) string {
+	return "… (earlier notes truncated; `atl notes " + slug + "` for all)\n"
 }
 
 // renderSandboxContext is renderContext with, if sandboxed, the sandbox
-// note after ATL_PORT_OFFSET.
-func renderSandboxContext(t model.Task, notes string, p config.Paths, envText string, sandboxed bool, now time.Time) string {
+// note after ATL_PORT_OFFSET, followed by the line that names roMounts
+// (mountsLine): at most mountsLineMax bytes, and less where it would leave
+// the notes less than the useful part notesTail keeps of them.
+func renderSandboxContext(t model.Task, notes string, p config.Paths, envText string, sandboxed bool, roMounts []string, now time.Time) string {
 	slug := oneLine(t.Slug)
 	branch := t.Branch
 	if branch == "" {
@@ -133,19 +175,30 @@ func renderSandboxContext(t model.Task, notes string, p config.Paths, envText st
 	if sandboxed {
 		w("\n%s\n", sandboxNote)
 	}
+	top := head.String()
+	head.Reset()
 	if env := envBlock(envText); env != "" {
 		w("\nEnvironment notes (%s):\n%s\n", envContextVar, env)
 	}
 
 	footer := fmt.Sprintf("\nUse `atl note %s \"...\"` to leave a status note for later sessions.\n", slug)
-	fixed := head.String()
+	const title = "\nNotes:\n"
+	text := notesBlock(notes)
+	fixed := top + head.String()
+	if sandboxed && len(roMounts) > 0 {
+		// Out of the notes' room, leaving them what notesTail needs.
+		budget := contextMaxLen - len(fixed) - len(footer)
+		if text != "" {
+			budget -= len(title) + min(len(text), len(notesMarker(slug))+contextMinNotes) + 1
+		}
+		fixed = top + mountsLine(roMounts, min(budget, mountsLineMax)) + head.String()
+	}
 	if len(fixed)+len(footer) > contextMaxLen {
 		// Pathological (huge title or many repos): no room for notes.
 		return truncateBytes(fixed, contextMaxLen-len(footer)-len("…\n")) + "…\n" + footer
 	}
-	const title = "\nNotes:\n"
 	room := contextMaxLen - len(fixed) - len(footer) - len(title)
-	if body := notesTail(notesBlock(notes), room, slug); body != "" {
+	if body := notesTail(text, room, slug); body != "" {
 		return fixed + title + body + "\n" + footer
 	}
 	return fixed + footer
@@ -163,7 +216,7 @@ func notesTail(text string, room int, slug string) string {
 	if len(text) <= room {
 		return text
 	}
-	marker := "… (earlier notes truncated; `atl notes " + slug + "` for all)\n"
+	marker := notesMarker(slug)
 	keep := room - len(marker)
 	if keep < contextMinNotes {
 		return ""
