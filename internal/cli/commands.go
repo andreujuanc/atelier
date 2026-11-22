@@ -473,7 +473,7 @@ func (c *cli) resumeCmd() *cobra.Command {
 func (c *cli) statusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status <task> <backlog|active|review|done|cancelled>",
-		Short: "Set a task's status (no other side effects)",
+		Short: "Set a task's status; a done or cancelled task set to an open status is reopened (task dir, worktrees, CLAUDE.md, setup)",
 		Args:  args(cobra.ExactArgs(2)),
 		RunE: func(cmd *cobra.Command, a []string) error {
 			st, err := model.ParseStatus(a[1])
