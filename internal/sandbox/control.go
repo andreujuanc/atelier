@@ -31,7 +31,10 @@ import (
 //   - hook, statusline, note and notes: the gate answers them itself (Task),
 //     on its own task's rows only;
 //   - copy: the gate puts the body in the user's clipboard (Copy), through
-//     the terminal attached to its own task's tmux session (see CopyMain).
+//     the terminal attached to its own task's tmux session (see CopyMain);
+//   - atl: only the assistant's gate (Control.Workspace set when it
+//     started), never a task's: it runs an allowed atl command line
+//     (CheckAssistantArgs) in its workspace, with the body as stdin.
 //
 // Protocol: the client sends the request as one line of JSON, followed by
 // exactly req.Body bytes (the hook's or status line's input, a note's text).
@@ -55,6 +58,7 @@ const (
 	OpNote       = "note"       // `atl note`: append a line to the task's notes
 	OpNotes      = "notes"      // `atl notes`: print, replace or clear them
 	OpCopy       = "copy"       // wl-copy (atl, see CopyMain): put the body in the user's clipboard
+	OpAtl        = "atl"        // the assistant's gate only: run atl with Args, the body as stdin
 )
 
 // Landing is a tool target of a PreToolUse hook as the task container
@@ -78,6 +82,7 @@ type ControlRequest struct {
 	Author   string            `json:"author,omitempty"`   // note: user or assistant
 	Set      bool              `json:"set,omitempty"`      // notes: replace them with the body
 	Clear    bool              `json:"clear,omitempty"`    // notes: clear them (with Set: allow an empty body)
+	Args     []string          `json:"args,omitempty"`     // atl: the command line, without the binary
 	Body     int64             `json:"body,omitempty"`     // bytes that follow the request line
 }
 
@@ -119,12 +124,30 @@ func maxBody(op string) int64 {
 	switch op {
 	case OpHook:
 		return MaxHookBody
-	case OpStatusLine, OpNote, OpNotes:
+	case OpStatusLine, OpNote, OpNotes, OpAtl:
 		return 1 << 20
 	case OpCopy:
 		return MaxCopy
 	}
 	return 0
+}
+
+// maxAtlOutput bounds what an atl command run for the assistant may print
+// (stdout and stderr together); the rest is dropped, and the gate says so.
+const maxAtlOutput = 16 << 20
+
+// maxAtlRunning bounds the atl commands running for the assistant at once;
+// a request beyond it is refused at once.
+const maxAtlRunning = 3
+
+// atlWriteTimeout bounds each reply write of an atl request.
+const atlWriteTimeout = 30 * time.Second
+
+func (c *Control) writeTimeout() time.Duration {
+	if c.WriteTimeout > 0 {
+		return c.WriteTimeout
+	}
+	return atlWriteTimeout
 }
 
 // MaxCopy bounds what a task can put in the user's clipboard at once: 1 MiB,
@@ -154,6 +177,21 @@ type Control struct {
 	// tmux.Client.Copy); nil: copy is refused. The text comes from the task:
 	// it only ever goes to Copy, as bytes, and is never logged.
 	Copy func(ctx context.Context, text []byte) error
+	// Workspace, set only in the assistant's gate, is its workspace dir:
+	// atl requests (OpAtl) run `<Atl> -w <Workspace> <args>` there. Empty
+	// (every task's gate): atl requests are refused.
+	Workspace string
+	// Resolve, needed with Workspace, reads an atl command line (what the
+	// gate will exec, -w included) as atl's own command tree will: the
+	// CommandPath of the command it runs ("atl notes") and whether that
+	// reads stdin (notes --set); an error refuses the request.
+	Resolve func(argv []string) (path string, readsStdin bool, err error)
+	// WriteTimeout bounds each reply write of an atl request (a client that
+	// stops reading); 0 → atlWriteTimeout.
+	WriteTimeout time.Duration
+
+	atlOnce  sync.Once
+	atlSlots chan struct{} // the atl commands running for the assistant
 
 	bigOnce sync.Once
 	big     chan struct{} // slots for bodies over bigBody
@@ -218,11 +256,13 @@ func (c *Control) check(req ControlRequest) error {
 	notFor := func(what string) error { return fmt.Errorf("%s is not for %s", what, req.Op) }
 	remote := req.Op == OpPush || req.Op == OpFetch
 	switch req.Op {
-	case OpPush, OpFetch, OpHook, OpStatusLine, OpNote, OpNotes, OpCopy:
+	case OpPush, OpFetch, OpHook, OpStatusLine, OpNote, OpNotes, OpCopy, OpAtl:
 	default:
 		return fmt.Errorf("unknown operation %q (a task may ask for push, fetch, hook, statusline, note, notes or copy)", req.Op)
 	}
 	switch {
+	case len(req.Args) > 0 && req.Op != OpAtl:
+		return notFor("a command line")
 	case req.Repo != "" && !remote:
 		return notFor("a repo")
 	case req.Repo != "" && !validControlRepo(req.Repo):
@@ -281,12 +321,26 @@ func (c *Control) argv(req ControlRequest) []string {
 type replyWriter struct {
 	mu  sync.Mutex
 	enc *json.Encoder
+	// conn and perWrite, when set (the assistant's atl op), bound each
+	// write: a client that stops reading cannot hold the gate. After a write
+	// fails, the rest is dropped.
+	conn     net.Conn
+	perWrite time.Duration
+	broken   bool
 }
 
 func (w *replyWriter) send(r controlReply) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.enc.Encode(r) // a client that went away is noticed by the reader
+	if w.broken {
+		return
+	}
+	if w.conn != nil && w.perWrite > 0 {
+		w.conn.SetWriteDeadline(time.Now().Add(w.perWrite))
+	}
+	if err := w.enc.Encode(r); err != nil && w.conn != nil {
+		w.broken = true
+	} // without conn: a client that went away is noticed by the reader
 }
 
 func (w *replyWriter) Write(p []byte) (int, error) {
@@ -335,6 +389,10 @@ func (c *Control) handle(conn net.Conn) {
 		c.copy(conn, in, out, req, refuse)
 		return
 	}
+	if req.Op == OpAtl {
+		c.atl(conn, in, out, req, refuse)
+		return
+	}
 	if req.Op != OpPush && req.Op != OpFetch {
 		c.task(conn, in, out, req, refuse)
 		return
@@ -345,7 +403,18 @@ func (c *Control) handle(conn net.Conn) {
 		return
 	}
 	args := c.argv(req)
+	logArgs := strings.Join(args, " ")
+	c.logf("run   atl %s", logArgs)
+	code := c.run(in, args, nil, out, out)
+	c.logf("done  atl %s: exit %d", logArgs, code)
+	out.exit(code, req.Op)
+}
 
+// run runs c.Atl with args where atl runs, with stdin (nil: none), its output
+// to stdout and stderr, and returns its exit status. It stops the command
+// (and what it started) after c.Timeout, or when the client hangs up, which
+// it notices by reading in to the end. Messages of the gate go to stdout.
+func (c *Control) run(in io.Reader, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = controlTimeout
@@ -361,14 +430,13 @@ func (c *Control) handle(conn net.Conn) {
 
 	cmd := exec.CommandContext(ctx, c.Atl, args...)
 	cmd.Env = controlEnv()
-	cmd.Stdin = nil
-	cmd.Stdout, cmd.Stderr = out, out
+	cmd.Stdin = stdin
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	// Its own process group, so that stopping it also stops git and ssh.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
 	cmd.WaitDelay = 10 * time.Second
-	c.logf("run   atl %s", strings.Join(args, " "))
-	err = cmd.Run()
+	err := cmd.Run()
 	code := 0
 	var exit *exec.ExitError
 	switch {
@@ -378,14 +446,116 @@ func (c *Control) handle(conn net.Conn) {
 			code = 1
 		}
 	case err != nil:
-		fmt.Fprintf(out, "atelier gate: %v\n", err)
+		fmt.Fprintf(stdout, "atelier gate: %v\n", err)
 		code = 1
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		fmt.Fprintf(out, "atelier gate: stopped after %s\n", timeout)
+		fmt.Fprintf(stdout, "atelier gate: stopped after %s\n", timeout)
 	}
-	c.logf("done  atl %s: exit %d", strings.Join(args, " "), code)
+	return code
+}
+
+// atl runs, in the assistant's gate only, an atl command line the assistant
+// may run in the gate's workspace: `<Atl> -w
+// <Workspace> <args>`, exec'd like the CLI, with the gate's environment
+// (never the requester's), the body as its stdin, stdout and stderr apart
+// (at most maxAtlOutput together) and the exit status passed back. A task's
+// gate (no Workspace) refuses it. The command line must pass
+// CheckAssistantArgs and resolve (Resolve, cobra's own reading of it) to an
+// allowed command (AssistantCommandPath); a body only goes with `atl notes
+// --set`; at most maxAtlRunning run at once (more are refused, not queued:
+// each is a process where atl runs, for up to 10 minutes). The log gets the command and the exit
+// status, never stdin nor the other arguments (a note's text).
+func (c *Control) atl(conn net.Conn, in *bufio.Reader, out *replyWriter, req ControlRequest, refuse func(string)) {
+	if c.Workspace == "" || c.Atl == "" || c.Resolve == nil {
+		refuse(req.Op + " is not served by this gate")
+		return
+	}
+	if err := CheckAssistantArgs(req.Args); err != nil {
+		refuse(err.Error())
+		return
+	}
+	argv := append([]string{"-w", c.Workspace}, req.Args...)
+	// As cobra will run it: both checks must pass.
+	path, readsStdin, err := c.Resolve(argv)
+	switch {
+	case err != nil:
+		refuse("atl " + req.Args[0] + ": " + err.Error())
+		return
+	case !AssistantCommandPath(path):
+		refuse(fmt.Sprintf("this command line runs %q, which does not run for the assistant", path))
+		return
+	case req.Body > 0 && !(path == "atl notes" && readsStdin):
+		refuse("standard input is only for atl notes --set")
+		return
+	}
+	c.atlOnce.Do(func() { c.atlSlots = make(chan struct{}, maxAtlRunning) })
+	var release func()
+	select {
+	case c.atlSlots <- struct{}{}:
+		var once sync.Once
+		release = func() { once.Do(func() { <-c.atlSlots }) }
+		defer release()
+	default:
+		refuse(fmt.Sprintf("%d atl commands of the assistant are running already: try again once one has finished", maxAtlRunning))
+		return
+	}
+	conn.SetReadDeadline(time.Now().Add(bodyTimeout))
+	stdin := make([]byte, req.Body)
+	if _, err := io.ReadFull(in, stdin); err != nil {
+		refuse("request body cut short")
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
+	sub := strings.TrimPrefix(path, "atl ")
+	lim := &outputLimit{left: maxAtlOutput}
+	stdout, stderr := lim.writer(out), lim.writer(stderrWriter{out})
+	c.logf("run   atl %s (for the assistant)", sub)
+	out.mu.Lock()
+	out.conn, out.perWrite = conn, c.writeTimeout()
+	out.mu.Unlock()
+	code := c.run(in, argv, bytes.NewReader(stdin), stdout, stderr)
+	release() // the process is done: its slot is free, whatever the client does now
+	if lim.cut() {
+		fmt.Fprintf(stderrWriter{out}, "atelier gate: output cut at %d MiB\n", maxAtlOutput>>20)
+	}
+	c.logf("done  atl %s (for the assistant): exit %d", sub, code)
 	out.exit(code, req.Op)
+}
+
+// outputLimit lets through the first left bytes written to its writers
+// together and drops the rest.
+type outputLimit struct {
+	mu      sync.Mutex
+	left    int
+	dropped bool
+}
+
+func (l *outputLimit) writer(w io.Writer) io.Writer { return limitedWriter{l, w} }
+
+func (l *outputLimit) cut() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.dropped
+}
+
+type limitedWriter struct {
+	l *outputLimit
+	w io.Writer
+}
+
+func (lw limitedWriter) Write(p []byte) (int, error) {
+	lw.l.mu.Lock()
+	n := min(len(p), lw.l.left)
+	lw.l.left -= n
+	if n < len(p) {
+		lw.l.dropped = true
+	}
+	lw.l.mu.Unlock()
+	if n > 0 {
+		lw.w.Write(p[:n])
+	}
+	return len(p), nil // what is dropped counts as written: the command goes on
 }
 
 // task reads the body of a task operation and has c.Task answer it.
@@ -450,11 +620,11 @@ func (c *Control) copy(conn net.Conn, in *bufio.Reader, out *replyWriter, req Co
 }
 
 // controlEnv is the environment of a command the gate runs: its own, minus
-// what would make atl think it runs in a task container.
+// what would make atl think it runs in a task container (or the assistant's).
 func controlEnv() []string {
 	var env []string
 	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, InEnv+"=") {
+		if !strings.HasPrefix(kv, InEnv+"=") && !strings.HasPrefix(kv, AssistantEnv+"=") {
 			env = append(env, kv)
 		}
 	}

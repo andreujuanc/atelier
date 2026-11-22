@@ -3,12 +3,14 @@ package hook
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 // assistantSetup points the environment at a temp root whose database path
@@ -189,5 +191,84 @@ func TestAssistantGuardProcess(t *testing.T) {
 	exit, _, errs, _ = runMain(t, EventAssistantGuard, "{nope")
 	if exit != 2 || !strings.Contains(errs, "not allowed") {
 		t.Errorf("malformed: exit=%d stderr=%q", exit, errs)
+	}
+}
+
+// TestAssistantGuardThroughGate: in the assistant's container the guard
+// asks the assistant's gate, which checks the targets against its own paths
+// and against where the container says they land; a gate that does not
+// answer, or a task's gate, refuses (the guard fails closed). Other hooks
+// and operations get nothing from the assistant's gate.
+func TestAssistantGuardThroughGate(t *testing.T) {
+	p, root := assistantSetup(t)
+	dir := p.AssistantDir()
+	serve := func(task sandbox.Task) string {
+		d, err := os.MkdirTemp("", "gate") // short: a socket path has at most 107 bytes
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(d) })
+		sock := filepath.Join(d, "atl.sock")
+		l, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { l.Close() })
+		go (&sandbox.Control{Slug: "atl_assistant", Atl: "/bin/false", Task: task, Workspace: root}).Serve(l)
+		return sock
+	}
+	sock := serve(NewAssistantServer(p))
+	inBox := func(sock string) func(string) string {
+		return envOf(map[string]string{sandbox.InEnv: "_assistant-abc123", sandbox.AssistantEnv: "1", "ATL_CONTROL_SOCK": sock})
+	}
+	guard := func(sock, stdin string) (int, string) {
+		var out, errb bytes.Buffer
+		code := run([]string{EventAssistantGuard}, strings.NewReader(stdin), &out, &errb, inBox(sock))
+		if out.Len() != 0 {
+			t.Errorf("stdout %q", out.String())
+		}
+		return code, errb.String()
+	}
+	if code, errs := guard(sock, assistantInput("Write", dir, "file_path", "notes.md")); code != 0 {
+		t.Errorf("write in the assistant dir: %d %s", code, errs)
+	}
+	for _, target := range []string{filepath.Join(root, "tasks", "fix", "api", "a.go"), filepath.Join(dir, "CLAUDE.md"),
+		filepath.Join(dir, ".claude", "settings.json"), filepath.Join(p.RunRoot(), "claude", "assistant", "settings.json")} {
+		if code, errs := guard(sock, assistantInput("Edit", dir, "file_path", target)); code != 2 || !strings.Contains(errs, "not allowed") {
+			t.Errorf("edit %s: %d %s", target, code, errs)
+		}
+	}
+	if code, errs := guard(sock, "{nope"); code != 2 || !strings.Contains(errs, "cannot decode") {
+		t.Errorf("bad input: %d %s", code, errs)
+	}
+	// A target that lands elsewhere in the container (a symlink only the
+	// container has, which it resolves) is blocked: the landings count too.
+	var out, errb bytes.Buffer
+	req := sandbox.ControlRequest{Op: sandbox.OpHook, Event: EventAssistantGuard,
+		Landings: []sandbox.Landing{{Given: filepath.Join(dir, "n.md"), Path: filepath.Join(root, "tasks", "n.md")}}}
+	code, ran, err := sandbox.Ask(sock, req, []byte(assistantInput("Write", dir, "file_path", "n.md")), &out, &errb, 0)
+	if err != nil || !ran || code != 2 {
+		t.Errorf("landing outside: %d %v %v %s", code, ran, err, errb.String())
+	}
+
+	// No gate, or a task's gate: refused.
+	none := filepath.Join(t.TempDir(), "none.sock")
+	if code, errs := guard(none, assistantInput("Write", dir, "file_path", "notes.md")); code != 2 || !strings.Contains(errs, "not allowed") {
+		t.Errorf("without a gate: %d %s", code, errs)
+	}
+	if code, errs := guard(serve(&TaskServer{}), assistantInput("Write", dir, "file_path", "notes.md")); code != 2 {
+		t.Errorf("a task's gate: %d %s", code, errs)
+	}
+
+	// Another hook is nothing to the assistant's gate; notes are refused.
+	out.Reset()
+	errb.Reset()
+	if code := run([]string{EventStop}, strings.NewReader(`{"session_id":"a1"}`), &out, &errb, inBox(sock)); code != 0 || out.Len() != 0 {
+		t.Errorf("Stop: %d %q %q", code, out.String(), errb.String())
+	}
+	errb.Reset()
+	if code, _, err := sandbox.Ask(sock, sandbox.ControlRequest{Op: sandbox.OpNotes}, nil, &out, &errb, 0); err != nil || code == 0 ||
+		!strings.Contains(errb.String(), "not served by the assistant's gate") {
+		t.Errorf("notes: %d %v %q", code, err, errb.String())
 	}
 }

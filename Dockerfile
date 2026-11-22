@@ -23,13 +23,15 @@
 # target, so building the box builds the task stage too (cached afterwards);
 # BuildKit skips it.
 
+# The atl binary, static (README "Install on the host" copies it out of this
+# stage: docker build --target build -t atl-build .).
 FROM golang:1.24-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/atl ./cmd/atl
+RUN CGO_ENABLED=0 go build -buildmode=exe -trimpath -ldflags="-s -w" -o /out/atl ./cmd/atl
 
 # What both images have: git, ssh client, the Docker CLI, the user and
 # Claude Code.

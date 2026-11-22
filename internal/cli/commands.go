@@ -700,11 +700,12 @@ func (c *cli) statuslineCmd() *cobra.Command {
 func (c *cli) gateCmd() *cobra.Command {
 	var taskID int64
 	var roMounts []string
+	var assistant bool
 	cmd := &cobra.Command{
-		Use:    "gate <slug> [--ro-mount PATH]... --task-id ID",
-		Short:  "Serve a sandboxed task's Docker socket and atl requests (internal)",
+		Use:    "gate <slug> [--ro-mount PATH]... --task-id ID | gate --assistant",
+		Short:  "Serve a sandboxed task's (or the assistant's) Docker socket and atl requests (internal)",
 		Hidden: true,
-		Args:   args(cobra.ExactArgs(1)),
+		Args:   args(cobra.RangeArgs(0, 1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
 			// atl starts it with the workspace applied ($ATL_WORKSPACE a
 			// path); a name works too.
@@ -714,6 +715,15 @@ func (c *cli) gateCmd() *cobra.Command {
 			p, err := config.Resolve()
 			if err != nil {
 				return err
+			}
+			if assistant {
+				if len(a) != 0 || taskID != 0 || len(roMounts) != 0 {
+					return usagef("--assistant takes no slug, --task-id or --ro-mount")
+				}
+				return c.assistantGate(cmd.Context(), p)
+			}
+			if len(a) != 1 {
+				return usagef("gate needs a task slug (or --assistant)")
 			}
 			slug := a[0]
 			if slug == "" || strings.ContainsAny(slug, `/\`) || slug == "." || slug == ".." {
@@ -735,11 +745,9 @@ func (c *cli) gateCmd() *cobra.Command {
 			}
 			runDir := p.RunDir(slug)
 			id := sandbox.ID(slug, dir)
-			bin := os.Getenv("ATL_BIN")
-			if bin == "" {
-				if bin, err = os.Executable(); err != nil {
-					return fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
-				}
+			bin, err := gateBin()
+			if err != nil {
+				return err
 			}
 			// The task by database id, checked against the slug once: a
 			// request never names a task.
@@ -797,7 +805,60 @@ func (c *cli) gateCmd() *cobra.Command {
 	}
 	cmd.Flags().Int64Var(&taskID, "task-id", 0, "the task's database id (must still have this slug)")
 	cmd.Flags().StringArrayVar(&roMounts, "ro-mount", nil, "a host path of $"+sandbox.MountsVar+" (resolved) the task may bind-mount, read-only only")
+	cmd.Flags().BoolVar(&assistant, "assistant", false, "serve the assistant's container of the workspace instead of a task's")
 	return cmd
+}
+
+// gateBin is the atl binary a gate runs push, fetch and the assistant's
+// commands with: $ATL_BIN, else the running one.
+func gateBin() (string, error) {
+	if bin := os.Getenv("ATL_BIN"); bin != "" {
+		return bin, nil
+	}
+	bin, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
+	}
+	return bin, nil
+}
+
+// assistantGate is `atl gate --assistant`: the gate of the workspace's
+// assistant container. Its Docker socket refuses everything (the assistant
+// has no Docker access); its control socket answers the assistant's guard
+// hook (hook.AssistantServer), runs the atl commands the assistant may use
+// in this workspace (sandbox.OpAtl, see sandbox.CheckAssistantArgs) and
+// relays copies to the terminal on the assistant's tmux session. Whether it
+// serves the assistant is fixed here, when it starts: a task's gate never
+// runs atl commands.
+func (c *cli) assistantGate(ctx context.Context, p config.Paths) error {
+	if p.Workspace == "" {
+		return errors.New("the assistant's gate needs a workspace")
+	}
+	dir := p.AssistantDir()
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return fmt.Errorf("assistant dir: %w", err)
+	}
+	bin, err := gateBin()
+	if err != nil {
+		return err
+	}
+	runDir := p.AssistantRunDir()
+	id := sandbox.AssistantID(dir)
+	g := &sandbox.Gate{
+		ID:         id,
+		Root:       root,
+		SocketHost: sandbox.SocketPath(runDir),
+		Log:        sandbox.NewLogger(),
+		Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
+		Ident:      sandbox.AssistantIdent(p.Workspace, bin),
+		NoDocker:   true,
+	}
+	ctl := &sandbox.Control{Slug: app.AssistantSession, Atl: bin, Task: hook.NewAssistantServer(p), Log: g.Log, Resolve: resolveAtl,
+		Workspace: p.Workspace}
+	tc := tmux.New()
+	ctl.Copy = func(ctx context.Context, text []byte) error { return tc.Copy(ctx, app.AssistantSession, text) }
+	return sandbox.Serve(ctx, g, ctl, runDir)
 }
 
 // remoteCmd is `atl push` (push true) or `atl fetch`. Inside a task
@@ -926,4 +987,34 @@ func (c *cli) hookCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// resolveAtl reads argv, an atl command line without the binary, as atl
+// run with it will (runIn: cobra's ExecuteC, which sets up the help and
+// completion commands and then Finds the command): it returns the
+// CommandPath of the command that runs ("atl notes"), and whether that
+// reads stdin (notes with --set, and not --help). The assistant's gate
+// checks both before it runs anything (sandbox.Control.Resolve).
+func resolveAtl(argv []string) (path string, readsStdin bool, err error) {
+	c := &cli{stdout: io.Discard, stderr: io.Discard}
+	root := c.rootCmd()
+	root.SetArgs(argv)
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.InitDefaultHelpCmd()
+	root.InitDefaultCompletionCmd(argv...)
+	cmd, flags, err := root.Find(argv)
+	if err != nil {
+		return "", false, err
+	}
+	if cmd.Flags().Lookup("set") != nil {
+		cmd.InitDefaultHelpFlag()
+		if err := cmd.ParseFlags(flags); err != nil {
+			return "", false, err
+		}
+		set, _ := cmd.Flags().GetBool("set")
+		help, _ := cmd.Flags().GetBool("help")
+		readsStdin = set && !help
+	}
+	return cmd.CommandPath(), readsStdin, nil
 }

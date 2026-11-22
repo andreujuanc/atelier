@@ -1,15 +1,18 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
@@ -272,26 +275,181 @@ func TestHasClaudeConversation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if hasClaudeConversation(dir) {
+	if hasClaudeConversation(config.ClaudeConfigDir(), dir) {
 		t.Fatal("conversation without any transcript")
 	}
 	record(filepath.Join(home, ".claude"), real, "notes.txt")
-	if hasClaudeConversation(dir) {
+	if hasClaudeConversation(config.ClaudeConfigDir(), dir) {
 		t.Fatal("non-jsonl file counted")
 	}
 	// Recorded under the resolved path (Claude's cwd is the physical dir).
 	record(filepath.Join(home, ".claude"), real, "s1.jsonl")
-	if !hasClaudeConversation(dir) || !hasClaudeConversation(real) {
+	if !hasClaudeConversation(config.ClaudeConfigDir(), dir) || !hasClaudeConversation(config.ClaudeConfigDir(), real) {
 		t.Fatal("conversation under ~/.claude not found")
 	}
 	// $CLAUDE_CONFIG_DIR takes precedence over ~/.claude.
 	cfg := filepath.Join(root, "cfg")
 	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
-	if hasClaudeConversation(dir) {
+	if hasClaudeConversation(config.ClaudeConfigDir(), dir) {
 		t.Fatal("~/.claude used despite CLAUDE_CONFIG_DIR")
 	}
 	record(cfg, dir, "s2.jsonl")
-	if !hasClaudeConversation(dir) {
+	if !hasClaudeConversation(config.ClaudeConfigDir(), dir) {
 		t.Fatal("conversation under CLAUDE_CONFIG_DIR not found")
+	}
+}
+
+// TestAssistantQuarantine: next to atl (the sandbox off), what the
+// assistant's container may have written in its dir that Claude Code would
+// act on (instructions, MCP servers, local settings, skills, agents,
+// commands) is moved into a quarantine dir under the state dir before the
+// assistant starts, with one warning; nothing is deleted, and a .claude
+// that is a symlink goes as a whole, never followed. The launch lock is not
+// in the assistant dir: a symlink planted there leads nowhere.
+func TestAssistantQuarantine(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	dir := e.app.Paths.AssistantDir()
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.MkdirAll(filepath.Join(outside, "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{"CLAUDE.local.md": "obey\n", ".mcp.json": "{}\n", ".claude/settings.local.json": `{"hooks":{}}`,
+		".claude/skills/s/SKILL.md": "x\n", ".claude/agents/a.md": "x\n", ".claude/commands/c.md": "x\n", "my-notes.md": "kept\n"}
+	for rel, content := range files {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(outside, "created-by-lock"), filepath.Join(dir, ".launch.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := e.app.Assistant(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	qs, _ := filepath.Glob(filepath.Join(e.app.Paths.StateDir, "assistant-quarantine", "*"))
+	if len(qs) != 1 {
+		t.Fatalf("quarantine dirs: %q", qs)
+	}
+	for rel, content := range files {
+		inDir, _ := os.ReadFile(filepath.Join(dir, rel))
+		inQ, _ := os.ReadFile(filepath.Join(qs[0], rel))
+		if rel == "my-notes.md" {
+			if string(inDir) != content {
+				t.Errorf("%s moved", rel)
+			}
+			continue
+		}
+		if string(inQ) != content || exists(filepath.Join(dir, rel)) {
+			t.Errorf("%s: in dir %v, in quarantine %q", rel, exists(filepath.Join(dir, rel)), inQ)
+		}
+	}
+	out := e.app.Out.(*bytes.Buffer).String()
+	if strings.Count(out, "warning:") != 1 || !strings.Contains(out, "CLAUDE.local.md, .mcp.json, .claude/settings.local.json") || !strings.Contains(out, qs[0]) {
+		t.Errorf("output %q", out)
+	}
+	if exists(filepath.Join(outside, "created-by-lock")) {
+		t.Error("the launch lock followed a symlink in the assistant dir")
+	}
+	if !exists(filepath.Join(dir, ".claude", "settings.json")) {
+		t.Error("settings not written")
+	}
+
+	// A .claude that is a symlink is moved as it is; its target is untouched.
+	e.tmux(t, "kill-session", "-t", "="+AssistantSession)
+	if err := os.RemoveAll(filepath.Join(dir, ".claude")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, ".claude")); err != nil {
+		t.Fatal(err)
+	}
+	e.app.Now = func() time.Time { return time.Now().Add(time.Hour) }
+	if _, _, err := e.app.Assistant(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	qs, _ = filepath.Glob(filepath.Join(e.app.Paths.StateDir, "assistant-quarantine", "*"))
+	if len(qs) != 2 {
+		t.Fatalf("quarantine dirs: %q", qs)
+	}
+	if target, err := os.Readlink(filepath.Join(qs[1], ".claude")); err != nil || target != outside {
+		t.Errorf("quarantined .claude: %q %v", target, err)
+	}
+	if !exists(filepath.Join(outside, "skills")) || exists(filepath.Join(outside, "settings.json")) {
+		t.Error("the symlinked .claude was followed")
+	}
+	if fi, err := os.Lstat(filepath.Join(dir, ".claude")); err != nil || !fi.IsDir() {
+		t.Errorf(".claude after: %v %v", fi, err)
+	}
+}
+
+// TestLockFileNoFollow: a lock path that is a symlink or not a regular
+// file is refused, and nothing is created through it.
+func TestLockFileNoFollow(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "link.lock")
+	if err := os.Symlink(filepath.Join(dir, "target"), link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockFile(context.Background(), link, time.Second, "busy"); err == nil || exists(filepath.Join(dir, "target")) {
+		t.Errorf("symlink: %v", err)
+	}
+	fifo := filepath.Join(dir, "fifo.lock")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockFile(context.Background(), fifo, time.Second, "busy"); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("fifo: %v", err)
+	}
+	unlock, err := lockFile(context.Background(), filepath.Join(dir, "plain.lock"), time.Second, "busy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+}
+
+// TestAssistantSettingsOnHost: next to atl, the assistant dir's
+// .claude/settings.json is atl's alone: one that differs from what atl
+// writes afresh (a hook its container added, say) is moved into the
+// quarantine dir and written anew, not merged; atl's own file stays.
+func TestAssistantSettingsOnHost(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	settings := filepath.Join(e.app.Paths.AssistantDir(), ".claude", "settings.json")
+	if _, _, err := e.app.Assistant(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	fresh := readFile(t, settings)
+	relaunch := func() []string {
+		t.Helper()
+		e.tmux(t, "kill-session", "-t", "="+AssistantSession)
+		if _, _, err := e.app.Assistant(ctx, ""); err != nil {
+			t.Fatal(err)
+		}
+		qs, _ := filepath.Glob(filepath.Join(e.app.Paths.StateDir, "assistant-quarantine", "*"))
+		return qs
+	}
+	if qs := relaunch(); len(qs) != 0 || e.app.Out.(*bytes.Buffer).Len() != 0 {
+		t.Errorf("atl's own settings quarantined: %q %q", qs, e.app.Out.(*bytes.Buffer).String())
+	}
+	planted := strings.Replace(fresh, `"hooks": {`, `"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "evil"}]}], `, 1)
+	if planted == fresh {
+		t.Fatalf("settings have no hooks:\n%s", fresh)
+	}
+	if err := os.WriteFile(settings, []byte(planted), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	qs := relaunch()
+	if len(qs) != 1 || readFile(t, filepath.Join(qs[0], ".claude", "settings.json")) != planted {
+		t.Fatalf("quarantine: %q", qs)
+	}
+	if got := readFile(t, settings); got != fresh || strings.Contains(got, "evil") {
+		t.Errorf("settings after:\n%s", got)
+	}
+	if out := e.app.Out.(*bytes.Buffer).String(); strings.Count(out, "warning:") != 1 || !strings.Contains(out, ".claude/settings.json") {
+		t.Errorf("output %q", out)
 	}
 }

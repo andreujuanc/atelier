@@ -115,7 +115,11 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 	if err != nil {
 		return err
 	}
-	if g.Log != nil {
+	switch {
+	case g.Log == nil:
+	case g.NoDocker:
+		g.Log.Printf("gate %s on %s: no Docker access (every Docker request is refused)", g.ID, sock)
+	default:
 		g.Log.Printf("gate %s on %s, mounts allowed under %s", g.ID, sock, g.Root)
 		if len(g.ROMounts) > 0 {
 			g.Log.Printf("gate %s: and, read-only only, from $%s: %s", g.ID, MountsVar, strings.Join(g.ROMounts, ", "))
@@ -166,15 +170,46 @@ func Alive(runDir string) bool {
 // from another atl binary or with other roMounts (see Ident) is stopped and
 // replaced first.
 func Start(atlBin, slug string, taskID int64, runDir, logPath string, roMounts []string) error {
+	args := []string{"gate", slug}
+	for _, m := range roMounts {
+		args = append(args, "--ro-mount", m)
+	}
+	args = append(args, "--task-id", strconv.FormatInt(taskID, 10))
+	return start(atlBin, args, Ident(taskID, atlBin, roMounts), slug, runDir, logPath)
+}
+
+// AssistantIdent is the Ident of the assistant's gate for the workspace dir
+// workspace, running the atl binary bin.
+func AssistantIdent(workspace, bin string) string {
+	s := "assistant of " + workspace
+	if fi, err := os.Stat(bin); err == nil {
+		s += fmt.Sprintf(", atl %d bytes %d", fi.Size(), fi.ModTime().UnixNano())
+	}
+	return s
+}
+
+// StartAssistant makes sure the assistant's gate for workspace (its dir)
+// serves runDir, as Start does for a task: `<atlBin> gate --assistant`, run
+// with this process's environment, which has the workspace applied. A gate
+// that answers for another workspace or from another atl binary
+// (AssistantIdent) is replaced.
+func StartAssistant(atlBin, workspace, runDir, logPath string) error {
+	return start(atlBin, []string{"gate", "--assistant"}, AssistantIdent(workspace, atlBin), "the assistant", runDir, logPath)
+}
+
+// start starts `<atlBin> <args>`, a gate with ident whose log is logPath,
+// unless one with that ident answers on runDir; one with another ident is
+// stopped first. what names the gate's charge in errors.
+func start(atlBin string, args []string, ident, what, runDir, logPath string) error {
 	if Alive(runDir) {
 		cur, _ := os.ReadFile(identPath(runDir))
-		if strings.TrimSpace(string(cur)) == Ident(taskID, atlBin, roMounts) {
+		if strings.TrimSpace(string(cur)) == ident {
 			return nil
 		}
 		Stop(runDir)
 		// One that missed the signal notices its socket is gone within 10s.
 		if err := awaitUnlocked(runDir, 15*time.Second); err != nil {
-			return fmt.Errorf("replace the gate for %s: %w", slug, err)
+			return fmt.Errorf("replace the gate for %s: %w", what, err)
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
@@ -185,11 +220,7 @@ func Start(atlBin, slug string, taskID int64, runDir, logPath string, roMounts [
 		return err
 	}
 	defer logFile.Close()
-	args := []string{"gate", slug}
-	for _, m := range roMounts {
-		args = append(args, "--ro-mount", m)
-	}
-	cmd := exec.Command(atlBin, append(args, "--task-id", strconv.FormatInt(taskID, 10))...)
+	cmd := exec.Command(atlBin, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -208,9 +239,9 @@ func Start(atlBin, slug string, taskID int64, runDir, logPath string, roMounts [
 			if Alive(runDir) { // lost a race with another atl starting it
 				return nil
 			}
-			return fmt.Errorf("gate for %s exited (%v); see %s", slug, err, logPath)
+			return fmt.Errorf("gate for %s exited (%v); see %s", what, err, logPath)
 		case <-deadline:
-			return fmt.Errorf("gate for %s did not come up; see %s", slug, logPath)
+			return fmt.Errorf("gate for %s did not come up; see %s", what, logPath)
 		case <-time.After(50 * time.Millisecond):
 		}
 	}

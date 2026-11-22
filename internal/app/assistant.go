@@ -1,16 +1,20 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/gen"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
 
@@ -41,9 +45,15 @@ func AssistantPrompt(slug string) string { return "Let's talk about task " + slu
 //
 // The assistant runs in window AssistantWindow of AssistantSession; if that
 // window is missing or its pane is dead the session is replaced. Concurrent
-// calls (from any process) are serialised by a lock file in the assistant
-// dir. The window is untagged, so Recover, Done and Cancel never touch it,
-// and it has no state-tracking hooks.
+// calls (from any process) are serialised by a lock file in the state dir
+// (assistantLock). The window is untagged, so Recover, Done and Cancel never touch it,
+// and it has no state-tracking hooks. Next to atl (the sandbox off) what
+// its container may have written in its dir is moved aside first
+// (quarantineAssistant).
+//
+// With the sandbox on, Claude runs in the assistant's own container (see
+// ensureAssistantSandbox), which every call makes sure of, gate included,
+// and the window runs docker exec into it, as a task session's window does.
 func (a *App) Assistant(ctx context.Context, taskRef string) (attach *exec.Cmd, hint string, err error) {
 	var prompt []string
 	slug := ""
@@ -59,19 +69,31 @@ func (a *App) Assistant(ctx context.Context, taskRef string) (attach *exec.Cmd, 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, "", fmt.Errorf("assistant: create %s: %w", dir, err)
 	}
-	unlock, err := lockFile(ctx, filepath.Join(dir, ".launch.lock"), assistantLockWait,
+	if err := os.MkdirAll(a.Paths.StateDir, 0o755); err != nil {
+		return nil, "", fmt.Errorf("assistant: %w", err)
+	}
+	unlock, err := lockFile(ctx, a.assistantLock(), assistantLockWait,
 		"another atl is launching the assistant")
 	if err != nil {
 		return nil, "", fmt.Errorf("assistant: %w", err)
 	}
 	defer unlock()
-	if err := gen.WriteAssistantFiles(dir, a.AtlBin); err != nil {
+	if a.Sandbox == nil {
+		a.quarantineAssistant(dir)
+	}
+	if err := gen.WriteAssistantFiles(dir, a.hookBin(), a.Sandbox != nil); err != nil {
 		return nil, "", fmt.Errorf("assistant: %w", err)
 	}
 
 	alive, err := a.Tmux.WindowAlive(ctx, AssistantSession, AssistantWindow)
 	if err != nil {
 		return nil, "", fmt.Errorf("assistant: %w", err)
+	}
+	container := ""
+	if a.Sandbox != nil {
+		if container, err = a.ensureAssistantSandbox(ctx, alive); err != nil {
+			return nil, "", fmt.Errorf("assistant: %w", err)
+		}
 	}
 	if alive {
 		if len(prompt) > 0 {
@@ -92,16 +114,157 @@ func (a *App) Assistant(ctx context.Context, taskRef string) (attach *exec.Cmd, 
 			return nil, "", fmt.Errorf("assistant: %w", err)
 		}
 	}
+	env := map[string]string{sandbox.AssistantEnv: "1"}
+	claudeDir := config.ClaudeConfigDir()
+	if a.Sandbox != nil {
+		claudeDir = a.Paths.AssistantClaudeDir()
+	}
+	argv := assistantArgv(hasClaudeConversation(claudeDir, dir), prompt)
+	var auth map[string]string
+	if a.Sandbox != nil {
+		// As for a task session (see launch): the token by name, from the
+		// tmux server's global environment; docker exec once the terminal
+		// is attached (the caller attaches right away).
+		if auth, err = a.sandboxAuth(); err != nil {
+			return nil, "", fmt.Errorf("assistant: %w", err)
+		}
+		argv = sandbox.WindowArgv(true, a.sandboxArgv(container, dir, env, auth, argv))
+	}
 	if _, err := a.Tmux.NewWindow(ctx, tmux.WindowSpec{
-		Session: AssistantSession,
-		Name:    AssistantWindow,
-		Dir:     dir,
-		Env:     a.windowEnv(map[string]string{"ATL_ASSISTANT": "1"}),
-		Argv:    assistantArgv(hasClaudeConversation(dir), prompt),
+		Session:   AssistantSession,
+		Name:      AssistantWindow,
+		Dir:       dir,
+		Env:       a.windowEnv(env),
+		Argv:      argv,
+		GlobalEnv: auth,
 	}); err != nil {
 		return nil, "", fmt.Errorf("assistant: %w", err)
 	}
 	return a.Tmux.AttachCmd(AssistantSession), "", nil
+}
+
+// assistantID names the assistant's sandbox (sandbox.AssistantID).
+func (a *App) assistantID() string { return sandbox.AssistantID(a.Paths.AssistantDir()) }
+
+// assistantGateLog is the assistant's gate log, next to hook.log. Not
+// "gate-assistant.log": that is the log of a task whose slug is assistant.
+func (a *App) assistantGateLog() string {
+	return filepath.Join(a.Paths.StateDir, "gate-_assistant.log")
+}
+
+// assistantSpec describes the assistant's container: one per workspace,
+// made from the workspace's task image ($ATL_SANDBOX_IMAGE, else the
+// default; never a project's). It sees, at the same paths as here, the
+// assistant dir and its own Claude config dir (Paths.AssistantClaudeDir,
+// as $CLAUDE_CONFIG_DIR), and its run dir (the atl binary, its gate's
+// sockets) at sandbox.RunMount, read-only; nothing else: no tasks, no repos,
+// no other part of the workspace, no $ATL_SANDBOX_MOUNTS, and no Docker
+// (no $DOCKER_HOST; its gate refuses every Docker request). atl in it sends
+// its commands to that gate (sandbox.AssistantEnv), which runs the ones
+// the assistant may use where atl runs. $ATL_CONTEXT, which describes the
+// place atl runs in, is passed as it is: the assistant manages it.
+func (a *App) assistantSpec() (sandbox.Spec, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return sandbox.Spec{}, err
+	}
+	dir := a.Paths.AssistantDir()
+	id := a.assistantID()
+	claude := a.Paths.AssistantClaudeDir()
+	spec := sandbox.Spec{
+		ID:      id,
+		Image:   a.Sandbox.Image,
+		User:    fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		Workdir: dir,
+		Env: map[string]string{
+			"HOME":               home,
+			sandbox.InEnv:        id,
+			sandbox.AssistantEnv: "1",
+			"CLAUDE_CONFIG_DIR":  claude,
+		},
+		Mounts: []sandbox.Mount{
+			{Src: dir, Dst: dir},
+			{Src: claude, Dst: claude},
+			{Src: a.Paths.AssistantRunDir(), Dst: sandbox.RunMount, RO: true},
+		},
+	}
+	for _, k := range []string{"LANG", "LC_ALL", "TZ", "ATL_CONTEXT"} {
+		if v := os.Getenv(k); v != "" {
+			spec.Env[k] = v
+		}
+	}
+	return spec, nil
+}
+
+// ensureAssistantSandbox makes the assistant's gate and container run, as
+// ensureSandbox does for a task: Docker, a static atl binary and a Claude
+// Code token first (each a one-line error), then the atl binary in its run
+// dir, its gate (replaced when it runs another atl binary), and its
+// container, created on first use with its Claude dir seeded, started after
+// a reboot, and replaced when its spec changed (image, atl paths, ...)
+// unless busy (the assistant's window is alive). It returns the container's
+// full ID. The container is never removed by atl: no task closes it (remove
+// it with docker rm -f; the next atl assistant makes a new one).
+func (a *App) ensureAssistantSandbox(ctx context.Context, busy bool) (string, error) {
+	if a.Paths.Workspace == "" {
+		return "", errors.New("the assistant's container needs a workspace")
+	}
+	if _, err := a.checkDocker(ctx); err != nil {
+		return "", err
+	}
+	if err := a.checkAtlBin(a.AtlBin); err != nil {
+		return "", err
+	}
+	if _, err := a.claudeAuth(); err != nil {
+		return "", err
+	}
+	runDir := a.Paths.AssistantRunDir()
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return "", err
+	}
+	if err := sandbox.InstallBin(a.AtlBin, runDir); err != nil {
+		return "", fmt.Errorf("install atl for the assistant's container: %w", err)
+	}
+	if err := os.MkdirAll(a.Paths.AssistantClaudeDir(), 0o700); err != nil {
+		return "", err
+	}
+	startGate := a.StartAssistantGate
+	if startGate == nil {
+		startGate = sandbox.StartAssistant
+	}
+	if err := startGate(a.AtlBin, a.Paths.Workspace, runDir, a.assistantGateLog()); err != nil {
+		return "", err
+	}
+	spec, err := a.assistantSpec()
+	if err != nil {
+		return "", err
+	}
+	fresh := func() error {
+		if spec.Image == sandbox.DefaultImage {
+			if missing, err := sandbox.ImageMissing(ctx, a.docker(), spec.Image); err == nil && missing {
+				return missingImage(spec.Image, "default")
+			}
+		}
+		return a.seedClaudeDirAt(a.Paths.AssistantClaudeDir(), a.Paths.AssistantDir(), "the assistant")
+	}
+	container, stale, err := sandbox.Ensure(ctx, a.docker(), spec, func() bool { return busy }, fresh)
+	if err != nil {
+		if errors.Is(err, sandbox.ErrNotAgent) {
+			return "", err
+		}
+		if missing, ierr := sandbox.ImageMissing(ctx, a.docker(), spec.Image); ierr == nil && missing {
+			from := "$ATL_SANDBOX_IMAGE"
+			if spec.Image == sandbox.DefaultImage {
+				from = "default"
+			}
+			return "", missingImage(spec.Image, from)
+		}
+		return "", fmt.Errorf("the assistant's container (image %s): %w", spec.Image, err)
+	}
+	if stale {
+		a.warnf("the assistant's container predates a change (image or atl paths); it is replaced once the assistant is closed")
+	}
+	return container, nil
 }
 
 // assistantArgv is the assistant's command: claude, continuing the last
@@ -157,9 +320,9 @@ func claudeProjectDirs(cfg, dir string) []string {
 
 // hasClaudeConversation reports whether Claude Code has a recorded
 // conversation (a *.jsonl transcript) for dir, under its absolute or
-// symlink-resolved path, in the user's Claude config dir.
-func hasClaudeConversation(dir string) bool {
-	for _, d := range claudeProjectDirs(config.ClaudeConfigDir(), dir) {
+// symlink-resolved path, in the Claude config dir cfg.
+func hasClaudeConversation(cfg, dir string) bool {
+	for _, d := range claudeProjectDirs(cfg, dir) {
 		entries, _ := os.ReadDir(d)
 		for _, e := range entries {
 			if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
@@ -192,4 +355,89 @@ func inClaudeProject(cfg, dir, transcript string) bool {
 		}
 	}
 	return false
+}
+
+// assistantLock is the lock that serialises launches of the assistant: in
+// the state dir, which no container sees (the assistant dir is its
+// container's to write: a lock there could be a symlink to anywhere).
+func (a *App) assistantLock() string {
+	return filepath.Join(a.Paths.StateDir, "assistant.lock")
+}
+
+// assistantUntrusted are the files of the assistant dir that Claude Code
+// reads as instructions, settings, tools or hooks and atl never writes: its
+// container may have written them (the assistant dir is read-write there),
+// and next to atl (the sandbox off) they would act on the host.
+var assistantUntrusted = []string{"CLAUDE.local.md", ".mcp.json", ".claude/settings.local.json",
+	".claude/skills", ".claude/agents", ".claude/commands"}
+
+// quarantineAssistant moves, before the assistant runs next to atl (the
+// sandbox off), what of assistantUntrusted is in its dir, and its
+// .claude/settings.json unless it is what atl would write afresh
+// (foreignAssistantSettings; atl then writes it from scratch), or all of .claude
+// when that is not a plain directory, into a new dir
+// <state dir>/assistant-quarantine/<time>/, at the same relative paths, and
+// says so in one warning. Nothing is deleted or followed: a symlink is moved
+// as it is. A move that fails is a warning too.
+func (a *App) quarantineAssistant(dir string) {
+	cands := assistantUntrusted
+	if fi, err := os.Lstat(filepath.Join(dir, ".claude")); err == nil && !fi.IsDir() {
+		cands = []string{"CLAUDE.local.md", ".mcp.json", ".claude"}
+	} else if a.foreignAssistantSettings(dir) {
+		cands = append(slices.Clone(cands), ".claude/settings.json")
+	}
+	q := filepath.Join(a.Paths.StateDir, "assistant-quarantine", a.now().UTC().Format("20060102T150405.000000000Z"))
+	var moved []string
+	for _, rel := range cands {
+		src := filepath.Join(dir, rel)
+		if _, err := os.Lstat(src); err != nil {
+			continue
+		}
+		dst := filepath.Join(q, rel)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			a.warnf("assistant: quarantine %s: %v", rel, err)
+			continue
+		}
+		if err := os.Rename(src, dst); err != nil {
+			a.warnf("assistant: quarantine %s: %v", rel, err)
+			continue
+		}
+		moved = append(moved, rel)
+	}
+	if len(moved) > 0 {
+		a.warnf("assistant: moved %s of %s to %s: its container could have written them, and next to atl they would act on the host",
+			strings.Join(moved, ", "), dir, q)
+	}
+}
+
+// foreignAssistantSettings reports whether the assistant dir's
+// .claude/settings.json is there and is not what atl would write afresh
+// (gen.WriteAssistantFiles into an empty dir): next to atl, atl owns that
+// file and does not merge it, since the assistant's container could have
+// added hooks or allow rules to it. A file atl cannot read as a regular
+// file counts as foreign; one it cannot render the fresh form for does not
+// (the launch then fails writing it, as before).
+func (a *App) foreignAssistantSettings(dir string) bool {
+	path := filepath.Join(dir, ".claude", "settings.json")
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	if !fi.Mode().IsRegular() {
+		return true
+	}
+	have, err := os.ReadFile(path)
+	if err != nil {
+		return true
+	}
+	tmp, err := os.MkdirTemp("", "atl-assistant-")
+	if err != nil {
+		return false
+	}
+	defer os.RemoveAll(tmp)
+	if err := gen.WriteAssistantFiles(tmp, a.hookBin(), a.Sandbox != nil); err != nil {
+		return false
+	}
+	fresh, err := os.ReadFile(filepath.Join(tmp, ".claude", "settings.json"))
+	return err == nil && !bytes.Equal(have, fresh)
 }

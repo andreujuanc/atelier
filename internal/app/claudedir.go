@@ -79,7 +79,13 @@ const (
 // The dir is the task's to write; what is in it is reached through package
 // nofollow, so a symlink the task left there is never written through.
 func (a *App) seedClaudeDir(t *model.Task) error {
-	dir := a.Paths.ClaudeDir(t.Slug)
+	return a.seedClaudeDirAt(a.Paths.ClaudeDir(t.Slug), a.Paths.TaskDir(t.Slug), "task "+t.Slug)
+}
+
+// seedClaudeDirAt is seedClaudeDir for the Claude dir dir of a container
+// whose sessions run in trusted (the task dir, the assistant dir); who
+// names the container's owner in messages.
+func (a *App) seedClaudeDirAt(dir, trusted, who string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -92,12 +98,12 @@ func (a *App) seedClaudeDir(t *model.Task) error {
 		c := &seedCopy{forbidden: forbiddenSources(user), dst: d}
 		for _, name := range claudeCopied {
 			if err := c.refresh(filepath.Join(user, name), name); err != nil {
-				a.warnf("task %s: copy %s of your Claude config: %v", t.Slug, name, err)
+				a.warnf("%s: copy %s of your Claude config: %v", who, name, err)
 			}
 		}
 	}
-	if err := writeClaudeState(d, a.Paths.TaskDir(t.Slug), os.Getenv("ANTHROPIC_API_KEY"), userTheme()); err != nil {
-		return fmt.Errorf("task %s: Claude state file: %w", t.Slug, err)
+	if err := writeClaudeState(d, trusted, os.Getenv("ANTHROPIC_API_KEY"), userTheme()); err != nil {
+		return fmt.Errorf("%s: Claude state file: %w", who, err)
 	}
 	return nil
 }

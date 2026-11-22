@@ -55,5 +55,5 @@ func CheckStaticBin(path string) error {
 // StaticBinError is CheckStaticBin's error as one line for the user: why a
 // task container cannot run atl, and how to build it.
 func StaticBinError(err error) error {
-	return fmt.Errorf("atl runs inside each task's container, so it must be a static Linux binary: %v; build it with `%s`", err, BuildStatic)
+	return fmt.Errorf("atl runs inside each task's container, so it must be a static Linux binary: %v; build it with `%s` (without Go: from the Dockerfile's build stage, see the README's \"Install on the host\")", err, BuildStatic)
 }

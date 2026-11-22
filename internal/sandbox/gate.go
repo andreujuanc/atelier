@@ -52,6 +52,10 @@ type Gate struct {
 	// also come from, or from inside, read-only only: a read-write request
 	// is made read-only.
 	ROMounts []string
+	// NoDocker refuses every Docker request: the assistant's gate, whose
+	// container has no Docker access at all (Root is then the assistant
+	// dir, which the gate stops without; Upstream is not used).
+	NoDocker bool
 
 	once   sync.Once
 	client *http.Client
@@ -149,6 +153,10 @@ func (g *Gate) logf(format string, args ...any) {
 
 func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.init()
+	if g.NoDocker {
+		g.deny(w, r, http.StatusForbidden, "the assistant has no Docker access")
+		return
+	}
 	if strings.Contains(r.URL.EscapedPath(), "%") {
 		g.deny(w, r, http.StatusForbidden, "encoded characters in the path are not accepted")
 		return

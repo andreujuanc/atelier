@@ -123,7 +123,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, env func(stri
 	if len(args) > 0 {
 		event = args[0]
 	}
-	if event != EventAssistantGuard && env(sandbox.InEnv) != "" {
+	if env(sandbox.InEnv) != "" {
 		return viaGate(event, stdin, stdout, stderr, env)
 	}
 	var p config.Paths
