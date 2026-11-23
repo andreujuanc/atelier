@@ -328,8 +328,8 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
 - `w` in the task TUI is a quit with `switching` set: it waits for operations exactly as
   `q` does (`requestQuit`), `q` or `ctrl+c` meanwhile clear it, and a forced quit is never
   a switch. `RunContext` returns `tui.ErrSwitchWorkspace` after the usual shutdown; the
-  CLI then re-executes. The workspace's name is drawn at the right end of the task TUI's
-  status line when it fits (there is no header line).
+  CLI then re-executes. The workspace's name is drawn in the task TUI's top bar (it was
+  at the right end of the status line before the top bar existed).
 - W4, tmux config: `tmux.ServerConfig` (the box's `/etc/tmux.conf` settings, under a
   comment saying atl rewrites the file) is written by `Client.UseConfig(path, user)` to
   `Paths.TmuxConf()` (`<StateDir>/tmux.conf`) when the file's content differs

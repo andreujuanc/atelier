@@ -2340,7 +2340,7 @@ func TestDirtyStar(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 12, Height: 20})
 	found := false
 	for _, l := range strings.Split(plainView(m), "\n") {
-		if strings.HasPrefix(l, "   alpha") {
+		if strings.HasPrefix(strings.TrimLeft(l, "▌ "), "alpha") { // selected or not
 			found = true
 			if !strings.Contains(l, "*") || ansi.StringWidth(l) > 12 {
 				t.Errorf("narrow alpha row %q", l)
