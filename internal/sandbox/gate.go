@@ -606,6 +606,14 @@ func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 		// The daemon would fetch it itself, with the credentials of the
 		// host it runs on.
 		g.deny(w, r, http.StatusForbidden, "building from a remote URL is not allowed; build from a local context")
+	case anyTrue(q["pull"]):
+		// The builder would pull each FROM image and store it under its
+		// name, past the image name rules of a pull (checkTag).
+		g.deny(w, r, http.StatusForbidden, "build --pull is not allowed: pull the base image first with docker pull, then build")
+	case anyNonEmpty(q["platform"]):
+		// A FROM image of another platform than the local one is pulled
+		// and stored under its name, as with --pull.
+		g.deny(w, r, http.StatusForbidden, "build --platform is not allowed: pull the base image for that platform first, then build without it")
 	default:
 		if err := g.buildTags(r); err != nil {
 			g.deny(w, r, http.StatusForbidden, err.Error())
@@ -1116,6 +1124,27 @@ func isZero(v any) bool {
 			}
 		}
 		return true
+	}
+	return false
+}
+
+// anyTrue reports whether one of vs is true as dockerd reads a boolean
+// query value: anything but "", "0", "no", "false" and "none", in any case.
+func anyTrue(vs []string) bool {
+	for _, v := range vs {
+		if !oneOf(strings.ToLower(strings.TrimSpace(v)), "", "0", "no", "false", "none") {
+			return true
+		}
+	}
+	return false
+}
+
+// anyNonEmpty reports whether one of vs is not blank.
+func anyNonEmpty(vs []string) bool {
+	for _, v := range vs {
+		if strings.TrimSpace(v) != "" {
+			return true
+		}
 	}
 	return false
 }

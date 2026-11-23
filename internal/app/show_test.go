@@ -449,3 +449,29 @@ func TestTranscript(t *testing.T) {
 		t.Fatalf("unknown session: %v", err)
 	}
 }
+
+// TestNotesHistoryCap: the notes history a task keeps of what the
+// assistant replaced stays under 1 MiB: the oldest entries go first, whole,
+// and the newest is always there.
+func TestNotesHistoryCap(t *testing.T) {
+	a := &App{Paths: config.Paths{StateDir: t.TempDir()}}
+	body := strings.Repeat("x", 60<<10) // near model.MaxNotesLen
+	for i := 0; i < 40; i++ {
+		if err := a.keepNotes("alpha", fmt.Sprintf("version %d\n## not a heading\n%s\n", i, body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := os.ReadFile(a.NotesHistory("alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if len(s) > maxNotesHistory || len(s) < maxNotesHistory-(62<<10) || !strings.HasPrefix(s, "## ") ||
+		!strings.Contains(s, "version 39\n") || strings.Contains(s, "version 0\n") {
+		t.Errorf("history: %d bytes, starts %q, newest kept %v, oldest gone %v", len(s), s[:min(len(s), 80)],
+			strings.Contains(s, "version 39\n"), !strings.Contains(s, "version 0\n"))
+	}
+	if n := strings.Count(s, " — before the assistant replaced or cleared them\n"); n != strings.Count(s, "version ") {
+		t.Errorf("%d headings for %d entries: one cut in the middle", n, strings.Count(s, "version "))
+	}
+}

@@ -43,7 +43,8 @@ fails (push from your shell instead).
 ## atl pr
 
 Run on the host. Per rw repo with pushed commits: `gh pr create --repo <origin's GitHub
-repo> --base <the repo's base branch>`, then the task moves to `review`. Push first.
+repo> --base <the repo's base branch>`, then the task moves to `review`; a done or cancelled
+task keeps its status (atl says so), and the assistant cannot run it on one. Push first.
 
 - The PR opens in the pinned origin's repository: with a fork as `origin`, in the fork.
 - An ssh alias (`git@github-work:org/api.git`) counts as github.com when `ssh -G` resolves it

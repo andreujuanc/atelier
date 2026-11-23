@@ -606,7 +606,11 @@ func (c *cli) prCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			res, err := ap.PR(cmd.Context(), a[0])
+			pr := ap.PR
+			if c.forAssistant {
+				pr = ap.PROpen
+			}
+			res, err := pr(cmd.Context(), a[0])
 			ghFailed := false
 			for _, r := range res {
 				fmt.Fprintf(c.stdout, "%s\t%s\n", r.Repo, r)

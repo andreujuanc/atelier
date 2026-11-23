@@ -49,8 +49,9 @@ It gets `context` / `ATL_CONTEXT` (not `[sandbox] context`) and the copy relay.
 runs `atl -w <workspace> <command> --for-assistant …` on the host, with the gate's
 environment, and returns output and exit status. With `--for-assistant` (hidden; the gate
 always adds it and refuses it in a request), `atl status` only moves an open task between
-open statuses, and `atl notes --set`/`--clear` first append the notes they replace, dated,
-to `<workspace>/state/notes-history/<slug>.md` (which no container sees). Log:
+open statuses, `atl pr` refuses a closed task, and `atl notes --set`/`--clear` first append
+the notes they replace, dated, to `<workspace>/state/notes-history/<slug>.md` (which no
+container sees; the oldest entries go past 1 MiB). Log:
 `<workspace>/state/gate-_assistant.log` (command names, exit status, refusals; never other
 arguments or stdin).
 
@@ -82,6 +83,7 @@ Refused, with a one-line reason:
 | `atl open` | attaches a terminal: open the task in the TUI or with `atl open <task>` in a terminal |
 | `atl done`, `atl cancel` | they remove the task's worktrees: close tasks yourself (TUI `d`/`c`, or the CLI) |
 | `atl status` to `done`/`cancelled`, or on a closed task (refused by atl) | closing is yours; reopening removes the task's containers, networks and volumes |
+| `atl pr` on a closed task (refused by atl) | it would move the task to `review` |
 | `--for-assistant` in any spelling | the gate sets it |
 | `atl repos pin` (`repos` with any argument) | accepting a changed origin URL is your decision |
 | `-w` / `--workspace` in any spelling | the workspace is the gate's own |

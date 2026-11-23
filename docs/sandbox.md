@@ -99,7 +99,7 @@ The session's start context tells Claude all of this.
 | a mount of `/var/run/docker.sock` becomes the gate's socket | testcontainers/localstack stay under the same rules |
 | refused: privileged, host network/PID/IPC, added capabilities, devices, security options, other runtimes, volume driver options, log drivers other than `json-file`/`local`/`none`, unknown container settings | each is a way out of the container |
 | images: pull and build allowed, remove refused; build from a remote URL refused | images are shared; the daemon would fetch with host credentials |
-| a pull or build may not name a tag atl's own containers run from (`atelier-task`, `atelier`, the workspace's and every project's image, in any spelling); a build may not name a tag that points to an image the task did not build (a pull may: it brings only the registry's content for that name); builds get the task's label; pulling all tags, tag, import, load, commit refused | a task could swap what later tasks, the assistant and `atl token` run |
+| a pull or build may not name a tag atl's own containers run from (`atelier-task`, `atelier`, the workspace's and every project's image, in any spelling); a build may not name a tag whose image has no `atelier.task` label (yours, or pulled: build under another tag), nor pull (`--pull`, `--platform`: pull the base image first); builds get the task's label; pulling all tags, tag, import, load, commit refused | a task could swap what later tasks, the assistant and `atl token` run |
 | BuildKit refused (`DOCKER_BUILDKIT=0` is set) | the gate cannot inspect BuildKit sessions |
 | the task's container is joined to every network the task creates; the task cannot stop, remove, or impersonate (`atl-<slug>-<hash>` names) it | services answer by compose service name |
 | form-encoded request bodies refused | Docker would read values the gate did not check |
@@ -215,8 +215,10 @@ refuses, `atl push`/`atl fetch`) and names the mounted host paths. `context` /
 - Notes and transcripts a task writes reach the assistant as prompt input. Claude Code's
   permission prompt runs in the assistant's container, so a hostile one skips it: the gate's
   allowlist is the only real limit ([assistant.md](assistant.md#permissions)).
-- The image rule is checked when the request arrives: a tag another task creates while a
-  build runs is overwritten when it ends.
+- Image names: rules are checked when the request arrives (a tag created while a build runs
+  is overwritten); tasks can build over each other's tags (and an image built `FROM` a
+  task's carries its label); a build pulls a missing `FROM` image under its own name (it
+  matters only for a reserved name not built yet).
 - The assistant's container can read the token too; it has no repo, task dir or Docker.
 - A task can write (never read) your clipboard while your terminal is on its tmux session.
   Read what you paste into a shell.

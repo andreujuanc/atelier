@@ -410,7 +410,8 @@ func TestPushedText(t *testing.T) {
 // TestForAssistant: as the assistant's gate runs them (--for-assistant,
 // which it always adds), atl status only moves an open task between open
 // statuses: closing a task, or reopening a closed one (which removes its
-// Docker objects), is refused and nothing changes; atl notes --set and
+// Docker objects), is refused and nothing changes, as is atl pr on a
+// closed task (it would set review); atl notes --set and
 // --clear first append the notes they replace, dated, to a file under the
 // state dir, so the user's text is never lost.
 func TestForAssistant(t *testing.T) {
@@ -449,6 +450,9 @@ func TestForAssistant(t *testing.T) {
 	if code, _, errs := atl(t, "status", "--for-assistant", "alpha", "active"); code != 1 || !strings.Contains(errs, "reopening it") ||
 		status("alpha") != "done" {
 		t.Errorf("reopen: %d %s (status %s)", code, errs, status("alpha"))
+	}
+	if code, _, errs := atl(t, "pr", "--for-assistant", "alpha"); code != 1 || !strings.Contains(errs, "open tasks only") {
+		t.Errorf("pr on a closed task: %d %s", code, errs)
 	}
 
 	notes := func(in string, args ...string) {

@@ -834,10 +834,13 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 // TestGateImageNames: a build or a pull may not create or move a tag that
 // atl runs its own containers from (the default task image, the box image,
 // the workspace's and the projects' images, in any spelling dockerd reads
-// as the same); a build may not name a tag that points to an image the
-// task did not build, while a pull may re-pull one (it brings only what the
-// registry has under that name); a pull by digest moves no tag, and every image a task builds carries its label. The other
-// endpoints that name images (tag, import, load, commit) stay refused.
+// as the same); a build may not name a tag that points to an image no task
+// built (the user's, a pulled one), but may build over one a task built,
+// while a pull may re-pull any (it brings only what the registry has under
+// that name); a pull by digest moves no tag; a build may not pull (--pull,
+// --platform: the builder would store FROM images under their names); and
+// every image a task builds carries its label. The other endpoints that
+// name images (tag, import, load, commit) stay refused.
 func TestGateImageNames(t *testing.T) {
 	reserved := []string{"ghcr.io/you/alpha-dev:2", ""}
 	c := newGateWith(t, func(g *Gate) { g.Reserved = func() ([]string, error) { return reserved, nil } })
@@ -849,9 +852,12 @@ func TestGateImageNames(t *testing.T) {
 		"/build?t=library/atelier-task",
 		"/build?t=atelier",
 		"/build?t=GHCR.IO/you/alpha-dev:2",
-		"/build?t=other-tool",              // another task's
 		"/build?t=localstack/localstack:4", // pulled by someone
 		"/build?t=Bad/Name",
+		"/build?pull=1",
+		"/build?t=new-tool&pull=true",
+		"/build?pull=0&pull=1",
+		"/build?platform=linux/arm64",
 		"/v1.45/build?t=atelier-task",
 		"/images/create?fromImage=atelier-task",
 		"/images/create?fromImage=atelier-task&tag=latest",
@@ -879,6 +885,8 @@ func TestGateImageNames(t *testing.T) {
 	for _, uri := range []string{
 		"/build?t=new-tool",
 		"/build?t=my-tool:dev&t=new-tool:2",
+		"/build?t=other-tool", // another task built it
+		"/build?t=new-tool&pull=0&platform=",
 		"/build",
 		"/images/create?fromImage=postgres&tag=17",
 		"/images/create?fromImage=atelier-task@sha256:" + strings.Repeat("a", 64),
@@ -892,6 +900,10 @@ func TestGateImageNames(t *testing.T) {
 		if status, out := c.do("POST", uri, ""); status >= 400 {
 			t.Errorf("POST %s: status %d (%s), want it forwarded", uri, status, out)
 		}
+	}
+	if _, out := c.do("POST", "/build?t=localstack/localstack:4", ""); !strings.Contains(out, "build under another tag") ||
+		!strings.Contains(out, "docker rmi localstack/localstack:4") {
+		t.Errorf("refusal of a pulled image's tag: %s", out)
 	}
 	if got := c.d.saw("POST /build?"); !strings.Contains(got, `"atelier.task":"`+testID+`"`) {
 		t.Errorf("build not labelled: %s", got)

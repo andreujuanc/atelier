@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -248,7 +250,15 @@ func (a *App) ReplaceNotesKept(ctx context.Context, ref, text string) (string, e
 	}
 }
 
-// keepNotes appends notes ("" is nothing to keep) to slug's NotesHistory.
+// maxNotesHistory caps a task's NotesHistory: the oldest entries go first.
+const maxNotesHistory = 1 << 20
+
+// notesEntry finds where each NotesHistory entry starts: its heading line.
+var notesEntry = regexp.MustCompile(`(?m)^## \d{4}-\d\d-\d\dT\S+ — before the assistant replaced or cleared them$`)
+
+// keepNotes appends notes ("" is nothing to keep) to slug's NotesHistory,
+// under the file's lock, dropping the oldest entries when the file would
+// be over maxNotesHistory.
 func (a *App) keepNotes(slug, notes string) error {
 	if notes == "" {
 		return nil
@@ -257,16 +267,43 @@ func (a *App) keepNotes(slug, notes string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", path)
 	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	if fi, err = f.Stat(); err != nil {
+		return err
+	}
+	start := max(0, fi.Size()-maxNotesHistory)
+	old := make([]byte, fi.Size()-start)
+	if _, err := f.ReadAt(old, start); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
 	entry := "## " + a.now().Format(time.RFC3339) + " — before the assistant replaced or cleared them\n\n" + strings.TrimRight(notes, "\n") + "\n\n"
-	if _, err := f.WriteString(entry); err != nil {
+	data := string(old) + entry
+	if start > 0 || len(data) > maxNotesHistory {
+		// From the first entry that starts late enough for the rest to fit.
+		cut := len(data) - len(entry)
+		for _, m := range notesEntry.FindAllStringIndex(data, -1) {
+			if m[0] >= len(data)-maxNotesHistory {
+				cut = m[0]
+				break
+			}
+		}
+		data = data[cut:]
+	}
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.WriteAt([]byte(data), 0); err != nil {
 		return err
 	}
 	return f.Sync()

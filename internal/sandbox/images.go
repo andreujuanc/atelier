@@ -123,10 +123,12 @@ func (g *Gate) reservedImages() ([]imageRef, error) {
 // checkTag returns why the task may not make s, an image reference that
 // names a tag (latest if none), point to a new image, or nil: it is one of
 // the tags atl runs its own containers from (reservedImages), or, for a
-// build (build true), it points to an image now that lacks this task's
-// label (another task's, the user's, one pulled: the task would put its own
-// content under a name others run). A pull may re-pull such a tag: it puts
-// only what the registry has under that very name there.
+// build (build true), it points to an image now that has no atelier.task
+// label at all (the user's own build, one pulled: the task would put its
+// own content under a name the user runs). An image a task built (any
+// atelier.task) may be built over, as tasks sharing a repo build the same
+// compose image names. A pull may re-pull any tag: it puts only what the
+// registry has under that very name there.
 func (g *Gate) checkTag(s string, reserved []imageRef, build bool) error {
 	r, err := parseImageRef(s)
 	if err != nil {
@@ -159,8 +161,9 @@ func (g *Gate) checkTag(s string, reserved []imageRef, build bool) error {
 	if err := json.Unmarshal(out, &img); err != nil {
 		return fmt.Errorf("cannot inspect image %s", s)
 	}
-	if img.Config.Labels[LabelTask] != g.ID {
-		return fmt.Errorf("image %s exists and was not built by this task: a task may only name new images or its own", s)
+	if _, byTask := img.Config.Labels[LabelTask]; !byTask {
+		return fmt.Errorf("image %s exists and no task built it (yours, or pulled): build under another tag, "+
+			"or, if a task built it before atl labelled builds, remove it on the host first (docker rmi %s)", s, s)
 	}
 	return nil
 }

@@ -548,3 +548,19 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   unset by the processes it marks). (6) A live window attaches with a warning when
   `ensureAssistantSandbox` fails. (7) Token container: `-e HOME=/tmp`. (10) The client's
   `readsStdin` is `resolveAtl` (`atl notes … --set --help` sends no body).
+- W5 second pass (on 7bb24dd). (1) `App.PR` set `review` on any task, a closed one too,
+  past the lock and reopen. Now `prReview` sets it under `lockTask` only on an open task; a
+  closed one keeps its status with a warning (the PRs are still created). `PROpen`
+  (`atl pr --for-assistant`) refuses a task that is not open before gh runs. (2) `/build`
+  with `pull` true (dockerd's `BoolValue` reading, any occurrence) or a non-empty
+  `platform` is refused: the legacy builder pulls `FROM` images (always with `pull`, on a
+  platform mismatch with `platform`, moby's `GetImageAndReleasableLayer`) and stores them
+  under their names, past the pull rule. Left open: a missing `FROM` image is pulled under
+  its name (docs/sandbox.md). (3) The build rule is now "no `atelier.task` label at all"
+  (the user's builds, pulled images), not "not this task's": tasks sharing a repo build the
+  same compose names, and images tasks built before builds were labelled must stay
+  rebuildable after a `docker rmi` (the refusal says so). Tasks overwriting each other's
+  non-reserved tags is the old behaviour, listed in "does not do yet". (4)
+  `notes-history/<slug>.md` is capped at 1 MiB (`maxNotesHistory`): under `flock`, the
+  tail is read, the entry appended, and whole entries (found by their heading line) are
+  dropped from the front; rewritten in place.
