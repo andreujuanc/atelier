@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 // assistantGuardMain runs the AssistantGuard event: no database, no store.
@@ -16,8 +18,15 @@ import (
 // refused (exit 2).
 func assistantGuardMain(p config.Paths, stdin io.Reader, stderr io.Writer) int {
 	data, err := io.ReadAll(io.LimitReader(stdin, int64(maxInput)+1))
-	if err != nil {
-		logError(p, stderr, EventAssistantGuard, "", fmt.Errorf("read stdin: %w", err))
+	return assistantGuardInput(p, data, err, nil, stderr)
+}
+
+// assistantGuardInput runs the AssistantGuard event on its input data
+// (readErr: reading it failed after those bytes); landings are where its
+// targets land in the assistant's container (see viaGate), nil next to atl.
+func assistantGuardInput(p config.Paths, data []byte, readErr error, landings []candidate, stderr io.Writer) int {
+	if readErr != nil {
+		logError(p, stderr, EventAssistantGuard, "", fmt.Errorf("read stdin: %w", readErr))
 		return assistantRefuse(stderr, "", "cannot read the hook input")
 	}
 	if len(data) > maxInput {
@@ -29,6 +38,7 @@ func assistantGuardMain(p config.Paths, stdin io.Reader, stderr io.Writer) int {
 		logError(p, stderr, EventAssistantGuard, "", fmt.Errorf("decode hook input: %w", err))
 		return assistantRefuse(stderr, "", "cannot decode the hook input")
 	}
+	in.landings = landings
 	exit, msg, err := AssistantGuard(in, p)
 	if err != nil {
 		logError(p, stderr, EventAssistantGuard, in.SessionID, err)
@@ -68,8 +78,10 @@ func assistantGuardedTool(name string) bool {
 // way the kernel would) lands inside Paths.AssistantDir(), but not in its
 // generated CLAUDE.md, .claude/, CLAUDE.local.md (auto-loaded instructions)
 // or .mcp.json (adds tools): the assistant must not loosen its own
-// permissions. Anything else, including a target it cannot resolve, is
-// blocked (exit 2 with msg); err carries details for the log.
+// permissions. In the assistant's container (in.landings, as the container
+// resolved the targets) every landing must be allowed too. Anything else,
+// including a target it cannot resolve, is blocked (exit 2 with msg); err
+// carries details for the log.
 func AssistantGuard(in Input, p config.Paths) (exit int, msg string, err error) {
 	if !assistantGuardedTool(in.ToolName) {
 		return 0, "", nil
@@ -137,5 +149,53 @@ func AssistantGuard(in Input, p config.Paths) (exit int, msg string, err error) 
 			}
 		}
 	}
+	for _, l := range in.landings {
+		if !allowed(l.landing) {
+			return blocked(l.given, nil)
+		}
+	}
 	return 0, "", nil
+}
+
+// AssistantServer answers, in the assistant's gate, what atl in the
+// assistant's container sends as a hook: the assistant's guard
+// (AssistantGuard), checked where atl runs against the gate's own paths and
+// against where the container says the targets land. The assistant has no
+// other hook and no status line; its notes and every other atl command go
+// through the gate's atl operation (sandbox.OpAtl), so the rest is refused.
+type AssistantServer struct{ p config.Paths }
+
+var _ sandbox.Task = (*AssistantServer)(nil)
+
+// NewAssistantServer returns the AssistantServer for the workspace whose
+// paths are p.
+func NewAssistantServer(p config.Paths) *AssistantServer { return &AssistantServer{p: p} }
+
+// Do answers one request (see sandbox.Task).
+func (s *AssistantServer) Do(req sandbox.ControlRequest, body []byte, stdout, stderr io.Writer) (code int) {
+	defer func() {
+		if r := recover(); r != nil {
+			logError(s.p, io.Discard, req.Op, "", fmt.Errorf("assistant gate: panic: %v\n%s", r, debug.Stack()))
+			code = assistantRefuse(stderr, "", "internal error")
+		}
+	}()
+	if req.Op != sandbox.OpHook {
+		fmt.Fprintf(stderr, "atelier gate: %s is not served by the assistant's gate\n", req.Op)
+		return 2
+	}
+	if req.Event != EventAssistantGuard {
+		return 0 // nothing to record: the assistant is no task session
+	}
+	var readErr error
+	if req.ReadErr != "" {
+		readErr = errors.New(req.ReadErr)
+	}
+	var landings []candidate
+	for _, l := range req.Landings {
+		if !filepath.IsAbs(l.Path) || filepath.Clean(l.Path) != l.Path {
+			return assistantRefuse(stderr, "", "a target the container resolved is not a clean absolute path")
+		}
+		landings = append(landings, candidate{given: l.Given, landing: l.Path})
+	}
+	return assistantGuardInput(s.p, body, readErr, landings, stderr)
 }

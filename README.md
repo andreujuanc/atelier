@@ -1,1221 +1,250 @@
 # atelier (`atl`)
 
 A terminal task studio for parallel Claude Code work. Each task gets its own git
-worktrees (one per read-write repo, on branch `atl/<slug>`); the real Claude Code TUI
-runs inside tmux (session `atl-<slug>`, one window per Claude session); atelier
-tracks session state in SQLite via Claude Code hooks.
-
-Requires git, tmux ≥ 3.2, `claude`, `gh` (for `atl pr`), and Docker with the task image:
-each task's Claude sessions run in the task's own container (the [sandbox](#sandbox), on by
-default). `atl` runs on the host (see [Install on the host](#install-on-the-host)): build
-it with `CGO_ENABLED=0 go build -buildmode=exe -o ~/.local/bin/atl ./cmd/atl`, build the
-task image with `build-images` (see [Docker image](#docker-image)), create a
-[workspace](#workspaces) with `atl workspace new <name>`, then run `atl doctor` in it.
+worktrees (branch `atl/<slug>` in every read-write repo), runs the real Claude Code TUI in
+tmux (one window per session), and runs those sessions in the task's own Docker container
+behind a gate that limits what the task can do. Session state is tracked in SQLite through
+Claude Code hooks.
 
 ## Install on the host
 
-**Requirements.** On a Linux host, on `PATH`: tmux ≥ 3.2, git, `gh` (logged in, for `atl
-pr`), `claude` (Claude Code, logged in), and the Docker CLI with access to the system's
-Docker daemon: your user in the `docker` group (as the box had it with `--group-add`).
-Rootless Docker and Podman are not supported: the gate forwards a task's Docker requests to
-the daemon whose unix socket `DOCKER_HOST` names (else `/var/run/docker.sock`), not to a
-Docker context, and a rootless daemon maps your user to another UID in containers, so a
-task could not write its bind-mounted worktrees. Go builds `atl`. Pushing and fetching use
-your own SSH agent, `~/.ssh` and git credentials, as any git on the host does.
+atl runs on a Linux host. Requirements, on `PATH`:
 
-**Build.** From the checkout:
+- tmux ≥ 3.2, git
+- `gh` (logged in), for `atl pr`, which runs on the host
+- Docker CLI with access to the system daemon (your user in the `docker` group). Rootless
+  Docker and Podman are not supported: a rootless daemon maps your UID to another one, so
+  tasks could not write their worktrees.
+
+Not needed: Go (atl builds in Docker), and Claude Code: task sessions, the assistant and
+`atl token` run `claude` from the task image. Only `ATL_SANDBOX=off` needs `claude` on the
+host, logged in.
+
+Pushing and fetching use your own SSH agent, `~/.ssh` and git credentials.
+
+Build from a clone of your own outside your repos dir, which no task ever writes: a task with
+atelier rw can write its canonical clone's `.git` (hooks, `core.fsmonitor`), which your git
+there would run.
+
+```bash
+git clone https://github.com/andreujuanc/atelier ~/src/atelier-build && cd ~/src/atelier-build
+```
+
+Run the steps below there (later: `git pull` there, then again).
+
+**1. Build `atl`** (a static Linux binary; it also runs inside containers).
+
+Without Go (the Dockerfile's `build` stage writes `/out/atl`):
+
+```bash
+docker build --target build -t atl-build . \
+  && id=$(docker create atl-build) \
+  && docker cp "$id:/out/atl" ~/.local/bin/atl \
+  && docker rm "$id"
+```
+
+With Go:
 
 ```bash
 CGO_ENABLED=0 go build -buildmode=exe -o ~/.local/bin/atl ./cmd/atl
 ```
 
-`atl` must be a static Linux binary: it is copied into each task's run dir and runs in the
-task's container too (hooks, the status line, `wl-copy`), whatever that container's image
-has. `CGO_ENABLED=0` makes it one; a plain `go build` on a host with a C compiler links
-against the host's C library. `-buildmode=exe` overrides a `GOFLAGS=-buildmode=pie` (some
-distributions set it): a position-independent build needs the system's program interpreter,
-which an image need not have (alpine's is musl's). `atl doctor` checks the binary (an ELF
-file with no program interpreter and no shared libraries), and starting a sandboxed session
-with any other (a dynamically linked one, a PIE, or not a Linux binary at all) fails with
-one line that gives the command above.
+`CGO_ENABLED=0` and `-buildmode=exe` are required: a dynamically linked or PIE binary
+fails in containers; `atl doctor` and session starts reject it.
 
-**Task image.** `build-images` (see [Docker image](#docker-image)) builds the task image
-`atelier-task` that task containers run, and the box image, which atl on the host does not
-need: `ATL_BUILD_BOX=0 build-images` builds only the task image.
-
-**First workspace.**
+**2. Build the task image** `atelier-task` (what task and assistant containers run):
 
 ```bash
-atl workspace new shop --repos ~/src/shop   # ~/atelier/workspaces/shop/atelier.toml
-cd ~/atelier/workspaces/shop                   # or: atl -w shop …, or ATL_WORKSPACE=shop
-atl doctor                                     # tools, workspace, settings, atl binary, Docker, task image, token
-atl token                                      # once per workspace: the token sandboxed sessions log in with
-atl                                            # the TUI
+ATL_BUILD_BOX=0 ./build-images
 ```
 
-Run `atl` in a plain terminal or inside your own tmux: opening a task attaches to the
-workspace's own tmux server (a nested client from inside yours), and **Ctrl-q** returns to
-the TUI either way (unless your own tmux binds Ctrl-q itself). A `gitconfig` file in the
-workspace is the global git config of `atl` and everything it runs (see **git_config**
-under [Workspaces](#workspaces)); without one git reads your `~/.gitconfig`.
+**3. Create a workspace and check it.**
 
-**tmux settings.** `atl` starts each workspace's tmux server (`tmux -L atl-<name>`) with
-`-f <workspace>/state/tmux.conf`, a file it writes (and rewrites when it differs, so edits
-there do not last) with what the box's `/etc/tmux.conf` has: no status bar, mouse on,
-`escape-time` 10, **Ctrl-q** bound to detach-client, `default-terminal` `tmux-256color` and
-RGB colour for every terminal (`terminal-features ",*:RGB"`). Neither `/etc/tmux.conf` nor
-your `~/.tmux.conf` is read by that server. Your own settings for it go in
-`<workspace>/tmux.conf`, a file `atl` never writes: the generated file ends with
-`source-file -q <workspace>/tmux.conf`, so tmux reads it last (its settings win; a missing
-file is no error), e.g. `source-file ~/.tmux.conf` to have your usual config there too
-(keep Ctrl-q free: it returns to the TUI). tmux reads these files only when the server
-starts: one that already runs keeps its options until it restarts (after its last session
-has ended), and `atl doctor` warns when the running server was started without the
-generated file. With `tmux_socket = "default"` `atl` uses tmux's default server, yours, and
-passes no file: it runs with your own config.
+```bash
+atl workspace new work --repos ~/src/work   # ~/atelier/workspaces/work/atelier.toml
+cd ~/atelier/workspaces/work                # or: atl -w work …, or ATL_WORKSPACE=work
+atl doctor                                  # tools, settings, atl binary, Docker, image, token
+atl token                                   # once per workspace: the token sessions and the assistant log in with
+atl                                         # the TUI
+```
 
-### Moving from a devcontainer box
+`--repos` is the directory that holds your canonical clones (`~/src/work/api`,
+`~/src/work/web`, …). atl never edits them; tasks get worktrees.
 
-A box's `devcontainer.json` carries a workspace's settings in mounts and variables; on the
-host they are the workspace's `atelier.toml`, and `atl workspace new <name>`, run on the
-host on the box's workspace directory, writes it from that file
-(`<workspace>/.devcontainer/devcontainer.json`, read as JSON with comments and trailing
-commas):
+Legacy: running atl itself in a container (the "box", `./build-images` without
+`ATL_BUILD_BOX=0`) still works; see [docs/workspaces.md](docs/workspaces.md#legacy-the-box).
+Moving from a devcontainer box to the host:
+[docs/workspaces.md](docs/workspaces.md#moving-from-a-devcontainer-box).
 
-| in `devcontainer.json` | on the host |
+## Concepts
+
+| term | meaning |
 |---|---|
-| `ATL_WORKSPACE` | the workspace directory itself (`$ATL_WORKSPACES/<name>`, selected as in [Workspaces](#workspaces)); a warning when it names another directory |
-| `ATL_REPOS` | `repos` |
-| `ATL_SANDBOX_MOUNTS` | `[sandbox].mounts` (a list) |
-| `ATL_SANDBOX_IMAGE`, `ATL_CONTEXT`, `ATL_SANDBOX_CONTEXT`, `ATL_TMUX_SOCKET` | `[sandbox].image`, `context`, `[sandbox].context`, `tmux_socket` |
-| `ATL_SANDBOX=docker` | the default: left out (`off` is not carried over, with a warning) |
-| a file mounted as the container user's `~/.gitconfig` | `git_config` (relative when it is in the workspace); none for `<workspace>/gitconfig`, which the default already picks up |
-| `~/.claude` mounted | not needed: `atl` finds your Claude Code config at the same path on the host |
-| `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` (any variable whose name has `KEY`, `TOKEN`, `SECRET` or `PASSWORD`) | never written: the same variable in the environment you start `atl` in, or the token `atl token` stored in `<workspace>/run/` (still there) |
-| the workspace, the repos, `/var/run/docker.sock` mounted, `--group-add <docker gid>` | not needed: the host's own paths, and your user in the `docker` group |
-| `--security-opt label=disable` | not needed: it was for the box's own bind mounts; task containers are created without it |
+| workspace | one directory (`~/atelier/workspaces/<name>`) with its tasks, database, projects, settings and its own tmux server |
+| repo | a canonical clone in the workspace's `repos` dir |
+| project | a named set of repos plus setup/teardown scripts, env and image (`config/projects/<name>.toml`) |
+| task | a unit of work: title, slug, status (`backlog`, `active`, `review`, `done`, `cancelled`), repos, port offset |
+| rw repo | a git worktree at `<task dir>/<repo>` on branch `atl/<slug>` |
+| ro repo | the canonical clone, given to Claude read-only (`--add-dir`; edits blocked) |
+| session | one Claude Code process in a tmux window of the task's tmux session `atl-<slug>`; state `running`, `waiting`, `idle`, `ended` or `stopped` |
+| sandbox | the Docker container a task's sessions run in (the assistant has one per workspace) |
+| gate | `atl gate`, one per container: its only way to Docker, atl's database, git credentials and your clipboard |
 
-The variables are read from `containerEnv` and `remoteEnv` (which wins), with
-`${localEnv:VAR}` and `${localEnv:VAR:default}` expanded from the environment you run `atl`
-in; a value with any other `${...}` (`${containerEnv:...}`, `${containerWorkspaceFolder}`)
-had a meaning only in the box and is skipped. A flag given to `atl workspace new` wins over
-the file, and the file over `ATL_*` variables you set. It prints each setting it writes
-with where it came from (e.g. `repos = ~/src/work (from .devcontainer/devcontainer.json)`)
-and each value it skipped with the reason, and leaves `.devcontainer/` in place.
+Details: [docs/tasks.md](docs/tasks.md), [docs/sandbox.md](docs/sandbox.md).
 
-The tasks, their worktrees, the database and the task containers stay where they are: the
-box used the host's paths, the host's Docker daemon and your user. Steps, for each
-workspace:
+## TUI
 
-1. In the box, close what runs: let running sessions reach a stopping point (or close the
-   tasks you are done with), quit `atl`, and stop the box. Its tmux server goes with it;
-   sessions still running in task containers are ended by the next `atl` that notices
-   their windows gone, and can be resumed.
-2. On the host, `atl workspace new <name>` (or, in the workspace selector, `enter` on the
-   directory, marked "not adopted", which lists the settings it would write and adopts it
-   on `y`). It keeps the directory's contents and writes `atelier.toml` from the box's
-   `devcontainer.json`; `--repos`, `--mount` and `--image` override what it says. A
-   directory with a database is a box's workspace: with no repos found (no `ATL_REPOS` in
-   the file, no `--repos`, no `ATL_REPOS` set) it refuses, since the default repos,
-   `<workspace>/repos`, would leave the box's clones behind, and says to give `--repos`.
-3. Run `atl -w <name>` (or `atl` alone, and pick the workspace in the selector). `atl open`,
-   Enter in the TUI, or `atl resume` start the stopped sessions again with `claude
-   --resume`. `atl doctor` should show `$ATL_TMUX_SOCKET = atl-<name> (default)`: the box
-   never set a tmux socket, so on the host the workspace gets a tmux server of its own.
+Run `atl` in a plain terminal or inside your own tmux. Opening a task attaches to the
+task's tmux session; **Ctrl-q** returns to the TUI (Claude keeps running).
 
-Move all the workspaces of a host together. A box sees only its own workspace under
-`$ATL_WORKSPACES`, so a new task in a box does not avoid the port offsets of the other
-workspaces (on the host, `atl` reads every workspace's database, a box's too), and `atl
-doctor` in a box says that it read no other workspace. While some workspaces still run in a
-box, two tasks can get the same offset; `atl doctor` on the host warns about such pairs.
+| key | action |
+|---|---|
+| `n` | new task (title, project, repos, base branch) |
+| `enter` | open: new session if none, else a picker of new / live / resumable sessions |
+| `s` | new session in the task |
+| `r` | resume stopped sessions |
+| `a` | add repos to the task (or upgrade ro → rw) |
+| `m` | edit the task's notes (`ctrl+s` save, `esc` leave) |
+| `t` | rename (title only) |
+| `d` / `c` | done / cancel (asks first) |
+| `p` | open PRs (`atl pr`) |
+| `D` | diff |
+| `A` | the atelier assistant, about the selected task |
+| `1`-`5` | set status: backlog, active, review, done, cancelled |
+| `/` | filter by slug or title |
+| `w` | switch workspace |
+| `q` | quit (waits for running operations; `ctrl+c` again forces) |
 
-To upgrade a box in place instead (a box image with this `atl`), run `atl workspace new
-<name>` in the box once: it adopts the directory with the box's settings and, since the
-box's sessions run on tmux's default server, writes `tmux_socket = "default"` with a
-comment. Delete that line (and its comment) when you move the workspace to the host: left
-in, `atl` on the host would use your own default tmux server. The box keeps working for a
-workspace that is not moved yet (its variables win over `atelier.toml`); do not run `atl`
-for one workspace in the box and on the host at the same time.
+Repo picker: type to filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter`
+confirms, `esc` cancels.
 
-**Example.** Two workspaces, `personal` and `work`: `work` also gives every task a private npm
-config. Before, `~/atelier/workspaces/work/.devcontainer/devcontainer.json`:
+## CLI
 
-```jsonc
-{
-  "image": "atelier",
-  "runArgs": ["--group-add", "<gid of the docker group>", "--security-opt", "label=disable"],
-  "mounts": [
-    "source=${localEnv:HOME}/atelier/workspaces/work,target=${localEnv:HOME}/atelier/workspaces/work,type=bind",
-    "source=${localEnv:HOME}/src/work,target=${localEnv:HOME}/src/work,type=bind",
-    "source=${localEnv:HOME}/atelier/workspaces/work/gitconfig,target=${localEnv:HOME}/.gitconfig,type=bind,readonly",
-    "source=${localEnv:HOME}/.claude,target=${localEnv:HOME}/.claude,type=bind",
-    "source=${localEnv:HOME}/.work.npmrc,target=${localEnv:HOME}/.work.npmrc,type=bind,readonly",
-    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
-  ],
-  "containerEnv": {
-    "ATL_WORKSPACE": "${localEnv:HOME}/atelier/workspaces/work",
-    "ATL_REPOS": "${localEnv:HOME}/src/work",
-    "ATL_SANDBOX": "docker",
-    "ATL_SANDBOX_MOUNTS": "${localEnv:HOME}/.work.npmrc"
-  }
-}
+`<task>` is a slug, numeric id or unique slug prefix. `-w <workspace>` works on every command.
+
+```sh
+atl                                  # TUI (workspace selector if no workspace is selected)
+atl new "Fix login" --project shop   # create a task; prints "<slug>\t<dir>"
+atl new "Spike" --repo api:rw --repo docs:ro -m "why" [--backlog] [--no-fetch]
+atl new "Hotfix" --project shop --base default   # base: auto (default) | default | production | <branch>
+atl add <task> web[:rw|ro] [--no-fetch]          # add a repo; docs:rw upgrades ro → rw
+atl ls [--status active,review|all] [--json]
+atl show <task> [--json | --notes]   # repos (dirty, ahead, pushed), sessions, notes
+atl open <task> [--session ID | --new]           # attach (resume or start Claude)
+atl session <task>                   # start another session
+atl resume <task>                    # relaunch stopped sessions (after a crash/reboot)
+atl status <task> <backlog|active|review|done|cancelled>   # reopening a closed task restores it
+atl rename <task> <new title...>
+atl diff <task>                      # each rw repo vs the commit it branched from
+atl push [task] [--repo R] [--force] # push atl/<slug> to origin (--force: with lease)
+atl fetch [task] [--repo R]          # git fetch origin in each repo of the task
+atl pr <task>                        # gh pr create per rw repo with pushed commits; status → review
+atl done <task> [--force]            # remove worktrees, Docker objects, fully pushed branches
+atl cancel <task> [--force]
+atl note <task> <text...> [--author user|assistant]   # append a dated line to the notes
+atl notes <task> [--set < file | --clear]
+atl transcript <task> [--session ID] [--tail N]       # condensed Claude transcript
+atl assistant [task]                 # the atelier assistant (own container per workspace)
+atl repos                            # git repos in the repos dir
+atl repos pin <repo>                 # accept a changed origin URL
+atl token [--paste]                  # claude setup-token in a throwaway container; store the token
+atl doctor                           # check everything; says what to fix
+atl workspace list [--json]
+atl workspace new <name> [--repos DIR] [--mount PATH]... [--image IMAGE]
+atl workspace open [<name>]          # TUI in that workspace, or the selector
 ```
 
-`personal`'s is the same with `personal` for `work` and without the npm config. Step 2 on
-the host:
+`push`/`fetch` default to `$ATL_TASK`, so a session can run them with no argument. Inside a
+task container only `note`, `notes`, `push`, `fetch` (and the hooks and status line) work; the
+assistant's container forwards an allowlist ([docs/assistant.md](docs/assistant.md)).
 
-```console
-$ atl workspace new personal
-atl: repos = ~/src/personal (from .devcontainer/devcontainer.json)
-atl: skipped the mount on /home/you/.gitconfig: its source is /home/you/atelier/workspaces/personal/gitconfig, which git_config already defaults to
-personal	/home/you/atelier/workspaces/personal
-$ atl workspace new work
-atl: repos = ~/src/work (from .devcontainer/devcontainer.json)
-atl: sandbox.mounts = ~/.work.npmrc (from .devcontainer/devcontainer.json)
-atl: skipped the mount on /home/you/.gitconfig: its source is /home/you/atelier/workspaces/work/gitconfig, which git_config already defaults to
-work	/home/you/atelier/workspaces/work
-```
+## Configuration
 
-They write these two `atelier.toml` files (`~/` is your home; `atl workspace new` writes the
-absolute paths):
+### `<workspace>/atelier.toml`
+
+Strict TOML: every key optional, unknown keys are an error. `~/` expands in `repos`,
+`git_config` and `mounts`; relative paths are relative to the workspace. No secrets here.
+
+| key | default | meaning |
+|---|---|---|
+| `repos` | `"repos"` | directory of canonical clones |
+| `git_config` | `"gitconfig"` if that file exists, else git's own | global git config for atl and everything it runs (`GIT_CONFIG_GLOBAL`) |
+| `context` | none | text added to the start context of the assistant and of unsandboxed sessions (max 1000 bytes) |
+| `tmux_socket` | `"atl-<name>"` | `tmux -L` name of the workspace's tmux server |
+| `[sandbox] image` | `"atelier-task"` | task container image (a project's `image` wins) |
+| `[sandbox] mounts` | none | host paths every task gets read-only ([docs/sandbox.md](docs/sandbox.md#host-files-for-every-task)) |
+| `[sandbox] context` | none | text added to sandboxed sessions' start context (max 1000 bytes) |
 
 ```toml
-# ~/atelier/workspaces/personal/atelier.toml
-repos = "~/src/personal"
-```
-
-```toml
-# ~/atelier/workspaces/work/atelier.toml
 repos = "~/src/work"
 
 [sandbox]
 mounts = ["~/.work.npmrc"]
 ```
 
-Each has its `gitconfig` next to `atelier.toml`, which `atl` uses without a `git_config`
-line. Then, on the host: `atl -w personal` in one terminal and `atl -w work` in another (two
-tmux servers, `atl-personal` and `atl-work`), or `atl` alone for the workspace selector.
-`.devcontainer/` stays (the box still works) until you remove it.
+More: [docs/workspaces.md](docs/workspaces.md).
 
-## Docker image
-
-The `Dockerfile` builds two images, both for your host user, so paths inside the
-containers match the host (git worktrees store absolute paths): the task image, its `task`
-target, which task containers run (the [sandbox](#sandbox), on by default), and the box,
-an image with `atl`, `claude`, `tmux`, `git` and `gh` that runs `atl` itself in a
-container. The box is optional, the older way in: `atl`
-[on the host](#install-on-the-host) needs only the task image. One command builds both,
-from any directory:
-
-```bash
-path/to/atelier/build-images
-```
-
-It builds the checkout it is in, for the user running it: the box image `atelier`, then
-the task image `atelier-task`. It stops at the first failure and prints the names of what it
-built at the end. `ATL_BOX_IMAGE` and `ATL_SANDBOX_IMAGE` (the variable `atl` reads for the
-task image) name them otherwise, e.g. `ATL_BOX_IMAGE=atelier-next build-images` to try a new box
-image beside the one in use. `ATL_BUILD_BOX=0` builds only the task image (all `atl` on the
-host needs). Its arguments go to both `docker build` calls (e.g. `build-images --no-cache`).
-What it runs, in the checkout (the first command only without `ATL_BUILD_BOX=0`):
-
-```bash
-docker build -t atelier \
-  --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
-docker build --target task -t atelier-task \
-  --build-arg USERNAME=$(whoami) --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
-```
-
-The task image is lean on purpose: Claude Code, git, the Docker CLI with the compose plugin, Node.js
-(the current LTS line, 26, from nodejs.org) with npm and corepack, and curl, jq, ripgrep,
-unzip, zip, xz, less, procps, openssh-client and ca-certificates, with a UTF-8 locale
-(`C.UTF-8`); not `atl` (it is mounted into task containers), tmux or gh. There is no other
-language and no compiler (no Go, Python or C toolchain): a repo with its own container
-setup (`.devcontainer`, compose files) is built and tested in that setup (see **Tools** in
-[Sandbox](#sandbox)); otherwise they come from the project's own
-`image` (see [Projects](#projects); e.g. one built `FROM atelier-task`), or the task
-installs them itself, and what is installed by hand lasts only until the task's container
-is replaced (see [Sandbox](#sandbox)). As the ordinary user, `npm install -g` installs
-into `~/.local`, on `PATH`. `--build-arg NODE_MAJOR=…` (an argument of `build-images` too)
-picks another Node.js line. With
-Docker's legacy builder, building the box builds this stage too (every stage before the
-target is built; cached afterwards).
-
-**The box (optional).** Run it with `docker run -it atelier` plus your mounts, as a
-devcontainer does (see [Moving from a devcontainer box](#moving-from-a-devcontainer-box)
-for what they are and what replaces them on the host). Its `/etc/tmux.conf` has the
-settings `atl` on the host writes for its tmux servers (see **tmux settings** under
-[Install on the host](#install-on-the-host)). The container starts a plain shell, not
-tmux: run `atl` there, press Enter on a task to open Claude full screen, and press
-**Ctrl-q** to go back to the TUI (Claude keeps running in tmux). Don't start `atl` inside a
-tmux session in the container: Ctrl-q would then detach that tmux client instead of
-returning to the TUI.
-
-Claude's own status line, under its prompt, shows which task you are in (see
-[Status line](#status-line)).
-
-## Usage
-
-```sh
-atl new "Fix login" --project shop        # task + worktrees, prints "<slug>\t<dir>"
-atl new "Spike" --repo api:rw --repo docs:ro -m "why" [--backlog] [--no-fetch]
-atl new "Hotfix" --project shop --base default   # branch from origin's default branch (production)
-atl add fix-login web [--no-fetch]  # add a repo to an open task (rw: worktree on atl/<slug>)
-atl add fix-login docs:ro           # ro: listed in CLAUDE.md; running sessions need a new one (s)
-atl add fix-login docs:rw           # upgrade an ro repo to rw (worktree on atl/<slug>); rw → ro is not possible
-atl repos                 # git repos in $ATL_REPOS, one per line
-atl repos pin api         # pin api's origin anew from its config (accept a changed origin URL)
-atl ls [--status active,review|all] [--json]
-atl open fix-login        # ensure the tmux session (resume or start Claude), attach
-atl open fix-login --session 3   # open that session: select it if live, else claude --resume it; attach
-atl open fix-login --new  # start a new Claude session and attach to it
-atl session fix-login     # start another Claude session (window) in the task
-atl resume fix-login      # after a crash/reboot: relaunch stopped sessions with claude --resume
-atl status fix-login review      # done/cancelled → backlog/active/review reopens the task (worktrees, CLAUDE.md, setup)
-atl rename fix-login Fix the login page   # title only: slug, branch atl/<slug>, tmux session and dirs keep the old name
-atl diff fix-login        # git diff of each rw repo vs its base commit (paged on a TTY)
-atl push [fix-login] [--repo api] [--force]  # push atl/<slug> of each rw repo to origin (--force: with lease); task defaults to $ATL_TASK
-atl fetch [fix-login] [--repo api]           # git fetch origin in each repo of the task (rw and ro)
-atl pr fix-login          # gh pr create (--repo = origin's, --base = the repo's base branch) per rw repo with pushed commits; status → review
-atl show fix-login [--json]     # task, repos (dirty, commits ahead, last commit, pushed), sessions, notes
-atl show fix-login --notes      # only the notes text (same as atl notes; read-only spelling)
-atl transcript fix-login [--session ID] [--tail N]  # last N (20; 0 = all) turns of a Claude session
-atl note fix-login waiting on design review [--author user|assistant]  # appends "- YYYY-MM-DD [user] waiting on…"
-atl notes fix-login       # print the task's notes text
-atl notes fix-login --set < notes.md   # replace the notes with stdin (an empty stdin is an error)
-atl notes fix-login --clear            # clear the notes
-atl assistant [fix-login] # the atelier assistant (one Claude session for all tasks); attach
-atl done fix-login [--force]    # teardown, remove worktrees and fully pushed branches, kill tmux
-atl cancel fix-login [--force]
-atl doctor                # tools, the workspace and where each setting came from, dirs, database, port offsets shared by two open tasks (in this workspace or across workspaces), the tmux server's config, sandbox mode (static atl binary, Docker, image, token); repos whose config atl refuses to run git with
-atl token [--paste]       # sandbox: run claude setup-token and store its token for task sessions (see Sandbox)
-atl                       # TUI (on a terminal), in the selected workspace; with none selected, the workspace selector
-atl -w shop ls            # any command in workspace shop (--workspace; else $ATL_WORKSPACE, else the current directory)
-atl workspace list [--json]          # workspaces under $ATL_WORKSPACES: name and path; * the selected one
-atl workspace new shop [--repos DIR] [--mount PATH]... [--image IMAGE]   # create (or adopt, reading its .devcontainer/devcontainer.json) $ATL_WORKSPACES/shop
-atl workspace open shop   # the TUI in workspace shop (same as atl -w shop)
-atl workspace open        # the workspace selector, whatever $ATL_WORKSPACE and the current directory say
-```
-
-TUI keys: `n` new task, `enter` open (see below), `s` new session, `r` resume, `a` add repos to the
-selected task, `m` edit the selected task's notes in place (see [Notes](#notes)), `t` rename
-the selected task (an input prefilled with its title; `enter` saves, `esc` cancels), `d` done,
-`c` cancel (both ask first, see below), `p` pr, `D` diff, `A` assistant (about the selected task), `1`-`5` status,
-`/` filter (matches the slug or the title), `w` switch workspace (leaves the TUI for the
-workspace selector, see [Workspaces](#workspaces)), `q` quit (while operations are running it
-waits for them and then quits; `ctrl+c` again forces it; meanwhile `n`, `t`, `a`, `d`, `c`
-and `/` are refused so no input is lost; `w` waits the same way and then switches, `q`
-or `ctrl+c` meanwhile make it a plain quit). The status line shows the workspace's name at
-its right end when there is room. The task list shows each task's title
-(with its session-state dot and `*` for uncommitted changes), truncated to the pane; the slug
-is in the details pane, with the task's notes below the details.
-Repos (in the new-task form and for `a`) are picked from a list of `$ATL_REPOS`: type to
-filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter` confirms, `esc` cancels.
-Repos already in the task are dimmed; `space` on an ro one marks it `[ro→rw]` to upgrade it.
-Choosing a project in the form preselects its repos. The form's Base field toggles
-(`space`, `←`/`→`; `enter` moves on) between "auto (dev → develop → default)" and
-"production patch (default branch)".
-
-`enter` on a task with no openable sessions starts a new Claude session and attaches. If
-the task has openable sessions, it asks instead of guessing: a picker lists "New session"
-first, then the live sessions (any session whose Claude window is still running, even if
-its last hook said it ended, e.g. around `/clear`), then the past ones you can resume
-(ended or stopped, with a Claude session id and a transcript that `claude --resume` run in
-the task dir can find: it still exists and is in Claude's project dir for the task dir, so
-a claude you ran in a subdirectory, or a nested `claude -p`, is not offered; a session
-with no recorded transcript is offered only if atl launched it), each group newest
-activity first. The most recently active session is highlighted, so `enter` continues it
-(`↑` for a new one). Closed (done or cancelled) tasks offer no past sessions. Each row shows
-the state, how long ago it was last active, the conversation title, the window name and,
-if there is room, the last prompt. The title is Claude Code's own (a `/rename` title, else
-the one it generated), else the first prompt, else the window name; it is read from the
-transcript when the picker opens (only the first and last MiB of a large one). `↑`/`↓`
-move, `enter` picks, `esc` cancels and launches nothing. A live session is attached to
-with its window selected (never resumed over); a past one is resumed (`claude --resume
-<id>`, only that one: other stopped sessions are left for `r`) and attached to; "New
-session" works like `s` and attaches. If an open (or `A`) finishes after you moved on to
-something else (the notes editor, a form, the filter, a prompt) or asked to quit, it does
-not attach and steal your keys: the status line says "ready — press enter again" (`A`
-again for the assistant). Plain `atl open` (no flags) keeps its old behaviour
-for scripts: attach if a window is live, else resume the stopped sessions, else start a
-new one. `atl open --session` and `--new` are mutually exclusive; `--session` attaches to
-a session with a live window like the picker, and refuses another task's session, past
-sessions it would not offer (no Claude id, transcript gone or recorded for another
-directory, or no transcript and not launched by atl), and resuming in a closed task.
-
-## Notes
-
-Each task has one free-form notes text (goal, decisions, where you left off, ...). The TUI
-shows it under the task's details, filling the rest of the details pane (wrapped, from the
-top; "(no notes — press m to write)" when empty). `m` turns that area into an editor
-prefilled with the text (until the text has loaded, keys are ignored and `esc` cancels);
-while it is focused every key goes to the editor (`enter` is a new line, arrows move, the
-text scrolls):
-
-- `ctrl+s` saves and leaves the editor. The save only succeeds if the notes are still what
-  the editor started from; if something changed them meanwhile (e.g. an agent ran
-  `atl note`), the editor stays open with your text and the status line says so: `ctrl+s`
-  again overwrites with your text, `ctrl+r` reloads theirs (dropping your edits).
-- `esc` leaves the editor; with unsaved changes it asks first ("discard …? y/n"). While a
-  save is in flight, only edits made after `ctrl+s` count as unsaved: leaving lets the save
-  finish, and "discard" drops only those newer edits. A question stays open until you answer
-  it (`y`, or any other key to go back to editing), even if the save finishes meanwhile.
-- `ctrl+r` reloads the stored text (dropping your edits); `ctrl+c` with unsaved changes asks
-  before quitting (`y` quits).
-- The editor can't hold tabs: saving from the TUI turns every tab in the text into 4 spaces
-  and drops U+FFFD characters (what invalid UTF-8 was stored as); opening such notes says so
-  in the status line. Leaving without changes saves nothing. `atl notes <task> --set` keeps
-  tabs.
-
-The editor stays on the task it was opened for, even if the selection or the list changes
-meanwhile; like other operations it is refused while the task is busy.
-
-`atl note <task> <text...> [--author user|assistant]` appends a line
-`- YYYY-MM-DD [author] text` (today's local date) at the end, so agents and the assistant can
-add to the notes without touching what you wrote. `atl notes <task>` prints the whole text,
-`atl notes <task> --set` replaces it with stdin, and `atl notes <task> --clear` clears it.
-`--set` with an empty stdin (or only blanks) is an error, so an empty pipe by mistake never
-wipes the notes; `--set --clear` accepts an empty stdin (and clears). Only `--set` ever
-reads stdin, and only after the task is found. Notes are capped at 64 KiB; control characters other than newline and tab
-are dropped. Notes work on closed tasks too. Before this, notes were a list of dated entries:
-upgrading folds them into the text, oldest first, as `- YYYY-MM-DD [author] body` lines.
-
-`atl rename` (TUI `t`) changes only the title, on a task of any status: the title is trimmed,
-space runs are collapsed, and an empty title, one with control characters or one longer
-than 200 characters is rejected (`atl new` has the same 200-character cap, and so do the
-TUI's title inputs). Submitting the `t` input unchanged saves nothing, also for an older
-title over 200 characters, which the input shows cut. The slug never changes, so keep using
-it (or the id) to refer to the task. An open task's generated `CLAUDE.md` is rewritten with
-the new title; if its task dir is gone (the task is being closed) nothing is recreated and
-the rename only warns.
-
-`atl new` (TUI `n`) derives the task's slug from the title: lowercase, each run of
-characters other than `a-z` and `0-9` becomes one `-`, at most 40 characters (`task` if
-nothing is left). When that slug is taken, the task gets the first free of `<slug>-2`,
-`<slug>-3`, … (the base cut, without a trailing `-`, so the result stays within 40
-characters). A slug is taken when a task of the workspace has it (open or closed), when
-something is at its task dir `$ATL_TASKS/<slug>` (left as it is), or when branch
-`atl/<slug>`, or a branch below it such as `atl/<slug>/x` (which keeps git from creating
-`atl/<slug>`), exists in the canonical clone of one of the new task's rw repos, as a local
-branch or under `origin/` after the fetch (`atl new` never takes over a branch it did not
-make). After that the slug never changes: `atl add` of a rw repo whose canonical
-clone already has `atl/<slug>` fails and keeps that branch, and reopening a task (below)
-uses its kept `atl/<slug>` on purpose.
-
-`<task>` is a slug, numeric id, or unique slug prefix. atelier pushes only when asked:
-push `atl/<slug>` (yourself, or with `atl push`) before `atl pr`. `atl push` pushes
-nothing but the task branch of the task's rw repos, to `origin`. `atl pr` opens each PR
-in origin's repository (the pinned origin's, see **Origin pin**): with a fork as `origin`,
-the PR is opened in the fork, not upstream. An ssh host alias in origin's URL
-(`git@github-work:org/api.git`) counts as github.com when `ssh -G` says its host name is
-github.com.
-
-`atl done`/`atl cancel` remove each worktree and then delete its `atl/<slug>` branch
-only if no commits on the branch would be lost (the branch's reflog is not kept): every
-commit on it must be reachable from another local branch or a remote-tracking ref (local
-refs only, no fetch), e.g. after you pushed it or when it has no commits of its own. Otherwise the branch is kept and reported
-(`kept branch atl/<slug> in <repo> (N unpushed commit(s))`); `--force` only discards
-uncommitted changes, never unpushed commits. They also refuse, even with `--force`, while a
-worktree's HEAD has commits no branch, remote-tracking ref or tag reaches (a detached HEAD
-or a rebase in progress): put them on a branch first.
-
-In the TUI, `d` and `c` open a dialog that says the task's worktrees and task dir are
-deleted, that files that are not committed cannot be recovered and that commits stay on the
-task branch. When a rw worktree has uncommitted changes it says so, and that they will be
-deleted. To confirm, tick `[ ] Delete them` with `space`, then press `enter`; `esc` or `n`
-closes the dialog and nothing happens. There is no separate force step: a dialog that showed
-uncommitted changes closes the task as `--force` does. If changes appear after a dialog
-that did not show any, the close is refused and the dialog comes back with them. Other
-refusals are shown in the status line.
-
-Setting a done or cancelled task back to an open status (`atl status <task> active`, TUI
-`1`-`3`) reopens it: the task dir, CLAUDE.md and settings come back, and each rw worktree is
-made again on `atl/<slug>`, from the kept local branch, else from `origin/atl/<slug>`, else
-(with a warning: the old commits are not on it) as a new branch from the task's base; the
-project's setup runs again. Nothing is resumed on its own: `enter` starts a new session, or
-offers the past ones whose transcript is still there. If a step fails, nothing is left
-behind and the task stays closed. Moving to done or cancelled with `atl status` (TUI `4`/`5`)
-only changes the status; `atl done`/`atl cancel` (TUI `d`/`c`) do the cleanup above.
-
-`atl show` also prints each session's title (from its transcript; `--json`: `title`,
-`""` when none). It never touches the network: "pushed" means the local remote-tracking ref
-`origin/atl/<slug>` exists (as of your last push or fetch). `--json` prints a stable
-snake_case object (see `internal/cli/info.go`); its `notes` is the notes text as a string
-(it used to be an array of dated notes). `atl transcript` reads the Claude Code
-transcript JSONL recorded by the hooks and condenses it to user/assistant text; tool
-calls become one-line `[tool: Name] …` summaries and tool results are skipped. Notes
-work on closed tasks too.
-
-`atl assistant [task]` (TUI `A`) opens the atelier assistant: a single Claude Code session,
-in tmux session `atl_assistant`, for managing tasks rather than writing code ("what's the
-status of X?", "where did I leave off?", "add repo Y to X"). It runs in
-`<workspace>/data/assistant/` with a generated `CLAUDE.md` (role and `atl` command
-reference, always rewritten) and `.claude/settings.json` (merged): read-only `atl`
-commands (`ls`, `show`, `transcript`, `repos`) and Read/Grep/Glob are allowed,
-every state-changing `atl` command asks first (`atl note` appends; `atl notes --set` replaces
-the notes, and the assistant is told to show you the new text first; `atl notes --clear`
-clears them). All of `atl notes` asks, even plain reads: a permission pattern can't reliably
-tell `atl notes X` from `atl notes X --set` (quoting, `--set=true`, flag order), so the assistant reads notes with
-`atl show <task> --notes` (or `--json`), which is allowed; common repo mutators (`git commit`, `push`,
-`checkout`, `reset`, `rebase`, `merge`, `stash`, `rm`, `mv`, `cp`, `sed -i`, `tee`, ...) are
-denied, and the `atl hook AssistantGuard` PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
-outside that dir (and on its own `CLAUDE.md`, `CLAUDE.local.md`, `.mcp.json` and `.claude/`, in
-any letter case). Bash and MCP
-tools cannot be fully sandboxed; the deny rules cover the common cases so that your global
-allow rules can't let the assistant change repos. It runs `claude --continue` when Claude Code
-has a previous conversation for that dir (a `*.jsonl` under
-`${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<dir with non-alphanumerics as ->`), else `claude`,
-so the conversation survives restarts. With a task, "Let's talk about task <slug>." is passed
-as the initial prompt. Keys are never typed into a running assistant (they could answer a
-pending permission prompt): the sentence is put in the tmux paste buffer instead and a hint
-(stderr, or the TUI status line) says to press `<prefix> ]` to paste it. Concurrent launches
-are serialised by `.launch.lock` in that dir; a session whose `assistant` window is missing or
-dead is replaced. Its tmux window is not tracked
-by atelier: crash recovery, `done` and `cancel` never touch it.
-
-Every `atl` invocation (except `hook`, `statusline` and `doctor`) first marks sessions whose tmux
-window is gone as `stopped`; the TUI also does so every few seconds.
-
-## Base branch
-
-Each rw repo's `atl/<slug>` branch starts from a base branch on origin (after `git fetch
-origin`, unless `--no-fetch`), chosen per task with `atl new --base`:
-
-- `auto` (default): `origin/dev` if it exists, else `origin/develop`, else origin's default
-  branch (`origin/HEAD`, `main` or `master`). Feature work starts from the integration branch.
-- `default` (or `production`): origin's default branch, for production patches.
-- any other value: that exact branch (e.g. `main`, `release/1.2`), which must exist as
-  `origin/<name>` in every rw repo, else `atl new` fails naming the repo and nothing is created.
-  `auto`, `default` and `production` are reserved words: a branch with one of those names
-  cannot be chosen.
-
-The choice is stored on the task, so `atl add` (and TUI `a`) resolves the same way for repos
-added later (tasks created before this choice existed keep origin's default branch). Each repo records the branch it started from: `atl pr` targets it (`gh pr create
---base <branch>`), `atl diff` compares against the commit it started from, the task's
-`CLAUDE.md` says "branched from `origin/<branch>`", `atl show` prints `base origin/<branch>`
-per repo (`--json`: task `base` = `""` auto, `":default"` or the branch name; repo
-`base_branch`), and the TUI details pane shows `← <branch>` per rw repo.
-
-## Workspaces
-
-A workspace is one directory with everything atelier owns for one body of work: its
-tasks, its database, its projects and the settings `atl` runs with. Workspaces live under
-`$ATL_WORKSPACES` (default `~/atelier/workspaces`), one directory each,
-`$ATL_WORKSPACES/<name>/`. A name is lowercase letters, digits, `-` and `_`, starts with a
-letter or digit, and has at most 32 characters. A directory is a workspace when it has an
-`atelier.toml`; without one it is not, whatever else is in it.
-
-```
-$ATL_WORKSPACES/<name>/
-  atelier.toml  the workspace's settings
-  tasks/        task dirs and worktrees (unless ATL_TASKS is set)
-  data/         atelier.db, assistant/
-  config/       projects/<name>.toml
-  state/        hook.log, gate logs, tmux.conf (see Install on the host)
-  run/          gate sockets, task Claude dirs, origin pins, the stored Claude token
-  repos/        canonical clones (unless repos names another directory)
-  gitconfig     optional: the global git config of atl and all it runs
-  tmux.conf     optional: your settings for its tmux server (see Install on the host)
-```
-
-`atelier.toml` is strict TOML: every key is optional, and an unknown key is an error.
+### Projects: `<workspace>/config/projects/<name>.toml`
 
 ```toml
-repos = "/home/you/src/shop"        # canonical clones; relative = to the workspace dir; default "repos"
-git_config = "gitconfig"        # global git config (GIT_CONFIG_GLOBAL); relative = to the workspace dir;
-                                # default "gitconfig" if that file exists, else git's own (~/.gitconfig)
-context = "..."                 # appended to every task session's start context (ATL_CONTEXT)
-tmux_socket = "atl-shop"        # tmux -L name of atl's tmux server; default "atl-<name>"
+setup = "npm ci"                      # sh -c in each rw worktree after creation (on the host)
+teardown = "docker compose down -v"   # sh -c in each rw worktree before removal (on the host)
+image = "shop-dev"                    # task container image, e.g. built FROM atelier-task
 
-[sandbox]
-image = "atelier-task"          # the task container image (ATL_SANDBOX_IMAGE)
-mounts = ["~/.npmrc"]           # host paths every task gets read-only (ATL_SANDBOX_MOUNTS)
-context = "..."                 # what sandboxed sessions get in place of context (ATL_SANDBOX_CONTEXT)
-```
-
-`~/` is your home in `repos`, `git_config` and `mounts`. No secrets go in it: the Claude
-token stays in `run/claude-token.json` (see [Sandbox](#sandbox)).
-
-**Which workspace.** A command that needs one uses the first of:
-
-1. `--workspace <name|path>` (`-w`), on any command;
-2. `$ATL_WORKSPACE`, a name or an absolute path;
-3. the current directory, when it is `$ATL_WORKSPACES/<name>` or inside it (symlinks
-   resolved in both; `atl` does not look for `atelier.toml` up the tree).
-
-With none of them, `atl` alone on a terminal shows the workspace selector (below); any
-other command fails with one line that names these ways and the existing workspaces, and
-`atl doctor` fails its `workspace` check and checks only the tools. A
-selected directory without `atelier.toml` is an error that says to run `atl workspace new
-<name>`. `atl workspace`, help and completion need no workspace, and neither does `atl` in
-a task container (it talks to the task's gate).
-
-**How it is applied.** `atl` sets environment variables in its own process before
-anything reads them, so everything it starts (its tmux server and the windows there, the
-gate, hooks, scripts, `atl diff` from the TUI) has them too:
-
-| setting | variable |
-|---|---|
-| the workspace dir | `ATL_WORKSPACE` (absolute) |
-| `repos` | `ATL_REPOS` |
-| `git_config` | `GIT_CONFIG_GLOBAL` |
-| `context` | `ATL_CONTEXT` |
-| `tmux_socket` | `ATL_TMUX_SOCKET` |
-| `sandbox.image` | `ATL_SANDBOX_IMAGE` |
-| `sandbox.mounts` | `ATL_SANDBOX_MOUNTS` (joined with `:`) |
-| `sandbox.context` | `ATL_SANDBOX_CONTEXT` |
-
-A variable that is already set (not empty) in the environment wins over the file, so a box
-that sets them keeps its values. One that `atl` set itself does not: `atl` records each
-variable it set, with a hash of its value, in `ATL_WORKSPACE_VARS`, and an `atl` started
-with that environment sets those again from the workspace it applies, while their values
-are still the recorded ones. So `atl -w other` run from the assistant's window (or a task
-window with `ATL_SANDBOX=off`; in a task container `atl` does not open workspaces) gets
-`other`'s settings, not those of the workspace the window is in; an `atl` started by `atl`
-follows `atelier.toml` as it is now; and a value you set yourself, even in such a window,
-always wins. Every tmux window `atl` creates gets `ATL_WORKSPACE`, `ATL_WORKSPACE_VARS` and
-the variables of the table (empty when unset; `GIT_CONFIG_GLOBAL` only when set) as its
-own, whatever environment the tmux server started with.
-`atl doctor` shows the workspace, how it was selected, and each setting with its value and
-where it came from: `env`, `atelier.toml` or `default` (a context by its size).
-
-**tmux.** Each workspace has its own tmux server, `tmux -L atl-<name>` unless
-`tmux_socket` says otherwise, so the `atl-<slug>` sessions of two workspaces never meet and
-`atl` never touches your own tmux server. To attach by hand: `tmux -L atl-<name> attach -t
-atl-<slug>`. `tmux_socket = "default"` is tmux's default server, which `atl` used before
-workspaces; sessions running there are not seen from `atl-<name>`, and `atl` would take
-them for stopped and end them. So `atl workspace new` run in a box, adopting that box's own
-workspace (its `ATL_WORKSPACE`) while `ATL_TMUX_SOCKET` is not set, writes `tmux_socket =
-"default"` with a comment, and says so: remove that line once no session runs on the old
-server (e.g. when moving `atl` to the host, see
-[Moving from a devcontainer box](#moving-from-a-devcontainer-box)). Anywhere else it never
-writes it. Opening a task from inside a client of another tmux server (another
-workspace's, or your own) attaches a nested client; from inside this workspace's server it
-switches the client. `atl` starts a
-server of its own with the settings it writes to `state/tmux.conf`, and tmux's default
-server with your own config (see **tmux settings** under
-[Install on the host](#install-on-the-host)).
-
-**git_config.** With `GIT_CONFIG_GLOBAL` set, git reads that file instead of
-`~/.gitconfig`, for `atl` and everything it runs: who commits (`user.name` and
-`user.email`, which task containers get as `GIT_AUTHOR_*` and `GIT_COMMITTER_*`; never the
-file itself), `insteadOf` rules, credential helpers. Without it git uses its own default.
-`atl doctor` warns when `git_config` names a file that does not exist. Neither it nor
-`~/.gitconfig` or `~/.config/git` can be an `ATL_SANDBOX_MOUNTS` path.
-
-**Between workspaces.** All workspaces share the Docker daemon, the host's ports and, when
-their `repos` are the same directory, canonical clones. Task containers and gate sockets
-are named by a hash of the task dir, so those of two workspaces never meet. A new task's
-port offset avoids the offsets of the open tasks of every other workspace (see
-[Environment](#environment)), and its slug avoids `atl/<slug>` branches already in the
-clones of its rw repos (see [Notes](#notes)).
-
-**Commands.**
-
-- `atl workspace list [--json]`: every directory under `$ATL_WORKSPACES` with a valid
-  name: its name and path, one without `atelier.toml` marked "not adopted". `*` marks the
-  selected one (by `-w`, `$ATL_WORKSPACE` or the current directory). `--json` gives `name`,
-  `path`, `adopted` and `current` for each.
-- `atl workspace new <name> [--repos DIR] [--mount PATH]... [--image IMAGE]`: makes
-  `$ATL_WORKSPACES/<name>/` with `atelier.toml`, `tasks/ data/ config/ state/`, and the
-  repos dir when it is inside the workspace. A directory that exists without
-  `atelier.toml` is adopted: its contents are kept, and the settings of the box in its
-  `.devcontainer/devcontainer.json`, when it has one, are taken (see
-  [Moving from a devcontainer box](#moving-from-a-devcontainer-box)). One that has a
-  database (`data/atelier.db`, a box's workspace) needs its repos, from that file,
-  `--repos` or `$ATL_REPOS`, except in that box: the default repos would leave the box's
-  clones behind. It refuses when `atelier.toml` exists, and a name whose task gate sockets
-  (`<workspace>/run/<12 chars>/docker.sock`) would not fit the 107 bytes of a socket path.
-  Each setting comes from the flags, else the box's `devcontainer.json`, else
-  `$ATL_REPOS`, `$ATL_SANDBOX_MOUNTS`, `$ATL_SANDBOX_IMAGE`, `$ATL_SANDBOX_CONTEXT` and
-  `$ATL_CONTEXT` when you set them (not when `atl` did, for the workspace it runs in), so
-  run in a box it writes the box's settings. It prints each setting it writes with where
-  it came from, and what it skipped, on stderr, then the name and the directory.
-- `atl workspace open <name>`: the TUI in that workspace, as `atl -w <name>`. Without a
-  name: the workspace selector, whatever `$ATL_WORKSPACE` and the current directory say
-  (with `-w <name>`, that workspace). Both need a terminal.
-
-**The selector.** A full-screen list of every directory under `$ATL_WORKSPACES` with a valid
-name, as `atl workspace list` shows them: the name and the path (dimmed); a directory
-without `atelier.toml` is dimmed and marked "not adopted". It starts on the workspace whose
-TUI was opened last (recorded in `$ATL_WORKSPACES/.last`; atl ignores it when it cannot
-read or write it), else on the first. Keys: `↑`/`↓` (`k`/`j`) move, `enter` opens the
-workspace, `n` creates one (type its name; `enter` creates it as `atl workspace new <name>`
-does with no flags, and selects it), `/` filters by name, `r` reloads the list, `q` or
-`ctrl+c` quits. `enter` on a directory without `atelier.toml` (or `n` with its name) shows
-what adopting it would write, computed as `atl workspace new <name>` does without flags
-(each setting with where it came from, what it skipped), and nothing is written until `y`
-adopts it; `n` or `esc` cancels. When adopting would be refused (a box's workspace whose
-repos are not found), it says so and how to adopt it instead. Opening a workspace
-replaces the selector with `atl -w <name>`, run in the environment `atl` started with (not
-the one a workspace was applied to), so nothing of one workspace reaches the next. `w` in
-the TUI does the same the other way: once no operation is running, it leaves the TUI and
-runs `atl workspace open` in that environment, on the workspace it left.
-
-A box that sets `ATL_WORKSPACE` to a directory works only once that directory has an
-`atelier.toml`: run `atl workspace new <name>` in the box once (its sessions stay on tmux's
-default server, see **tmux** above).
-
-## Environment
-
-| variable | default |
-|---|---|
-| `ATL_WORKSPACES` | `~/atelier/workspaces` — the workspaces root (see [Workspaces](#workspaces)) |
-| `ATL_WORKSPACE` | unset — the workspace, a name or an absolute path (see [Workspaces](#workspaces)); `atl` sets it to the workspace dir for everything it starts |
-| `ATL_WORKSPACE_VARS` | set by `atl` — the variables it set itself, each with a hash of its value (see [Workspaces](#workspaces)) |
-| `ATL_REPOS` | `repos` of `atelier.toml`, default `<workspace>/repos` — canonical clones, `$ATL_REPOS/<name>` (never edited) |
-| `ATL_TASKS` | `<workspace>/tasks` — task dirs, `$ATL_TASKS/<slug>/` |
-| `ATL_TMUX_SOCKET` | `tmux_socket` of `atelier.toml`, default `atl-<name>` — the tmux socket name (`tmux -L`) of atl's tmux server |
-| `GIT_CONFIG_GLOBAL` | `git_config` of `atelier.toml`, default `<workspace>/gitconfig` if it exists, else unset (git's `~/.gitconfig`) |
-| `ATL_BIN` | the running binary — `atl` path written into hook commands |
-| `ATL_CONTEXT` | unset — extra text appended to every task session's start context (max 1000 bytes; atl refuses to start if longer) |
-| `ATL_SANDBOX` | unset (on) — each task's sessions run in the task's own container (see [Sandbox](#sandbox)); unset, empty and `docker` mean on, `off` switches it off (going away), anything else is an error |
-| `ATL_SANDBOX_IMAGE` | `atelier-task` — the task container image, unless the task's project names one (see [Docker image](#docker-image)) |
-| `ATL_SANDBOX_CONTEXT` | unset — what sandboxed sessions get in place of `ATL_CONTEXT` (same limit) |
-| `ATL_SANDBOX_MOUNTS` | unset — host files and directories every task gets read-only, `:`-separated absolute paths like `PATH` (`~/` is your home); see **Host files for every task** under [Sandbox](#sandbox) |
-| `CLAUDE_CODE_OAUTH_TOKEN` | unset — with the sandbox on, the token (`claude setup-token`) that sandboxed sessions log in with; when set it wins over the one `atl token` stored |
-| `ANTHROPIC_API_KEY` | unset — with the sandbox on, an API key for sandboxed sessions instead of a token (also wins over the stored one) |
-
-`ATL_CONTEXT` and the `ATL_SANDBOX_*` settings also come from `atelier.toml` when they are
-not set; a variable set in the environment wins over the file (see
-[Workspaces](#workspaces)). `atl doctor` prints the workspace, every setting with where it
-came from, and every path it resolved.
-
-Claude windows and scripts get `ATL_TASK`, `ATL_TASK_DIR`, `ATL_PORT_OFFSET`
-(0, 100, 200…, see below) plus the project's `env`; scripts also get
-`ATL_REPO`, `ATL_WORKTREE`, `ATL_BRANCH`.
-
-**Port offset.** `atl new` gives the task the lowest multiple of 100 (from 0) that no open
-task (backlog, active or review) has, in this workspace or in any other: every workspace
-binds the same host's ports. The other workspaces are the directories under
-`$ATL_WORKSPACES` with a workspace name and a `data/atelier.db`, with or without
-`atelier.toml`; their databases are only read. One that cannot be read (locked for more
-than 2 seconds, not a database, written by an `atl` with another schema version) is
-skipped with a warning, and its offsets are not avoided. The offset is kept until the task
-is closed, and reopening a task gives it its old one back, even when another open task has
-it by then. Two workspaces creating a task at the same moment can still pick the same
-offset; `atl doctor` warns about every open task that has the same offset as an open task
-of another workspace, naming both (`personal/fix-login and work/api-docs (+300)`): close one of
-them (new tasks avoid both offsets). It also warns about two open tasks of this workspace
-with the same offset (`personal/fix-login and personal/old-task (+300)`, after a reopen). A
-devcontainer box sees only its own workspace under `$ATL_WORKSPACES`, so there the other
-workspaces' offsets are not avoided, and doctor says it read none (see
-[Moving from a devcontainer box](#moving-from-a-devcontainer-box)).
-
-## Sandbox
-
-Each task gets its own Docker container, and its Claude sessions run there, not next to
-`atl`, where they could reach everything `atl` can: in the Docker image that is the host's
-Docker socket, your SSH agent, every repo and every other task. `atl` stays where it is and
-is the only thing that talks to the Docker daemon directly. This is the default; there is
-nothing to switch on.
-
-`ATL_SANDBOX=off` (a setting of the workspace, so of the box) switches it off: sessions
-run next to `atl` again, as they did before the sandbox. It is a way out while the sandbox
-is new, and it is going away, so do not build on it. Unset, empty or `docker` mean on; any
-other value is an error, and `atl` does not start. `atl doctor` says which mode is on.
-
-When Docker cannot be reached, starting a session fails, and `atl doctor` fails, with one
-line that gives docker's reason and says what to do: start Docker or give `atl` access to
-it, or set `ATL_SANDBOX=off`.
-
-```
-atl (box)  ── docker exec ──▶  task container atl-<slug>-<hash>   one per task
-   │                              claude, your tools, the task dir
-   └─ atl gate <slug>  ◀── /run/atl/docker.sock ── docker / docker compose in the task
-          │  │         ◀── /run/atl/atl.sock ───── atl hook / statusline / note / notes /
-          │  │                                     push / fetch, wl-copy in the task
-          │  └──▶ atelier's database, hook log     (this task's rows only)
-          ▼
-     Docker daemon
-```
-
-A task container sees, at the same paths as `atl`: the task dir; the git database
-(`.git`) of each rw repo's clone, which the worktree needs and which every task with that
-repo rw shares (so such tasks can reach each other, see the first item of what the sandbox
-does not do yet); each ro repo, read-only; the task's own Claude Code config dir (see
-below); and what `ATL_SANDBOX_MOUNTS` lists, read-only (see **Host files for every task**
-below). It does not see the Docker socket, the SSH agent, other repos, other tasks' dirs,
-your Claude Code config dir (login, settings,
-other sessions' transcripts), nor atelier's database, state dir (hook log, gate logs) or
-config dir (projects). It is created on the task's first session, reused by later ones (so what a
-session installs is there for the next), restarted after a reboot and removed by `atl
-done`/`atl cancel`. When the task's repos change (`atl add`), it is replaced the next time
-a session starts while no other session runs in it; `atl add` says so when sessions are
-running in it now, since those do not see the new repo (a running container cannot get
-another mount): close them, then start or resume a session.
-
-**atl in the container.** The hooks, the status line, `atl note` and `atl notes` work in a
-task container without the database: they send their input to the task's gate on
-`/run/atl/atl.sock`, and the gate answers them itself, from the database where `atl` runs,
-with the same code as outside (same session states, read-only guard, start context and
-output). The gate knows its task by database id, set when it starts, and reads and writes
-that task's rows only: the session ids, Claude session ids, working directory and
-`ATL_TASK` a hook brings can only pick among this task's sessions, a Claude session id
-that another task's session has is refused, and the start context and status line are
-always this task's. Hook errors go to `hook.log` where `atl` runs, as before. A hook whose
-gate cannot be reached fails open with the error on stderr (an oversized `PreToolUse`
-input is still refused). For `atl notes` and `atl note` the task must be the container's
-own (`$ATL_TASK`); every other `atl` command says in one line that it does not work in a
-task container. A gate started by an older `atl` binary, with another `ATL_SANDBOX_MOUNTS`,
-or for a task that was deleted since, is replaced the next time `atl` starts a session in
-the task.
-
-The tmux window of a session runs `docker exec` into the container, so everything else
-(session states, crash recovery, resume, the picker) works as before. When the window dies
-before Claude does (it is closed, or tmux or the box restarts while the task containers
-keep running), Docker leaves what it started running in the container; `atl` ends it (every
-process there with the session's `ATL_SESSION`, Claude's children included) when it
-notices the window gone, which it checks when it starts, and again right before it resumes
-the session.
-
-Claude in the container gets the window's size from `docker exec`, which reads it when it
-starts and then follows the window's resizes, but loses one that comes while it is still
-starting (Claude would then keep a detached window's 80x24 in a larger terminal). So a
-window `atl` attaches your terminal to right away (`atl open`, Enter in the TUI) starts
-`docker exec` only once the terminal is attached (or after 10 seconds), and every window
-has `docker exec` send the size once more 1, 3 and 7 seconds after it started.
-
-**Copying.** Claude Code's fullscreen mode selects with the mouse itself and copies on
-release. Next to `atl` it copied through tmux to your terminal's clipboard; a task
-container has neither tmux nor a clipboard tool, so the copy went nowhere. The container
-gets a copy relay instead: `wl-copy` there is `atl` (a link next to it in the run dir,
-first on `PATH`), and sessions run with `WAYLAND_DISPLAY=atl-copy-relay`, without which
-Claude Code would not use `wl-copy`. That names no socket: other Wayland programs in the
-container fail to connect, as without a display. Claude Code takes it for a display,
-though, so for a link or an MCP server's sign-in it tries to open a browser (`xdg-open`,
-which the default image has not), then says it could not and shows the URL.
-`wl-copy` sends the text to the task's gate on `/run/atl/atl.sock`, and the gate puts it
-in a tmux paste buffer and, with `tmux load-buffer -w`, in the clipboard of the terminal
-attached to the task's tmux session (the one used last, if several are), as Claude Code
-did itself in tmux. As before, that takes a terminal that accepts OSC 52 and that tmux
-knows accepts it (tmux assumes so for `xterm*`; add others to `terminal-features`),
-whatever tmux's `set-clipboard` says: `load-buffer -w` sends the text with it `off` too
-(checked with tmux 3.5a). With no terminal on the task's session, nothing is copied. A
-copy is at most 1 MiB; the gate log gets its time and size, never the text.
-`wl-copy --primary`, which Claude Code runs right after with the same text, copies nothing.
-Scripts in the task can use `wl-copy` too (text on standard input or as arguments,
-`--trim-newline`). The relay only writes: `wl-paste` is refused and nothing in the task
-reads your clipboard (so pasting an image from it into a sandboxed Claude does not work;
-pasting text with your terminal does).
-
-A session that ends normally (Claude exits, the window closes) is ended the same way: what
-it started that still runs in the container (a dev server it put in the background, say)
-is ended once Claude is gone. The gate does it when Claude's `SessionEnd` hook records the
-end, and `atl` does it wherever else it records a session as ended. A session that still
-runs (after `/clear`, which reports an end too) and the task's other sessions are left
-alone. What should outlive a session belongs in a Docker service (`docker compose`); the
-session's start context says so.
-
-**Claude Code in the container.** Your Claude Code login stays where `atl` runs. Sessions
-in a task log in with a token instead:
-
-1. Run `atl token` where `atl` runs (it needs a Pro, Max, Ultra, Team or Enterprise
-   plan). It runs `claude setup-token` in a tmux window you are attached to: open the URL
-   it shows, approve access in the browser (paste the code back if it asks), and press
-   Enter when the token is on the screen. `atl` reads the token from that screen and
-   stores it in `<workspace>/run/claude-token.json`, mode 0600, a place no task container
-   sees; the window and its scrollback are removed. If `atl` cannot pick out exactly one
-   token of the expected shape (`sk-ant-oat01-…`) there, it asks you to paste it, without
-   echo. `atl token --paste` stores a token you already have the same way (read from the
-   terminal without echo, or from standard input).
-2. Or put a token in the environment `atl` runs in as `CLAUDE_CODE_OAUTH_TOKEN`, e.g. in
-   `containerEnv` of the devcontainer, or `remoteEnv` from a variable of your host:
-   `"CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}"`. An API key in
-   `ANTHROPIC_API_KEY` works too (Claude Code prefers it when both are set). Either
-   variable, when set, wins over the stored token.
-3. `atl doctor` says where the token comes from (the environment or the file) and, for a
-   stored one, when it was stored and how old it is. The token lasts a year: doctor warns
-   from 30 days before that, and fails after it; run `atl token` again then. (The age
-   counts from when `atl` stored it: a token pasted with `--paste` may be older.) Without
-   any token, starting a sandboxed session fails with one line that names `atl token`.
-
-`atl` hands the token to each session by name: the tmux server gets it from `atl`'s own
-environment or the stored file (read on its standard input, not from a command line) and
-`docker exec -e CLAUDE_CODE_OAUTH_TOKEN` passes it on. So it is on no command line, not in
-the container's stored configuration, and a new token reaches the next session without a
-new container. `atl` never prints it. A token-authenticated session can only make model
-requests: claude.ai connectors and Remote Control are not available in it.
-
-Each task has its own Claude Code config dir, `<workspace>/run/claude/<hash>`, mounted at the same path in that
-task's container only and set as `CLAUDE_CONFIG_DIR` there. It holds what Claude Code
-keeps: its state file, the task's transcripts (so `claude --resume` works across a new
-container), history. When a new container is created for the task, `atl` refreshes in it
-copies of your own setup from your config dir (`$CLAUDE_CONFIG_DIR`, else `~/.claude`),
-whichever of these exist: `settings.json` (without `apiKeyHelper` and the other settings
-that run a program for credentials, and without the variables of its `env` block whose
-name, in any case, contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or
-`AUTH`, or starts with `AWS_`), `CLAUDE.md`, `keybindings.json`, `skills/`, `agents/` and
-`commands/`. What is copied, the other `env` variables included, the task can read. They
-are copies: a task can change its own, never yours, and a change of yours reaches a task
-with its next new container. `atl` also sets in the task's
-state file (`.claude.json`) that onboarding is done (with your theme), that the task dir is
-trusted and, with an API key, that the key is approved, so no first-start screen
-shows. Not carried over: your login (`.credentials.json`), your state file (account, your
-own MCP servers and their settings, project trust), transcripts and `projects/`, plugins,
-other files your settings may point to (hook or status line scripts in `~/.claude`), and
-claude.ai connectors. Add MCP servers a task needs to the repo's `.mcp.json` or install
-them in the session.
-
-A hook's `transcript_path` comes from the task: the gate records it only if it lies in the
-task's own Claude dir (symlinks resolved), and logs and ignores any other. Since the task
-can change what is there afterwards, `atl show`, `atl transcript` and the picker read a
-transcript only from the task's Claude dir or yours (where sessions with the sandbox off
-keep theirs), as described under **Files a task can write** below. They read it as a
-stream, holding one line at a time (a line over 32 MiB is skipped) and the turns they
-show, so its size does not decide how much memory `atl` takes. `atl done` and
-`atl cancel` empty the task's Claude dir except its transcripts (`projects/`, symlinks and
-other special files in it removed), which `atl show` and `atl transcript` still read for
-closed tasks; delete the dir yourself when you no longer need them. Sessions started with
-the sandbox off (before it was the default, or with `ATL_SANDBOX=off`) kept their
-transcripts in your own config dir, which the container does not see: they cannot be
-resumed in it.
-
-**Files a task can write.** Where `atl` itself reads or writes files the task can write
-too (the task dir's `CLAUDE.md` and `.claude/`, the task's Claude dir and transcripts, the
-files of a worktree the dirty check hashes), it follows no symlink, neither on the way nor
-at the end, reads only regular files and never waits on a pipe: what a task plants there
-cannot make `atl` read or write anything else. A
-`.claude/settings.json` that is a symlink or not a regular file is replaced without being
-read, and a `.claude` that is a symlink makes the session launch fail.
-
-**Tools.** The image of a task's container is the project's `image = "..."` (in its
-toml), else `ATL_SANDBOX_IMAGE`, else `atelier-task`, the default task image (see
-[Docker image](#docker-image) for how to build it and what it has). When the default image
-is not on the Docker daemon, starting a session fails, and `atl doctor` fails, with one
-line that gives the command to build it; another image that is missing is left to docker
-to pull, and if that fails the launch says so in one line. An image needs `claude` and
-`sh`, and should have the user that runs `atl` (same name, uid and home directory, as
-atelier's images have), so that what the task writes in the task dir and its Claude dir
-stays yours.
-
-The default image has Node.js and no other language (see [Docker image](#docker-image)). A
-repo with its own container setup (a `.devcontainer`, compose files, or one its docs or
-`CLAUDE.md` describe) is built, tested and run in that setup, with `docker` and `docker
-compose` through the gate (see **Docker** below); the session's start context tells it so.
-When that setup asks for something the gate refuses (a mount from outside the task dir, such
-as `~/.npmrc` when `ATL_SANDBOX_MOUNTS` does not list it, a privileged service, a Dockerfile
-that needs BuildKit), the session does not
-edit the repo: it overrides that part with a file in the task dir (for compose, an override
-file passed with `-f`) and tells you what it overrode. The project's `image` is for repos
-without such a setup, or for tools Claude should have next to it: a project that needs Go,
-Python, a C toolchain or anything else there names an image that has it.
-Sessions can run whatever the image has and install more: as the image's ordinary user
-`npm install -g` and the like; for system packages (a language included) the task may be
-root in its own container: `docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`.
-But what is installed by hand lives in the container only, and is gone when the task's
-container is replaced (after a change of the task's repos or image): what a project keeps
-needing belongs in its own `image`, e.g. one built `FROM atelier-task`. The session's start
-context says so too.
-
-**Docker.** `docker` and `docker compose` in a task talk to the task's *gate*, not to the
-daemon. The gate (`atl gate <slug>`, started by `atl` and stopped when the task closes;
-log in `gate-<slug>.log` next to `hook.log`) forwards only what a task may do:
-
-- everything the task creates gets the label `atelier.task`; the task lists, inspects,
-  stops and removes only what carries its own. Each container or network a call names (in
-  the path or in the request: a network mode, volumes from, endpoint settings, network
-  connect) is checked and forwarded by the full ID the check found, so a name that comes
-  to mean something else by the time Docker reads it (Docker also takes a unique ID
-  prefix for a name) never reaches another object; volumes are named exactly, and a volume
-  delete of the task waits while another of its requests that names a volume (a container
-  create, an inspect) is between its check and Docker's answer, so Docker never makes the
-  container a fresh volume of that name without the label, and a delete never reaches
-  another task's volume that took the name in between;
-- bind mounts must come from the task dir (symlinks resolved), or, read-only only, from what
-  `ATL_SANDBOX_MOUNTS` lists (see **Host files for every task** below); a mount of
-  `/var/run/docker.sock` becomes a mount of the gate's socket, so tools that drive Docker
-  themselves (localstack, testcontainers) stay inside the same rules;
-- privileged mode, host network/PID/IPC, added capabilities, devices, security options,
-  other runtimes, volume driver options and log drivers other than `json-file`, `local` and
-  `none` (the others send logs to an address from where the daemon runs) are refused; a
-  container setting the gate does not know is refused too;
-- images are shared: a task may pull and build, not remove; a build from a remote URL
-  (`docker build <git or https URL>`) is refused, since the daemon would fetch it with the
-  host's credentials: build from a local context;
-- the task's own container is joined to every network the task creates, so services
-  answer by their compose service name; the task cannot stop or remove that container.
-  Names in its pattern (`atl-<slug>-<hash>`, in any case, with or without Docker's leading
-  slash) are atl's: a task can neither create a container under one nor rename one to it.
-  A request whose body is a form is refused (Docker would read its values ahead of the
-  query, which is what the gate checks: a new name, a build's remote, a pull's source).
-
-`atl` itself uses, replaces and removes a task's container only if it carries the label
-`atelier.agent=<id>` that `atl` gave it and no `atelier.task` label (a container a task
-creates always has that one; it can get `atelier.agent` from its image). Should a
-container of that name be something else, starting a session fails with one line that
-names it, and `atl` leaves it alone (also at `atl done`): remove or rename it yourself.
-Once checked, `atl` addresses the container by its full ID (the session's `docker exec`
-included), not by its name.
-
-`atl done`/`atl cancel` remove what the task left on the daemon (containers, networks,
-volumes).
-
-**Host files for every task.** Some repos need a file from your host to build, such as an
-`.npmrc` with the credentials of a private npm registry. `ATL_SANDBOX_MOUNTS` lists such
-files and directories: absolute paths separated by `:`, like `PATH` (empty entries are
-ignored, `~/` is your home directory), e.g. `ATL_SANDBOX_MOUNTS=~/.work.npmrc`. Every
-task's container has each of them read-only, at the same path, and the gate lets a container
-the task creates bind-mount one, or a path inside a listed directory, read-only only: a
-request to mount it read-write (a compose file's `~/.npmrc:/home/node/.npmrc` without
-`:ro`, say) is made read-only, which the gate log notes, and the relabel options `z`/`Z` are
-dropped. Every task can read what is listed, whatever its file permissions say (a task may
-be root in its own container), and so can whatever runs in it: list only what you would
-hand to any task. Read-only stops writes, not reads, and not connecting to a socket that
-sits in a listed directory.
-
-`atl` resolves each path's symlinks once, when it starts, and uses the result everywhere.
-It can only check the box: Docker resolves bind-mount sources on the host, so each path
-must exist at the same path there too (as the workspace and repos do), or the task's
-container cannot be created. `atl` refuses to start, in one line that names the path and the
-rule, when a path is not absolute, does not exist, is not a file or directory, has a comma
-or quote in it (docker's `--mount` cannot take one), is `/`, or is, contains or lies inside
-what the sandbox keeps from tasks: the workspace (without one, atelier's data, state and
-config dirs), the run dir (gate sockets, task Claude dirs, origin pins, the stored token),
-`ATL_REPOS`, the tasks dir, your Claude Code config dir, your git config
-(`GIT_CONFIG_GLOBAL`, `~/.gitconfig`, `~/.config/git`), the Docker socket, the SSH agent's
-socket, `/proc`, `/sys` or `/dev`. `atl doctor` lists the paths and names each one that is
-missing or refused, and why. A sandboxed session's start context names them in one line
-(cut, saying how many more, when the list is long). A changed list reaches a task the next
-time a session starts in it: its gate is replaced then, and its container too once no
-session runs in it (as after `atl add`).
-
-What the sandbox does not do yet:
-
-- A task can run code in every other task that has the same repo read-write. Both mount
-  that repo's clone (`.git`, with its hooks and config) read-write, so a hook,
-  `core.hooksPath`, `core.fsmonitor` or filter one task writes there runs in the other
-  task's container the next time git runs there. From there it reaches that task's
-  worktree, its Claude dir (transcripts), its token and its gate (`atl push`/`atl fetch`
-  of its branch, its notes). Tasks that share an rw repo are not kept apart.
-- The task can read Claude Code's token (or API key), which its sessions need to work:
-  what runs in the task can use it to make model requests on your account, also from
-  elsewhere, until you revoke it.
-- The git database of a task's rw repos is writable from the task (other branches, hooks
-  and config of that clone included). Only `atl`'s own git, where it runs, is guarded
-  against that config (see **Git where atl runs** below), with one limit there; git in a
-  task's container is not (see the first item).
-- A task can swap a checked mount path for a symlink before the daemon mounts it.
-- After the gate is restarted (`atl` upgraded, box restarted), services a task started with
-  the Docker socket mounted (localstack, testcontainers) need to be recreated.
-- Notes and transcripts a task writes reach the assistant where `atl` runs (`atl notes`,
-  `atl transcript`) as prompt input.
-- A task can write your clipboard (never read it), up to 1 MiB at a time, while a
-  terminal of yours is on its tmux session (see **Copying** above): what runs in the task
-  can plant a command there for you to paste elsewhere, also in place of what you just
-  copied. Read what you paste into a shell.
-- Only the classic image builder goes through the gate (`DOCKER_BUILDKIT=0` is set in the
-  task); BuildKit sessions are refused.
-- Tasks can bind any free host port, and there is no network egress policy.
-- Project setup and teardown scripts still run where `atl` runs.
-- `gh` and plain `git push`/`git fetch` have no credentials in a task: pushing and
-  fetching go through `atl push`/`atl fetch` (see Git below), and `atl pr` runs where
-  `atl` runs.
-
-It needs a static Linux `atl` binary, a token for Claude Code (above), the workspace, the
-repos and what `ATL_SANDBOX_MOUNTS` lists at the same paths for `atl` and the Docker
-daemon, and a workspace path short enough for the gate's socket
-(`<workspace>/run/<12 chars>/docker.sock`, at most 107 bytes). `atl doctor` reports the
-mode and checks the `atl` binary (a static Linux one, see
-[Install on the host](#install-on-the-host)), the daemon, the image, the token and
-`ATL_SANDBOX_MOUNTS`.
-
-**Session context.** A sandboxed session's start context has a built-in note on the
-sandbox (a repo's own container setup first, else tools run here; what the Docker gate
-refuses and how to override a repo's setup for it; `atl push`/`atl fetch` for git), and a
-line that names what `ATL_SANDBOX_MOUNTS` lists; that line gives way to the notes when room
-is short.
-`ATL_CONTEXT` is *not* passed to task containers: it describes the place `atl` runs in,
-and rules for a shared box ("run everything through docker", "never mount ...")
-contradict a task's own container. Put
-what sandboxed sessions should know in `ATL_SANDBOX_CONTEXT` instead; `ATL_CONTEXT` still
-reaches whatever runs next to `atl` (the assistant, and tasks when the sandbox is off).
-
-**Git.** Commits work in the task container and land on the task branch. Your git config
-is not given to the container (it may hold credentials); only `user.name` and
-`user.email` are, as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`.
-
-There are no push or fetch credentials in a task (no SSH agent, no `~/.ssh`), so plain
-`git push`, `git fetch` and `gh` fail there. Instead a session runs `atl push` (when you
-tell it to push) and `atl fetch` (to rebase on fresh remote branches). In the container
-these open nothing: they send a request to the task's gate on `/run/atl/atl.sock`, and the
-gate runs `atl push` or `atl fetch` for its task where `atl` runs (naming the task by
-database id and exact slug, so no other task can be taken for it), with your SSH agent,
-`~/.ssh/config` and git credentials, and passes the output and exit status back. The
-request can only name the operation, one of the task's repos and `--force`; the task is
-always the gate's own. So an agent can push its own branch, and cannot push `main`, tags
-or another task's branch through its gate (a task that runs code in another task that
-shares its rw repo, see above, uses that task's gate). Requests and refusals are in the gate log; a push may take its
-time (up to 10 minutes), e.g. while your SSH key waits for a touch.
-
-A push asked from a task runs without a terminal, so an SSH key that needs a PIN or a
-passphrase typed at a prompt fails there (push from your own shell then); a key that only
-needs a touch works, though this has not been tried with a hardware key yet.
-
-**Git where atl runs.** `atl` itself runs git in the task's repos where it runs, next to
-your SSH agent and the Docker socket: `git status` for the dirty marks and `atl show`/`atl
-done`, `git diff` for `atl diff`, `worktree add`/`remove`, branch cleanup, the remote
-check of `atl pr`, push and fetch. A repo's config can name programs git then runs
-(`core.fsmonitor`, hooks, an ssh command, filters, ...), and that config is the task's to
-write. This holds whether the sandbox is on or not (the plan is for it to be the only
-mode), and it is done three ways:
-
-- Every git `atl` runs is told not to: `--no-pager`, no fsmonitor, no hooks (the hooks
-  directory and every hook configured in git config), no submodule recursion, no
-  automatic gc, no editor, no lazy fetch from a partial clone's promisor remote, and no
-  transport at all except for push, fetch and the remote check, which use your own
-  credential helpers, askpass and ssh command, never the repo's (`ext::` remotes and
-  bundle URIs off). `atl diff` runs no external diff or textconv program and shows a
-  submodule as its commit only. `gh pr create` (for `atl pr`) runs outside the worktree
-  with `--repo` set to the pinned origin's GitHub repository, so it neither reads the
-  repo's remotes nor runs git in it.
-- Where git would read a file through a filter (a `filter.<name>.clean` program the
-  config names), `atl` gets its answer without git doing so: the dirty check compares the
-  worktree with the index itself (stat data, and the file's hash where that is not
-  conclusive); `atl done` and `worktree remove` use that check instead of git's. A file
-  touched without a change reads as clean; one whose content is converted on checkout
-  (a filter, `eol`, `text`, `working-tree-encoding`) and whose stat data changed reads as
-  dirty, which is the safe answer.
-- What cannot be avoided is checked right before, reading the config with the same
-  command-line settings as the command, and refused: `atl diff` (it reads changed
-  files through the filters) and the checkout of `atl new`/`atl add` refuse while the repo's
-  own config (its `.git/config` or a worktree's `config.worktree`) defines a filter
-  program; the exact filter commands `git lfs install` writes are let through. With
-  git-lfs on, the checkout may download, so it is also refused while the
-  repo's own config has git-lfs settings (other than `lfs.repositoryformatversion` and
-  `lfs.<url>.access`/`locksverify`), `http.*` settings or URL rewrite rules, or its origin
-  is not the pinned one. Push, fetch and the remote check are refused while it has
-  `url.<base>.insteadOf`/`pushInsteadOf` rules, or `http.*` settings for an https origin.
-  All of these (`atl diff`, the checkout, push, fetch and the remote check) are also
-  refused while the repo's own config includes another file (`include.path`, or
-  `includeIf.<condition>.path` whatever its condition): what a conditional include brings
-  in can depend on what differs between the check and the command (the remote the
-  command defines, the branch, the git dir).
-
-The task can also replace its worktree, `<task dir>/<repo>`, with a symlink or point the
-worktree's `.git` file into another repo. So before `atl` runs git or a project script in
-a worktree (`atl push`, `atl fetch`, `atl pr`, `atl diff`, `atl show`, the dirty marks, the
-teardown and worktree removal of `atl done`/`atl cancel`), it checks that the path is a
-directory, not a symlink, and a worktree of that repo's canonical clone; if not, the
-command fails for that repo naming the path (the dirty marks skip it), and `atl
-done`/`atl cancel` refuse, or with `--force` close the task and leave the path alone. Push,
-fetch and the remote check of `atl pr` then run in the canonical clone itself, which the
-task cannot swap.
-
-A refusal names the repo, the setting and its value, prints a warning, and is logged in
-`refused.log` in the state dir (next to `hook.log`, which no task container sees). `atl
-doctor` lists, per repo, the settings it would refuse on now. Settings `atl` overrides
-anyway (a husky `core.hooksPath`, `core.fsmonitor=true`, your own `core.sshCommand` in a
-repo) are not listed. Remove the setting and run the command again.
-
-The limit: a check and git's own reading of the config are two moments, so a task
-rewriting its config in a tight loop could slip a setting in between. Also, git cannot
-fetch a missing object for `atl` (the promisor remote is the config's to choose), so a
-partial clone (`clone --filter`) cannot be an rw repo: the checkout of `atl new` fails.
-
-**Origin pin.** Push and fetch do not go wherever the repo's `origin` points now. `atl`
-pins each repo's origin URLs (fetch and push, as the config says them, before any
-`insteadOf` rule) in `<workspace>/run/origins/<repo>.json`, a place no task container sees, and pushes and
-fetches there, through a remote defined on the command line under a random name; your own
-`insteadOf`/`pushInsteadOf` rules (in your global git config, see [Workspaces](#workspaces)) apply to it then, once.
-`refs/remotes/origin/*`, `refs/remotes/origin/HEAD` (created when missing, as `git
-fetch` does since git 2.48) and `--force-with-lease` work as before. `atl new` and `atl
-add` fetch the pinned origin the same way before branching. The pin is written once per
-repo (clones are shared between tasks), the first time `atl` needs it: at `atl new`/`atl
-add`, before the container of a task using the repo starts, or at the first `atl
-push`/`atl fetch`, whichever comes first. That is trust on first use: the URL is whatever
-the clone said at that moment, and `atl` never rewrites it on its own. When the repo's
-config says something else later, `atl` uses the pin and prints a warning naming both; to
-accept the new URL, run `atl repos pin <repo>` (where `atl` runs; not from a task).
-
-## Projects
-
-`<workspace>/config/projects/shop.toml`:
-
-```toml
-setup = "npm ci"                          # sh -c in each rw worktree after creation
-teardown = "docker compose down -v"       # sh -c in each rw worktree before removal
-image = "shop-dev"                        # task container image (see Sandbox)
-
-[env]
+[env]                                 # added to sessions and scripts
 COMPOSE_PROJECT_NAME = "shop"
 
 [[repos]]
 name = "api"
-mode = "rw"     # git worktree on atl/<slug>
+mode = "rw"
 
 [[repos]]
 name = "docs"
-mode = "ro"     # not a worktree: passed to claude with --add-dir, edits blocked
+mode = "ro"
 ```
 
-## Hooks
+### Environment variables
 
-atelier writes `<taskdir>/.claude/settings.json` (merged with any existing keys) with
-hooks that run `atl hook <event>` for SessionStart, UserPromptSubmit, Notification,
-PostToolUse, Stop, SessionEnd and PreToolUse, and a `statusLine` that runs
-`atl statusline` (see [Status line](#status-line)). The file is rewritten before every
-Claude launch (new session, resume, `open --session`), so the `atl` path stays current and
-existing tasks pick up new entries on their next launch; your own keys and hooks in it are
-kept. Your global `~/.claude/settings.json` is never touched (only read, for its
-`statusLine`). They keep session state current
-(`running`, `waiting` on permission prompts, `idle`, `ended`; `stopped` comes from
-crash recovery) and record each session's transcript path, and the PreToolUse hook blocks Edit/Write/MultiEdit/NotebookEdit
-on paths inside read-only repos, and inside the original clone (`$ATL_REPOS/<name>`) of the
-task's rw repos, whose edits belong in the worktree. Hook failures never block Claude (except the
-read-only guard) and are logged to `hook.log` (in a sandboxed task the gate runs them, see
-[Sandbox](#sandbox)). The assistant's `AssistantGuard` hook
-(see above) fails closed: input it cannot inspect is refused.
+A variable set in the environment wins over `atelier.toml`.
 
-On SessionStart (startup, resume, `/clear`, compaction) inside a task, `atl hook
-SessionStart` also prints Claude Code's `hookSpecificOutput.additionalContext` JSON with
-fresh task context (title, status, branch, repos with their base branch or read-only
-warning, `ATL_PORT_OFFSET`, the notes text; at most 2500 bytes), so a session
-sees current notes without any file being rewritten. If the notes don't fit, their end is kept
-(appended notes are the newest), cut at a line start, after "… (earlier notes truncated;
-`atl notes <slug>` for all)". If `ATL_CONTEXT` is set in the hook's
-environment (e.g. a devcontainer's `containerEnv`: "no language runtimes here; run tests
-inside each repo's container via docker"), its text (newlines kept, up to 1000 bytes) is added
-as an "Environment notes" section before the notes. A longer `ATL_CONTEXT` makes `atl` (and
-`atl doctor`) fail with its size; the hook itself only cuts it, so a session never loses its context. This is the only hook output on
-stdout; if the context cannot be built the error goes to `hook.log` and nothing is printed.
+| variable | default | meaning |
+|---|---|---|
+| `ATL_WORKSPACES` | `~/atelier/workspaces` | the workspaces root |
+| `ATL_WORKSPACE` | from the current directory | the workspace: name or absolute path |
+| `ATL_REPOS` | `repos` | canonical clones |
+| `ATL_TASKS` | `<workspace>/tasks` | task dirs |
+| `ATL_TMUX_SOCKET` | `tmux_socket` | tmux server name |
+| `ATL_CONTEXT` | `context` | see `context` |
+| `ATL_SANDBOX` | on | `off` runs sessions next to atl, unsandboxed (temporary escape hatch; going away). Anything but unset, empty, `docker` or `off` is an error |
+| `ATL_SANDBOX_IMAGE` | `[sandbox] image` | task image (also read by `build-images`) |
+| `ATL_SANDBOX_MOUNTS` | `[sandbox] mounts` | `:`-separated absolute paths |
+| `ATL_SANDBOX_CONTEXT` | `[sandbox] context` | see `[sandbox] context` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | the token from `atl token` | token for sandboxed sessions and the assistant; wins over the stored one |
+| `ANTHROPIC_API_KEY` | none | API key instead of a token (also wins) |
 
-## Status line
+Sessions and project scripts get `ATL_TASK`, `ATL_TASK_DIR` and `ATL_PORT_OFFSET` (0, 100,
+200…, chosen to avoid other open tasks in every workspace: add it to every port you bind) plus the
+project's `env`. Scripts also get `ATL_REPO`, `ATL_WORKTREE` and `ATL_BRANCH`.
 
-A task's Claude session shows the task it belongs to at the bottom of Claude Code's
-screen, e.g. `● Fix login`, also when it runs full screen with the tmux status bar hidden.
-The dot has the colour the TUI uses for the session's state (waiting, running, idle);
-`NO_COLOR` makes it plain, and `COLORFGBG` with a light background picks the TUI's
-light-theme colours. Claude Code runs `atl statusline` with the session's JSON on stdin;
-atelier finds the task from the Claude session id, else `ATL_TASK`, else the working
-directory under `$ATL_TASKS/<slug>/`, and prints the title on one line (control characters
-removed, cut at 80 columns). It prints nothing if it can't tell (errors go to `hook.log`).
-If a task's `.claude/settings.json` already has a `statusLine` of yours, atelier leaves it
-alone; its own entry (`<atl> statusline`) is updated in place. Like hooks, Claude Code runs
-it only in trusted workspaces and not with `disableAllHooks`.
+## Docs
 
-Atelier's status line only appears when you have no global status line of your own. A
-task's project settings take precedence over your `~/.claude/settings.json` (or
-`$CLAUDE_CONFIG_DIR/settings.json`), so if that file defines a `statusLine`, atelier does
-not add its entry to task settings, and removes it on the next launch if an earlier one
-wrote it; your global status line shows instead. To see atelier's anyway, remove your
-global `statusLine`, or call `atl statusline` from your own status line script (pass it
-the same JSON on stdin; it prints one line, or nothing). A global file that is missing or
-can't be parsed counts as having no `statusLine`. In a sandboxed task your status line
-runs in the task's container, from the copy of your settings there (see
-[Sandbox](#sandbox)): a script it calls must exist in the container too.
+| doc | covers |
+|---|---|
+| [docs/tasks.md](docs/tasks.md) | slugs, opening sessions, notes, rename, done/cancel, reopening, show/transcript |
+| [docs/sandbox.md](docs/sandbox.md) | the task container, the gate's Docker rules, mounts, the token, copying, limits |
+| [docs/git.md](docs/git.md) | base branches, push/fetch through the gate, `atl pr`, how atl runs git safely |
+| [docs/workspaces.md](docs/workspaces.md) | workspace selection, settings, tmux, port offsets, moving from a devcontainer box |
+| [docs/hooks.md](docs/hooks.md) | hooks, session state, start context, status line |
+| [docs/assistant.md](docs/assistant.md) | the atelier assistant |
 
-`atl statusline` only reads the database: it never creates or migrates it, and prints
-nothing while the database is at another schema version than the binary (the next `atl`
-command or hook migrates it). In a sandboxed task it asks the task's gate, which shows
-that task only.
+Design notes: [docs/WORKSPACES.md](docs/WORKSPACES.md), [docs/PLAN.md](docs/PLAN.md),
+[docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## Tests
 
-`go test ./...` runs unit tests and `test/e2e.sh` (skipped with `-short`), which
-builds `atl`, creates fake repos and a project in a temp dir and drives
-new → session → hooks → crash recovery → resume → open --session → diff → pr → done against an
-isolated tmux server, with `claude` and `gh` replaced by `test/stubs`.
+```bash
+go test ./...          # unit tests + test/e2e.sh (skip e2e with -short)
+```
 
 ## License
 

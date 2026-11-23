@@ -61,6 +61,15 @@ func (a *App) Doctor(ctx context.Context) []Check {
 		}()
 	}
 	wg.Wait()
+	// With the sandbox on, Claude Code runs in containers only (task
+	// sessions, the assistant, atl token): not needed where atl runs.
+	if sb, err := sandbox.FromEnv(); err == nil && sb != nil {
+		for i, tl := range tools {
+			if tl.name == "claude" {
+				checks[i] = claudeNotNeeded(checks[i])
+			}
+		}
+	}
 	if a.WorkspaceErr != nil {
 		return append(checks, fail("workspace", a.WorkspaceErr.Error()))
 	}
@@ -294,6 +303,18 @@ func checkTool(ctx context.Context, name string, args []string, ver func(string)
 		return c
 	}
 	return pass(name, first)
+}
+
+// claudeNoteOnHost is what doctor's claude check says with the sandbox on.
+const claudeNoteOnHost = "not needed on the host: sessions and the assistant run Claude in containers"
+
+// claudeNotNeeded is the claude tool check c with the sandbox on: a pass
+// whether or not claude is installed where atl runs, with what was found.
+func claudeNotNeeded(c Check) Check {
+	if c.OK && !c.Warn && c.Detail != "" {
+		return pass(c.Name, claudeNoteOnHost+" (found: "+c.Detail+")")
+	}
+	return pass(c.Name, claudeNoteOnHost)
 }
 
 var tmuxVersionRE = regexp.MustCompile(`(\d+)\.(\d+)`)

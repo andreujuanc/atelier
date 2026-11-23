@@ -52,6 +52,15 @@ type Gate struct {
 	// also come from, or from inside, read-only only: a read-write request
 	// is made read-only.
 	ROMounts []string
+	// NoDocker refuses every Docker request: the assistant's gate, whose
+	// container has no Docker access at all (Root is then the assistant
+	// dir, which the gate stops without; Upstream is not used).
+	NoDocker bool
+	// Reserved returns the image names atl runs its own containers from,
+	// besides DefaultImage and BoxImage: the workspace's task image and
+	// every project's. A task may not create or move these tags (see
+	// checkTag); an error refuses every request that would.
+	Reserved func() ([]string, error)
 
 	once   sync.Once
 	client *http.Client
@@ -102,7 +111,10 @@ var gateRoutes = []gateRoute{
 	route("POST", `/exec/([^/]+)/(start|resize)`, gateExec),
 	route("GET", `/exec/([^/]+)/json`, gateExec),
 
-	// Images are shared between tasks: reading and pulling is fine, removing is not.
+	// Images are shared between tasks: reading is fine, removing is not; a
+	// pull or a build may only name a tag that is neither atl's nor
+	// another's (checkTag). Tagging, importing, loading and committing are
+	// not in this table: refused.
 	route("GET", `/images/json`, gatePass),
 	route("GET", `/images/(.+)/(json|history)`, gatePass),
 	route("GET", `/distribution/(.+)/json`, gatePass),
@@ -149,6 +161,10 @@ func (g *Gate) logf(format string, args ...any) {
 
 func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.init()
+	if g.NoDocker {
+		g.deny(w, r, http.StatusForbidden, "the assistant has no Docker access")
+		return
+	}
 	if strings.Contains(r.URL.EscapedPath(), "%") {
 		g.deny(w, r, http.StatusForbidden, "encoded characters in the path are not accepted")
 		return
@@ -577,15 +593,6 @@ func gateExecCreate(g *Gate, w http.ResponseWriter, r *http.Request, m []string)
 	}
 }
 
-func gateImagePull(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
-	q := r.URL.Query()
-	if q.Get("fromImage") == "" || q.Get("fromSrc") != "" {
-		g.deny(w, r, http.StatusForbidden, "only pulling from a registry is allowed")
-		return
-	}
-	g.forward(w, r, nil)
-}
-
 func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 	q := r.URL.Query()
 	switch {
@@ -599,7 +606,19 @@ func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 		// The daemon would fetch it itself, with the credentials of the
 		// host it runs on.
 		g.deny(w, r, http.StatusForbidden, "building from a remote URL is not allowed; build from a local context")
+	case anyTrue(q["pull"]):
+		// The builder would pull each FROM image and store it under its
+		// name, past the image name rules of a pull (checkTag).
+		g.deny(w, r, http.StatusForbidden, "build --pull is not allowed: pull the base image first with docker pull, then build")
+	case anyNonEmpty(q["platform"]):
+		// A FROM image of another platform than the local one is pulled
+		// and stored under its name, as with --pull.
+		g.deny(w, r, http.StatusForbidden, "build --platform is not allowed: pull the base image for that platform first, then build without it")
 	default:
+		if err := g.buildTags(r); err != nil {
+			g.deny(w, r, http.StatusForbidden, err.Error())
+			return
+		}
 		g.forward(w, r, nil)
 	}
 }
@@ -1105,6 +1124,27 @@ func isZero(v any) bool {
 			}
 		}
 		return true
+	}
+	return false
+}
+
+// anyTrue reports whether one of vs is true as dockerd reads a boolean
+// query value: anything but "", "0", "no", "false" and "none", in any case.
+func anyTrue(vs []string) bool {
+	for _, v := range vs {
+		if !oneOf(strings.ToLower(strings.TrimSpace(v)), "", "0", "no", "false", "none") {
+			return true
+		}
+	}
+	return false
+}
+
+// anyNonEmpty reports whether one of vs is not blank.
+func anyNonEmpty(vs []string) bool {
+	for _, v := range vs {
+		if strings.TrimSpace(v) != "" {
+			return true
+		}
 	}
 	return false
 }

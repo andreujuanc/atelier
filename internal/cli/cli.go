@@ -62,6 +62,7 @@ type cli struct {
 	ws             *workspace.Applied
 	wsErr          error
 	wsDone         bool            // applyWorkspace ran
+	forAssistant   bool            // --for-assistant (hidden): the assistant's gate runs this command (sandbox.ForAssistantFlag)
 	ctx            context.Context // the invocation's context (for Recover)
 }
 
@@ -148,6 +149,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 // runIn runs atl with args; stdin is what commands read (atl notes --set).
 func runIn(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	c := &cli{stdout: stdout, stderr: stderr, ctx: ctx}
+	if sandbox.InAssistant() && (len(args) == 0 || (args[0] != "hook" && args[0] != "statusline")) {
+		return c.assistantViaGate(args, stdin)
+	}
 	defer func() {
 		if c.app != nil {
 			c.app.Close()
@@ -177,6 +181,51 @@ func runIn(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 		return exitUsage
 	}
 	return exitErr
+}
+
+// maxAssistantStdin bounds the stdin atl in the assistant's container sends
+// with a command (the gate takes at most this much).
+const maxAssistantStdin = 1 << 20
+
+// assistantViaGate runs atl in the assistant's container: the command line
+// goes, as it is, to the assistant's gate, which runs it where atl runs, in
+// its own workspace, if the assistant may run it (sandbox.CheckAssistantArgs:
+// the gate decides, not this side); its output and exit status come back.
+// Standard input is sent only for `notes --set` (read to the end first),
+// the one command that reads it, as the gate reads the command line
+// (readsStdin): another may run with a stdin that never ends.
+func (c *cli) assistantViaGate(args []string, stdin io.Reader) int {
+	var body []byte
+	if readsStdin(args) {
+		if isTerminal(stdin) {
+			fmt.Fprintln(c.stderr, "atl: reading standard input; end with ctrl-d")
+		}
+		data, err := io.ReadAll(io.LimitReader(stdin, maxAssistantStdin+1))
+		if err != nil {
+			fmt.Fprintf(c.stderr, "atl: read stdin: %v\n", err)
+			return exitErr
+		}
+		if len(data) > maxAssistantStdin {
+			fmt.Fprintf(c.stderr, "atl: stdin is over %d bytes, the limit here\n", maxAssistantStdin)
+			return exitErr
+		}
+		body = data
+	}
+	req := sandbox.ControlRequest{Op: sandbox.OpAtl, Args: args}
+	code, _, err := sandbox.Ask(os.Getenv("ATL_CONTROL_SOCK"), req, body, c.stdout, c.stderr, 0)
+	if err != nil {
+		fmt.Fprintf(c.stderr, "atl: in the assistant's container atl asks its gate, which did not answer: %v\n", err)
+		return exitErr
+	}
+	return code
+}
+
+// readsStdin reports whether the command line is `atl notes ... --set`
+// (in any spelling, and not with --help), which reads stdin, as the
+// assistant's gate reads it (resolveAtl).
+func readsStdin(args []string) bool {
+	path, stdin, err := resolveAtl(args)
+	return err == nil && path == "atl notes" && stdin
 }
 
 func isUsage(err error) bool {
@@ -250,6 +299,8 @@ func (c *cli) rootCmd() *cobra.Command {
 	}
 	root.CompletionOptions.HiddenDefaultCmd = true
 	root.PersistentFlags().StringVarP(&c.wsFlag, "workspace", "w", "", "the workspace: a name under $"+workspace.RootVar+" or a path (default: $"+workspace.Var+", else the one the current directory is in)")
+	root.PersistentFlags().BoolVar(&c.forAssistant, sandbox.ForAssistantFlag, false, "run for the assistant (its gate passes it)")
+	root.PersistentFlags().MarkHidden(sandbox.ForAssistantFlag)
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	root.AddCommand(
 		c.newCmd(), c.addCmd(), c.reposCmd(), c.lsCmd(), c.openCmd(), c.sessionCmd(), c.resumeCmd(), c.statusCmd(), c.renameCmd(),

@@ -38,6 +38,9 @@ type App struct {
 	Docker  sandbox.Runner // nil → the docker CLI
 	// StartGate starts a task's gate if none runs; nil → sandbox.Start.
 	StartGate func(atlBin, slug string, taskID int64, runDir, logPath string, roMounts []string) error
+	// StartAssistantGate starts the assistant's gate if none runs; nil →
+	// sandbox.StartAssistant.
+	StartAssistantGate func(atlBin, workspace, runDir, logPath string) error
 	// CheckBin checks that AtlBin can run in a task container; nil →
 	// sandbox.CheckStaticBin.
 	CheckBin func(path string) error

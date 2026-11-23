@@ -154,3 +154,42 @@ func TestNewTmux(t *testing.T) {
 func pathsUnder(root string) config.Paths {
 	return config.Paths{StateDir: filepath.Join(root, "state")}
 }
+
+// TestDoctorClaudeOnHost: with the sandbox on, Claude Code is not needed
+// where atl runs (sessions, the assistant and atl token run it in
+// containers): the claude check passes, saying so, whether or not it is
+// installed. With the sandbox off it stays required.
+func TestDoctorClaudeOnHost(t *testing.T) {
+	bin := t.TempDir()
+	t.Setenv("PATH", bin) // no claude (nor anything else)
+	t.Setenv(sandbox.InEnv, "")
+	a := &App{WorkspaceErr: errors.New("no workspace")} // doctor checks only the tools
+	claude := func() Check {
+		t.Helper()
+		for _, c := range a.Doctor(context.Background()) {
+			if c.Name == "claude" {
+				return c
+			}
+		}
+		t.Fatal("no claude check")
+		return Check{}
+	}
+	t.Setenv("ATL_SANDBOX", "off")
+	if c := claude(); c.OK || !strings.Contains(c.Detail, "not found") {
+		t.Errorf("sandbox off, no claude: %s %q", c.Level(), c.Detail)
+	}
+	t.Setenv("ATL_SANDBOX", "")
+	if c := claude(); c.Level() != "ok" || c.Detail != claudeNoteOnHost {
+		t.Errorf("sandbox on, no claude: %s %q", c.Level(), c.Detail)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte("#!/bin/sh\necho '9.9.9 (Claude Code)'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if c := claude(); c.Level() != "ok" || c.Detail != claudeNoteOnHost+" (found: 9.9.9 (Claude Code))" {
+		t.Errorf("sandbox on, claude installed: %s %q", c.Level(), c.Detail)
+	}
+	t.Setenv("ATL_SANDBOX", "off")
+	if c := claude(); c.Level() != "ok" || c.Detail != "9.9.9 (Claude Code)" {
+		t.Errorf("sandbox off, claude installed: %s %q", c.Level(), c.Detail)
+	}
+}

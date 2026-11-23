@@ -200,6 +200,16 @@ func (p Paths) ProjectFile(name string) string {
 // "assistant" directory next to the database ($XDG_DATA_HOME/atelier/assistant).
 func (p Paths) AssistantDir() string { return filepath.Join(filepath.Dir(p.DB), "assistant") }
 
+// AssistantRunDir returns the run dir of the assistant's container (its
+// gate's sockets, the atl binary it runs): "assistant" next to the task run
+// dirs, a name no task's (12 hex digits) can have.
+func (p Paths) AssistantRunDir() string { return filepath.Join(p.runRoot(), "assistant") }
+
+// AssistantClaudeDir returns the Claude Code config dir of the assistant's
+// container (its $CLAUDE_CONFIG_DIR): "claude/assistant" next to the task
+// Claude dirs, which are named by 12 hex digits.
+func (p Paths) AssistantClaudeDir() string { return filepath.Join(p.runRoot(), "claude", "assistant") }
+
 // ClaudeConfigDir returns Claude Code's config dir: $CLAUDE_CONFIG_DIR,
 // else ~/.claude ("" if neither is known).
 func ClaudeConfigDir() string {

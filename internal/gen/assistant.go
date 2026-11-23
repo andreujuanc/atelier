@@ -29,7 +29,7 @@ const AssistantGuardEvent = "AssistantGuard"
 var (
 	assistantAllow = []string{
 		"Bash(atl ls *)", "Bash(atl show *)", "Bash(atl transcript *)",
-		"Bash(atl repos *)", "Bash(atl --help *)", "Read", "Grep", "Glob",
+		"Bash(atl repos *)", "Bash(atl help *)", "Read", "Grep", "Glob",
 	}
 	assistantAsk = []string{
 		"Bash(atl new *)", "Bash(atl add *)", "Bash(atl status *)", "Bash(atl session *)",
@@ -46,7 +46,11 @@ var (
 	// retiredAssistantRules lists allow/ask rules earlier atelier versions
 	// wrote that are no longer wanted; they are removed on rewrite. Earlier
 	// versions spelled Bash rules "Bash(atl ls:*)".
-	retiredAssistantRules = colonForms(assistantAllow, assistantAsk)
+	retiredAssistantRules = append(colonForms(assistantAllow, assistantAsk), retiredAtlHelp...)
+	// retiredAtlHelp allowed "atl --help <anything>" without asking: cobra
+	// takes the argument after a leading flag as its value and runs what
+	// follows (`atl --help --help=false done X`). Help is `atl help`.
+	retiredAtlHelp = []string{"Bash(atl --help *)", "Bash(atl --help:*)"}
 )
 
 // colonForms returns the legacy "Bash(cmd:*)" spelling of every
@@ -67,7 +71,7 @@ func colonForms(lists ...[]string) []string {
 // regenerated) and merges its .claude/settings.json in dir, creating dir if
 // needed. The settings merge keeps every user key, hook and permission rule
 // and replaces only atelier's own (see WriteSettings for the hook rules).
-func WriteAssistantFiles(dir, atlBin string) error {
+func WriteAssistantFiles(dir, atlBin string, inContainer bool) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("gen: create assistant dir: %w", err)
 	}
@@ -76,7 +80,7 @@ func WriteAssistantFiles(dir, atlBin string) error {
 		return fmt.Errorf("gen: %w", err)
 	}
 	defer d.Close()
-	if err := d.WriteFile("CLAUDE.md", []byte(AssistantClaudeMD()), 0o644); err != nil {
+	if err := d.WriteFile("CLAUDE.md", []byte(AssistantClaudeMD(inContainer)), 0o644); err != nil {
 		return fmt.Errorf("gen: %w", err)
 	}
 	return writeAssistantSettings(d, atlBin)
@@ -168,7 +172,7 @@ func writeAssistantSettings(d *nofollow.Dir, atlBin string) error {
 }
 
 // AssistantClaudeMD renders the atelier assistant's CLAUDE.md.
-func AssistantClaudeMD() string {
+func AssistantClaudeMD(inContainer bool) string {
 	var b strings.Builder
 	w := func(s ...string) {
 		for _, l := range s {
@@ -239,7 +243,7 @@ func AssistantClaudeMD() string {
 		"  `--clear` forms write), so prefer `atl show <task> --notes`.",
 		"- `atl repos` — git repos available in $ATL_REPOS.",
 		"- `atl diff <task>` — git diff of each rw repo against its base commit (read-only, may ask permission).",
-		"- `atl --help`, `atl <command> --help` — usage.",
+		"- `atl help`, `atl help <command>` — usage.",
 		"",
 		"Changes state (ALWAYS confirm first):",
 		"",
@@ -253,7 +257,8 @@ func AssistantClaudeMD() string {
 		"  — create a task with worktrees. `--base`: auto (default; origin/dev, else develop, else the default",
 		"  branch) for feature work, `default` (or `production`) for a production patch from origin's default branch, or a branch name.",
 		"- `atl add <task> <repo>[:rw|ro]` — add a repo to an open task.",
-		"- `atl status <task> <backlog|active|review|done|cancelled>` — set the status only (no other effects).",
+		"- `atl status <task> <backlog|active|review|done|cancelled>` — set the status; a done or cancelled task set",
+		"  to an open status is reopened (worktrees made again, its containers, networks and volumes removed).",
 		"- `atl rename <task> <new title...>` — change the task's title only; the slug, branch `atl/<slug>`, tmux",
 		"  session and dirs keep the original name (refer to the task by its slug afterwards too).",
 		"- `atl session <task>` — start a new Claude session in the task (not attached).",
@@ -276,5 +281,57 @@ func AssistantClaudeMD() string {
 		"After a status discussion, offer to append a short note, e.g.",
 		"`atl note X \"<summary>\" --author assistant` — and run it only after the user agrees.",
 	)
-	return b.String()
+	md := b.String()
+	if inContainer {
+		for _, r := range inContainerMD {
+			md = strings.Replace(md, r[0], r[1], 1)
+		}
+	}
+	return md
+}
+
+// inContainerMD are the passages of the assistant's CLAUDE.md that differ
+// when it runs in its own container (the sandbox on), as [text next to atl,
+// text in the container]: there it has no repos, worktrees or task dirs,
+// and `atl` runs through its gate, which refuses `atl open`, `atl done`,
+// `atl cancel`, `atl status` to a closed status or on a closed task,
+// --workspace and --force.
+var inContainerMD = [][2]string{
+	{"or offer to implement anything. You run in your own folder: any code you touched here would not be in\n" +
+		"the task's git worktrees. You may glance at `git log` / `atl show` output only to summarise progress.\n",
+		"or offer to implement anything. You run in a container of your own that has only this folder: no repos,\n" +
+			"no worktrees, no task dirs (the worktree paths `atl show` prints are not here), and no Docker. You see a\n" +
+			"task only through `atl`: `atl show` for its state, `atl diff` for its changes, `atl transcript` for its\n" +
+			"sessions; use them only to summarise progress.\n"},
+	{"session and tell them how to get there: in the atl TUI select the task and press Enter (or run\n" +
+		"`atl open <task>`). The task session sees the task's worktrees.\n",
+		"session and tell them how to get there: in the atl TUI select the task and press Enter (or run\n" +
+			"`atl open <task>` in a terminal; you cannot run it). The task session sees the task's worktrees.\n"},
+	{"  `status`, `rename`, `session`, `resume`, `open`, `pr`, `done`, `cancel`, `note`, `notes --set`,\n",
+		"  `status`, `rename`, `session`, `resume`, `pr`, `note`, `notes --set`,\n"},
+	{"- Git in worktrees is read-only: `git log`, `git diff`, `git status`, `git show` only.\n",
+		"- There are no worktrees here: for a task's changes run `atl diff <task>`, for its git state\n" +
+			"  `atl show <task>`.\n" +
+			"- `atl` here asks atelier (where it runs, outside your container) to run the command for this\n" +
+			"  workspace only: the commands below and `--help`. It refuses everything else, `atl open`,\n" +
+			"  `atl done`, `atl cancel`, `atl status` to `done`/`cancelled` or on a closed task, `--workspace` (`-w`)\n" +
+			"  and `--force` (`-f`); do not try to work around that.\n"},
+	{"- `atl open <task>` — start/resume the task's session and attach the terminal (better done by the user\n" +
+		"  from the atelier TUI).\n",
+		"- `atl open <task>` does not run here (it attaches a terminal): tell the user to open the task in the\n" +
+			"  atl TUI (select it and press Enter) or to run `atl open <task>` in a terminal.\n"},
+	{"- `atl done <task>` — finish: kill its tmux session, remove worktrees, status done.\n" +
+		"- `atl cancel <task>` — same as done, status cancelled.\n",
+		"- `atl done` and `atl cancel` do not run here (they remove the task's worktrees): when a task looks\n" +
+			"  finished, tell the user to close it in the atl TUI (`d` done, `c` cancel) or with `atl done <task>`\n" +
+			"  in a terminal.\n"},
+	{"- `atl status <task> <backlog|active|review|done|cancelled>` — set the status; a done or cancelled task set\n" +
+		"  to an open status is reopened (worktrees made again, its containers, networks and volumes removed).\n",
+		"- `atl status <task> <backlog|active|review>` — move an open task between open statuses. Closing a task\n" +
+			"  (`done`, `cancelled`) and reopening a closed one (which removes its containers) are the user's: refused here.\n"},
+	{"  `atl notes X --set <<'EOF'` … `EOF`. It overwrites what the user wrote: only when the user asks,\n",
+		"  `atl notes X --set <<'EOF'` … `EOF` (atelier keeps the text it replaces in a history file the user can\n" +
+			"  read). It overwrites what the user wrote: only when the user asks,\n"},
+	{"4. Optionally a glance at `git log` in the worktree paths from `atl show` (no in-depth code reading).\n",
+		"4. Optionally `atl diff X` for what changed (no in-depth code reading).\n"},
 }

@@ -87,11 +87,17 @@ func (a *App) lockTask(ctx context.Context, id int64) (func(), error) {
 
 // lockFile takes an exclusive flock on path (created if missing), waiting
 // up to wait (or until ctx ends); busy describes the holder in the timeout
-// error. The returned func releases it.
+// error. The returned func releases it. It follows no symlink at path and
+// takes only a regular file (never a pipe or device: it does not wait to
+// open one).
 func lockFile(ctx context.Context, path string, wait time.Duration, busy string) (func(), error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock: %w", err)
+	}
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("open lock: %s is not a regular file", path)
 	}
 	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()

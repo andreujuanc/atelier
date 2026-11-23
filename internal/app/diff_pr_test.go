@@ -331,3 +331,37 @@ func TestPRResultString(t *testing.T) {
 		t.Fatal("helpers")
 	}
 }
+
+// TestPRClosedTask: atl pr never reopens a task behind reopen's back. For
+// the assistant (PROpen) a closed task is refused before gh runs; for the
+// user the PR is created and the closed status stays, with a warning.
+func TestPRClosedTask(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	gh := installGH(t)
+	e.addRepo(t, "api", "main")
+	e.githubOrigins(t, "api")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Ship it", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := e.app.Paths.WorktreePath(task.Slug, "api")
+	commitIn(t, api, "a.txt", "a\n")
+	git(t, api, "push", "-q", "origin", "atl/ship-it")
+	if err := e.app.SetStatus(ctx, task.Slug, model.StatusDone); err != nil { // atl status: the worktree stays
+		t.Fatal(err)
+	}
+	if _, err := e.app.PROpen(ctx, task.Slug); err == nil || !strings.Contains(err.Error(), "open tasks only") || gh.calls() != 0 {
+		t.Errorf("assistant's pr on a closed task: %v (gh calls %d)", err, gh.calls())
+	}
+	res, err := e.app.PR(ctx, task.Slug)
+	if err != nil || len(res) != 1 || res[0].URL == "" {
+		t.Fatalf("user's pr: %+v %v", res, err)
+	}
+	if st, _ := e.app.Store.GetTaskBySlug(ctx, task.Slug); st.Status != model.StatusDone {
+		t.Errorf("status %s, want done", st.Status)
+	}
+	if out := e.app.Out.(*bytes.Buffer).String(); !strings.Contains(out, "its status is left as it is") {
+		t.Errorf("output %q", out)
+	}
+}

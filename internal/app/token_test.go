@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 // storedTestToken is a made-up token of the shape `claude setup-token`
@@ -471,5 +474,67 @@ func TestTokenRefusedInsideSandbox(t *testing.T) {
 	}
 	if exists(e.app.Paths.ClaudeToken()) {
 		t.Error("stored inside a task container")
+	}
+}
+
+// TestTokenArgv: next to atl, the token window runs claude setup-token as
+// before; with the sandbox on, in a throwaway container of the task image,
+// as the user, with no mount and no variable but TERM, LANG and HOME=/tmp.
+func TestTokenArgv(t *testing.T) {
+	a := &App{}
+	if got := a.tokenArgv("atl-token-abc123"); !slices.Equal(got, []string{"sh", "-c", tokenScript}) {
+		t.Errorf("sandbox off: %q", got)
+	}
+	a.Sandbox = &sandbox.Config{Image: "task-image"}
+	got := a.tokenArgv("atl-token-abc123")
+	if len(got) < 4 || !slices.Equal(got[:4], []string{"sh", "-c", tokenContainerScript, "atl-token"}) {
+		t.Fatalf("sandbox on: %q", got)
+	}
+	want := []string{"docker", "run", "--rm", "-it", "--pull=never", "--name", "atl-token-abc123", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		"-e", "TERM", "-e", "LANG", "-e", "HOME=/tmp", "task-image", "claude", "setup-token"}
+	if !slices.Equal(got[4:], want) {
+		t.Errorf("sandbox on: %q, want %q", got[4:], want)
+	}
+	if !strings.Contains(tokenContainerScript, "\n\"$@\"\n") || !strings.Contains(tokenContainerScript, "unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY") {
+		t.Errorf("script:\n%s", tokenContainerScript)
+	}
+}
+
+// TestSetupTokenSandboxChecks: with the sandbox on, atl token needs Docker
+// and the default task image, and says so in one line before any window.
+func TestSetupTokenSandboxChecks(t *testing.T) {
+	e := tokenEnv(t, "")
+	fd := &fakeDocker{down: true}
+	e.app.Docker = fd.run
+	e.app.Sandbox = &sandbox.Config{Image: sandbox.DefaultImage}
+	if _, err := e.app.SetupToken(context.Background(), func(*exec.Cmd) error { return nil }, noAsk(t)); err == nil ||
+		!strings.Contains(err.Error(), "cannot reach Docker") {
+		t.Errorf("Docker down: %v", err)
+	}
+	fd.down = false
+	fd.missing = map[string]bool{sandbox.DefaultImage: true}
+	if _, err := e.app.SetupToken(context.Background(), func(*exec.Cmd) error { return nil }, noAsk(t)); err == nil ||
+		!strings.Contains(err.Error(), "is not on the Docker daemon") {
+		t.Errorf("image missing: %v", err)
+	}
+	if e.app.Tmux.HasSession(context.Background(), TokenSession) {
+		t.Error("token window started")
+	}
+}
+
+// TestSetupTokenCustomImageNotPulled: another task image that is not on the
+// daemon is an error for atl token (it never pulls: the image's claude
+// makes the token).
+func TestSetupTokenCustomImageNotPulled(t *testing.T) {
+	e := tokenEnv(t, "")
+	fd := &fakeDocker{missing: map[string]bool{"my-image": true}}
+	e.app.Docker = fd.run
+	e.app.Sandbox = &sandbox.Config{Image: "my-image"}
+	if _, err := e.app.SetupToken(context.Background(), func(*exec.Cmd) error { return nil }, noAsk(t)); err == nil ||
+		!strings.Contains(err.Error(), "my-image") || !strings.Contains(err.Error(), "does not pull it") {
+		t.Errorf("custom image missing: %v", err)
+	}
+	if e.app.Tmux.HasSession(context.Background(), TokenSession) {
+		t.Error("token window started")
 	}
 }

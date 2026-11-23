@@ -43,7 +43,9 @@ const (
 // land in this container. The gate's stdout, stderr and exit code are
 // passed on as they are. When the gate cannot answer, the hook behaves like
 // one that fails: exit 0 with the error on stderr (there is no hook log in
-// here), except that an oversized PreToolUse input is still refused.
+// here), except that an oversized PreToolUse input is still refused, and
+// that the assistant's guard (AssistantGuard, from the assistant's
+// container) refuses: it fails closed.
 func viaGate(event string, stdin io.Reader, stdout, stderr io.Writer, env func(string) string) int {
 	var data []byte
 	var readErr error
@@ -54,12 +56,16 @@ func viaGate(event string, stdin io.Reader, stdout, stderr io.Writer, env func(s
 	if readErr != nil {
 		req.ReadErr = readErr.Error()
 	}
-	if event == EventPreToolUse {
+	if event == EventPreToolUse || event == EventAssistantGuard {
 		req.Landings = containerLandings(data)
 	}
 	// JSON escaping can grow odd paths and text past the line limit: then
 	// the guard goes without the landings (it still resolves the targets
 	// itself), and the session context without ATL_CONTEXT.
+	if event == EventAssistantGuard && lineLen(req) > sandbox.MaxRequestLine {
+		// The assistant's guard does not go without the landings: it fails closed.
+		return assistantRefuse(stderr, "", "its targets are too long to check")
+	}
 	if lineLen(req) > sandbox.MaxRequestLine {
 		req.Landings = nil
 	}
@@ -77,6 +83,10 @@ func viaGate(event string, stdin io.Reader, stdout, stderr io.Writer, env func(s
 		err = fmt.Errorf("the task's gate refused the request: %s", strings.TrimSpace(errb.String()))
 	}
 	logError(config.Paths{}, stderr, event, "", err)
+	if event == EventAssistantGuard {
+		// The assistant's guard fails closed, here too.
+		return assistantRefuse(stderr, "", "its gate did not answer")
+	}
 	if event == EventPreToolUse && len(data) > maxInput {
 		in, _ := partialInput(data)
 		return refuseOversized(stderr, in.ToolName)

@@ -39,7 +39,7 @@ func strList(t *testing.T, v any) []string {
 
 func TestAssistantClaudeMD(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "assistant")
-	if err := WriteAssistantFiles(dir, "/usr/bin/atl"); err != nil {
+	if err := WriteAssistantFiles(dir, "/usr/bin/atl", false); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "CLAUDE.md"))
@@ -116,7 +116,7 @@ func TestAssistantClaudeMD(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("tampered"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteAssistantFiles(dir, "/usr/bin/atl"); err != nil {
+	if err := WriteAssistantFiles(dir, "/usr/bin/atl", false); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(dir, "CLAUDE.md")); string(b) != md {
@@ -126,7 +126,7 @@ func TestAssistantClaudeMD(t *testing.T) {
 
 func TestAssistantSettings(t *testing.T) {
 	dir := t.TempDir()
-	if err := WriteAssistantFiles(dir, "/opt/my atl/atl"); err != nil {
+	if err := WriteAssistantFiles(dir, "/opt/my atl/atl", false); err != nil {
 		t.Fatal(err)
 	}
 	m := readAssistantSettings(t, dir)
@@ -275,7 +275,7 @@ func TestAssistantSettingsMerge(t *testing.T) {
 		if i == 2 {
 			bin = "/new/place/atl" // moved binary: old entry still replaced
 		}
-		if err := WriteAssistantFiles(dir, bin); err != nil {
+		if err := WriteAssistantFiles(dir, bin, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -318,7 +318,7 @@ func TestAssistantSettingsMerge(t *testing.T) {
 
 	// idempotent byte for byte
 	before, _ := os.ReadFile(path)
-	if err := WriteAssistantFiles(dir, "/new/place/atl"); err != nil {
+	if err := WriteAssistantFiles(dir, "/new/place/atl", false); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := os.ReadFile(path)
@@ -337,7 +337,7 @@ func TestAssistantSettingsInvalidPermissions(t *testing.T) {
 	if err := os.WriteFile(path, []byte(orig), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteAssistantFiles(dir, "atl"); err != nil {
+	if err := WriteAssistantFiles(dir, "atl", false); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(path + ".bak"); string(b) != orig {
@@ -353,12 +353,12 @@ func TestAssistantSettingsInvalidPermissions(t *testing.T) {
 }
 
 func TestRetiredAssistantRules(t *testing.T) {
-	for _, want := range []string{"Bash(atl ls:*)", "Bash(atl --help:*)", "Bash(atl open:*)", "Bash(atl note:*)"} {
+	for _, want := range []string{"Bash(atl ls:*)", "Bash(atl --help:*)", "Bash(atl --help *)", "Bash(atl help:*)", "Bash(atl open:*)", "Bash(atl note:*)"} {
 		if !contains(retiredAssistantRules, want) {
 			t.Errorf("retired lacks %s", want)
 		}
 	}
-	if len(retiredAssistantRules) != len(assistantAllow)+len(assistantAsk)-3 { // Read, Grep, Glob
+	if len(retiredAssistantRules) != len(assistantAllow)+len(assistantAsk)-3+len(retiredAtlHelp) { // Read, Grep, Glob
 		t.Errorf("retired = %v", retiredAssistantRules)
 	}
 	for _, l := range [][]string{assistantAllow, assistantAsk, assistantDeny} {
@@ -377,4 +377,72 @@ func contains(l []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// TestAssistantClaudeMDInContainer: in its own container (the sandbox on)
+// the assistant is told that it has no repos or worktrees and sees tasks
+// through atl only, that atl open, --workspace and --force are refused, and
+// what to tell the user instead; next to atl the text is as before.
+func TestAssistantClaudeMDInContainer(t *testing.T) {
+	host, box := AssistantClaudeMD(false), AssistantClaudeMD(true)
+	for _, r := range inContainerMD {
+		if !strings.Contains(host, r[0]) {
+			t.Errorf("host text lacks %q", r[0])
+		}
+		if strings.Contains(box, r[0]) && !strings.Contains(r[1], r[0]) {
+			t.Errorf("container text still has %q", r[0])
+		}
+		if !strings.Contains(box, r[1]) {
+			t.Errorf("container text lacks %q", r[1])
+		}
+	}
+	for _, want := range []string{"container of your own", "no repos", "no worktrees", "`atl diff`", "no Docker",
+		"`atl open <task>` in a terminal; you cannot run it", "select it and press Enter",
+		"`atl done` and `atl cancel` do not run here", "(`d` done, `c` cancel)",
+		"`atl done`, `atl cancel`, `atl status` to `done`/`cancelled` or on a closed task, `--workspace` (`-w`)",
+		"`atl status <task> <backlog|active|review>`", "reopening a closed one (which removes its containers)",
+		"keeps the text it replaces in a history file"} {
+		if !strings.Contains(box, want) {
+			t.Errorf("container text lacks %q", want)
+		}
+	}
+	if strings.Contains(box, "only changes the status") || strings.Contains(box, "<backlog|active|review|done|cancelled>") {
+		t.Error("container text offers atl status to close or reopen a task")
+	}
+	if strings.Contains(box, "`resume`, `open`, `pr`") || strings.Contains(box, "glance at `git log`") ||
+		strings.Contains(box, "- `atl done <task>` — finish") || strings.Contains(box, "`pr`, `done`, `cancel`") {
+		t.Error("container text offers atl open, done/cancel or git in worktrees")
+	}
+	dir := filepath.Join(t.TempDir(), "assistant")
+	if err := WriteAssistantFiles(dir, "/run/atl/bin/atl", true); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "CLAUDE.md")); string(b) != box {
+		t.Error("CLAUDE.md in a container is not the container text")
+	}
+}
+
+// TestAssistantHelpRule: `atl --help *` ran anything without asking (cobra
+// takes the argument after a leading --help as its value and runs what
+// follows); an old settings file loses it, and help is `atl help`.
+func TestAssistantHelpRule(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"permissions": {"allow": ["Bash(atl --help *)", "Bash(atl --help:*)", "Bash(mine)"]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteAssistantFiles(dir, "atl", true); err != nil {
+		t.Fatal(err)
+	}
+	allow := strList(t, readAssistantSettings(t, dir)["permissions"].(map[string]any)["allow"])
+	if contains(allow, "Bash(atl --help *)") || contains(allow, "Bash(atl --help:*)") || !contains(allow, "Bash(atl help *)") ||
+		!contains(allow, "Bash(mine)") {
+		t.Errorf("allow = %v", allow)
+	}
+	if md := AssistantClaudeMD(true); strings.Contains(md, "atl --help") || !strings.Contains(md, "`atl help <command>`") {
+		t.Error("CLAUDE.md still offers atl --help")
+	}
 }

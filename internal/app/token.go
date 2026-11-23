@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
 
@@ -172,6 +175,67 @@ claude setup-token
 printf '\n%s ' 'Press Enter to go back to atl (it reads the token from this screen).'
 read -r _`
 
+// tokenContainerScript is tokenScript with the sandbox on: its arguments
+// are the command that runs claude setup-token in a throwaway container
+// (tokenArgv). docker run reads the window's size when it starts and then
+// follows its resizes, but loses one that comes while it starts (as docker
+// exec does, see sandbox.WindowArgv), and Claude Code breaks the token at
+// the width it sees: so it waits, up to 10 seconds, for the client atl
+// attaches, and a helper has the window's size sent again (SIGWINCH to the
+// window's process group, which every process in it but docker run
+// ignores) 1, 3 and 7 seconds after the start.
+const tokenContainerScript = `unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY
+i=0
+while [ $i -lt 100 ]; do
+	n=$(tmux display-message -p -t "$TMUX_PANE" '#{session_attached}' 2> /dev/null) || break
+	[ "${n:-0}" = 0 ] || break
+	sleep 0.1 2> /dev/null || { sleep 1; i=$((i + 9)); }
+	i=$((i + 1))
+done
+(for d in 1 2 4; do sleep $d; kill -WINCH 0 || exit 0; done) < /dev/null > /dev/null 2>&1 &
+"$@"
+kill $! 2> /dev/null
+printf '\n%s ' 'Press Enter to go back to atl (it reads the token from this screen).'
+read -r _`
+
+// tokenArgv is the command of the token window: tokenScript next to atl;
+// with the sandbox on, tokenContainerScript running claude setup-token in a
+// throwaway container named name of the task image (`docker run --rm -it --pull=never`,
+// as the user running atl, with no mount and no variable but TERM, LANG
+// and HOME=/tmp, a home that exists and is writable whatever users the
+// image has: claude writes its config there, and it goes with --rm), so Claude Code need not be installed where atl runs.
+func (a *App) tokenArgv(name string) []string {
+	if a.Sandbox == nil {
+		return []string{"sh", "-c", tokenScript}
+	}
+	return []string{"sh", "-c", tokenContainerScript, "atl-token",
+		"docker", "run", "--rm", "-it", "--pull=never", "--name", name, "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		"-e", "TERM", "-e", "LANG", "-e", "HOME=/tmp", a.Sandbox.Image, "claude", "setup-token"}
+}
+
+// checkTokenImage refuses, with the sandbox on, to run claude setup-token
+// without a Docker daemon or the task image (one line each, as a session's
+// launch says it). The image is never pulled for it (`--pull=never`): the
+// token is minted by the image's own claude, so it must be one you built or
+// pulled yourself, not whatever a registry has under that name.
+func (a *App) checkTokenImage(ctx context.Context) error {
+	if a.Sandbox == nil {
+		return nil
+	}
+	if _, err := a.checkDocker(ctx); err != nil {
+		return err
+	}
+	image := a.Sandbox.Image
+	if missing, err := sandbox.ImageMissing(ctx, a.docker(), image); err == nil && missing {
+		if image == sandbox.DefaultImage {
+			return missingImage(image, "default")
+		}
+		return errors.New("task image " + image + " (from $ATL_SANDBOX_IMAGE) is not on the Docker daemon, and atl token does not pull it " +
+			"(its claude makes the token): build or pull it yourself")
+	}
+	return nil
+}
+
 // tokenPoll is how often SetupToken looks whether the token window ended.
 const tokenPoll = 200 * time.Millisecond
 
@@ -184,6 +248,9 @@ const tokenPoll = 200 * time.Millisecond
 // and its scrollback are gone when SetupToken returns.
 func (a *App) SetupToken(ctx context.Context, attach func(*exec.Cmd) error, ask func(prompt string) (string, error)) (auto bool, err error) {
 	if err := outsideSandbox("get a Claude Code token"); err != nil {
+		return false, err
+	}
+	if err := a.checkTokenImage(ctx); err != nil {
 		return false, err
 	}
 	screen, width, err := a.runTokenWindow(ctx, attach)
@@ -213,26 +280,37 @@ func (a *App) PasteToken(ask func(prompt string) (string, error), prompt string)
 	return a.StoreToken(tok)
 }
 
-// runTokenWindow runs tokenScript in window tokenWindow of TokenSession,
-// attaches the user to it and returns the window's text and width once it
-// ended (or the user detached), then removes the session.
+// runTokenWindow runs tokenScript (with the sandbox on,
+// tokenContainerScript, see tokenArgv) in window tokenWindow of
+// TokenSession, attaches the user to it and returns the window's text and
+// width once it ended (or the user detached), then removes the session, and
+// the token's container should it still run (the user left early).
 func (a *App) runTokenWindow(ctx context.Context, attach func(*exec.Cmd) error) (string, int, error) {
 	if a.Tmux.HasSession(ctx, TokenSession) {
 		if err := a.Tmux.KillSession(ctx, TokenSession); err != nil {
 			return "", 0, err
 		}
 	}
+	var rnd [3]byte
+	rand.Read(rnd[:])
+	container := "atl-token-" + hex.EncodeToString(rnd[:])
 	dir, _ := os.UserHomeDir()
 	win, err := a.Tmux.NewWindow(ctx, tmux.WindowSpec{
 		Session: TokenSession,
 		Name:    tokenWindow,
 		Dir:     dir,
 		Env:     a.windowEnv(nil),
-		Argv:    []string{"sh", "-c", tokenScript},
+		Argv:    a.tokenArgv(container),
 	})
 	kill := func() {
 		if err := a.Tmux.KillSession(context.WithoutCancel(ctx), TokenSession); err != nil {
 			a.warnf("%v", err)
+		}
+		if a.Sandbox != nil {
+			// docker run's client may die with the window and leave
+			// setup-token waiting in the container (it is gone already
+			// when it ended: --rm). Best effort: an error says nothing more.
+			a.docker()(context.WithoutCancel(ctx), "rm", "-f", container)
 		}
 	}
 	if err != nil {

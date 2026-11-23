@@ -11,6 +11,8 @@ import (
 
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
+
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 // tokenCmd gets the Claude Code token of sandboxed sessions: it runs
@@ -44,6 +46,11 @@ func (c *cli) tokenCmd() *cobra.Command {
 				if !isTerminal(os.Stdin) || !isTerminal(c.stdout) {
 					return errors.New("atl token runs claude setup-token in tmux and needs a terminal; " +
 						"to store a token you already have, use atl token --paste")
+				}
+				// With the sandbox on, claude setup-token runs in a
+				// throwaway container: Claude Code need not be on the host.
+				if ap.Sandbox, err = sandbox.FromEnv(); err != nil {
+					return err
 				}
 				var auto bool
 				auto, err = ap.SetupToken(cmd.Context(), func(attach *exec.Cmd) error {

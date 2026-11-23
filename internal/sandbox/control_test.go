@@ -141,6 +141,8 @@ func TestControlRefusals(t *testing.T) {
 		{Op: OpNote, Set: true},
 		{Op: OpNotes, Author: "user"},
 		{Op: OpStatusLine, Landings: []Landing{{Given: "/a", Path: "/a"}}},
+		{Op: OpPush, Args: []string{"--all"}},
+		{Op: OpNotes, Args: []string{"notes", "t2"}},
 	} {
 		code, out := lab.ask(t, req)
 		if code != exitRefused || !strings.Contains(out, "atelier gate:") {
@@ -155,7 +157,7 @@ func TestControlRefusals(t *testing.T) {
 	// fields, not JSON.
 	for _, line := range []string{
 		`{"op":"push","slug":"t2"}`,
-		`{"op":"push","args":["--all"]}`,
+		`{"op":"push","argv":["--all"]}`,
 		`{"op":"push"} {"op":"fetch"}`,
 		`push t1`,
 		``,

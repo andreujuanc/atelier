@@ -28,13 +28,27 @@ const prFooter = "Created by atelier"
 // PR opens a pull request (`gh pr create --repo <the pinned origin's>`) for
 // each rw repo of the task that has commits on its branch and whose branch
 // is on origin; if any PR was created (or already existed) the task moves
-// to review. atelier never pushes: a repo whose branch is not on origin is
-// skipped with reason "push <branch> first". Per-repo failures (including
-// gh's) are reported as skipped results, never abort the other repos.
-func (a *App) PR(ctx context.Context, ref string) ([]PRResult, error) {
+// to review, if it is still open (checked under the per-task lock): a
+// closed task keeps its status, with a warning (setting it would skip what
+// reopening does). atelier never pushes: a repo whose branch is not on
+// origin is skipped with reason "push <branch> first". Per-repo failures
+// (including gh's) are reported as skipped results, never abort the other
+// repos.
+func (a *App) PR(ctx context.Context, ref string) ([]PRResult, error) { return a.pr(ctx, ref, false) }
+
+// PROpen is PR for the assistant's gate (atl pr run for the assistant): a
+// task that is not open is refused before anything is created.
+func (a *App) PROpen(ctx context.Context, ref string) ([]PRResult, error) {
+	return a.pr(ctx, ref, true)
+}
+
+func (a *App) pr(ctx context.Context, ref string, openOnly bool) ([]PRResult, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
 		return nil, err
+	}
+	if openOnly && !t.Status.Open() {
+		return nil, fmt.Errorf("task %s is %s: atl pr runs for the assistant on open tasks only (ask the user to run it in a terminal)", t.Slug, t.Status)
 	}
 	body := prFooter
 	if d := strings.TrimSpace(t.Description); d != "" {
@@ -56,13 +70,35 @@ func (a *App) PR(ctx context.Context, ref string) ([]PRResult, error) {
 		}
 		res = append(res, pr)
 	}
-	if created > 0 && t.Status != model.StatusReview {
+	if created > 0 {
 		// Record PRs already opened even if interrupted afterwards.
-		if err := a.Store.SetTaskStatus(context.WithoutCancel(ctx), t.ID, model.StatusReview); err != nil {
+		if err := a.prReview(context.WithoutCancel(ctx), t.ID); err != nil {
 			return res, err
 		}
 	}
 	return res, loopErr
+}
+
+// prReview sets task id to review after PR opened PRs, under the per-task
+// lock, unless it is closed (a warning says so) or in review already.
+func (a *App) prReview(ctx context.Context, id int64) error {
+	unlock, err := a.lockTask(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	t, err := a.Store.GetTask(ctx, id)
+	if err != nil {
+		return err
+	}
+	switch {
+	case !t.Status.Open():
+		a.warnf("task %s is %s: its status is left as it is (set it with atl status to reopen it)", t.Slug, t.Status)
+		return nil
+	case t.Status == model.StatusReview:
+		return nil
+	}
+	return a.Store.SetTaskStatus(ctx, t.ID, model.StatusReview)
 }
 
 func (a *App) prRepo(ctx context.Context, t *model.Task, r model.TaskRepo, body string) PRResult {

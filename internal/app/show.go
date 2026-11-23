@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/andreujuanc/atelier/internal/gitx"
@@ -210,4 +214,97 @@ func (a *App) ReplaceNotes(ctx context.Context, ref, text string) (string, error
 		return "", err
 	}
 	return a.Store.ReplaceNotes(ctx, t.ID, text)
+}
+
+// NotesHistory is the file that keeps, for task slug, the notes the
+// assistant replaced or cleared (ReplaceNotesKept): in the state dir, which
+// no container sees.
+func (a *App) NotesHistory(slug string) string {
+	return filepath.Join(a.Paths.StateDir, "notes-history", slug+".md")
+}
+
+// ReplaceNotesKept is ReplaceNotes for the assistant's gate (atl notes
+// --set or --clear run for the assistant): the notes it replaces are first
+// appended, under a dated heading, to NotesHistory, and are then replaced
+// only if they are still those (a compare-and-set, retried a few times), so
+// the user's text is never lost, whatever the assistant's container asked
+// for. If they cannot be kept, nothing changes.
+func (a *App) ReplaceNotesKept(ctx context.Context, ref, text string) (string, error) {
+	t, err := a.Store.ResolveTask(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	for i := 0; ; i++ {
+		prev, err := a.Store.GetNotes(ctx, t.ID)
+		if err != nil {
+			return "", err
+		}
+		if err := a.keepNotes(t.Slug, prev); err != nil {
+			return "", fmt.Errorf("task %s: keep its notes before they are replaced: %w", t.Slug, err)
+		}
+		out, err := a.Store.SetNotes(ctx, t.ID, text, prev)
+		if errors.Is(err, model.ErrNotesConflict) && i < 3 {
+			continue
+		}
+		return out, err
+	}
+}
+
+// maxNotesHistory caps a task's NotesHistory: the oldest entries go first.
+const maxNotesHistory = 1 << 20
+
+// notesEntry finds where each NotesHistory entry starts: its heading line.
+var notesEntry = regexp.MustCompile(`(?m)^## \d{4}-\d\d-\d\dT\S+ — before the assistant replaced or cleared them$`)
+
+// keepNotes appends notes ("" is nothing to keep) to slug's NotesHistory,
+// under the file's lock, dropping the oldest entries when the file would
+// be over maxNotesHistory.
+func (a *App) keepNotes(slug, notes string) error {
+	if notes == "" {
+		return nil
+	}
+	path := a.NotesHistory(slug)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	if fi, err = f.Stat(); err != nil {
+		return err
+	}
+	start := max(0, fi.Size()-maxNotesHistory)
+	old := make([]byte, fi.Size()-start)
+	if _, err := f.ReadAt(old, start); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	entry := "## " + a.now().Format(time.RFC3339) + " — before the assistant replaced or cleared them\n\n" + strings.TrimRight(notes, "\n") + "\n\n"
+	data := string(old) + entry
+	if start > 0 || len(data) > maxNotesHistory {
+		// From the first entry that starts late enough for the rest to fit.
+		cut := len(data) - len(entry)
+		for _, m := range notesEntry.FindAllStringIndex(data, -1) {
+			if m[0] >= len(data)-maxNotesHistory {
+				cut = m[0]
+				break
+			}
+		}
+		data = data[cut:]
+	}
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.WriteAt([]byte(data), 0); err != nil {
+		return err
+	}
+	return f.Sync()
 }
