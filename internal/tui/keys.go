@@ -5,6 +5,7 @@ import (
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // runeKey is the key press of the printable rune r (as typed).
@@ -15,10 +16,16 @@ func runeKey(r rune) tea.KeyPressMsg {
 	return tea.KeyPressMsg{Code: r, Text: string(r)}
 }
 
-// staticCursor stops ti's cursor from blinking: a blinking cursor would
-// redraw the whole screen twice a second.
-func staticCursor(ti *textinput.Model) {
+// styleInput styles ti in the theme and stops its cursor from blinking (a
+// blinking cursor would redraw the whole screen twice a second).
+func styleInput(ti *textinput.Model) {
 	st := ti.Styles()
+	for _, s := range []*textinput.StyleState{&st.Focused, &st.Blurred} {
+		s.Prompt = keyStyle
+		s.Placeholder = dimStyle
+		s.Text = lipgloss.NewStyle()
+	}
+	st.Cursor.Color = primary
 	st.Cursor.Blink = false
 	ti.SetStyles(st)
 }
@@ -99,13 +106,30 @@ func (m *WorkspacePicker) paste(msg tea.PasteMsg) tea.Cmd {
 	return cmd
 }
 
-// isDark is whether the terminal background is dark (the colours' variant).
-var isDark = true
+// restyleInputs applies the theme again to the inputs (after it changed).
+func (m *Model) restyleInputs() {
+	styleInput(&m.filterInput)
+	styleInput(&m.renameInput)
+	for _, f := range []*newForm{m.form, m.lastForm} {
+		if f != nil {
+			for i := range f.inputs {
+				styleInput(&f.inputs[i])
+			}
+		}
+	}
+	if m.notes != nil {
+		m.notes.restyle()
+	}
+}
 
 // View implements tea.Model.
 func (m *Model) View() tea.View {
 	v := tea.NewView(m.render())
 	v.AltScreen = true
+	v.WindowTitle = "atelier"
+	if ws := clean(m.workspace); ws != "" {
+		v.WindowTitle = "atelier · " + ws
+	}
 	return v
 }
 
@@ -113,5 +137,6 @@ func (m *Model) View() tea.View {
 func (m *WorkspacePicker) View() tea.View {
 	v := tea.NewView(m.render())
 	v.AltScreen = true
+	v.WindowTitle = "atelier · workspaces"
 	return v
 }

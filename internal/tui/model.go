@@ -25,6 +25,7 @@ const (
 	dirtyEvery   = 5 * time.Second // after the previous check finished
 	dirtyTimeout = 30 * time.Second
 	selDebounce  = 150 * time.Millisecond
+	spinEvery    = 100 * time.Millisecond
 )
 
 type mode int
@@ -41,6 +42,8 @@ const (
 	// modeNotesLoading: m was pressed and the notes text is loading; keys
 	// are swallowed (esc cancels) until it arrives or fails.
 	modeNotesLoading
+	// modeHelp: the key reference (?) is open; any key closes it.
+	modeHelp
 )
 
 // confirmState is the done/cancel dialog: confirming (space ticks the box,
@@ -64,6 +67,7 @@ type (
 	recoverTickMsg struct{}
 	dirtyTickMsg   struct{}
 	selTickMsg     struct{ seq int }
+	spinTickMsg    struct{}
 
 	listMsg struct {
 		tasks []app.TaskView
@@ -276,6 +280,10 @@ type Model struct {
 	// workspace is the name of the workspace the TUI runs in ("" unknown),
 	// shown on the status line.
 	workspace string
+
+	// spinFrame is the busy spinner's frame; spinning: its tick is armed.
+	spinFrame int
+	spinning  bool
 }
 
 // Forced reports whether the user forced the quit (second ctrl+c) while
@@ -291,11 +299,11 @@ func New(ctx context.Context, be Backend) *Model {
 	fi := textinput.New()
 	fi.Prompt = "/"
 	fi.Placeholder = "filter"
-	staticCursor(&fi)
+	styleInput(&fi)
 	ri := textinput.New()
 	ri.Prompt = "title> "
 	ri.Placeholder = "the task's new title (enter saves, esc cancels)"
-	staticCursor(&ri)
+	styleInput(&ri)
 	ri.CharLimit = model.MaxTitleLen
 	return &Model{
 		be:  be,
@@ -319,7 +327,8 @@ func New(ctx context.Context, be Backend) *Model {
 func (m *Model) Init() tea.Cmd {
 	m.listing, m.recovering, m.dirtying = true, true, true
 	return tea.Batch(m.listCmd(), m.recoverCmd(), m.projectsCmd(), m.dirtyCmd(),
-		m.after(listEvery, listTickMsg{}), m.after(recoverEvery, recoverTickMsg{}))
+		m.after(listEvery, listTickMsg{}), m.after(recoverEvery, recoverTickMsg{}),
+		tea.RequestBackgroundColor)
 }
 
 // --- commands ---
@@ -684,8 +693,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.setStatus(m.quitText(n))
 	}
+	// The busy spinner turns while an operation runs.
+	if !m.spinning && len(m.busyOps()) > 0 {
+		m.spinning = true
+		cmd = tea.Batch(cmd, m.after(spinEvery, spinTickMsg{}))
+	}
 	return m, cmd
 }
+
+// spinner is the busy spinner's current frame (one cell).
+func (m *Model) spinner() string { return spinFrames[m.spinFrame%len(spinFrames)] }
+
+var spinFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func (m *Model) quitText(n int) string {
 	if m.switching {
@@ -722,6 +741,19 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return m.handlePaste(msg)
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
+	case tea.BackgroundColorMsg:
+		if msg.IsDark() != isDark {
+			applyTheme(msg.IsDark())
+			m.restyleInputs()
+		}
+		return nil
+	case spinTickMsg:
+		m.spinFrame++
+		if len(m.busyOps()) == 0 {
+			m.spinning = false
+			return nil
+		}
+		return m.after(spinEvery, spinTickMsg{})
 
 	case listTickMsg:
 		cmds := []tea.Cmd{m.after(listEvery, listTickMsg{})}
@@ -1102,6 +1134,10 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.renameKey(msg)
 	case modeSessions:
 		return m.sessionsKey(msg)
+	case modeHelp:
+		// Any key closes the key reference; it never acts on a task.
+		m.mode = modeNormal
+		return nil
 	}
 	return m.normalKey(key)
 }
@@ -1394,6 +1430,9 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		m.form.setWidth(m.formInputWidth())
 		m.mode = modeForm
 		return tea.Batch(m.projectsCmd(), m.syncProject())
+	case "?":
+		m.mode = modeHelp
+		return nil
 	case "A":
 		return m.assistant()
 	}

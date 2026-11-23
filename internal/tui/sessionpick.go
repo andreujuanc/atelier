@@ -11,6 +11,7 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/palette"
 )
 
 // sessionPicker is the modal list Enter shows for a task that has sessions
@@ -79,15 +80,20 @@ func (p *sessionPicker) update(msg tea.KeyPressMsg) pickResult {
 	return pickContinue
 }
 
+// dialog is the picker as a box over the screen (w×h above the status
+// line).
+func (p *sessionPicker) dialog(w, h int, now time.Time) *dialog {
+	iw := dialogWidth(96, w)
+	ih := min(p.rows()+2, max(h-2, 1))
+	return box("Open "+clean(p.slug), p.lines(iw, ih, now), iw, primary)
+}
+
 // lines renders the picker in w×h cells; now dates the relative times.
 func (p *sessionPicker) lines(w, h int, now time.Time) []string {
 	if w <= 0 || h <= 0 {
 		return nil
 	}
 	var head []string
-	if h >= 6 {
-		head = append(head, titleStyle.Render(trunc("Open "+clean(p.slug), w)))
-	}
 	if h >= 3 {
 		live := 0
 		for _, c := range p.choices {
@@ -95,8 +101,8 @@ func (p *sessionPicker) lines(w, h int, now time.Time) []string {
 				live++
 			}
 		}
-		head = append(head, dimStyle.Render(trunc(fmt.Sprintf(
-			"%d live (attach), %d past (resume with claude --resume)", live, len(p.choices)-live), w)))
+		head = append(head, trunc(okStyle.Render(strconv.Itoa(live))+dimStyle.Render(" live (attach)  ")+
+			labelStyle.Render(strconv.Itoa(len(p.choices)-live))+dimStyle.Render(" past (resume with claude --resume)"), w), "")
 	}
 	listH := h - len(head)
 	out := append([]string(nil), head...)
@@ -126,11 +132,7 @@ func (p *sessionPicker) lines(w, h int, now time.Time) []string {
 }
 
 func (p *sessionPicker) newRow(cur bool, w int) string {
-	hint := "  starts Claude in a new window"
-	if cur {
-		return selStyle.Render(fit("> New session"+hint, w))
-	}
-	return trunc("  "+markStyle.Render("New session")+dimStyle.Render(hint), w)
+	return rowText(cur, w, seg{"+ New session", keyStyle}, seg{"  starts Claude in a new window", dimStyle})
 }
 
 // stateStyle colours a session state like the list's dots.
@@ -157,6 +159,10 @@ func choiceRow(c app.SessionChoice, cur bool, w int, now time.Time) string {
 	if !s.LastEventAt.IsZero() {
 		age = humanAge(now.Sub(s.LastEventAt)) + " ago"
 	}
+	glyph := palette.StateLook(s.State).Glyph
+	if glyph == " " {
+		glyph = "·"
+	}
 	state := fmt.Sprintf("%-7s", clean(string(s.State)))
 	ageCol := fmt.Sprintf("%-7s", age)
 	name := clean(s.Name)
@@ -171,7 +177,7 @@ func choiceRow(c app.SessionChoice, cur bool, w int, now time.Time) string {
 	if name != title {
 		nameSuffix = "  " + name
 	}
-	rest := w - 2 - len(state) - 2 - len(ageCol) - 2
+	rest := w - 2 - 2 - len(state) - 2 - len(ageCol) - 2
 	if rest < 0 {
 		rest = 0
 	}
@@ -185,15 +191,11 @@ func choiceRow(c app.SessionChoice, cur bool, w int, now time.Time) string {
 			snippet = "  last: " + trunc(lp, room)
 		}
 	}
+	st := stateStyle(s.State)
+	ts := lipgloss.NewStyle()
 	if cur {
-		return selStyle.Render(fit("> "+state+"  "+ageCol+"  "+titleT+nameSuffix+snippet, w))
+		ts = ts.Bold(true)
 	}
-	line := "  " + stateStyle(s.State).Render(state) + "  " + dimStyle.Render(ageCol) + "  " + titleT
-	if nameSuffix != "" {
-		line += labelStyle.Render(nameSuffix)
-	}
-	if snippet != "" {
-		line += dimStyle.Render(snippet)
-	}
-	return trunc(line, w)
+	return rowText(cur, w, seg{glyph + " " + state, st}, seg{"  " + ageCol + "  ", dimStyle}, seg{titleT, ts},
+		seg{nameSuffix, labelStyle}, seg{snippet, dimStyle})
 }

@@ -53,6 +53,7 @@ type notesEditor struct {
 	// changes = the value differs from it.
 	sending string
 	loading bool // a ctrl+r reload is in flight
+	w       int  // the width the editor was last fitted to
 	// ask is a pending y/n question: every key answers it (nothing reaches
 	// the editor or normal mode); only an answer or closing the editor
 	// clears it.
@@ -73,14 +74,8 @@ func newNotesEditor(t app.TaskView, text string) *notesEditor {
 	ta.MaxHeight = 0 // no line limit (and any height)
 	ta.MaxWidth = 0
 	ta.Placeholder = "notes for this task (ctrl+s saves, esc leaves)"
-	plain := lipgloss.NewStyle()
-	st := ta.Styles()
-	st.Focused = textarea.StyleState{Base: plain, Text: plain, CursorLine: plain, Placeholder: dimStyle,
-		EndOfBuffer: plain, Prompt: plain, LineNumber: plain, CursorLineNumber: plain}
-	st.Blurred = st.Focused
-	st.Cursor.Blink = false
-	ta.SetStyles(st)
 	e := &notesEditor{id: t.Task.ID, slug: t.Task.Slug, task: t, ta: ta}
+	e.restyle()
 	e.ta.Focus()
 	e.load(text)
 	return e
@@ -377,29 +372,23 @@ func (m *Model) notesTask() *app.TaskView {
 // detailPaneSize is the size of the details pane: the right pane, or the
 // whole body on a narrow terminal (where it only shows while editing).
 func (m *Model) detailPaneSize() (w, h int) {
-	h = m.height - 2
-	if h < 0 {
-		h = 0
-	}
-	if m.width >= minSplitWidth {
-		return m.width - listWidth(m.width) - 3, h
-	}
-	return m.width, h
+	l := m.layout()
+	return l.detailInW, l.detailInH
 }
 
 // notesLayout splits a details pane of height h with nInfo detail lines:
-// the notes area (a blank line, its header and notesH lines) takes the
+// the notes area (its header and notesH lines) takes the
 // rest, at least minNotesLines (fewer detail lines are kept for it).
 func notesLayout(nInfo, h int) (keepInfo, notesH int) {
 	const minNotesLines = 3
 	keepInfo = nInfo
-	if h-nInfo-2 < minNotesLines {
-		keepInfo = h - 2 - minNotesLines
+	if h-nInfo-1 < minNotesLines {
+		keepInfo = h - 1 - minNotesLines
 		if keepInfo < 0 {
 			keepInfo = 0
 		}
 	}
-	notesH = h - keepInfo - 2
+	notesH = h - keepInfo - 1
 	if notesH < 1 {
 		notesH = 1
 	}
@@ -418,8 +407,9 @@ func (m *Model) syncNotesSize() {
 	if w < 1 {
 		w = 1
 	}
-	if e.ta.Width() != w {
+	if e.w != w {
 		e.ta.SetWidth(w)
+		e.w = w
 	}
 	if e.ta.Height() != notesH {
 		e.ta.SetHeight(notesH)
@@ -430,21 +420,21 @@ func (m *Model) syncNotesSize() {
 // its header, then the editor when t is being edited, else the notes text
 // wrapped and from the top.
 func (m *Model) notesLines(t *app.TaskView, w, n int) []string {
-	out := []string{""}
+	var out []string
 	e := m.notes
 	if e != nil && e.id == t.Task.ID {
 		hdr := headerStyle.Render("Notes") + " "
 		switch {
 		case e.conflict:
-			hdr += errStyle.Render("changed meanwhile: ctrl+s overwrite · ctrl+r reload")
+			hdr += errStyle.Render("✗ changed meanwhile: ctrl+s overwrite · ctrl+r reload")
 		case e.saving && !e.dirty():
-			hdr += markStyle.Render("saving…")
+			hdr += keyStyle.Render(m.spinner() + " saving…")
 		case e.dirty():
-			hdr += markStyle.Render("editing*") + dimStyle.Render(" · ctrl+s save · esc leave")
+			hdr += warnStyle.Render("editing*") + dimStyle.Render(" · ctrl+s save · esc leave")
 		default:
-			hdr += markStyle.Render("editing") + dimStyle.Render(" · ctrl+s save · esc leave")
+			hdr += keyStyle.Render("editing") + dimStyle.Render(" · ctrl+s save · esc leave")
 		}
-		out = append(out, trunc(hdr, w))
+		out = append(out, ruleAfter(hdr, w))
 		lines := strings.Split(strings.TrimSuffix(e.ta.View(), "\n"), "\n")
 		if len(lines) > n {
 			lines = lines[:n]
@@ -454,13 +444,13 @@ func (m *Model) notesLines(t *app.TaskView, w, n int) []string {
 		}
 		return out
 	}
-	out = append(out, headerStyle.Render("Notes"))
+	out = append(out, rule("Notes", w))
 	if m.detail == nil || m.detail.Task.ID != t.Task.ID {
 		return append(out, dimStyle.Render("…"))
 	}
 	text := notesDisplay(m.detail.Notes)
 	if strings.TrimSpace(text) == "" {
-		return append(out, dimStyle.Render(trunc("(no notes — press m to write)", w)))
+		return append(out, trunc(dimStyle.Render("no notes — ")+keyStyle.Render("m")+dimStyle.Render(" to write"), w))
 	}
 	var lines []string
 	for _, l := range strings.Split(text, "\n") {
@@ -468,7 +458,10 @@ func (m *Model) notesLines(t *app.TaskView, w, n int) []string {
 			lines = append(lines, "")
 			continue
 		}
-		lines = append(lines, strings.Split(ansi.Wrap(l, w, ""), "\n")...)
+		st := noteStyle(l)
+		for _, wl := range strings.Split(ansi.Wrap(l, w, ""), "\n") {
+			lines = append(lines, st.Render(wl))
+		}
 	}
 	if len(lines) > n {
 		more := len(lines) - (n - 1)
@@ -493,4 +486,43 @@ func notesDisplay(s string) string {
 		return -1
 	}, s)
 	return strings.TrimRightFunc(s, unicode.IsSpace)
+}
+
+// restyle styles the editor in the theme: a bar in the primary colour down
+// its left side, the cursor line highlighted.
+func (e *notesEditor) restyle() {
+	plain := lipgloss.NewStyle()
+	bar := lipgloss.NewStyle().Foreground(primary)
+	st := e.ta.Styles()
+	st.Focused = textarea.StyleState{Base: plain, Text: plain, CursorLine: selStyle, Placeholder: dimStyle,
+		EndOfBuffer: plain, Prompt: bar, LineNumber: plain, CursorLineNumber: plain}
+	st.Blurred = st.Focused
+	st.Cursor.Blink = false
+	st.Cursor.Color = primary
+	e.ta.SetStyles(st)
+	e.ta.Prompt = "▎"
+}
+
+// ruleAfter is a heading already styled (hdr), then a line to width w.
+func ruleAfter(hdr string, w int) string {
+	n := w - ansi.StringWidth(hdr) - 1
+	if n <= 0 {
+		return trunc(hdr, w)
+	}
+	return hdr + " " + ruleStyle.Render(strings.Repeat("─", n))
+}
+
+// noteStyle is how a notes line is drawn (its text unchanged): markdown
+// headings bold, ticked checkboxes dimmed as done.
+func noteStyle(l string) lipgloss.Style {
+	t := strings.TrimSpace(l)
+	switch {
+	case strings.HasPrefix(t, "#"):
+		return lipgloss.NewStyle().Bold(true).Foreground(primary)
+	case strings.HasPrefix(t, "- [x]"), strings.HasPrefix(t, "- [X]"), strings.HasPrefix(t, "* [x]"):
+		return dimStyle.Strikethrough(false)
+	case strings.HasPrefix(t, "- [ ]"), strings.HasPrefix(t, "* [ ]"):
+		return lipgloss.NewStyle()
+	}
+	return lipgloss.NewStyle()
 }

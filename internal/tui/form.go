@@ -59,7 +59,7 @@ func newTaskForm(projects []string) *newForm {
 		ti := textinput.New()
 		ti.Prompt = ""
 		ti.Placeholder = placeholders[i]
-		staticCursor(&ti)
+		styleInput(&ti)
 		ti.CharLimit = 500
 		if i == fieldTitle {
 			ti.CharLimit = model.MaxTitleLen // as atl new and rename

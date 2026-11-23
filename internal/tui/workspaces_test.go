@@ -121,10 +121,10 @@ func TestWorkspacePickerView(t *testing.T) {
 	m := newWSTest(t, f, "")
 	v := wsView(m)
 	for _, want := range []string{
-		"atelier workspaces  ~/atelier/workspaces",
+		"atelier  workspaces  ~/atelier/workspaces",
 		" alpha  ~/atelier/workspaces/alpha ",
-		" beta   ~/atelier/workspaces/beta\n",
-		" old    ~/atelier/workspaces/old  not adopted\n",
+		" beta   ~/atelier/workspaces/beta ",
+		" old    ~/atelier/workspaces/old  not adopted ",
 		"enter open  n new workspace  / filter",
 	} {
 		if !strings.Contains(v, want) {
@@ -136,8 +136,8 @@ func TestWorkspacePickerView(t *testing.T) {
 	}
 	// The path dimmed; the directory without atelier.toml dimmed.
 	raw := m.View().Content
-	if !strings.Contains(raw, dimStyle.Render("~/atelier/workspaces/beta")) || !strings.Contains(raw, dimStyle.Render("old")) ||
-		!strings.Contains(raw, dimStyle.Render("  not adopted")) {
+	if !strings.Contains(raw, dimStyle.Render("  ~/atelier/workspaces/beta")) || !strings.Contains(raw, dimStyle.Render("old  ")) ||
+		!strings.Contains(raw, warnStyle.Bold(false).Render("  not adopted")) {
 		t.Errorf("not dimmed:\n%q", raw)
 	}
 	// No preselection: the first row.
@@ -230,10 +230,10 @@ func TestWorkspacePickerAdopt(t *testing.T) {
 		for _, want := range []string{
 			"Adopt ~/atelier/workspaces/old as workspace old?",
 			"It writes atelier.toml (keeping what is there) with:",
-			"  repos = ~/src/work (from .devcontainer/devcontainer.json)",
-			"  sandbox.mounts = ~/.work.npmrc (from .devcontainer/devcontainer.json)",
-			"  skipped ANTHROPIC_API_KEY: a secret",
-			"  note: tmux_socket",
+			"• repos = ~/src/work (from .devcontainer/devcontainer.json)",
+			"• sandbox.mounts = ~/.work.npmrc (from .devcontainer/devcontainer.json)",
+			"• skipped ANTHROPIC_API_KEY: a secret",
+			"• note: tmux_socket",
 			"Adopt it? y/n",
 			"y adopt (as `atl workspace new old` does)  n/esc cancel",
 		} {
@@ -335,7 +335,7 @@ func TestWorkspacePickerNew(t *testing.T) {
 	}
 	m.nameInput.SetValue("")
 	typeWS(m, "old")
-	if v := wsView(m); !strings.Contains(v, "~/atelier/workspaces/old exists without atelier.toml: enter shows what adopting it writes") {
+	if v := wsView(m); !strings.Contains(v, "~/atelier/workspaces/old exists without atelier.toml:  enter shows what adopting it writes") {
 		t.Errorf("typing old:\n%s", v)
 	}
 	// enter: the adopt confirmation, as from the list.
@@ -467,9 +467,9 @@ func TestSwitchWorkspaceKey(t *testing.T) {
 	m, _ = newTest(t, fb)
 	m.workspace = "alpha"
 	lines := strings.Split(plainView(m), "\n")
-	// The status line, above the help (two lines at 120 columns).
-	if st := lines[len(lines)-3]; !strings.HasSuffix(st, "workspace alpha") || ansi.StringWidth(st) != 120 {
-		t.Errorf("status line %q", st)
+	// The top bar names the workspace.
+	if hd := lines[0]; !strings.HasPrefix(hd, " atelier  alpha") || ansi.StringWidth(hd) > 120 {
+		t.Errorf("top bar %q", hd)
 	}
 	op := press(m, "s")
 	if isQuit(press(m, "w")) || !m.quitRequested || !m.switching {

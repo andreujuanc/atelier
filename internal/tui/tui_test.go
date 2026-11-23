@@ -470,7 +470,7 @@ func TestGroupingAndClosedLimit(t *testing.T) {
 		}
 	}
 	m, _ := newTest(t, &fakeBackend{tasks: tasks})
-	if !strings.Contains(plainView(m), "DONE (10/15)") {
+	if !strings.Contains(plainView(m), "DONE 10/15") {
 		t.Fatalf("header count missing:\n%s", plainView(m))
 	}
 }
@@ -599,11 +599,11 @@ func TestWaitingMarkerAndHighlight(t *testing.T) {
 	if waitStyle.Render("x") != "x" && right == ansi.Strip(right) {
 		t.Fatalf("waiting session not styled: %q", line)
 	}
-	if !strings.Contains(ansi.Strip(line), "▶") {
+	if !strings.Contains(ansi.Strip(line), "needs you") {
 		t.Fatalf("waiting session not highlighted: %q", ansi.Strip(line))
 	}
 	// details pane
-	for _, s := range []string{"slug", "atl/gamma", "+300", "/tasks/gamma", "rw  api  ← dev", "ro  docs"} {
+	for _, s := range []string{"slug", "atl/gamma", "+300", "/tasks/gamma", "rw  api   ← dev", "ro  docs"} {
 		if !strings.Contains(v, s) {
 			t.Errorf("details missing %q:\n%s", s, v)
 		}
@@ -740,7 +740,7 @@ func TestDoneDialogLines(t *testing.T) {
 	if got := plain(lines); !reflect.DeepEqual(got, want) {
 		t.Fatalf("dirty dialog:\n%s", strings.Join(got, "\n"))
 	}
-	if lines[5] != errStyle.Render(dirtyLine) {
+	if lines[5] != errStyle.Bold(true).Render(dirtyLine) {
 		t.Fatalf("warning line not in the error style: %q", lines[5])
 	}
 	c.ticked, c.unticked = true, false
@@ -939,11 +939,11 @@ func TestNewTaskForm(t *testing.T) {
 		t.Fatalf("after esc: mode %d repos %q focus %d", m.mode, summary(m.form.repos), m.form.focus)
 	}
 	key(m, "down") // Base: auto by default, toggled by right/space/left
-	if v := plainView(m); !strings.Contains(v, "(•) auto (dev → develop → default)") || !strings.Contains(v, baseHint) {
+	if v := plainView(m); !strings.Contains(v, "● auto (dev → develop → default)") || !strings.Contains(v, "auto = origin/dev → develop → default branch;") {
 		t.Fatalf("base field:\n%s", v)
 	}
 	key(m, "right")
-	if !m.form.prodBase || !strings.Contains(plainView(m), "(•) production patch (default branch)") {
+	if !m.form.prodBase || !strings.Contains(plainView(m), "● production patch (default branch)") {
 		t.Fatalf("right did not toggle:\n%s", plainView(m))
 	}
 	key(m, " ")
@@ -1169,7 +1169,7 @@ func TestPicker(t *testing.T) {
 		t.Fatalf("selection %v", p.selection())
 	}
 	view = ansi.Strip(strings.Join(p.lines(60, 12), "\n"))
-	for _, s := range []string{"[ro] gone", "[rw] Bill-app", "[  ] docs", "selected: gone(ro) Bill-app(rw) web-app(rw)", "filter: "} {
+	for _, s := range []string{"[ro] gone", "[rw] Bill-app", "[  ] docs", "selected: gone(ro) Bill-app(rw) web-app(rw)", "› "} {
 		if !strings.Contains(view, s) {
 			t.Fatalf("view lacks %q:\n%s", s, view)
 		}
@@ -1237,19 +1237,19 @@ func TestAddRepoFlow(t *testing.T) {
 		t.Fatalf("add picker:\n%s", v)
 	}
 	// the cursor starts on the first repo not in the task
-	if cur := m.picker.current(); cur != "lib" || !strings.Contains(plainView(m), "> [  ] lib") {
+	if cur := m.picker.current(); cur != "lib" || !strings.Contains(plainView(m), "▌ [  ] lib") {
 		t.Fatalf("initial cursor on %q:\n%s", cur, plainView(m))
 	}
 	key(m, "up") // docs: locked ro, still shows the cursor marker
-	if !strings.Contains(plainView(m), "> [ro] docs  (in task") {
+	if !strings.Contains(plainView(m), "▌ [ro] docs  (in task") {
 		t.Fatalf("no cursor on locked row:\n%s", plainView(m))
 	}
 	key(m, " ") // space toggles upgrading it to rw
-	if !strings.Contains(plainView(m), "> [ro→rw] docs  (upgrade)") || !strings.Contains(plainView(m), "selected: docs(rw)") {
+	if !strings.Contains(plainView(m), "▌ [ro→rw] docs  (upgrade)") || !strings.Contains(plainView(m), "selected: docs(rw)") {
 		t.Fatalf("upgrade not selected:\n%s", plainView(m))
 	}
 	key(m, " ")
-	if len(m.picker.sel) != 0 || !strings.Contains(plainView(m), "> [ro] docs  (in task") {
+	if len(m.picker.sel) != 0 || !strings.Contains(plainView(m), "▌ [ro] docs  (in task") {
 		t.Fatalf("upgrade not deselected: %v\n%s", m.picker.sel, plainView(m))
 	}
 	key(m, "up") // api: locked rw, not selectable
@@ -1476,7 +1476,7 @@ func TestSmallSizes(t *testing.T) {
 		key(m, "esc")
 	}
 	m.Update(tea.WindowSizeMsg{Width: 30, Height: 10})
-	if strings.Contains(plainView(m), "│") {
+	if v := plainView(m); strings.Contains(v, "slug ") || strings.Contains(v, "Repos") {
 		t.Fatal("narrow terminal shows the details pane")
 	}
 }
@@ -1731,7 +1731,7 @@ func TestSanitize(t *testing.T) {
 		t.Fatalf("%d lines, want %d", n, m.height)
 	}
 	v := plainView(m)
-	for _, want := range []string{"\n  evil [2J second line tab", "evil [2J second line tab", "]0;pwn desc", "p q"} {
+	for _, want := range []string{"▌  evil [2J second line tab", "evil [2J second line tab", "]0;pwn desc", "p q"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("view missing %q:\n%s", want, v)
 		}
@@ -2066,7 +2066,7 @@ func TestPickerLockedRows(t *testing.T) {
 	p.update(keyMsg("home"))
 	p.update(keyMsg(" "))
 	view := ansi.Strip(strings.Join(p.lines(60, 10), "\n"))
-	if !strings.Contains(view, "> [rw] api  (in task)") || !strings.Contains(view, "api is already in the task") {
+	if !strings.Contains(view, "▌ [rw] api  (in task)") || !strings.Contains(view, "api is already in the task") {
 		t.Fatalf("locked cursor row:\n%s", view)
 	}
 	p.update(keyMsg("down"))
@@ -2256,9 +2256,17 @@ func TestAggregateDot(t *testing.T) {
 func listLine(t *testing.T, m *Model, slug string) string {
 	t.Helper()
 	for _, l := range strings.Split(plainView(m), "\n") {
-		left := strings.SplitN(l, "│", 2)[0]
-		if strings.Contains(left, slug) && !strings.Contains(left, "slug") {
-			return left
+		// "│ " + the row (its lead: the selection bar or a space) + " │ │ details"
+		parts := strings.SplitN(l, "│", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		left := []rune(parts[1])
+		if len(left) < 2 {
+			continue
+		}
+		if row := string(left[2:]); strings.Contains(row, slug) && !strings.Contains(row, "slug") {
+			return row
 		}
 	}
 	t.Fatalf("no list line for %s:\n%s", slug, plainView(m))
@@ -2332,7 +2340,7 @@ func TestDirtyStar(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 12, Height: 20})
 	found := false
 	for _, l := range strings.Split(plainView(m), "\n") {
-		if strings.HasPrefix(l, "  alpha") {
+		if strings.HasPrefix(l, "   alpha") {
 			found = true
 			if !strings.Contains(l, "*") || ansi.StringWidth(l) > 12 {
 				t.Errorf("narrow alpha row %q", l)
@@ -2454,10 +2462,11 @@ func TestSelectedRowSeparator(t *testing.T) {
 	}
 	glyph, dotStyle := dotFor(aggregate(r.task.Sessions))
 	dot := dotStyle.Render(glyph)
-	if l := m.rowLine(r, true, 40); !strings.HasPrefix(l, dot+selStyle.Render(" ")) {
+	selDot := barStyle.Render("▌") + dotStyle.Background(surface).Render(glyph)
+	if l := m.rowLine(r, true, 40); !strings.HasPrefix(l, selDot+selStyle.Render(" ")) {
 		t.Fatalf("selected row %q", l)
 	}
-	if l := m.rowLine(r, false, 40); !strings.HasPrefix(l, dot+" ") {
+	if l := m.rowLine(r, false, 40); !strings.HasPrefix(l, " "+dot+" ") {
 		t.Fatalf("unselected row %q", l)
 	}
 }
@@ -2610,8 +2619,8 @@ func TestOpenSessionPicker(t *testing.T) {
 		t.Fatalf("mode %v picker %+v", m.mode, m.sessPick)
 	}
 	v := plainView(m)
-	for _, s := range []string{"Open gamma", "  New session", "1 live (attach), 2 past",
-		"> waiting  2m ago   Fix the login redirect  claude-7  last: now add a test",
+	for _, s := range []string{"Open gamma", "+ New session", "1 live (attach)  2 past",
+		"▌ ● waiting  2m ago   Fix the login redirect  claude-7  last: now add a test",
 		"ended    3h ago   Refactor the session store  claude-5  last: run the tests again",
 		"stopped  2d ago   claude-4", "↑/↓ move  enter open (live: attach, past: resume)  esc cancel"} {
 		if !strings.Contains(v, s) {
@@ -2645,7 +2654,7 @@ func TestOpenSessionPicker(t *testing.T) {
 			t.Fatalf("after %s cursor = %d, want %d", c.key, m.sessPick.cursor, c.want)
 		}
 	}
-	if !strings.Contains(plainView(m), "> stopped  2d ago") {
+	if !strings.Contains(plainView(m), "▌ ○ stopped  2d ago") {
 		t.Errorf("highlight not on the stopped session:\n%s", plainView(m))
 	}
 
@@ -2781,7 +2790,7 @@ func TestChoiceRowSnippetFits(t *testing.T) {
 		t.Fatalf("mid row %q", mid)
 	}
 	narrow := ansi.Strip(choiceRow(c, true, 40, now))
-	if strings.Contains(narrow, "claude-5") || !strings.Contains(narrow, "> ended    1h ago   Refactor") || ansi.StringWidth(narrow) != 40 {
+	if strings.Contains(narrow, "claude-5") || !strings.Contains(narrow, "▌ · ended    1h ago   Refactor") || ansi.StringWidth(narrow) != 40 {
 		t.Fatalf("narrow row %q", narrow)
 	}
 	// Same text as the title: no snippet.
@@ -2819,7 +2828,9 @@ func TestListShowsTitleNotSlug(t *testing.T) {
 	selectTask(t, m, "fix-login")
 	var left []string
 	for _, l := range strings.Split(plainView(m), "\n") {
-		left = append(left, strings.SplitN(l, "│", 2)[0])
+		if parts := strings.SplitN(l, "│", 3); len(parts) == 3 {
+			left = append(left, parts[1]) // the list box's inside
+		}
 	}
 	list := strings.Join(left, "\n")
 	for _, want := range []string{"  Repair the sign-in page", "  Try Redis", "  A very long title"} {

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
@@ -263,22 +264,53 @@ func summary(sel []app.RepoArg) string {
 	return strings.Join(parts, " ")
 }
 
-// lines renders the picker in w×h cells.
+// styledSummary is summary with the modes coloured.
+func styledSummary(sel []app.RepoArg) string {
+	parts := make([]string, 0, len(sel))
+	for _, r := range sel {
+		parts = append(parts, clean(r.Name)+modeStyle(r.Mode).Render("("+string(r.Mode)+")"))
+	}
+	return strings.Join(parts, " ")
+}
+
+// modeStyle colours a repo mode: rw in the primary colour, ro purple.
+func modeStyle(m model.Mode) lipgloss.Style {
+	if m == model.ModeRW {
+		return keyStyle
+	}
+	return lipgloss.NewStyle().Foreground(purple).Bold(true)
+}
+
+// dialog is the picker as a box over the screen (w×h above the status
+// line): as tall as its rows need, up to the screen.
+func (p *picker) dialog(w, h int) *dialog {
+	iw := dialogWidth(64, w)
+	rows := len(p.visible())
+	if rows < 6 {
+		rows = 6
+	}
+	ih := min(rows+3, 20, max(h-2, 1))
+	return box(clean(p.title), p.lines(iw, ih), iw, primary)
+}
+
+// lines renders the picker in w×h cells: the filter, the repos, then the
+// selection.
 func (p *picker) lines(w, h int) []string {
 	if w <= 0 || h <= 0 {
 		return nil
 	}
 	vis := p.visible()
 	var head, foot []string
-	if h >= 6 {
-		head = append(head, titleStyle.Render(trunc(clean(p.title), w)))
-	}
 	if h >= 3 {
 		count := fmt.Sprintf("  %d/%d", len(vis), len(p.items()))
-		head = append(head, trunc(labelStyle.Render("filter: ")+clean(p.filter)+markStyle.Render("▏")+dimStyle.Render(count), w))
+		f := clean(p.filter) + keyStyle.Render("▏")
+		if p.filter == "" {
+			f = keyStyle.Render("▏") + dimStyle.Render("type to filter")
+		}
+		head = append(head, trunc(keyStyle.Render("› ")+f+dimStyle.Render(count), w))
 	}
 	if h >= 2 {
-		s := summary(p.sel)
+		s := styledSummary(p.sel)
 		if s == "" {
 			s = dimStyle.Render("none")
 		}
@@ -294,7 +326,7 @@ func (p *picker) lines(w, h int) []string {
 	var list []string
 	switch {
 	case p.err != "":
-		list = []string{errStyle.Render(trunc("error: "+clean(firstLine(p.err)), w))}
+		list = []string{errStyle.Render(trunc("✗ error: "+clean(firstLine(p.err)), w))}
 	case p.loading && len(vis) == 0:
 		list = []string{dimStyle.Render(trunc("loading repos…", w))}
 	case len(vis) == 0 && p.filter != "":
@@ -329,37 +361,25 @@ func (p *picker) lines(w, h int) []string {
 }
 
 func (p *picker) row(name string, cur bool, w int) string {
+	plain := lipgloss.NewStyle()
 	if m := p.locked[name]; m == model.ModeRO && p.modeOf(name) == model.ModeRW {
-		text := "  [ro→rw] " + clean(name) + "  (upgrade)"
-		if cur {
-			return selStyle.Render(fit("> "+text[2:], w))
-		}
-		return trunc("  "+markStyle.Render("[ro→rw]")+" "+clean(name)+dimStyle.Render("  (upgrade)"), w)
+		return rowText(cur, w, seg{"[ro→rw]", modeStyle(model.ModeRW)}, seg{" " + clean(name), plain},
+			seg{"  (upgrade)", dimStyle})
 	}
 	if m := p.locked[name]; m != "" {
 		hint := "  (in task)"
 		if m == model.ModeRO {
 			hint = "  (in task; space: upgrade to rw)"
 		}
-		text := fmt.Sprintf("  [%s] %s%s", m, clean(name), hint)
-		if cur {
-			return selStyle.Render(fit(dimStyle.Render("> "+text[2:]), w))
-		}
-		return dimStyle.Render(trunc(text, w))
+		return rowText(cur, w, seg{fmt.Sprintf("[%s] %s%s", m, clean(name), hint), dimStyle})
 	}
-	marker := "[  ]"
-	switch p.modeOf(name) {
+	mode := p.modeOf(name)
+	marker, ms := "[  ]", dimStyle
+	switch mode {
 	case model.ModeRW:
-		marker = "[rw]"
+		marker, ms = "[rw]", modeStyle(mode)
 	case model.ModeRO:
-		marker = "[ro]"
+		marker, ms = "[ro]", modeStyle(mode)
 	}
-	text := "  " + marker + " " + clean(name)
-	if cur {
-		return selStyle.Render(fit("> "+text[2:], w))
-	}
-	if marker != "[  ]" {
-		return trunc("  "+markStyle.Render(marker)+" "+clean(name), w)
-	}
-	return trunc(text, w)
+	return rowText(cur, w, seg{marker, ms}, seg{" " + clean(name), plain})
 }
