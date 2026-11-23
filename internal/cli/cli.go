@@ -62,6 +62,7 @@ type cli struct {
 	ws             *workspace.Applied
 	wsErr          error
 	wsDone         bool            // applyWorkspace ran
+	forAssistant   bool            // --for-assistant (hidden): the assistant's gate runs this command (sandbox.ForAssistantFlag)
 	ctx            context.Context // the invocation's context (for Recover)
 }
 
@@ -191,8 +192,8 @@ const maxAssistantStdin = 1 << 20
 // its own workspace, if the assistant may run it (sandbox.CheckAssistantArgs:
 // the gate decides, not this side); its output and exit status come back.
 // Standard input is sent only for `notes --set` (read to the end first),
-// the one command that reads it: another may run with a stdin that never
-// ends.
+// the one command that reads it, as the gate reads the command line
+// (readsStdin): another may run with a stdin that never ends.
 func (c *cli) assistantViaGate(args []string, stdin io.Reader) int {
 	var body []byte
 	if readsStdin(args) {
@@ -219,15 +220,12 @@ func (c *cli) assistantViaGate(args []string, stdin io.Reader) int {
 	return code
 }
 
-// readsStdin reports whether the command line has a --set flag (in any
-// spelling: --set, --set=true): `atl notes <task> --set` reads stdin.
+// readsStdin reports whether the command line is `atl notes ... --set`
+// (in any spelling, and not with --help), which reads stdin, as the
+// assistant's gate reads it (resolveAtl).
 func readsStdin(args []string) bool {
-	for _, a := range args {
-		if a == "--set" || strings.HasPrefix(a, "--set=") {
-			return true
-		}
-	}
-	return false
+	path, stdin, err := resolveAtl(args)
+	return err == nil && path == "atl notes" && stdin
 }
 
 func isUsage(err error) bool {
@@ -301,6 +299,8 @@ func (c *cli) rootCmd() *cobra.Command {
 	}
 	root.CompletionOptions.HiddenDefaultCmd = true
 	root.PersistentFlags().StringVarP(&c.wsFlag, "workspace", "w", "", "the workspace: a name under $"+workspace.RootVar+" or a path (default: $"+workspace.Var+", else the one the current directory is in)")
+	root.PersistentFlags().BoolVar(&c.forAssistant, sandbox.ForAssistantFlag, false, "run for the assistant (its gate passes it)")
+	root.PersistentFlags().MarkHidden(sandbox.ForAssistantFlag)
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	root.AddCommand(
 		c.newCmd(), c.addCmd(), c.reposCmd(), c.lsCmd(), c.openCmd(), c.sessionCmd(), c.resumeCmd(), c.statusCmd(), c.renameCmd(),

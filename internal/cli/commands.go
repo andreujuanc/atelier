@@ -20,8 +20,10 @@ import (
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/project"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/tmux"
+	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
 func (c *cli) newCmd() *cobra.Command {
@@ -485,6 +487,9 @@ func (c *cli) statusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if c.forAssistant {
+				return ap.SetOpenStatus(cmd.Context(), a[0], st)
+			}
 			return ap.SetStatus(cmd.Context(), a[0], st)
 		},
 	}
@@ -766,6 +771,7 @@ func (c *cli) gateCmd() *cobra.Command {
 				Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
 				Ident:      sandbox.Ident(taskID, bin, roMounts),
 				ROMounts:   roMounts,
+				Reserved:   reservedImages(p, os.Getenv("ATL_SANDBOX_IMAGE"), os.Getenv("ATL_BOX_IMAGE")),
 			}
 			ts.SetROMounts(roMounts)
 			// A session ended (Claude exits): what it left running in the
@@ -807,6 +813,40 @@ func (c *cli) gateCmd() *cobra.Command {
 	cmd.Flags().StringArrayVar(&roMounts, "ro-mount", nil, "a host path of $"+sandbox.MountsVar+" (resolved) the task may bind-mount, read-only only")
 	cmd.Flags().BoolVar(&assistant, "assistant", false, "serve the assistant's container of the workspace instead of a task's")
 	return cmd
+}
+
+// reservedImages is a task gate's sandbox.Gate.Reserved: the image names
+// atl runs its own containers from, besides the default task image and
+// box image. The task image and box image the gate was started with (its
+// environment is atl's, the workspace applied) are fixed; the workspace's
+// sandbox.image and every project's image are read again on each call, so
+// a name the user sets while the gate runs is reserved at once. A file
+// that cannot be read is an error: the gate then refuses.
+func reservedImages(p config.Paths, startImages ...string) func() ([]string, error) {
+	return func() ([]string, error) {
+		names := append([]string(nil), startImages...)
+		if p.Workspace != "" {
+			c, err := workspace.ReadConfig(p.Workspace)
+			if err != nil {
+				return nil, err
+			}
+			if c.Sandbox != nil {
+				names = append(names, c.Sandbox.Image)
+			}
+		}
+		projects, err := project.List(p)
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range projects {
+			pr, err := project.Load(p, n)
+			if err != nil {
+				return nil, err
+			}
+			names = append(names, pr.Image)
+		}
+		return names, nil
+	}
 }
 
 // gateBin is the atl binary a gate runs push, fetch and the assistant's

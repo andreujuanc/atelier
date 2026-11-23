@@ -510,3 +510,41 @@ All workspaces share one Docker daemon, the host's ports and possibly canonical 
   (they remove a task's worktrees); it refuses them with a line that says to close the task
   in the TUI (`d`/`c`) or the CLI. `atl status <task> done` stays allowed: it only changes
   the status. One assistant per workspace stays (the user's choice: keep workspaces apart).
+- W5 follow-up, adversarial review (code in any container is hostile). (1) Sandbox-off
+  quarantine was a denylist run on every host launch (missed `.git` with `core.fsmonitor`,
+  moved the user's own `CLAUDE.local.md` each time, raced a running container). Now
+  `ensureAssistantSandbox` writes `<state dir>/assistant-in-container` before `Ensure`, and a
+  host launch with it (`leaveAssistantContainer`) removes the container (`sandbox.Agent` +
+  `rm -f`; any Docker error refuses the launch, one line), kills the `atl_assistant`
+  session, `sandbox.Stop`s the gate, renames (`renameat` from `O_NOFOLLOW` dir fds)
+  everything but `CLAUDE.md` (regular) and `.claude/settings.json` (regular and equal to
+  the fresh form) into `<state dir>/assistant-quarantine/<time>/`, then removes the marker;
+  a failed move refuses the launch and keeps the marker. No marker: nothing moves.
+  `foreignAssistantSettings` reads through `nofollow` (regular only, 1 MiB). (2) Task gates:
+  `/build` `t=` (each) and `/images/create` (`fromImage` once, `tag` once; no tag at all =
+  every tag, refused; by digest moves no tag) pass `Gate.checkTag`: not one of
+  `reservedImages` (`atelier-task`, `atelier`, and `Gate.Reserved` = `cli.reservedImages`:
+  `ATL_SANDBOX_IMAGE`/`ATL_BOX_IMAGE` from the gate's environment at start, `atelier.toml`'s
+  `sandbox.image` and every project's `image` read again per request; unreadable refuses),
+  compared after dockerd's normalisation (`parseImageRef`: docker.io, `library/`,
+  `index.docker.io`, latest); a build tag also not an existing image without
+  `atelier.task=<id>` (inspected by the normalised name). Pulls skip that (coordinator's
+  call): a pull only brings the registry's content for that very name, and `compose pull`
+  of a shared `postgres:16` must work. Builds get `labels` with `atelier.task=<id>` (and no
+  `atelier.agent`). Tag, load, import (`fromSrc`), commit stay out of the route table. The
+  assistant's `Spec.NoPull` adds `--pull=never` (any missing image is an error, one line).
+  (3) Hidden global `--for-assistant` (`sandbox.ForAssistantFlag`): the assistant's gate
+  inserts it right after the command (`-w <ws> <cmd> --for-assistant <rest>`, before any
+  `--`); `CheckAssistantArgs` refuses it in a request, and `status` with `done`/`cancelled`
+  in its arguments. With it `atl status` is `App.SetOpenStatus` (closed target or closed
+  task refused, under `lockTask`) and `atl notes --set/--clear` is `App.ReplaceNotesKept`
+  (old text appended to `<state dir>/notes-history/<slug>.md`, `O_NOFOLLOW`, then a
+  compare-and-set `SetNotes` with that text as base, retried 3 times). A root flag rather
+  than one on `status`: one insertion point, no per-command knowledge in the gate.
+  (4) README builds from a separate clone, never a canonical one. (5) A gone assistant
+  window: `endAssistantProcs` (from `ensureAssistantSandbox` when not busy) stops atl's own
+  container (`docker stop -t 2`), which `Ensure` then starts: everything an old window
+  started ends, whatever environment it scrubbed (an `ATL_SESSION`-style marker can be
+  unset by the processes it marks). (6) A live window attaches with a warning when
+  `ensureAssistantSandbox` fails. (7) Token container: `-e HOME=/tmp`. (10) The client's
+  `readsStdin` is `resolveAtl` (`atl notes … --set --help` sends no body).

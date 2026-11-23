@@ -479,7 +479,7 @@ func TestTokenRefusedInsideSandbox(t *testing.T) {
 
 // TestTokenArgv: next to atl, the token window runs claude setup-token as
 // before; with the sandbox on, in a throwaway container of the task image,
-// as the user, with no mount and no variable but TERM and LANG.
+// as the user, with no mount and no variable but TERM, LANG and HOME=/tmp.
 func TestTokenArgv(t *testing.T) {
 	a := &App{}
 	if got := a.tokenArgv("atl-token-abc123"); !slices.Equal(got, []string{"sh", "-c", tokenScript}) {
@@ -491,7 +491,7 @@ func TestTokenArgv(t *testing.T) {
 		t.Fatalf("sandbox on: %q", got)
 	}
 	want := []string{"docker", "run", "--rm", "-it", "--pull=never", "--name", "atl-token-abc123", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
-		"-e", "TERM", "-e", "LANG", "task-image", "claude", "setup-token"}
+		"-e", "TERM", "-e", "LANG", "-e", "HOME=/tmp", "task-image", "claude", "setup-token"}
 	if !slices.Equal(got[4:], want) {
 		t.Errorf("sandbox on: %q, want %q", got[4:], want)
 	}

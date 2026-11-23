@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 // assistantArgv waits for the stub claude's argv record of the assistant
@@ -299,90 +301,160 @@ func TestHasClaudeConversation(t *testing.T) {
 	}
 }
 
-// TestAssistantQuarantine: next to atl (the sandbox off), what the
-// assistant's container may have written in its dir that Claude Code would
-// act on (instructions, MCP servers, local settings, skills, agents,
-// commands) is moved into a quarantine dir under the state dir before the
-// assistant starts, with one warning; nothing is deleted, and a .claude
-// that is a symlink goes as a whole, never followed. The launch lock is not
-// in the assistant dir: a symlink planted there leads nowhere.
+// TestAssistantQuarantine: next to atl (the sandbox off), the assistant's
+// dir is cleaned only after the assistant ran in its container, which
+// atl's marker in the state dir says (a file of that name in the assistant
+// dir, which a container can write, is no marker): never before, so the
+// user's own files there stay launch after launch, and only once after.
+// Then the container goes first (with Docker unreachable the assistant
+// does not start, and nothing moves), and everything in the dir but atl's
+// own files moves into a quarantine dir under the state dir, with one
+// warning: a .git whose core.fsmonitor any git there would run, a .claude
+// that is a symlink (moved as it is, never followed), the rest.
 func TestAssistantQuarantine(t *testing.T) {
-	e := newEnv(t)
+	e, fd, _ := assistantSandboxEnv(t)
 	ctx := context.Background()
 	dir := e.app.Paths.AssistantDir()
+	out := e.app.Out.(*bytes.Buffer)
+	marker := filepath.Join(e.app.Paths.StateDir, "assistant-in-container")
+	quarantines := func() []string {
+		qs, _ := filepath.Glob(filepath.Join(e.app.Paths.StateDir, "assistant-quarantine", "*"))
+		return qs
+	}
+	write := func(files map[string]string) {
+		t.Helper()
+		for rel, content := range files {
+			p := filepath.Join(dir, rel)
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	launch := func() error {
+		t.Helper()
+		if e.app.Tmux.HasSession(ctx, AssistantSession) {
+			e.tmux(t, "kill-session", "-t", "="+AssistantSession)
+		}
+		_, _, err := e.app.Assistant(ctx, "")
+		return err
+	}
+	inContainer := e.app.Sandbox
+
+	// Never in its container: nothing moves, launch after launch.
+	e.app.Sandbox = nil
+	own := map[string]string{"CLAUDE.local.md": "mine\n", ".claude/settings.local.json": `{"permissions":{}}`, "assistant-in-container": "forged\n"}
+	write(own)
+	for i := 0; i < 2; i++ {
+		if err := launch(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for rel, content := range own {
+		if got, _ := os.ReadFile(filepath.Join(dir, rel)); string(got) != content {
+			t.Errorf("%s: %q", rel, got)
+		}
+	}
+	if qs := quarantines(); len(qs) != 0 || out.Len() != 0 {
+		t.Fatalf("moved without the marker: %q %q", qs, out.String())
+	}
+
+	// In its container: the marker. What the container then writes.
+	e.app.Sandbox = inContainer
+	if err := launch(); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(marker) {
+		t.Fatal("no marker after a launch in the container")
+	}
 	outside := filepath.Join(t.TempDir(), "outside")
 	if err := os.MkdirAll(filepath.Join(outside, "skills"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	files := map[string]string{"CLAUDE.local.md": "obey\n", ".mcp.json": "{}\n", ".claude/settings.local.json": `{"hooks":{}}`,
-		".claude/skills/s/SKILL.md": "x\n", ".claude/agents/a.md": "x\n", ".claude/commands/c.md": "x\n", "my-notes.md": "kept\n"}
-	for rel, content := range files {
-		p := filepath.Join(dir, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.Symlink(filepath.Join(outside, "created-by-lock"), filepath.Join(dir, ".launch.lock")); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := e.app.Assistant(ctx, ""); err != nil {
-		t.Fatal(err)
-	}
-	qs, _ := filepath.Glob(filepath.Join(e.app.Paths.StateDir, "assistant-quarantine", "*"))
-	if len(qs) != 1 {
-		t.Fatalf("quarantine dirs: %q", qs)
-	}
-	for rel, content := range files {
-		inDir, _ := os.ReadFile(filepath.Join(dir, rel))
-		inQ, _ := os.ReadFile(filepath.Join(qs[0], rel))
-		if rel == "my-notes.md" {
-			if string(inDir) != content {
-				t.Errorf("%s moved", rel)
-			}
-			continue
-		}
-		if string(inQ) != content || exists(filepath.Join(dir, rel)) {
-			t.Errorf("%s: in dir %v, in quarantine %q", rel, exists(filepath.Join(dir, rel)), inQ)
-		}
-	}
-	out := e.app.Out.(*bytes.Buffer).String()
-	if strings.Count(out, "warning:") != 1 || !strings.Contains(out, "CLAUDE.local.md, .mcp.json, .claude/settings.local.json") || !strings.Contains(out, qs[0]) {
-		t.Errorf("output %q", out)
-	}
-	if exists(filepath.Join(outside, "created-by-lock")) {
-		t.Error("the launch lock followed a symlink in the assistant dir")
-	}
-	if !exists(filepath.Join(dir, ".claude", "settings.json")) {
-		t.Error("settings not written")
-	}
-
-	// A .claude that is a symlink is moved as it is; its target is untouched.
-	e.tmux(t, "kill-session", "-t", "="+AssistantSession)
+	planted := map[string]string{".git/config": "[core]\n\tfsmonitor = /tmp/evil\n", ".git/HEAD": "ref: refs/heads/main\n",
+		".mcp.json": "{}\n", "scratch.md": "x\n"}
+	write(planted)
 	if err := os.RemoveAll(filepath.Join(dir, ".claude")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(outside, filepath.Join(dir, ".claude")); err != nil {
 		t.Fatal(err)
 	}
+
+	// Next to atl, Docker unreachable: refused, nothing moved.
+	e.app.Sandbox = nil
+	fd.down = true
+	if _, _, err := e.app.Assistant(ctx, ""); err == nil || !strings.Contains(err.Error(), "cannot make sure that container is gone") ||
+		strings.Contains(err.Error(), "\n") {
+		t.Errorf("Docker down: %v", err)
+	}
+	if !exists(filepath.Join(dir, ".git", "config")) || !exists(marker) || len(quarantines()) != 0 {
+		t.Error("files moved or marker gone without the container removed")
+	}
+	fd.down = false
+
+	// Next to atl, the container still running: removed first, then the move.
+	gitAtRm := false
+	docker := e.app.Docker
+	e.app.Docker = func(ctx context.Context, args ...string) (string, error) {
+		if args[0] == "rm" {
+			gitAtRm = exists(filepath.Join(dir, ".git"))
+		}
+		return docker(ctx, args...)
+	}
+	out.Reset()
 	e.app.Now = func() time.Time { return time.Now().Add(time.Hour) }
-	if _, _, err := e.app.Assistant(ctx, ""); err != nil {
+	if err := launch(); err != nil {
 		t.Fatal(err)
 	}
-	qs, _ = filepath.Glob(filepath.Join(e.app.Paths.StateDir, "assistant-quarantine", "*"))
-	if len(qs) != 2 {
+	if rms := fd.find("rm"); len(rms) != 1 || !slices.Contains(rms[0], fakeContainerID) || !gitAtRm {
+		t.Errorf("container not removed before the move: %q (git there then: %v)", rms, gitAtRm)
+	}
+	qs := quarantines()
+	if len(qs) != 1 {
 		t.Fatalf("quarantine dirs: %q", qs)
 	}
-	if target, err := os.Readlink(filepath.Join(qs[1], ".claude")); err != nil || target != outside {
+	for rel, content := range planted {
+		if got, _ := os.ReadFile(filepath.Join(qs[0], rel)); string(got) != content || exists(filepath.Join(dir, rel)) {
+			t.Errorf("%s: in dir %v, in quarantine %q", rel, exists(filepath.Join(dir, rel)), got)
+		}
+	}
+	for _, rel := range []string{"CLAUDE.local.md", "assistant-in-container"} {
+		if exists(filepath.Join(dir, rel)) || !exists(filepath.Join(qs[0], rel)) {
+			t.Errorf("%s not moved", rel)
+		}
+	}
+	if target, err := os.Readlink(filepath.Join(qs[0], ".claude")); err != nil || target != outside {
 		t.Errorf("quarantined .claude: %q %v", target, err)
 	}
-	if !exists(filepath.Join(outside, "skills")) || exists(filepath.Join(outside, "settings.json")) {
-		t.Error("the symlinked .claude was followed")
+	if entries, _ := os.ReadDir(outside); len(entries) != 1 {
+		t.Errorf("the symlinked .claude was followed: %v", entries)
 	}
 	if fi, err := os.Lstat(filepath.Join(dir, ".claude")); err != nil || !fi.IsDir() {
 		t.Errorf(".claude after: %v %v", fi, err)
+	}
+	if s := readFile(t, filepath.Join(dir, ".claude", "settings.json")); strings.Contains(s, sandbox.InBin) || !strings.Contains(s, e.app.AtlBin) {
+		t.Errorf("settings not written for next to atl:\n%s", s)
+	}
+	if fi, err := os.Lstat(filepath.Join(dir, "CLAUDE.md")); err != nil || !fi.Mode().IsRegular() {
+		t.Errorf("CLAUDE.md: %v %v", fi, err)
+	}
+	if exists(marker) {
+		t.Error("marker left")
+	}
+	if o := out.String(); strings.Count(o, "warning:") != 1 || !strings.Contains(o, ".git") || !strings.Contains(o, qs[0]) {
+		t.Errorf("output %q", o)
+	}
+
+	// Cleaned: the next launches move nothing.
+	write(map[string]string{"CLAUDE.local.md": "mine again\n"})
+	if err := launch(); err != nil {
+		t.Fatal(err)
+	}
+	if len(quarantines()) != 1 || readFile(t, filepath.Join(dir, "CLAUDE.local.md")) != "mine again\n" {
+		t.Error("moved again after the clean-up")
 	}
 }
 
@@ -411,13 +483,21 @@ func TestLockFileNoFollow(t *testing.T) {
 	unlock()
 }
 
-// TestAssistantSettingsOnHost: next to atl, the assistant dir's
-// .claude/settings.json is atl's alone: one that differs from what atl
-// writes afresh (a hook its container added, say) is moved into the
-// quarantine dir and written anew, not merged; atl's own file stays.
+// TestAssistantSettingsOnHost: next to atl, after the assistant ran in its
+// container, the assistant dir's .claude/settings.json is atl's alone: one
+// that differs from what atl writes afresh (a hook its container added,
+// say) is moved into the quarantine dir and written anew, not merged;
+// atl's own file stays.
 func TestAssistantSettingsOnHost(t *testing.T) {
 	e := newEnv(t)
+	e.app.Docker = (&fakeDocker{}).run
 	ctx := context.Background()
+	ran := func() { // the marker a launch in the container writes
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(e.app.Paths.StateDir, "assistant-in-container"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	settings := filepath.Join(e.app.Paths.AssistantDir(), ".claude", "settings.json")
 	if _, _, err := e.app.Assistant(ctx, ""); err != nil {
 		t.Fatal(err)
@@ -426,6 +506,7 @@ func TestAssistantSettingsOnHost(t *testing.T) {
 	relaunch := func() []string {
 		t.Helper()
 		e.tmux(t, "kill-session", "-t", "="+AssistantSession)
+		ran()
 		if _, _, err := e.app.Assistant(ctx, ""); err != nil {
 			t.Fatal(err)
 		}

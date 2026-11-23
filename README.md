@@ -22,9 +22,15 @@ host, logged in.
 
 Pushing and fetching use your own SSH agent, `~/.ssh` and git credentials.
 
-Build from an up-to-date checkout. atl never updates a canonical clone's own checkout (tasks
-get worktrees), so if atelier is one of your repos, update that checkout yourself first:
-`git fetch origin && git switch main && git reset --hard origin/main` (discards local changes there).
+Build from a clone of your own outside your repos dir, which no task ever writes: a task with
+atelier rw can write its canonical clone's `.git` (hooks, `core.fsmonitor`), which your git
+there would run.
+
+```bash
+git clone https://github.com/andreujuanc/atelier ~/src/atelier-build && cd ~/src/atelier-build
+```
+
+Run the steps below there (later: `git pull` there, then again).
 
 **1. Build `atl`** (a static Linux binary; it also runs inside containers).
 

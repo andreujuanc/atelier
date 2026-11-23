@@ -56,6 +56,11 @@ type Gate struct {
 	// container has no Docker access at all (Root is then the assistant
 	// dir, which the gate stops without; Upstream is not used).
 	NoDocker bool
+	// Reserved returns the image names atl runs its own containers from,
+	// besides DefaultImage and BoxImage: the workspace's task image and
+	// every project's. A task may not create or move these tags (see
+	// checkTag); an error refuses every request that would.
+	Reserved func() ([]string, error)
 
 	once   sync.Once
 	client *http.Client
@@ -106,7 +111,10 @@ var gateRoutes = []gateRoute{
 	route("POST", `/exec/([^/]+)/(start|resize)`, gateExec),
 	route("GET", `/exec/([^/]+)/json`, gateExec),
 
-	// Images are shared between tasks: reading and pulling is fine, removing is not.
+	// Images are shared between tasks: reading is fine, removing is not; a
+	// pull or a build may only name a tag that is neither atl's nor
+	// another's (checkTag). Tagging, importing, loading and committing are
+	// not in this table: refused.
 	route("GET", `/images/json`, gatePass),
 	route("GET", `/images/(.+)/(json|history)`, gatePass),
 	route("GET", `/distribution/(.+)/json`, gatePass),
@@ -585,15 +593,6 @@ func gateExecCreate(g *Gate, w http.ResponseWriter, r *http.Request, m []string)
 	}
 }
 
-func gateImagePull(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
-	q := r.URL.Query()
-	if q.Get("fromImage") == "" || q.Get("fromSrc") != "" {
-		g.deny(w, r, http.StatusForbidden, "only pulling from a registry is allowed")
-		return
-	}
-	g.forward(w, r, nil)
-}
-
 func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 	q := r.URL.Query()
 	switch {
@@ -608,6 +607,10 @@ func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 		// host it runs on.
 		g.deny(w, r, http.StatusForbidden, "building from a remote URL is not allowed; build from a local context")
 	default:
+		if err := g.buildTags(r); err != nil {
+			g.deny(w, r, http.StatusForbidden, err.Error())
+			return
+		}
 		g.forward(w, r, nil)
 	}
 }

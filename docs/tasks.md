@@ -98,11 +98,15 @@ The task's Claude dir keeps its transcripts after closing; delete
 
 `atl status <task> done|cancelled` (TUI `4`/`5`) only changes the status; no cleanup.
 
-Setting a done or cancelled task back to `backlog`, `active` or `review` reopens it: task
-dir, `CLAUDE.md` and settings come back, each rw worktree is recreated on `atl/<slug>` (from
-the kept local branch, else `origin/atl/<slug>`, else a new branch from the base, with a
-warning), and the project's setup runs. The task gets its old port offset back. Nothing is
-resumed automatically. If a step fails, nothing is left behind and the task stays closed.
+Setting a done or cancelled task back to `backlog`, `active` or `review` reopens it. First
+what is left of its sandbox is removed: its container and every container, network and volume
+the task created (volume data included), its gate, and its Claude dir except transcripts; its
+next session starts a new container. Then the task dir, `CLAUDE.md` and settings come back,
+each rw worktree is recreated on `atl/<slug>` (from the kept local branch, else
+`origin/atl/<slug>`, else a new branch from the base, with a warning), and the project's
+setup runs. The task gets its old port offset back. Nothing is resumed automatically. If a
+step fails, the task stays closed and what was made is removed (a removed sandbox stays so).
+The assistant can do neither: its gate refuses closing and reopening.
 
 ## show and transcript
 

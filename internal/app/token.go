@@ -201,15 +201,16 @@ read -r _`
 // tokenArgv is the command of the token window: tokenScript next to atl;
 // with the sandbox on, tokenContainerScript running claude setup-token in a
 // throwaway container named name of the task image (`docker run --rm -it --pull=never`,
-// as the user running atl, with no mount and no variable but TERM and
-// LANG), so Claude Code need not be installed where atl runs.
+// as the user running atl, with no mount and no variable but TERM, LANG
+// and HOME=/tmp, a home that exists and is writable whatever users the
+// image has: claude writes its config there, and it goes with --rm), so Claude Code need not be installed where atl runs.
 func (a *App) tokenArgv(name string) []string {
 	if a.Sandbox == nil {
 		return []string{"sh", "-c", tokenScript}
 	}
 	return []string{"sh", "-c", tokenContainerScript, "atl-token",
 		"docker", "run", "--rm", "-it", "--pull=never", "--name", name, "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
-		"-e", "TERM", "-e", "LANG", a.Sandbox.Image, "claude", "setup-token"}
+		"-e", "TERM", "-e", "LANG", "-e", "HOME=/tmp", a.Sandbox.Image, "claude", "setup-token"}
 }
 
 // checkTokenImage refuses, with the sandbox on, to run claude setup-token

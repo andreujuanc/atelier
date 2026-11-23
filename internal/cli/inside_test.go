@@ -185,7 +185,7 @@ func TestInsideAssistantContainer(t *testing.T) {
 		out.String() != "ran notes\n" || errb.String() != "warn\n" {
 		t.Errorf("notes --set: %d %q %q", code, out.String(), errb.String())
 	}
-	if got := read("argv"); got != "-w\n/home/you/atelier/workspaces/personal\nnotes\nalpha\n--set\n" {
+	if got := read("argv"); got != "-w\n/home/you/atelier/workspaces/personal\nnotes\n--for-assistant\nalpha\n--set\n" {
 		t.Errorf("argv %q", got)
 	}
 	if got := read("stdin"); got != "new notes\n" {
@@ -199,6 +199,17 @@ func TestInsideAssistantContainer(t *testing.T) {
 	}
 	if got := read("stdin"); got != "" {
 		t.Errorf("stdin of ls %q", got)
+	}
+	read("argv")
+	// As the gate reads the line: notes --set --help only prints help, and
+	// reads no stdin, so none is sent (the gate would refuse it).
+	out.Reset()
+	errb.Reset()
+	if code := runIn(ctx, []string{"notes", "alpha", "--set", "--help"}, strings.NewReader("not read"), &out, &errb); code != 4 || out.String() != "ran notes\n" {
+		t.Errorf("notes --set --help: %d %q %q", code, out.String(), errb.String())
+	}
+	if got := read("stdin"); got != "" {
+		t.Errorf("stdin of notes --set --help %q", got)
 	}
 	read("argv")
 

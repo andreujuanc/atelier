@@ -257,7 +257,8 @@ func AssistantClaudeMD(inContainer bool) string {
 		"  — create a task with worktrees. `--base`: auto (default; origin/dev, else develop, else the default",
 		"  branch) for feature work, `default` (or `production`) for a production patch from origin's default branch, or a branch name.",
 		"- `atl add <task> <repo>[:rw|ro]` — add a repo to an open task.",
-		"- `atl status <task> <backlog|active|review|done|cancelled>` — set the status only (no other effects).",
+		"- `atl status <task> <backlog|active|review|done|cancelled>` — set the status; a done or cancelled task set",
+		"  to an open status is reopened (worktrees made again, its containers, networks and volumes removed).",
 		"- `atl rename <task> <new title...>` — change the task's title only; the slug, branch `atl/<slug>`, tmux",
 		"  session and dirs keep the original name (refer to the task by its slug afterwards too).",
 		"- `atl session <task>` — start a new Claude session in the task (not attached).",
@@ -293,7 +294,8 @@ func AssistantClaudeMD(inContainer bool) string {
 // when it runs in its own container (the sandbox on), as [text next to atl,
 // text in the container]: there it has no repos, worktrees or task dirs,
 // and `atl` runs through its gate, which refuses `atl open`, `atl done`,
-// `atl cancel`, --workspace and --force.
+// `atl cancel`, `atl status` to a closed status or on a closed task,
+// --workspace and --force.
 var inContainerMD = [][2]string{
 	{"or offer to implement anything. You run in your own folder: any code you touched here would not be in\n" +
 		"the task's git worktrees. You may glance at `git log` / `atl show` output only to summarise progress.\n",
@@ -312,7 +314,8 @@ var inContainerMD = [][2]string{
 			"  `atl show <task>`.\n" +
 			"- `atl` here asks atelier (where it runs, outside your container) to run the command for this\n" +
 			"  workspace only: the commands below and `--help`. It refuses everything else, `atl open`,\n" +
-			"  `atl done`, `atl cancel`, `--workspace` (`-w`) and `--force` (`-f`); do not try to work around that.\n"},
+			"  `atl done`, `atl cancel`, `atl status` to `done`/`cancelled` or on a closed task, `--workspace` (`-w`)\n" +
+			"  and `--force` (`-f`); do not try to work around that.\n"},
 	{"- `atl open <task>` — start/resume the task's session and attach the terminal (better done by the user\n" +
 		"  from the atelier TUI).\n",
 		"- `atl open <task>` does not run here (it attaches a terminal): tell the user to open the task in the\n" +
@@ -321,7 +324,14 @@ var inContainerMD = [][2]string{
 		"- `atl cancel <task>` — same as done, status cancelled.\n",
 		"- `atl done` and `atl cancel` do not run here (they remove the task's worktrees): when a task looks\n" +
 			"  finished, tell the user to close it in the atl TUI (`d` done, `c` cancel) or with `atl done <task>`\n" +
-			"  in a terminal. `atl status <task> done` only changes the status: do not use it to close a task.\n"},
+			"  in a terminal.\n"},
+	{"- `atl status <task> <backlog|active|review|done|cancelled>` — set the status; a done or cancelled task set\n" +
+		"  to an open status is reopened (worktrees made again, its containers, networks and volumes removed).\n",
+		"- `atl status <task> <backlog|active|review>` — move an open task between open statuses. Closing a task\n" +
+			"  (`done`, `cancelled`) and reopening a closed one (which removes its containers) are the user's: refused here.\n"},
+	{"  `atl notes X --set <<'EOF'` … `EOF`. It overwrites what the user wrote: only when the user asks,\n",
+		"  `atl notes X --set <<'EOF'` … `EOF` (atelier keeps the text it replaces in a history file the user can\n" +
+			"  read). It overwrites what the user wrote: only when the user asks,\n"},
 	{"4. Optionally a glance at `git log` in the worktree paths from `atl show` (no in-depth code reading).\n",
 		"4. Optionally `atl diff X` for what changed (no in-depth code reading).\n"},
 }

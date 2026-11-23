@@ -27,7 +27,7 @@ func TestCheckAssistantArgs(t *testing.T) {
 		{"pr", "alpha"}, {"note", "alpha", "waiting", "on", "review", "--author", "assistant"},
 		{"note", "alpha", "x", "--author=assistant"}, {"note", "--author", "assistant", "alpha", "x"},
 		{"notes", "alpha"}, {"notes", "alpha", "--set"}, {"notes", "alpha", "--clear"}, {"rename", "alpha", "New", "title"},
-		{"doctor"}, {"help"}, {"help", "open"}, {"help", "done"}, {"ls", "-h"}, {"ls", "--help"}, {"status", "alpha", "done"},
+		{"doctor"}, {"help"}, {"help", "open"}, {"help", "done"}, {"ls", "-h"}, {"ls", "--help"}, {"status", "alpha", "backlog"},
 	} {
 		if err := CheckAssistantArgs(args); err != nil {
 			t.Errorf("%q refused: %v", args, err)
@@ -43,6 +43,12 @@ func TestCheckAssistantArgs(t *testing.T) {
 		{[]string{"done", "alpha"}, "removes the task's worktrees"},
 		{[]string{"cancel", "alpha"}, "removes the task's worktrees"},
 		{[]string{"done", "--help"}, "removes the task's worktrees"},
+		// So is closing it with atl status; reopening it is refused by atl
+		// itself (the gate's --for-assistant).
+		{[]string{"status", "alpha", "done"}, "closing a task is the user's"},
+		{[]string{"status", "alpha", "cancelled"}, "closing a task is the user's"},
+		{[]string{"status", "alpha", "active", "--for-assistant=false"}, "the gate sets it"},
+		{[]string{"ls", "--for-assistant"}, "the gate sets it"},
 		{[]string{"assistant"}, "does not run for the assistant"},
 		{[]string{"token"}, "does not run for the assistant"},
 		{[]string{"token", "--paste"}, "does not run for the assistant"},
@@ -194,7 +200,7 @@ func TestControlAtlForTheAssistant(t *testing.T) {
 	if code != 0 || !ran || out != "out\n" || errs != "err\n" {
 		t.Errorf("notes --set: %d %v %q %q", code, ran, out, errs)
 	}
-	if got := read("argv"); got != "-w\n/home/you/atelier/workspaces/personal\nnotes\nalpha\n--set\n" {
+	if got := read("argv"); got != "-w\n/home/you/atelier/workspaces/personal\nnotes\n--for-assistant\nalpha\n--set\n" {
 		t.Errorf("argv %q", got)
 	}
 	if got := read("stdin"); got != "the new notes\nsecret-ish text\n" {

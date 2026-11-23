@@ -137,6 +137,9 @@ type Spec struct {
 	Workdir   string
 	Mounts    []Mount
 	Env       map[string]string
+	// NoPull: docker run never pulls the image (--pull=never); it must be
+	// on the daemon already, built or pulled by the user.
+	NoPull bool
 }
 
 // Hash identifies the spec; it is stored on the container (label
@@ -150,6 +153,9 @@ func (s Spec) RunArgs() []string { return s.runArgs(s.Hash()) }
 func (s Spec) runArgs(hash string) []string {
 	args := []string{"run", "-d", "--init", "--name", ContainerName(s.ID),
 		"--label", LabelAgent + "=" + s.ID}
+	if s.NoPull {
+		args = append(args, "--pull=never")
+	}
 	if hash != "" {
 		args = append(args, "--label", labelSpec+"="+hash)
 	}

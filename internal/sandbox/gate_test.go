@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -65,6 +66,12 @@ func newDaemon(t *testing.T) (*daemon, string) {
 		{"networks", hostnetID, "hostnet", map[string]string{}},
 		{"volumes", "myvol", "myvol", map[string]string{LabelTask: testID}},
 		{"volumes", "hostvol", "hostvol", map[string]string{}},
+		// Images by name (tag included).
+		{"images", "sha256:a1", "localstack/localstack:4", map[string]string{}},
+		{"images", "sha256:a2", "atelier-task", map[string]string{}},
+		{"images", "sha256:a3", "ghcr.io/you/tool:1", map[string]string{}},
+		{"images", "sha256:a4", "other-tool", map[string]string{LabelTask: "someone-else"}},
+		{"images", "sha256:a5", "my-tool:dev", map[string]string{LabelTask: testID}},
 	}}
 	sock := filepath.Join(t.TempDir(), "daemon.sock")
 	l, err := net.Listen("unix", sock)
@@ -90,6 +97,16 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	d.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
+	if p := versionPrefix.ReplaceAllString(r.URL.Path, ""); r.Method == "GET" && strings.HasPrefix(p, "/images/") && strings.HasSuffix(p, "/json") {
+		// An image inspect: by name as dockerd reads it.
+		if o := d.findImage(strings.TrimSuffix(strings.TrimPrefix(p, "/images/"), "/json")); o != nil {
+			json.NewEncoder(w).Encode(map[string]any{"Id": o.id, "Config": map[string]any{"Labels": o.labels}})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"message":"no such image"}`)
+		}
+		return
+	}
 	parts := strings.Split(strings.Trim(versionPrefix.ReplaceAllString(r.URL.Path, ""), "/"), "/")
 	var obj *object
 	if len(parts) >= 2 && oneOf(parts[0], "containers", "networks", "volumes") && !oneOf(parts[1], "json", "create", "prune") {
@@ -181,6 +198,29 @@ func (d *daemon) noteMissingVolumes(body []byte) {
 			d.mu.Unlock()
 		}
 	}
+}
+
+// findImage looks an image up by its name, read as dockerd reads it
+// (latest when no tag).
+func (d *daemon) findImage(ref string) *object {
+	norm := func(s string) string {
+		r, err := parseImageRef(s)
+		if err != nil {
+			return "invalid " + s
+		}
+		if r.tag == "" && r.digest == "" {
+			r.tag = "latest"
+		}
+		return r.String()
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, o := range d.objects {
+		if o.kind == "images" && norm(o.name) == norm(ref) {
+			return o
+		}
+	}
+	return nil
 }
 
 // find looks an object up as dockerd does: by full ID, then by name, then
@@ -788,6 +828,83 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 	}
 	if b := c.d.body("POST /networks/new1/connect"); !strings.Contains(b, `"`+agentID+`"`) {
 		t.Errorf("the task's own container was not joined to its new network: %q", b)
+	}
+}
+
+// TestGateImageNames: a build or a pull may not create or move a tag that
+// atl runs its own containers from (the default task image, the box image,
+// the workspace's and the projects' images, in any spelling dockerd reads
+// as the same); a build may not name a tag that points to an image the
+// task did not build, while a pull may re-pull one (it brings only what the
+// registry has under that name); a pull by digest moves no tag, and every image a task builds carries its label. The other
+// endpoints that name images (tag, import, load, commit) stay refused.
+func TestGateImageNames(t *testing.T) {
+	reserved := []string{"ghcr.io/you/alpha-dev:2", ""}
+	c := newGateWith(t, func(g *Gate) { g.Reserved = func() ([]string, error) { return reserved, nil } })
+	for _, uri := range []string{
+		"/build?t=atelier-task",
+		"/build?t=ok-name&t=atelier-task:latest",
+		"/build?t=docker.io/library/atelier-task",
+		"/build?t=index.docker.io/library/atelier-task:latest",
+		"/build?t=library/atelier-task",
+		"/build?t=atelier",
+		"/build?t=GHCR.IO/you/alpha-dev:2",
+		"/build?t=other-tool",              // another task's
+		"/build?t=localstack/localstack:4", // pulled by someone
+		"/build?t=Bad/Name",
+		"/v1.45/build?t=atelier-task",
+		"/images/create?fromImage=atelier-task",
+		"/images/create?fromImage=atelier-task&tag=latest",
+		"/images/create?fromImage=docker.io/library/atelier-task:latest",
+		"/images/create?fromImage=ghcr.io/you/alpha-dev&tag=2",
+		"/images/create?fromImage=postgres", // every tag
+		"/images/create?fromImage=postgres&fromImage=atelier-task&tag=latest",
+		"/images/create?fromImage=atelier-task@sha256:" + strings.Repeat("a", 64) + "&tag=latest",
+		"/images/create?fromImage=x&fromSrc=-&repo=atelier-task",
+		"/images/atelier-task/tag?repo=x",
+		"/images/x/tag?repo=atelier-task&tag=latest",
+		"/images/load",
+		"/commit?container=mine&repo=atelier-task",
+	} {
+		before := len(c.d.requests)
+		if status, out := c.do("POST", uri, ""); status != http.StatusForbidden && status != http.StatusBadRequest {
+			t.Errorf("POST %s: status %d (%s), want refused", uri, status, out)
+		}
+		for _, r := range c.d.requests[before:] {
+			if !strings.HasPrefix(r, "GET ") {
+				t.Errorf("POST %s: %s reached the daemon", uri, r)
+			}
+		}
+	}
+	for _, uri := range []string{
+		"/build?t=new-tool",
+		"/build?t=my-tool:dev&t=new-tool:2",
+		"/build",
+		"/images/create?fromImage=postgres&tag=17",
+		"/images/create?fromImage=atelier-task@sha256:" + strings.Repeat("a", 64),
+		"/images/create?fromImage=atelier-task&tag=sha256:" + strings.Repeat("a", 64),
+		"/images/create?fromImage=ghcr.io/you/alpha-dev&tag=3",
+		// A re-pull of an image someone else pulled: only the registry's content.
+		"/images/create?fromImage=localstack/localstack&tag=4",
+		"/images/create?fromImage=other-tool:latest",
+		"/images/create?fromImage=index.docker.io/library/other-tool&tag=latest",
+	} {
+		if status, out := c.do("POST", uri, ""); status >= 400 {
+			t.Errorf("POST %s: status %d (%s), want it forwarded", uri, status, out)
+		}
+	}
+	if got := c.d.saw("POST /build?"); !strings.Contains(got, `"atelier.task":"`+testID+`"`) {
+		t.Errorf("build not labelled: %s", got)
+	}
+	if status, _ := c.do("POST", "/build?t=x&labels="+url.QueryEscape(`{"atelier.agent":"`+testID+`","a":"b"}`), ""); status >= 400 {
+		t.Errorf("build with labels: %d", status)
+	} else if got := c.d.saw("POST /build?"); strings.Contains(got, "atelier.agent") || !strings.Contains(got, `"a":"b"`) {
+		t.Errorf("build labels: %s", got)
+	}
+	// What atl uses cannot be read: refused.
+	c.g.Reserved = func() ([]string, error) { return nil, errors.New("projects unreadable") }
+	if status, out := c.do("POST", "/build?t=new-tool", ""); status != http.StatusForbidden {
+		t.Errorf("unreadable reserved names: %d %s", status, out)
 	}
 }
 

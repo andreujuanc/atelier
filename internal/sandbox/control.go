@@ -178,7 +178,8 @@ type Control struct {
 	// it only ever goes to Copy, as bytes, and is never logged.
 	Copy func(ctx context.Context, text []byte) error
 	// Workspace, set only in the assistant's gate, is its workspace dir:
-	// atl requests (OpAtl) run `<Atl> -w <Workspace> <args>` there. Empty
+	// atl requests (OpAtl) run `<Atl> -w <Workspace> <command>
+	// --for-assistant <rest>` there. Empty
 	// (every task's gate): atl requests are refused.
 	Workspace string
 	// Resolve, needed with Workspace, reads an atl command line (what the
@@ -456,9 +457,9 @@ func (c *Control) run(in io.Reader, args []string, stdin io.Reader, stdout, stde
 }
 
 // atl runs, in the assistant's gate only, an atl command line the assistant
-// may run in the gate's workspace: `<Atl> -w
-// <Workspace> <args>`, exec'd like the CLI, with the gate's environment
-// (never the requester's), the body as its stdin, stdout and stderr apart
+// may run in the gate's workspace: `<Atl> -w <Workspace> <command>
+// --for-assistant <rest>` (ForAssistantFlag), exec'd like the CLI, with the
+// gate's environment (never the requester's), the body as its stdin, stdout and stderr apart
 // (at most maxAtlOutput together) and the exit status passed back. A task's
 // gate (no Workspace) refuses it. The command line must pass
 // CheckAssistantArgs and resolve (Resolve, cobra's own reading of it) to an
@@ -475,7 +476,9 @@ func (c *Control) atl(conn net.Conn, in *bufio.Reader, out *replyWriter, req Con
 		refuse(err.Error())
 		return
 	}
-	argv := append([]string{"-w", c.Workspace}, req.Args...)
+	// The gate's flag right after the command (never a flag, see
+	// CheckAssistantArgs), where no "--" can come before it.
+	argv := append([]string{"-w", c.Workspace, req.Args[0], "--" + ForAssistantFlag}, req.Args[1:]...)
 	// As cobra will run it: both checks must pass.
 	path, readsStdin, err := c.Resolve(argv)
 	switch {

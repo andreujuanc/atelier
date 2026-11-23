@@ -396,7 +396,11 @@ func (c *cli) notesCmd() *cobra.Command {
 				}
 				text = data
 			}
-			text, err = ap.ReplaceNotes(cmd.Context(), t.Slug, text)
+			if c.forAssistant {
+				text, err = ap.ReplaceNotesKept(cmd.Context(), t.Slug, text)
+			} else {
+				text, err = ap.ReplaceNotes(cmd.Context(), t.Slug, text)
+			}
 			if err != nil {
 				return err
 			}

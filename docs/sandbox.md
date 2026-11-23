@@ -21,13 +21,15 @@ atl (host) ── docker exec ──▶ task container: claude, your tools, the 
 
 With `ATL_SANDBOX=off`, Claude on the host reads what containers could write:
 
-- The assistant dir: before the assistant starts on the host, atl moves `CLAUDE.local.md`,
-  `.mcp.json`, `.claude/settings.local.json`, `.claude/skills/`, `.claude/agents/` and
-  `.claude/commands/` (all of `.claude` if it is a symlink) to
-  `<workspace>/state/assistant-quarantine/<time>/` and prints one warning naming them.
-  Nothing is deleted; move back what you trust. `.claude/settings.json` is atl's there: if it
-  differs from what atl writes fresh, it goes to the same dir and atl writes it from scratch
-  (with the sandbox on, atl merges it, keeping your keys and rules).
+- The assistant dir, if the assistant ran in its container since the last host launch (a
+  marker in `<workspace>/state/`, which no container sees). Before the assistant starts on
+  the host, atl removes that container (if Docker cannot confirm it is gone, the assistant
+  does not start), stops its gate, then moves everything in the dir except `CLAUDE.md` and
+  `.claude/settings.json` (only if it is what atl writes fresh) to
+  `<workspace>/state/assistant-quarantine/<time>/`, symlinks as they are, and prints one
+  warning naming what moved: a `.git` with `core.fsmonitor` would run on any git there.
+  Nothing is deleted; move back what you trust. Once per container run: your own files there
+  stay on later host launches.
 - Task dirs: no such step. A task's `CLAUDE.md`, `.claude/`, `.mcp.json` and worktrees were
   writable by its container; read them before you run a task's sessions on the host.
 
@@ -61,7 +63,8 @@ config dir, atelier's database, state dir (logs) or config dir (projects).
 
 Image: the project's `image`, else `ATL_SANDBOX_IMAGE` / `[sandbox] image`, else
 `atelier-task`. A missing `atelier-task` fails with the build command; another missing image
-is pulled.
+is pulled for a task, never for the assistant or `atl token` (`--pull=never`: they run the
+image's `claude` with your token).
 
 `atelier-task` has Claude Code, git, the Docker CLI with compose, Node.js LTS with npm and
 corepack, and curl, jq, ripgrep, zip/unzip, xz, procps, ssh client. No other language, no
@@ -96,6 +99,7 @@ The session's start context tells Claude all of this.
 | a mount of `/var/run/docker.sock` becomes the gate's socket | testcontainers/localstack stay under the same rules |
 | refused: privileged, host network/PID/IPC, added capabilities, devices, security options, other runtimes, volume driver options, log drivers other than `json-file`/`local`/`none`, unknown container settings | each is a way out of the container |
 | images: pull and build allowed, remove refused; build from a remote URL refused | images are shared; the daemon would fetch with host credentials |
+| a pull or build may not name a tag atl's own containers run from (`atelier-task`, `atelier`, the workspace's and every project's image, in any spelling); a build may not name a tag that points to an image the task did not build (a pull may: it brings only the registry's content for that name); builds get the task's label; pulling all tags, tag, import, load, commit refused | a task could swap what later tasks, the assistant and `atl token` run |
 | BuildKit refused (`DOCKER_BUILDKIT=0` is set) | the gate cannot inspect BuildKit sessions |
 | the task's container is joined to every network the task creates; the task cannot stop, remove, or impersonate (`atl-<slug>-<hash>` names) it | services answer by compose service name |
 | form-encoded request bodies refused | Docker would read values the gate did not check |
@@ -146,9 +150,10 @@ atl token --paste    # store a token you already have (no echo, or from stdin)
 ```
 
 `atl token` runs `claude setup-token` in a throwaway container of the task image
-(`docker run --rm -it --pull=never`, as your user, no mounts, only `TERM` and `LANG`); with
-`ATL_SANDBOX=off`, on the host. The token is minted by that image's own `claude`, so the image
-is never pulled for it: a missing image (also a custom `[sandbox] image`) is an error.
+(`docker run --rm -it --pull=never`, as your user, no mounts, only `TERM`, `LANG` and
+`HOME=/tmp`); with `ATL_SANDBOX=off`, on the host. The token is minted by that image's own
+`claude`, so the image is never pulled for it: a missing image (also a custom
+`[sandbox] image`) is an error.
 
 It is stored in `<workspace>/run/claude-token.json` (mode 0600), which no container sees.
 `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` in atl's environment win over the stored token.
@@ -207,10 +212,11 @@ refuses, `atl push`/`atl fetch`) and names the mounted host paths. `context` /
 - A task can swap a checked mount path for a symlink before the daemon mounts it.
 - After a gate restart (atl upgraded), services that mounted the Docker socket must be
   recreated.
-- Notes and transcripts a task writes reach the assistant as prompt input, and the
-  assistant's gate runs state-changing commands for it (`new`, `add`, `session`, `pr`,
-  `done`, …). Claude Code's permission prompt is the only check between such input and
-  those commands: read what the assistant asks to run.
+- Notes and transcripts a task writes reach the assistant as prompt input. Claude Code's
+  permission prompt runs in the assistant's container, so a hostile one skips it: the gate's
+  allowlist is the only real limit ([assistant.md](assistant.md#permissions)).
+- The image rule is checked when the request arrives: a tag another task creates while a
+  build runs is overwritten when it ends.
 - The assistant's container can read the token too; it has no repo, task dir or Docker.
 - A task can write (never read) your clipboard while your terminal is on its tmux session.
   Read what you paste into a shell.

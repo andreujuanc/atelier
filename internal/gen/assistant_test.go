@@ -399,10 +399,15 @@ func TestAssistantClaudeMDInContainer(t *testing.T) {
 	for _, want := range []string{"container of your own", "no repos", "no worktrees", "`atl diff`", "no Docker",
 		"`atl open <task>` in a terminal; you cannot run it", "select it and press Enter",
 		"`atl done` and `atl cancel` do not run here", "(`d` done, `c` cancel)",
-		"`atl done`, `atl cancel`, `--workspace` (`-w`) and `--force` (`-f`)"} {
+		"`atl done`, `atl cancel`, `atl status` to `done`/`cancelled` or on a closed task, `--workspace` (`-w`)",
+		"`atl status <task> <backlog|active|review>`", "reopening a closed one (which removes its containers)",
+		"keeps the text it replaces in a history file"} {
 		if !strings.Contains(box, want) {
 			t.Errorf("container text lacks %q", want)
 		}
+	}
+	if strings.Contains(box, "only changes the status") || strings.Contains(box, "<backlog|active|review|done|cancelled>") {
+		t.Error("container text offers atl status to close or reopen a task")
 	}
 	if strings.Contains(box, "`resume`, `open`, `pr`") || strings.Contains(box, "glance at `git log`") ||
 		strings.Contains(box, "- `atl done <task>` — finish") || strings.Contains(box, "`pr`, `done`, `cancel`") {

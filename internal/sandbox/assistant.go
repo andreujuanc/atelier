@@ -44,6 +44,15 @@ var AssistantCommands = []string{
 	"pr", "note", "notes", "rename", "doctor", "help",
 }
 
+// ForAssistantFlag is the hidden global atl flag (--for-assistant) that the
+// assistant's gate puts right after the command of every command line it
+// runs, and that no request may carry (CheckAssistantArgs): with it, atl
+// status only moves an open task between open statuses (no closing, no
+// reopening, see app.SetOpenStatus), and atl notes --set and --clear first
+// keep the notes they replace in a file only atl sees
+// (app.ReplaceNotesKept).
+const ForAssistantFlag = "for-assistant"
+
 // MaxAssistantArgs bounds the arguments of one OpAtl request.
 const MaxAssistantArgs = 256
 
@@ -66,6 +75,11 @@ var ErrAssistantOpen = errors.New("atl open attaches a terminal and does not run
 //     no command the assistant may run has it (done and cancel, where it
 //     discards uncommitted work, are the user's);
 //   - done and cancel: they remove the task's worktrees;
+//   - status with done or cancelled among its arguments (closing a task is
+//     the user's; atl itself, run with ForAssistantFlag, also refuses to
+//     close or reopen one);
+//   - any spelling of ForAssistantFlag: the gate adds it, the requester
+//     may not turn it off;
 //   - --author with any value but assistant (--author <x>, --author=<x>),
 //     and atl note without --author assistant: the assistant writes no note
 //     that reads as the user's;
@@ -94,6 +108,8 @@ func CheckAssistantArgs(args []string) error {
 			return errWorkspaceFlag
 		case a == "--force" || strings.HasPrefix(a, "--force="):
 			return errForceFlag
+		case a == "--"+ForAssistantFlag || strings.HasPrefix(a, "--"+ForAssistantFlag+"="):
+			return errors.New("--" + ForAssistantFlag + " is not accepted: the gate sets it")
 		case len(a) > 1 && a[0] == '-' && a[1] != '-':
 			// Short flags, possibly grouped (-fw), possibly with a value
 			// attached (-wother): a w or f anywhere may be one.
@@ -135,6 +151,9 @@ func CheckAssistantArgs(args []string) error {
 			"ask the user to close the task in the atl TUI (d done, c cancel) or with atl " + sub + " <task> in a terminal")
 	case strings.HasPrefix(sub, "-"):
 		return fmt.Errorf("flag %s before the command is not accepted: put the command first (help: atl help <command>, or atl <command> --help)", sub)
+	case sub == "status" && (slices.Contains(args[1:], "done") || slices.Contains(args[1:], "cancelled")):
+		return errors.New("atl status done/cancelled does not run for the assistant (closing a task is the user's): " +
+			"ask the user to close it in the atl TUI (d done, c cancel) or with atl done/cancel <task> in a terminal")
 	case sub == "repos":
 		for _, a := range args[1:] {
 			if !strings.HasPrefix(a, "-") {

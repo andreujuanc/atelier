@@ -406,3 +406,77 @@ func TestPushedText(t *testing.T) {
 		}
 	}
 }
+
+// TestForAssistant: as the assistant's gate runs them (--for-assistant,
+// which it always adds), atl status only moves an open task between open
+// statuses: closing a task, or reopening a closed one (which removes its
+// Docker objects), is refused and nothing changes; atl notes --set and
+// --clear first append the notes they replace, dated, to a file under the
+// state dir, so the user's text is never lost.
+func TestForAssistant(t *testing.T) {
+	setup(t)
+	for _, title := range []string{"alpha", "beta"} {
+		if code, _, errs := atl(t, "new", title, "--repo", "api", "--no-fetch"); code != 0 {
+			t.Fatalf("new: %d %s", code, errs)
+		}
+	}
+	status := func(slug string) string {
+		t.Helper()
+		_, out, _ := atl(t, "ls", "--status", "all", "--json")
+		var tasks []map[string]any
+		if err := json.Unmarshal([]byte(out), &tasks); err != nil {
+			t.Fatal(err)
+		}
+		for _, tk := range tasks {
+			if tk["slug"] == slug {
+				return tk["status"].(string)
+			}
+		}
+		return ""
+	}
+	if code, _, errs := atl(t, "status", "--for-assistant", "alpha", "review"); code != 0 || status("alpha") != "review" {
+		t.Fatalf("open to open: %d %s", code, errs)
+	}
+	for _, st := range []string{"done", "cancelled"} {
+		if code, _, errs := atl(t, "status", "--for-assistant", "alpha", st); code != 1 || !strings.Contains(errs, "closes the task") ||
+			status("alpha") != "review" {
+			t.Errorf("to %s: %d %s", st, code, errs)
+		}
+	}
+	if code, _, errs := atl(t, "status", "alpha", "done"); code != 0 {
+		t.Fatalf("user closes: %d %s", code, errs)
+	}
+	if code, _, errs := atl(t, "status", "--for-assistant", "alpha", "active"); code != 1 || !strings.Contains(errs, "reopening it") ||
+		status("alpha") != "done" {
+		t.Errorf("reopen: %d %s (status %s)", code, errs, status("alpha"))
+	}
+
+	notes := func(in string, args ...string) {
+		t.Helper()
+		var out, errb bytes.Buffer
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if code := runIn(ctx, append([]string{"notes", "beta"}, args...), strings.NewReader(in), &out, &errb); code != 0 {
+			t.Fatalf("notes %q: %d %s", args, code, errb.String())
+		}
+	}
+	history := filepath.Join(os.Getenv("ATL_WORKSPACE"), "state", "notes-history", "beta.md")
+	notes("the user's plan\n", "--set")
+	if _, err := os.Stat(history); !os.IsNotExist(err) {
+		t.Errorf("history kept for the user's own --set: %v", err)
+	}
+	notes("the assistant's text\n", "--for-assistant", "--set")
+	notes("", "--clear", "--for-assistant")
+	if _, out, _ := atl(t, "notes", "beta"); out != "" {
+		t.Errorf("notes after --clear: %q", out)
+	}
+	h, err := os.ReadFile(history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := string(h); strings.Count(s, "\n## ")+strings.Count(s[:3], "## ") != 2 ||
+		!strings.Contains(s, "the user's plan\n") || !strings.Contains(s, "the assistant's text\n") ||
+		strings.Index(s, "the user's plan") > strings.Index(s, "the assistant's text") {
+		t.Errorf("history:\n%s", s)
+	}
+}

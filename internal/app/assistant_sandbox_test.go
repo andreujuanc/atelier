@@ -85,6 +85,7 @@ func TestSandboxAssistant(t *testing.T) {
 	id := sandbox.AssistantID(dir)
 	for _, want := range []string{
 		"--name atl-" + id + " ",
+		"--pull=never ", // its claude gets the token: never what a registry has under that name
 		"--label atelier.agent=" + id + " ",
 		"--mount type=bind,src=" + dir + ",dst=" + dir + " ",
 		"--mount type=bind,src=" + claude + ",dst=" + claude + " ",
@@ -191,5 +192,70 @@ func TestSandboxAssistantFails(t *testing.T) {
 	}
 	if len(*gates) != 1 { // only the image check comes after the gate
 		t.Errorf("gate starts: %q", *gates)
+	}
+}
+
+// TestSandboxAssistantEndsOldWindow: once the assistant's window is gone,
+// what it started in the container (an old claude, what it left in the
+// background) is ended before a new window starts: the container, atl's
+// own, is stopped by its ID (and then started again); while the window
+// lives nothing is stopped.
+func TestSandboxAssistantEndsOldWindow(t *testing.T) {
+	e, fd, _ := assistantSandboxEnv(t)
+	ctx := context.Background()
+	sessionAtStop := []bool{}
+	docker := e.app.Docker
+	e.app.Docker = func(ctx context.Context, args ...string) (string, error) {
+		if args[0] == "stop" {
+			sessionAtStop = append(sessionAtStop, e.app.Tmux.HasSession(ctx, AssistantSession))
+		}
+		return docker(ctx, args...)
+	}
+	for i := 0; i < 2; i++ { // first launch, then a reattach
+		if _, _, err := e.app.Assistant(ctx, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stops := fd.find("stop"); len(stops) != 0 {
+		t.Errorf("stopped with no earlier window or a live one: %q", stops)
+	}
+	e.tmux(t, "kill-session", "-t", "="+AssistantSession)
+	if _, _, err := e.app.Assistant(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	stops := fd.find("stop")
+	if len(stops) != 1 || stops[0][len(stops[0])-1] != fakeContainerID || !slices.Equal(sessionAtStop, []bool{false}) {
+		t.Errorf("stops %q (a window there then: %v)", stops, sessionAtStop)
+	}
+	if !e.app.Tmux.HasSession(ctx, AssistantSession) {
+		t.Error("no new window")
+	}
+}
+
+// TestSandboxAssistantReattachWarns: with the assistant's window alive, a
+// failure to make sure of its container (Docker gone a moment, no token)
+// does not keep the terminal from attaching: a warning says why. Without a
+// live window it is the error it was.
+func TestSandboxAssistantReattachWarns(t *testing.T) {
+	e, fd, _ := assistantSandboxEnv(t)
+	ctx := context.Background()
+	if _, _, err := e.app.Assistant(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	out := e.app.Out.(*bytes.Buffer)
+	out.Reset()
+	fd.down = true
+	cmd, _, err := e.app.Assistant(ctx, "")
+	if err != nil || cmd == nil || !strings.Contains(out.String(), "warning:") || !strings.Contains(out.String(), "cannot reach Docker") {
+		t.Errorf("reattach with Docker down: %v %v %q", cmd, err, out.String())
+	}
+	fd.down = false
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	if _, _, err := e.app.Assistant(ctx, ""); err != nil {
+		t.Errorf("reattach without a token: %v", err)
+	}
+	e.tmux(t, "kill-session", "-t", "="+AssistantSession)
+	if _, _, err := e.app.Assistant(ctx, ""); err == nil || !strings.Contains(err.Error(), "atl token") {
+		t.Errorf("new window without a token: %v", err)
 	}
 }

@@ -1068,3 +1068,36 @@ func (a *App) cleanupBranch(ctx context.Context, name, repo, branch string) {
 	}
 	fmt.Fprintf(a.out(), "deleted branch %s in %s\n", branch, name)
 }
+
+// SetOpenStatus is SetStatus for the assistant's gate (atl status run for
+// the assistant): it only moves an open task between open statuses. A
+// closed status is refused (closing is the user's: atl done or cancel),
+// and so is a task that is closed: reopening it removes its Docker objects
+// and restarts its sandbox (see reopen). The check and the change are made
+// under the per-task lock, as done, cancel and reopen hold it.
+func (a *App) SetOpenStatus(ctx context.Context, ref string, st model.Status) error {
+	if !st.Valid() {
+		return fmt.Errorf("invalid status %q", st)
+	}
+	if !st.Open() {
+		return fmt.Errorf("status %s closes the task, which the assistant does not do: "+
+			"ask the user to close it in the atl TUI (d done, c cancel) or with atl done/cancel in a terminal", st)
+	}
+	t, err := a.Store.ResolveTask(ctx, ref)
+	if err != nil {
+		return err
+	}
+	unlock, err := a.lockTask(ctx, t.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
+		return err
+	}
+	if !t.Status.Open() {
+		return fmt.Errorf("task %s is %s, and reopening it (which removes its containers, networks and volumes and starts its sandbox anew) "+
+			"is not for the assistant: ask the user to run atl status %s %s in a terminal", t.Slug, t.Status, t.Slug, st)
+	}
+	return a.Store.SetTaskStatus(ctx, t.ID, st)
+}
