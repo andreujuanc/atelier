@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/model"
@@ -15,7 +15,7 @@ import (
 // more than h lines.
 func checkView(t *testing.T, m *Model, w, h int) string {
 	t.Helper()
-	v := m.View()
+	v := m.View().Content
 	lines := strings.Split(v, "\n")
 	if len(lines) != h {
 		t.Errorf("view has %d lines, want %d", len(lines), h)
@@ -49,7 +49,7 @@ func TestNotesArea(t *testing.T) {
 			t.Errorf("notes area lacks %q:\n%s", want, v)
 		}
 	}
-	if strings.Contains(m.View(), "\x1b[31m red") {
+	if strings.Contains(m.View().Content, "\x1b[31m red") {
 		t.Fatal("unsanitized notes rendered")
 	}
 	// wrapped: the long line takes several rows, all within the pane
@@ -577,7 +577,7 @@ func TestNotesLoading(t *testing.T) {
 			t.Fatalf("%s while loading returned a command", k)
 		}
 	}
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("js")})
+	m.Update(textKey("js"))
 	if m.mode != modeNotesLoading || m.selected().Task.Slug != "gamma" || m.form != nil || m.confirm != nil ||
 		m.quitRequested || fb.count("NewSession") != 0 || fb.count("GetNotes") != 0 {
 		t.Fatalf("keys leaked while loading: mode %v sel %s", m.mode, m.selected().Task.Slug)
@@ -589,7 +589,7 @@ func TestNotesLoading(t *testing.T) {
 	key(m, "esc")
 
 	// "mjs" as one burst: m starts loading, j and s are swallowed
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("mjs")})
+	_, cmd := m.Update(textKey("mjs"))
 	if m.mode != modeNotesLoading || m.selected().Task.Slug != "gamma" || fb.count("NewSession") != 0 {
 		t.Fatalf("burst: mode %v sel %s sessions %d", m.mode, m.selected().Task.Slug, fb.count("NewSession"))
 	}

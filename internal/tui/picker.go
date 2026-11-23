@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
@@ -191,7 +191,7 @@ const (
 )
 
 // update handles a key.
-func (p *picker) update(msg tea.KeyMsg) pickResult {
+func (p *picker) update(msg tea.KeyPressMsg) pickResult {
 	k := msg.String()
 	switch k {
 	case "up", "ctrl+p", "down", "ctrl+n", "pgup", "pgdown", "home", "end":
@@ -218,7 +218,7 @@ func (p *picker) update(msg tea.KeyMsg) pickResult {
 		p.cursor = 0
 	case "end":
 		p.cursor = len(p.visible()) - 1
-	case " ":
+	case "space":
 		name := p.current()
 		switch {
 		case name == "":
@@ -238,9 +238,9 @@ func (p *picker) update(msg tea.KeyMsg) pickResult {
 	case "ctrl+u":
 		p.setFilter("")
 	default:
-		if msg.Type == tea.KeyRunes && !msg.Alt {
+		if msg.Text != "" && msg.Mod&(tea.ModAlt|tea.ModCtrl) == 0 {
 			var b strings.Builder
-			for _, r := range msg.Runes {
+			for _, r := range msg.Text {
 				if r > ' ' && r != 0x7f {
 					b.WriteRune(r)
 				}

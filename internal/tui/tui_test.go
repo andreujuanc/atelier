@@ -13,10 +13,9 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/muesli/termenv"
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
@@ -365,47 +364,45 @@ func press(m *Model, k string) tea.Cmd {
 	return cmd
 }
 
-func keyMsg(k string) tea.KeyMsg {
-	var msg tea.KeyMsg
-	switch k {
-	case "enter":
-		msg = tea.KeyMsg{Type: tea.KeyEnter}
-	case "esc":
-		msg = tea.KeyMsg{Type: tea.KeyEsc}
-	case "tab":
-		msg = tea.KeyMsg{Type: tea.KeyTab}
-	case "up":
-		msg = tea.KeyMsg{Type: tea.KeyUp}
-	case "down":
-		msg = tea.KeyMsg{Type: tea.KeyDown}
-	case "ctrl+b":
-		msg = tea.KeyMsg{Type: tea.KeyCtrlB}
-	case "ctrl+c":
-		msg = tea.KeyMsg{Type: tea.KeyCtrlC}
-	case "ctrl+n":
-		msg = tea.KeyMsg{Type: tea.KeyCtrlN}
-	case "ctrl+p":
-		msg = tea.KeyMsg{Type: tea.KeyCtrlP}
-	case "ctrl+u":
-		msg = tea.KeyMsg{Type: tea.KeyCtrlU}
-	case "ctrl+s":
-		msg = tea.KeyMsg{Type: tea.KeyCtrlS}
-	case "ctrl+r":
-		msg = tea.KeyMsg{Type: tea.KeyCtrlR}
-	case "ctrl+end":
-		msg = tea.KeyMsg{Type: tea.KeyCtrlEnd}
-	case "backspace":
-		msg = tea.KeyMsg{Type: tea.KeyBackspace}
-	case "pgdown":
-		msg = tea.KeyMsg{Type: tea.KeyPgDown}
-	case "pgup":
-		msg = tea.KeyMsg{Type: tea.KeyPgUp}
-	case " ":
-		msg = tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}}
-	default:
-		msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
+// keyMsg is the key press k: a key name ("enter", "ctrl+s", "shift+tab",
+// " " for space) or typed text (one event, as fast typing may deliver).
+func keyMsg(k string) tea.KeyPressMsg {
+	named := map[string]rune{
+		"enter": tea.KeyEnter, "esc": tea.KeyEscape, "tab": tea.KeyTab, "up": tea.KeyUp,
+		"down": tea.KeyDown, "left": tea.KeyLeft, "right": tea.KeyRight, "end": tea.KeyEnd,
+		"home": tea.KeyHome, "backspace": tea.KeyBackspace, "pgdown": tea.KeyPgDown,
+		"pgup": tea.KeyPgUp, "delete": tea.KeyDelete,
 	}
-	return msg
+	if k == " " || k == "space" {
+		return tea.KeyPressMsg{Code: tea.KeySpace, Text: " "}
+	}
+	var mod tea.KeyMod
+	name := k
+	for _, p := range []struct {
+		prefix string
+		mod    tea.KeyMod
+	}{{"ctrl+", tea.ModCtrl}, {"alt+", tea.ModAlt}, {"shift+", tea.ModShift}} {
+		if rest, ok := strings.CutPrefix(name, p.prefix); ok && rest != "" {
+			mod |= p.mod
+			name = rest
+		}
+	}
+	if code, ok := named[name]; ok {
+		return tea.KeyPressMsg{Code: code, Mod: mod}
+	}
+	if mod != 0 && len([]rune(name)) == 1 {
+		return tea.KeyPressMsg{Code: []rune(name)[0], Mod: mod}
+	}
+	return textKey(k)
+}
+
+// textKey is typed text s delivered as one key event.
+func textKey(s string) tea.KeyPressMsg {
+	rs := []rune(s)
+	if len(rs) == 1 {
+		return tea.KeyPressMsg{Code: rs[0], Text: s}
+	}
+	return tea.KeyPressMsg{Code: tea.KeyExtended, Text: s}
 }
 
 func typeText(m *Model, s string) {
@@ -418,7 +415,7 @@ func typeText(m *Model, s string) {
 	}
 }
 
-func plainView(m *Model) string { return ansi.Strip(m.View()) }
+func plainView(m *Model) string { return ansi.Strip(m.View().Content) }
 
 func sampleTasks() []app.TaskView {
 	return []app.TaskView{
@@ -588,7 +585,7 @@ func TestWaitingMarkerAndHighlight(t *testing.T) {
 	if !strings.Contains(v, "claude-7") || !strings.Contains(v, "waiting") || !strings.Contains(v, "2m") {
 		t.Fatalf("session line missing:\n%s", v)
 	}
-	raw := m.View()
+	raw := m.View().Content
 	var line string
 	for _, l := range strings.Split(raw, "\n") {
 		if strings.Contains(ansi.Strip(l), "claude-7") {
@@ -1185,7 +1182,7 @@ func TestPicker(t *testing.T) {
 		t.Fatalf("no match:\n%s", v)
 	}
 	// a pasted multi-rune string filters; spaces are dropped
-	p.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" do cs"), Paste: true})
+	p.paste(" do cs")
 	if p.filter != "zzzdocs" {
 		t.Fatalf("paste: %q", p.filter)
 	}
@@ -1427,7 +1424,7 @@ func TestOtherKeys(t *testing.T) {
 	if !strings.Contains(m.status, "https://example.com/pr/1") || !strings.Contains(m.status, "web skipped (no commits)") {
 		t.Fatalf("pr status %q", m.status)
 	}
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	_, cmd := m.Update(textKey("q"))
 	if cmd == nil || cmd() != tea.Quit() {
 		t.Fatal("q does not quit")
 	}
@@ -1443,7 +1440,7 @@ func TestSmallSizes(t *testing.T) {
 	sizes := [][2]int{{0, 0}, {1, 1}, {10, 5}, {30, 10}, {39, 12}, {40, 3}, {80, 24}, {200, 60}}
 	check := func(w, h int) {
 		t.Helper()
-		v := m.View()
+		v := m.View().Content
 		lines := strings.Split(v, "\n")
 		if h > 0 && len(lines) > h {
 			t.Errorf("%dx%d: %d lines", w, h, len(lines))
@@ -1724,7 +1721,7 @@ func TestSanitize(t *testing.T) {
 	fb.tasks[1].Task.Description = "\x1b]0;pwn\x07desc\r\nmore"
 	fb.tasks[1].Task.Project = "p\nq"
 	m, _ := newTest(t, fb)
-	raw := m.View()
+	raw := m.View().Content
 	for _, bad := range []string{"\x1b[2J", "\x1b]0;", "\x07", "\t", "\r"} {
 		if strings.Contains(raw, bad) {
 			t.Fatalf("view contains %q", bad)
@@ -1912,7 +1909,7 @@ func TestMultiRuneKeys(t *testing.T) {
 	}
 	key(m, "esc")
 	// a paste in normal mode does nothing
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("dy"), Paste: true})
+	_, cmd := m.Update(tea.PasteMsg{Content: "dy"})
 	drain(m, cmd)
 	if m.mode != modeNormal || fb.count("Done") != 0 {
 		t.Fatal("paste acted")
@@ -2247,10 +2244,10 @@ func TestAggregateDot(t *testing.T) {
 			t.Errorf("%s: glyph width %d", c.name, ansi.StringWidth(g))
 		}
 	}
-	if waitStyle.GetForeground() != lipgloss.TerminalColor(accent) || !waitStyle.GetBold() {
+	if waitStyle.GetForeground() != accent || !waitStyle.GetBold() {
 		t.Error("waiting dot is not accent + bold")
 	}
-	if runStyle.GetForeground() != lipgloss.TerminalColor(okColor) {
+	if runStyle.GetForeground() != okColor {
 		t.Error("running dot is not green")
 	}
 }
@@ -2447,9 +2444,6 @@ func TestDirtyTimeout(t *testing.T) {
 }
 
 func TestSelectedRowSeparator(t *testing.T) {
-	old := lipgloss.ColorProfile()
-	lipgloss.SetColorProfile(termenv.ANSI256)
-	t.Cleanup(func() { lipgloss.SetColorProfile(old) })
 	fb := &fakeBackend{tasks: sampleTasks()}
 	m, _ := newTest(t, fb)
 	var r row
@@ -2546,7 +2540,7 @@ func TestDotsSmallSizes(t *testing.T) {
 			m.Update(tea.WindowSizeMsg{Width: w, Height: h})
 			for _, slug := range []string{"a-very-long-slug-that-will-not-fit", "b", "d"} {
 				selectSlug(t, m, slug)
-				for _, l := range strings.Split(m.View(), "\n") {
+				for _, l := range strings.Split(m.View().Content, "\n") {
 					if ansi.StringWidth(l) > w {
 						t.Fatalf("%dx%d: line too wide: %q", w, h, ansi.Strip(l))
 					}
@@ -2975,8 +2969,8 @@ func TestRenameKey(t *testing.T) {
 	// resizing while editing resizes the input
 	key(m, "t")
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
-	if want := 80 - len(m.renameInput.Prompt) - 1; m.renameInput.Width != want {
-		t.Fatalf("rename input width after resize = %d, want %d", m.renameInput.Width, want)
+	if want := 80 - len(m.renameInput.Prompt) - 1; m.renameInput.Width() != want {
+		t.Fatalf("rename input width after resize = %d, want %d", m.renameInput.Width(), want)
 	}
 }
 

@@ -5,7 +5,7 @@ inter-package interfaces and CLI surface so milestones can be built independentl
 
 ## 0. Basics
 
-- Module: `github.com/andreujuanc/atelier`, Go 1.24, binary `atl` from `./cmd/atl`.
+- Module: `github.com/andreujuanc/atelier`, Go 1.25, binary `atl` from `./cmd/atl`.
 - Deps (only these unless a reviewer approves more):
   - `modernc.org/sqlite` (no cgo)
   - `github.com/spf13/cobra` (interspersed flags: `atl new "title" --project P`)

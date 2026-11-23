@@ -6,10 +6,9 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/charmbracelet/bubbles/cursor"
-	"github.com/charmbracelet/bubbles/textarea"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/app"
@@ -75,10 +74,12 @@ func newNotesEditor(t app.TaskView, text string) *notesEditor {
 	ta.MaxWidth = 0
 	ta.Placeholder = "notes for this task (ctrl+s saves, esc leaves)"
 	plain := lipgloss.NewStyle()
-	ta.FocusedStyle.Base, ta.FocusedStyle.CursorLine, ta.FocusedStyle.Text = plain, plain, plain
-	ta.FocusedStyle.Placeholder = dimStyle
-	ta.BlurredStyle = ta.FocusedStyle
-	ta.Cursor.SetMode(cursor.CursorStatic)
+	st := ta.Styles()
+	st.Focused = textarea.StyleState{Base: plain, Text: plain, CursorLine: plain, Placeholder: dimStyle,
+		EndOfBuffer: plain, Prompt: plain, LineNumber: plain, CursorLineNumber: plain}
+	st.Blurred = st.Focused
+	st.Cursor.Blink = false
+	ta.SetStyles(st)
 	e := &notesEditor{id: t.Task.ID, slug: t.Task.Slug, task: t, ta: ta}
 	e.ta.Focus()
 	e.load(text)
@@ -90,7 +91,7 @@ func newNotesEditor(t app.TaskView, text string) *notesEditor {
 func (e *notesEditor) load(text string) {
 	e.ta.SetValue(text)
 	// Start at the top, like the notes area shows them.
-	e.ta, _ = e.ta.Update(tea.KeyMsg{Type: tea.KeyCtrlHome})
+	e.ta.MoveToBegin()
 	e.base, e.start, e.conflict = text, e.ta.Value(), false
 }
 
@@ -195,7 +196,7 @@ func (m *Model) cancelNotesLoad() {
 
 // notesLoadingKey handles a key while the notes are loading: esc cancels,
 // every other key is swallowed (ctrl+c is handled by handleKey).
-func (m *Model) notesLoadingKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) notesLoadingKey(msg tea.KeyPressMsg) tea.Cmd {
 	if msg.String() == "esc" {
 		slug := ""
 		if m.notesLoad != nil {
@@ -217,7 +218,7 @@ func (m *Model) closeNotes() {
 // notesKey handles a key while the notes editor is focused: every key goes
 // to the editor except ctrl+s (save), ctrl+r (reload), esc (leave) and the
 // answer to a pending question.
-func (m *Model) notesKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) notesKey(msg tea.KeyPressMsg) tea.Cmd {
 	e := m.notes
 	if e == nil {
 		m.mode = modeNormal

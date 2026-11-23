@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/cursor"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/workspace"
@@ -35,7 +34,7 @@ type WorkspaceSelector struct {
 // the name of the workspace chosen, "" when the user quit.
 func RunWorkspaces(ctx context.Context, s WorkspaceSelector) (string, error) {
 	m := NewWorkspacePicker(ctx, s)
-	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx)).Run()
+	_, err := tea.NewProgram(m, tea.WithContext(ctx)).Run()
 	if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {
 		return "", nil
 	}
@@ -100,11 +99,11 @@ func NewWorkspacePicker(ctx context.Context, s WorkspaceSelector) *WorkspacePick
 	fi := textinput.New()
 	fi.Prompt = "/"
 	fi.Placeholder = "filter"
-	fi.Cursor.SetMode(cursor.CursorStatic)
+	staticCursor(&fi)
 	ni := textinput.New()
 	ni.Prompt = "new workspace> "
 	ni.Placeholder = "name (lowercase letters, digits, - and _)"
-	ni.Cursor.SetMode(cursor.CursorStatic)
+	staticCursor(&ni)
 	ni.CharLimit = 32
 	return &WorkspacePicker{ctx: ctx, s: s, selName: s.Preselect, filterInput: fi, nameInput: ni, width: 80, height: 24}
 }
@@ -158,7 +157,9 @@ func (m *WorkspacePicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.clampOffset()
 		return m, nil
-	case tea.KeyMsg:
+	case tea.PasteMsg:
+		return m, m.paste(msg)
+	case tea.KeyPressMsg:
 		return m, m.handleKey(msg)
 	case wsLoadedMsg:
 		m.loading, m.loaded = false, true
@@ -201,7 +202,7 @@ func (m *WorkspacePicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *WorkspacePicker) setStatus(s string, isErr bool) { m.status, m.statusErr = s, isErr }
 
-func (m *WorkspacePicker) handleKey(msg tea.KeyMsg) tea.Cmd {
+func (m *WorkspacePicker) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	key := msg.String()
 	if key == "ctrl+c" {
 		return tea.Quit
@@ -226,13 +227,10 @@ func (m *WorkspacePicker) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 	// Fast-typed letters may arrive as one event ("jj"): one at a time.
-	if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 && !msg.Alt {
-		if msg.Paste {
-			return nil
-		}
+	if rs := []rune(msg.Text); len(rs) > 1 && msg.Mod&(tea.ModAlt|tea.ModCtrl) == 0 {
 		var cmds []tea.Cmd
-		for _, r := range msg.Runes {
-			cmds = append(cmds, m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}))
+		for _, r := range rs {
+			cmds = append(cmds, m.handleKey(runeKey(r)))
 		}
 		return tea.Batch(cmds...)
 	}
@@ -285,7 +283,7 @@ func (m *WorkspacePicker) handleKey(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m *WorkspacePicker) filterKey(msg tea.KeyMsg) tea.Cmd {
+func (m *WorkspacePicker) filterKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		m.mode = wsNormal
@@ -311,7 +309,7 @@ func (m *WorkspacePicker) filterKey(msg tea.KeyMsg) tea.Cmd {
 	return cmd
 }
 
-func (m *WorkspacePicker) newKey(msg tea.KeyMsg) tea.Cmd {
+func (m *WorkspacePicker) newKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		m.mode = wsNormal
@@ -447,8 +445,8 @@ func (m *WorkspacePicker) abbrev(p string) string {
 	return p
 }
 
-// View implements tea.Model.
-func (m *WorkspacePicker) View() string {
+// render draws the screen.
+func (m *WorkspacePicker) render() string {
 	w, h := m.width, m.height
 	if w <= 0 || h <= 0 {
 		return ""

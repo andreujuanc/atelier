@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/app"
@@ -51,7 +51,7 @@ func (p *sessionPicker) picked() *app.SessionChoice {
 }
 
 // update handles a key.
-func (p *sessionPicker) update(msg tea.KeyMsg) pickResult {
+func (p *sessionPicker) update(msg tea.KeyPressMsg) pickResult {
 	switch msg.String() {
 	case "esc":
 		return pickCancel

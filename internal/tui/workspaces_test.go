@@ -7,10 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/muesli/termenv"
 
 	"github.com/andreujuanc/atelier/internal/workspace"
 )
@@ -110,7 +108,7 @@ func wsKey(m *WorkspacePicker, k string) bool {
 	return drainWS(m, cmd)
 }
 
-func wsView(m *WorkspacePicker) string { return ansi.Strip(m.View()) }
+func wsView(m *WorkspacePicker) string { return ansi.Strip(m.View().Content) }
 
 func sampleWorkspaces() []workspace.Entry {
 	return []workspace.Entry{wsRow("alpha", true), wsRow("beta", true), wsRow("old", false)}
@@ -119,9 +117,6 @@ func sampleWorkspaces() []workspace.Entry {
 // TestWorkspacePickerView: a plain list, the name and the path; a
 // directory without atelier.toml dimmed and marked not adopted.
 func TestWorkspacePickerView(t *testing.T) {
-	old := lipgloss.ColorProfile()
-	lipgloss.SetColorProfile(termenv.ANSI256)
-	t.Cleanup(func() { lipgloss.SetColorProfile(old) })
 	f := &fakeWorkspaces{rows: sampleWorkspaces()}
 	m := newWSTest(t, f, "")
 	v := wsView(m)
@@ -140,7 +135,7 @@ func TestWorkspacePickerView(t *testing.T) {
 		t.Errorf("counts shown:\n%s", v)
 	}
 	// The path dimmed; the directory without atelier.toml dimmed.
-	raw := m.View()
+	raw := m.View().Content
 	if !strings.Contains(raw, dimStyle.Render("~/atelier/workspaces/beta")) || !strings.Contains(raw, dimStyle.Render("old")) ||
 		!strings.Contains(raw, dimStyle.Render("  not adopted")) {
 		t.Errorf("not dimmed:\n%q", raw)
@@ -165,7 +160,7 @@ func TestWorkspacePickerView(t *testing.T) {
 		for w := 0; w <= 60; w += 3 {
 			for _, h := range []int{0, 1, 2, 4, 7} {
 				m.Update(tea.WindowSizeMsg{Width: w, Height: h})
-				v := m.View()
+				v := m.View().Content
 				if h > 0 && w > 0 && strings.Count(v, "\n")+1 > h {
 					t.Fatalf("%dx%d: %d lines", w, h, strings.Count(v, "\n")+1)
 				}

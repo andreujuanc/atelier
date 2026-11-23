@@ -2,11 +2,12 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"strconv"
 	"strings"
 	"unicode"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/app"
@@ -34,8 +35,8 @@ var (
 	stopStyle = lookStyle(palette.StateLook(model.StateStopped))
 )
 
-func adaptive(c palette.Color) lipgloss.AdaptiveColor {
-	return lipgloss.AdaptiveColor{Light: c.Light, Dark: c.Dark}
+func adaptive(c palette.Color) color.Color {
+	return lipgloss.LightDark(isDark)(lipgloss.Color(c.Light), lipgloss.Color(c.Dark))
 }
 
 // lookStyle is the lipgloss style of a palette look.
@@ -118,8 +119,8 @@ func trunc(s string, w int) string {
 	return ansi.Truncate(s, w, "…")
 }
 
-// View implements tea.Model.
-func (m *Model) View() string {
+// render draws the screen.
+func (m *Model) render() string {
 	w, h := m.width, m.height
 	if w <= 0 || h <= 0 {
 		return ""

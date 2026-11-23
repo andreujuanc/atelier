@@ -10,9 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/cursor"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
@@ -292,11 +291,11 @@ func New(ctx context.Context, be Backend) *Model {
 	fi := textinput.New()
 	fi.Prompt = "/"
 	fi.Placeholder = "filter"
-	fi.Cursor.SetMode(cursor.CursorStatic)
+	staticCursor(&fi)
 	ri := textinput.New()
 	ri.Prompt = "title> "
 	ri.Placeholder = "the task's new title (enter saves, esc cancels)"
-	ri.Cursor.SetMode(cursor.CursorStatic)
+	staticCursor(&ri)
 	ri.CharLimit = model.MaxTitleLen
 	return &Model{
 		be:  be,
@@ -717,9 +716,11 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		if m.form != nil {
 			m.form.setWidth(m.formInputWidth())
 		}
-		m.renameInput.Width = m.renameInputWidth()
+		m.renameInput.SetWidth(m.renameInputWidth())
 		return nil
-	case tea.KeyMsg:
+	case tea.PasteMsg:
+		return m.handlePaste(msg)
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 
 	case listTickMsg:
@@ -1061,7 +1062,7 @@ func (m *Model) exec(op, slug string, c *exec.Cmd) tea.Cmd {
 	})
 }
 
-func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	key := msg.String()
 	if key == "ctrl+c" {
 		m.switching = false
@@ -1075,14 +1076,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 	// Bubble Tea may deliver fast-typed letters as one multi-rune event
 	// ("jjj"): in normal mode replay them one key at a time (the mode may
-	// change on the way, e.g. "/abc"). Pastes are ignored there.
-	if m.mode == modeNormal && msg.Type == tea.KeyRunes && len(msg.Runes) > 1 && !msg.Alt {
-		if msg.Paste {
-			return nil
-		}
+	// change on the way, e.g. "/abc"). Pastes arrive as tea.PasteMsg and
+	// are ignored there.
+	if rs := []rune(msg.Text); m.mode == modeNormal && len(rs) > 1 && msg.Mod&(tea.ModAlt|tea.ModCtrl) == 0 {
 		var cmds []tea.Cmd
-		for _, r := range msg.Runes {
-			cmds = append(cmds, m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}))
+		for _, r := range rs {
+			cmds = append(cmds, m.handleKey(runeKey(r)))
 		}
 		return tea.Batch(cmds...)
 	}
@@ -1108,7 +1107,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 // renameKey handles a key while a task's title is being edited (`t`).
-func (m *Model) renameKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) renameKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		m.mode = modeNormal
@@ -1162,7 +1161,7 @@ func (m *Model) renameKey(msg tea.KeyMsg) tea.Cmd {
 	return cmd
 }
 
-func (m *Model) filterKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) filterKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		m.mode = modeNormal
@@ -1193,7 +1192,7 @@ func (m *Model) applyFilter(f string) tea.Cmd {
 
 // sessionsKey handles a key in the session picker: enter attaches to a live
 // session, resumes a past one or starts a new one; esc launches nothing.
-func (m *Model) sessionsKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) sessionsKey(msg tea.KeyPressMsg) tea.Cmd {
 	p := m.sessPick
 	if p == nil {
 		m.mode = modeNormal
@@ -1228,7 +1227,7 @@ func (m *Model) sessionsKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 // pickerKey handles a key in the repo picker.
-func (m *Model) pickerKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) pickerKey(msg tea.KeyPressMsg) tea.Cmd {
 	p, t := m.picker, m.pickTask
 	res := p.update(msg)
 	if res == pickContinue {
@@ -1266,7 +1265,7 @@ func (m *Model) pickerKey(msg tea.KeyMsg) tea.Cmd {
 	return m.addStep(t.Task.ID, t.Task.Slug, sel, 0, nil, nil)
 }
 
-func (m *Model) formKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) formKey(msg tea.KeyPressMsg) tea.Cmd {
 	res, cmd := m.form.update(msg)
 	switch res {
 	case formPick:
@@ -1310,7 +1309,7 @@ func (m *Model) confirmKey(key string) tea.Cmd {
 		m.confirm, m.mode = nil, modeNormal
 		m.setStatus(c.verb + " " + c.slug + " aborted")
 		return nil
-	case " ":
+	case "space":
 		c.ticked, c.unticked = !c.ticked, false
 		return nil
 	case "enter":
@@ -1472,7 +1471,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		m.renameInput.SetValue(m.renameOrig)
 		m.renameFill = m.renameInput.Value()
 		m.renameInput.CursorEnd()
-		m.renameInput.Width = m.renameInputWidth()
+		m.renameInput.SetWidth(m.renameInputWidth())
 		m.renameInput.Focus()
 		m.setStatus("")
 		m.mode = modeRename
