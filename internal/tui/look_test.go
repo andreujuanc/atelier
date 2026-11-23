@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"image/color"
 	"strings"
 	"testing"
@@ -251,5 +252,39 @@ func TestSessionAges(t *testing.T) {
 	}
 	if l := strings.TrimRight(listLine(t, m, "shut"), " "); strings.HasSuffix(l, "5m") {
 		t.Errorf("closed row %q", l)
+	}
+}
+
+// TestScrolling: in a long list the selected row stays in the box, the
+// box says what is above and below, and a page moves by the box's height.
+func TestScrolling(t *testing.T) {
+	var ts []app.TaskView
+	for i := int64(1); i <= 40; i++ {
+		ts = append(ts, tv(i, fmt.Sprintf("t%02d", i), model.StatusBacklog))
+	}
+	fb := &fakeBackend{tasks: ts}
+	m, _ := newTest(t, fb)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	h := m.listHeight()
+	if l := m.layout(); h != l.listInH || h != l.bodyH-2 {
+		t.Fatalf("list height %d, layout %+v", h, l)
+	}
+	for i := 0; i < 39; i++ {
+		key(m, "j")
+		v := checkView(t, m, 80, 24)
+		sel := m.selected().Task.Slug
+		if !strings.Contains(v, "▌  Title of "+sel) {
+			t.Fatalf("after %d j: %s not visible:\n%s", i+1, sel, v)
+		}
+	}
+	if v := plainView(m); !strings.Contains(v, "↑ ") || strings.Contains(v, "↓ ") {
+		t.Fatalf("at the bottom: hints\n%s", v)
+	}
+	key(m, "pgup")
+	if got := m.selIdx; got != 40-h {
+		t.Fatalf("pgup: row %d, want %d", got, 40-h)
+	}
+	if v := plainView(m); !strings.Contains(v, "↓ ") {
+		t.Fatalf("no hint below:\n%s", v)
 	}
 }

@@ -417,8 +417,11 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 		star = ""
 	}
 	base, starStyle, busyStyle := lipgloss.NewStyle(), warnStyle, keyStyle
-	if !t.Task.Status.Open() {
+	switch {
+	case !t.Task.Status.Open():
 		base = dimStyle
+	case aggregate(t.Sessions) == dotWaiting:
+		base = base.Bold(true) // a session waits for you: stand out
 	}
 	lead := " "
 	if sel {

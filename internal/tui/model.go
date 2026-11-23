@@ -625,14 +625,10 @@ func (m *Model) selectionChanged() tea.Cmd {
 	return m.after(selDebounce, selTickMsg{m.selSeq})
 }
 
-// listHeight is the number of list rows visible: the screen less the
-// status line and the help (see helpLines).
+// listHeight is the number of list rows visible: the list pane's inside
+// (see layout).
 func (m *Model) listHeight() int {
-	h := m.height - 1 - len(m.helpLines(m.width))
-	if h < 1 {
-		h = 1
-	}
-	return h
+	return max(m.layout().listInH, 1)
 }
 
 func (m *Model) clampOffset() {

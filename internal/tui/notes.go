@@ -513,16 +513,15 @@ func ruleAfter(hdr string, w int) string {
 }
 
 // noteStyle is how a notes line is drawn (its text unchanged): markdown
-// headings bold, ticked checkboxes dimmed as done.
+// headings bold in the primary colour, ticked checkboxes dimmed as done.
 func noteStyle(l string) lipgloss.Style {
 	t := strings.TrimSpace(l)
 	switch {
 	case strings.HasPrefix(t, "#"):
 		return lipgloss.NewStyle().Bold(true).Foreground(primary)
-	case strings.HasPrefix(t, "- [x]"), strings.HasPrefix(t, "- [X]"), strings.HasPrefix(t, "* [x]"):
-		return dimStyle.Strikethrough(false)
-	case strings.HasPrefix(t, "- [ ]"), strings.HasPrefix(t, "* [ ]"):
-		return lipgloss.NewStyle()
+	case strings.HasPrefix(t, "- [x]"), strings.HasPrefix(t, "- [X]"),
+		strings.HasPrefix(t, "* [x]"), strings.HasPrefix(t, "* [X]"):
+		return dimStyle
 	}
 	return lipgloss.NewStyle()
 }
