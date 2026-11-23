@@ -551,6 +551,12 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 - Ticks: reload from DB every 1s (`App.List`; dirty status via `App.Get` for selected task only, at most every 3s);
   `App.Recover` every 5s. Errors shown in a status line, never crash.
 - Model logic (update/selection/grouping/filter) unit-tested without a terminal.
+- Look (charm v2: bubbletea, bubbles, lipgloss): `theme.go` holds every style, light and dark variants picked from
+  `tea.BackgroundColorMsg` (session-state colours from `internal/palette`, shared with `atl statusline`). Top bar
+  (workspace, session counts of open tasks); list and details in rounded boxes (`layout` decides sizes; `listHeight` is
+  the list box's inside), the focused one in the primary colour; the new-task form, pickers, done/cancel and the `?` key
+  reference are boxes composited over the dimmed screen (`composite`), the status and help lines stay live. A spinner
+  ticks only while operations run. Pastes (`tea.PasteMsg`) go to the input that has the keyboard, never to normal mode.
 
 ## 6. Milestone ownership
 
