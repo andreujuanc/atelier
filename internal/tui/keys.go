@@ -126,10 +126,6 @@ func (m *Model) restyleInputs() {
 func (m *Model) View() tea.View {
 	v := tea.NewView(m.render())
 	v.AltScreen = true
-	v.WindowTitle = "atelier"
-	if ws := clean(m.workspace); ws != "" {
-		v.WindowTitle = "atelier · " + ws
-	}
 	return v
 }
 
@@ -137,6 +133,5 @@ func (m *Model) View() tea.View {
 func (m *WorkspacePicker) View() tea.View {
 	v := tea.NewView(m.render())
 	v.AltScreen = true
-	v.WindowTitle = "atelier · workspaces"
 	return v
 }
