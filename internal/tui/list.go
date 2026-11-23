@@ -123,3 +123,14 @@ func humanAge(d time.Duration) string {
 	}
 	return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
 }
+
+// lastActivity is the latest event of ss (zero when none has any).
+func lastActivity(ss []model.Session) time.Time {
+	var t time.Time
+	for _, s := range ss {
+		if s.LastEventAt.After(t) {
+			t = s.LastEventAt
+		}
+	}
+	return t
+}

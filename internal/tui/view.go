@@ -143,6 +143,11 @@ func listWidth(w int) int {
 // panel draws lines in a rounded box w×h with title set in its top border;
 // focused boxes are drawn in the primary colour. h < 2 draws nothing.
 func panel(title, right string, lines []string, w, h int, focused bool) []string {
+	return panelB(title, right, "", lines, w, h, focused)
+}
+
+// panelB is panel with bottom set at the right of its bottom border.
+func panelB(title, right, bottom string, lines []string, w, h int, focused bool) []string {
 	if w < 4 || h < 2 {
 		return nil
 	}
@@ -182,6 +187,9 @@ func panel(title, right string, lines []string, w, h int, focused bool) []string
 			l = lines[i]
 		}
 		out = append(out, side+" "+fit(l, inner-2)+" "+side)
+	}
+	if bw := ansi.StringWidth(bottom); bottom != "" && bw+4 <= inner {
+		return append(out, bs.Render("╰"+strings.Repeat("─", inner-bw-3))+" "+bottom+" "+bs.Render("─╯"))
 	}
 	return append(out, bs.Render("╰"+strings.Repeat("─", inner)+"╯"))
 }
@@ -267,6 +275,7 @@ func (m *Model) listPane(l layout, w, h int) []string {
 		return m.listLines(w, h)
 	}
 	inner := m.listLines(w-4, h-2)
+	bottom := m.scrollHint(h - 2)
 	n := 0
 	for _, r := range m.rows {
 		if r.isTask() {
@@ -280,7 +289,7 @@ func (m *Model) listPane(l layout, w, h int) []string {
 	} else if m.loaded {
 		right = labelStyle.Render(strconv.Itoa(n))
 	}
-	return panel(title, right, inner, w, h, m.mode != modeNotes)
+	return panelB(title, right, bottom, inner, w, h, m.mode != modeNotes)
 }
 
 // detailPane is the details pane, boxed when there is room.
@@ -361,15 +370,7 @@ func (m *Model) listLines(w, h int) []string {
 		return []string{dimStyle.Render(trunc("no tasks — press n to create one", w)), "",
 			trunc(keyStyle.Render("n")+descStyle.Render(" new task  ")+keyStyle.Render("A")+descStyle.Render(" assistant"), w)}
 	}
-	off := m.offset
-	if m.selIdx >= off+h {
-		// the help took a line since the offset was set (see helpLines)
-		off = m.selIdx - h + 1
-	}
-	end := off + h
-	if end > len(m.rows) {
-		end = len(m.rows)
-	}
+	off, end := m.listWindow(h)
 	var out []string
 	for i := off; i < end; i++ {
 		out = append(out, m.rowLine(m.rows[i], i == m.selIdx, w))
@@ -421,9 +422,9 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 	}
 	lead := " "
 	if sel {
-		base = base.Background(surface).Bold(true)
-		starStyle = starStyle.Background(surface)
-		busyStyle = busyStyle.Background(surface)
+		base = onSelected(base).Bold(true)
+		starStyle = onSelected(starStyle)
+		busyStyle = onSelected(busyStyle)
 		dotStyle = dotStyle.Background(surface)
 		lead = barStyle.Render("▌")
 	}
@@ -434,8 +435,21 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 	if busy != "" {
 		line += busyStyle.Render(busy)
 	}
-	if sel {
-		if n := w - 3 - ansi.StringWidth(titleT+star+busy); n > 0 {
+	// The last session activity at the right, when there is room.
+	age := ""
+	if a := lastActivity(t.Sessions); !a.IsZero() && t.Task.Status.Open() {
+		age = humanAge(m.now().Sub(a))
+	}
+	used := ansi.StringWidth(titleT + star + busy)
+	if age != "" && used+2+len(age) <= w-3 {
+		as := dimStyle
+		pad := strings.Repeat(" ", w-3-used-len(age))
+		if sel {
+			as, pad = onSelected(dimStyle), selStyle.Render(pad)
+		}
+		line += pad + as.Render(age)
+	} else if sel {
+		if n := w - 3 - used; n > 0 {
 			line += selStyle.Render(strings.Repeat(" ", n))
 		}
 	}
@@ -461,6 +475,9 @@ func (m *Model) detailLines(w, h int) []string {
 	}
 	if t == nil {
 		if len(m.rows) == 0 {
+			if m.loaded && m.filter == "" && len(m.tasks) == 0 {
+				return welcomeLines(w)
+			}
 			return nil
 		}
 		return []string{dimStyle.Render(trunc("no task selected", w))}
@@ -629,9 +646,12 @@ func (m *Model) statusLine(w int) string {
 		}
 	}
 	if st := clean(m.status); st != "" {
-		if m.statusErr {
+		switch {
+		case m.statusErr:
 			s += errStyle.Render("✗ " + st)
-		} else {
+		case m.statusOK:
+			s += okStyle.Render("✓ ") + st
+		default:
 			s += st
 		}
 	}
@@ -1113,4 +1133,50 @@ func (m *Model) formLines(w, h int) []string {
 		out = out[start : start+h]
 	}
 	return out
+}
+
+// listWindow is the range of rows the list shows in h lines.
+func (m *Model) listWindow(h int) (off, end int) {
+	off = m.offset
+	if m.selIdx >= off+h {
+		// the help took a line since the offset was set (see helpLines)
+		off = m.selIdx - h + 1
+	}
+	end = min(off+h, len(m.rows))
+	return off, max(end, off)
+}
+
+// scrollHint says how many rows are above and below the visible ones.
+func (m *Model) scrollHint(h int) string {
+	if h <= 0 || len(m.rows) == 0 {
+		return ""
+	}
+	off, end := m.listWindow(h)
+	var parts []string
+	if off > 0 {
+		parts = append(parts, "↑ "+strconv.Itoa(off))
+	}
+	if n := len(m.rows) - end; n > 0 {
+		parts = append(parts, "↓ "+strconv.Itoa(n))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return dimStyle.Render(strings.Join(parts, "  ") + " more")
+}
+
+// welcomeLines fill the details pane while there are no tasks at all.
+func welcomeLines(w int) []string {
+	item := func(k, d string) string {
+		return trunc(" "+keyStyle.Render(fmt.Sprintf("%-6s", k))+" "+d, w)
+	}
+	return []string{
+		trunc(titleStyle.Render("Welcome to atelier"), w),
+		trunc(dimStyle.Render("A task studio for parallel Claude Code work."), w),
+		"",
+		item("n", "create a task: its own worktrees, on branch atl/<slug>"),
+		item("enter", "open it: Claude Code in tmux, one window per session"),
+		item("A", "ask the atelier assistant"),
+		item("?", "every key"),
+	}
 }

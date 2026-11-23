@@ -23,6 +23,7 @@ var (
 	cBorder  = palette.Color{Light: "#C4C8DA", Dark: "#3B4261"}
 	cSurface = palette.Color{Light: "#E1E2E9", Dark: "#292E42"} // the selected row
 	cOnBrand = palette.Color{Light: "#FFFFFF", Dark: "#1A1B26"} // text on a filled chip
+	cOnSel   = palette.Color{Light: "#1A1B26", Dark: "#C0CAF5"} // text on the selected row
 )
 
 // isDark is whether the terminal background is dark (which variant of
@@ -34,6 +35,7 @@ var (
 	accent, subtle, errColor, okColor color.Color
 	primary, purple, warn, muted      color.Color
 	faint, border, surface, onBrand   color.Color
+	onSel                             color.Color
 
 	headerStyle lipgloss.Style // section and group headings
 	selStyle    lipgloss.Style // the selected row's background
@@ -63,10 +65,11 @@ func applyTheme(dark bool) {
 	errColor, okColor = adaptive(palette.Err), adaptive(palette.OK)
 	primary, purple, warn, muted = adaptive(cPrimary), adaptive(cPurple), adaptive(cWarn), adaptive(cMuted)
 	faint, border, surface, onBrand = adaptive(cFaint), adaptive(cBorder), adaptive(cSurface), adaptive(cOnBrand)
+	onSel = adaptive(cOnSel)
 
 	s := lipgloss.NewStyle()
 	headerStyle = s.Bold(true)
-	selStyle = s.Background(surface)
+	selStyle = s.Background(surface).Foreground(onSel)
 	markStyle = s.Foreground(accent).Bold(true)
 	dimStyle = s.Foreground(muted)
 	labelStyle = s.Foreground(muted)
@@ -160,7 +163,7 @@ func rowText(sel bool, w int, segs ...seg) string {
 		t := trunc(s.text, rem)
 		st := s.st
 		if sel {
-			st = st.Background(surface)
+			st = onSelected(st)
 		}
 		b.WriteString(st.Render(t))
 		used += ansi.StringWidth(t)
@@ -169,4 +172,15 @@ func rowText(sel bool, w int, segs ...seg) string {
 		b.WriteString(selStyle.Render(strings.Repeat(" ", w-used)))
 	}
 	return b.String()
+}
+
+// onSelected is st on the selected row: its background, and its text
+// colour when st has none (readable whichever background the terminal
+// really has).
+func onSelected(st lipgloss.Style) lipgloss.Style {
+	st = st.Background(surface)
+	if _, none := st.GetForeground().(lipgloss.NoColor); none {
+		st = st.Foreground(onSel)
+	}
+	return st
 }

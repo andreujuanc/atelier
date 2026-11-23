@@ -322,7 +322,7 @@ func (m *Model) notesSaved(msg notesSavedMsg) tea.Cmd {
 		if msg.err != nil {
 			m.setErr(fmt.Errorf("save notes of %s (editor closed, text not saved): %w", msg.slug, msg.err))
 		} else {
-			m.setStatus("notes of " + msg.slug + " saved")
+			m.setOK("notes of " + msg.slug + " saved")
 		}
 		return m.reload()
 	}
@@ -349,7 +349,7 @@ func (m *Model) notesSaved(msg notesSavedMsg) tea.Cmd {
 		return m.reload()
 	}
 	m.closeNotes()
-	m.setStatus("notes of " + msg.slug + " saved")
+	m.setOK("notes of " + msg.slug + " saved")
 	return m.reload()
 }
 

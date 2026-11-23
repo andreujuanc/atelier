@@ -268,6 +268,8 @@ type Model struct {
 	// statusFromOut: the status is an App.Out line (warnMsg), which a later
 	// line may replace; other error statuses are kept until the next action.
 	statusFromOut bool
+	// statusOK: the status reports an operation that worked (drawn with ✓).
+	statusOK bool
 
 	// quitRequested: quit once no operation is in flight. forceQuit: the
 	// user forced the quit with operations still running.
@@ -662,7 +664,13 @@ func (m *Model) setStatus(s string) { m.setStatusErr(s, false) }
 func (m *Model) setErr(err error) { m.setStatusErr(firstLine(err.Error()), true) }
 
 func (m *Model) setStatusErr(s string, isErr bool) {
-	m.status, m.statusErr, m.statusFromOut = s, isErr, false
+	m.status, m.statusErr, m.statusFromOut, m.statusOK = s, isErr, false, false
+}
+
+// setOK shows s as the outcome of an operation that worked.
+func (m *Model) setOK(s string) {
+	m.setStatus(s)
+	m.statusOK = s != ""
 }
 
 func firstLine(s string) string {
@@ -896,7 +904,11 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			return m.addStep(msg.id, msg.slug, msg.repos, next, added, failed)
 		}
 		delete(m.busy, msg.id)
-		m.setStatusErr(firstLine(addSummary(msg.slug, added, failed)), len(failed) > 0)
+		if len(failed) > 0 {
+			m.setStatusErr(firstLine(addSummary(msg.slug, added, failed)), true)
+		} else {
+			m.setOK(firstLine(addSummary(msg.slug, added, failed)))
+		}
 		return m.reload()
 	case warnMsg:
 		if m.statusErr && !m.statusFromOut {
@@ -920,7 +932,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 				m.setErr(fmt.Errorf("%s: %w", msg.op, msg.err))
 			}
 		} else {
-			m.setStatus(msg.text)
+			m.setOK(msg.text)
 		}
 		return m.reload()
 	case closeCheckMsg:
@@ -940,7 +952,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.setErr(fmt.Errorf("%s: %w", msg.verb, msg.err))
 			return m.reload()
 		}
-		m.setStatus(fmt.Sprintf("%s %s", msg.slug, map[string]string{"done": "done", "cancel": "cancelled"}[msg.verb]))
+		m.setOK(fmt.Sprintf("%s %s", msg.slug, map[string]string{"done": "done", "cancel": "cancelled"}[msg.verb]))
 		return m.reload()
 	case newTaskMsg:
 		m.creating = false
@@ -951,7 +963,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		m.lastForm = nil
 		m.selID, m.stickyID = msg.task.ID, 0
 		m.selIdx = len(m.rows) // fallback if it is filtered out
-		m.setStatus(fmt.Sprintf("created %s (%s)", msg.task.Slug, m.be.TaskDir(msg.task.Slug)))
+		m.setOK(fmt.Sprintf("created %s (%s)", msg.task.Slug, m.be.TaskDir(msg.task.Slug)))
 		return tea.Batch(m.reload(), m.selectionChanged())
 	case openMsg:
 		delete(m.busy, msg.id)
@@ -1009,7 +1021,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			}
 			m.setStatusErr(text, true)
 		} else if msg.op == "open" {
-			m.setStatus("attached " + msg.slug)
+			m.setOK("attached " + msg.slug)
 		}
 		return m.reload()
 	}
