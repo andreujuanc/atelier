@@ -986,36 +986,61 @@ func (c *confirmState) dialog(w, h int) *dialog {
 	return box(title, c.lines(iw, max(h-2, 1)), iw, errColor)
 }
 
-// helpDialog lists every key of the task list with what it does.
-func helpDialog(w, h int) *dialog {
-	iw := dialogWidth(64, w)
-	sections := []struct {
-		title string
-		items []helpItem
-	}{
-		{"Tasks", []helpItem{{"n", "new task"}, {"t", "rename the selected task"}, {"1-5", "set the status: backlog active review done cancelled"},
-			{"d", "done: close, deleting worktrees"}, {"c", "cancel: close, deleting worktrees"}, {"a", "add repos to the task"},
-			{"m", "edit the task's notes"}, {"p", "open pull requests"}, {"D", "show the diff (pager)"}}},
-		{"Sessions", []helpItem{{"enter", "open: attach, or pick a session"}, {"s", "start a new session"}, {"r", "resume stopped sessions"},
-			{"A", "the atelier assistant"}}},
-		{"Moving", []helpItem{{"↑/↓ j/k", "move"}, {"pgup/pgdn", "page"}, {"/", "filter by slug or title"}, {"esc", "clear the filter"},
-			{"w", "switch workspace"}, {"q", "quit"}}},
+// helpSection is a titled group of keys in the key reference.
+type helpSection struct {
+	title string
+	items []helpItem
+}
+
+var helpSections = []helpSection{
+	{"Tasks", []helpItem{{"n", "new task"}, {"t", "rename (the title)"}, {"1-5", "status: backlog … cancelled"},
+		{"d", "done (closes, asks first)"}, {"c", "cancel (closes, asks first)"}, {"a", "add repos (or ro → rw)"},
+		{"m", "edit the notes"}, {"p", "open pull requests"}, {"D", "diff in a pager"}}},
+	{"Sessions", []helpItem{{"enter", "open (attach or pick)"}, {"s", "new session"}, {"r", "resume stopped sessions"},
+		{"A", "the atelier assistant"}}},
+	{"Moving", []helpItem{{"↑/↓ j/k", "move"}, {"pgup/pgdn", "page"}, {"/", "filter by slug or title"},
+		{"esc", "clear the filter"}, {"w", "switch workspace"}, {"q", "quit"}}},
+}
+
+// helpColumn renders sections at width w, a blank line between them.
+func helpColumn(secs []helpSection, w int) []string {
+	kw := 0 // the widest key
+	for _, s := range secs {
+		for _, it := range s.items {
+			kw = max(kw, ansi.StringWidth(it.key))
+		}
 	}
+	kw++
 	var out []string
-	kw := 10
-	for i, s := range sections {
+	for i, s := range secs {
 		if i > 0 {
 			out = append(out, "")
 		}
-		out = append(out, rule(s.title, iw))
+		out = append(out, rule(s.title, w))
 		for _, it := range s.items {
-			out = append(out, trunc(" "+keyStyle.Render(fmt.Sprintf("%-*s", kw, it.key))+" "+it.desc, iw))
+			out = append(out, trunc(" "+keyStyle.Render(fmt.Sprintf("%-*s", kw, it.key))+" "+it.desc, w))
 		}
 	}
-	out = append(out, "")
+	return out
+}
+
+// helpDialog lists every key of the task list with what it does: in one
+// column, or two when one does not fit the height (h rows).
+func helpDialog(w, h int) *dialog {
+	iw := dialogWidth(64, w)
+	out := helpColumn(helpSections, iw)
+	if len(out)+4 > h-2 && w >= 80 {
+		iw = dialogWidth(96, w)
+		cw := (iw - 3) / 2
+		left, right := helpColumn(helpSections[:1], cw), helpColumn(helpSections[1:], cw)
+		out = nil
+		for i := 0; i < max(len(left), len(right)); i++ {
+			out = append(out, fit(at(left, i), cw)+"   "+at(right, i))
+		}
+	}
 	for _, l := range legends {
 		if ansi.StringWidth(l) <= iw {
-			out = append(out, l)
+			out = append(out, "", l)
 			break
 		}
 	}

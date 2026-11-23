@@ -27,7 +27,7 @@ func TestHelpOverlay(t *testing.T) {
 		t.Fatalf("? mode %v", m.mode)
 	}
 	v := checkView(t, m, 120, 40)
-	for _, want := range []string{"Keys", "rename the selected task", "switch workspace", "any key closes"} {
+	for _, want := range []string{"Keys", "rename (the title)", "switch workspace", "any key closes"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("key reference lacks %q:\n%s", want, v)
 		}
@@ -286,5 +286,24 @@ func TestScrolling(t *testing.T) {
 	}
 	if v := plainView(m); !strings.Contains(v, "↓ ") {
 		t.Fatalf("no hint below:\n%s", v)
+	}
+}
+
+// TestHelpColumns: on a short terminal the key reference takes two
+// columns so that every key still shows.
+func TestHelpColumns(t *testing.T) {
+	m, _ := newTest(t, &fakeBackend{tasks: sampleTasks()})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	key(m, "?")
+	v := checkView(t, m, 80, 24)
+	for _, s := range helpSections {
+		for _, it := range s.items {
+			if !strings.Contains(v, it.key) {
+				t.Errorf("key %q not shown:\n%s", it.key, v)
+			}
+		}
+	}
+	if !strings.Contains(v, "quit") || !strings.Contains(v, "uncommitted") {
+		t.Errorf("bottom of the reference cut:\n%s", v)
 	}
 }
