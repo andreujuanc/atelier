@@ -532,7 +532,7 @@ func (m *WorkspacePicker) rowLine(r workspace.Entry, sel bool, w, nameW int) str
 	if !r.Workspace {
 		name = dimStyle
 	}
-	segs := []seg{{fmt.Sprintf("%-*s", nameW, clean(r.Name)), name}, {"  " + clean(m.abbrev(r.Dir)), dimStyle}}
+	segs := []seg{{padRight(clean(r.Name), nameW), name}, {"  " + clean(m.abbrev(r.Dir)), dimStyle}}
 	if !r.Workspace {
 		segs = append(segs, seg{"  not adopted", warnStyle.Bold(false)})
 	}

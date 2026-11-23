@@ -361,7 +361,7 @@ func (m *Model) listLines(w, h int) []string {
 	}
 	if len(m.rows) == 0 {
 		if !m.loaded {
-			return []string{dimStyle.Render(trunc(m.spinner()+" loading…", w))}
+			return []string{dimStyle.Render(trunc("loading…", w))}
 		}
 		if m.filter != "" {
 			return []string{dimStyle.Render(trunc("no tasks match /"+clean(m.filter), w)),
@@ -465,7 +465,7 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 	if w < 3 {
 		return trunc(lead+dotStyle.Render(glyph), w)
 	}
-	return lead + dotStyle.Render(glyph) + sep + line
+	return trunc(lead+dotStyle.Render(glyph)+sep+line, w)
 }
 
 // detailLines renders the details pane (width w, height h) of the task
@@ -548,7 +548,7 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 		if mode == model.ModeRW {
 			ms = keyStyle
 		}
-		return " " + ms.Render(fmt.Sprintf("%-2s", clean(string(mode)))) + "  " + fmt.Sprintf("%-*s", nameW, clean(name))
+		return " " + ms.Render(fmt.Sprintf("%-2s", clean(string(mode)))) + "  " + padRight(clean(name), nameW)
 	}
 	if len(status) == 0 {
 		for _, r := range task.Repos {
@@ -593,7 +593,7 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 			glyph = "·"
 		}
 		st := stateStyle(s.State)
-		name := fmt.Sprintf("%-*s", sessW, sessionName(s))
+		name := padRight(sessionName(s), sessW)
 		state := fmt.Sprintf("%-7s", clean(string(s.State)))
 		var line string
 		switch s.State {
@@ -960,8 +960,7 @@ func composite(lines []string, d *dialog, w int) []string {
 			out[i] = bd.Render(plain)
 			continue
 		}
-		left := ansi.Cut(plain, 0, x)
-		right := ansi.Cut(plain, x+d.w, w)
+		left, right := cutAround(plain, x, x+d.w, w)
 		out[i] = bd.Render(left) + trunc(d.lines[i-y], w-x) + bd.Render(right)
 	}
 	return out
@@ -1018,7 +1017,7 @@ func helpColumn(secs []helpSection, w int) []string {
 		}
 		out = append(out, rule(s.title, w))
 		for _, it := range s.items {
-			out = append(out, trunc(" "+keyStyle.Render(fmt.Sprintf("%-*s", kw, it.key))+" "+it.desc, w))
+			out = append(out, trunc(" "+keyStyle.Render(padRight(it.key, kw))+" "+it.desc, w))
 		}
 	}
 	return out

@@ -184,3 +184,25 @@ func onSelected(st lipgloss.Style) lipgloss.Style {
 	}
 	return st
 }
+
+// padRight pads s with spaces to w cells (wide characters count double).
+func padRight(s string, w int) string {
+	if n := w - ansi.StringWidth(s); n > 0 {
+		return s + strings.Repeat(" ", n)
+	}
+	return s
+}
+
+// cutAround splits plain text (w cells wide) around the columns [x0, x1)
+// a dialog covers: left is exactly x0 cells and right exactly w-x1, a
+// wide character straddling either edge replaced by spaces.
+func cutAround(plain string, x0, x1, w int) (left, right string) {
+	left = padRight(ansi.Truncate(plain, x0, ""), x0)
+	right = ansi.TruncateLeft(plain, x1, "")
+	if n := max(w-x1, 0); ansi.StringWidth(right) > n {
+		// a wide character straddles x1: blank its visible half
+		right = " " + ansi.TruncateLeft(plain, x1+1, "")
+	}
+	right = padRight(ansi.Truncate(right, max(w-x1, 0), ""), max(w-x1, 0))
+	return left, right
+}

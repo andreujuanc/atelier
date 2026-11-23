@@ -1595,5 +1595,6 @@ func (m *Model) busyOps() []string {
 // renameInputWidth is the visible width of the `t` title input: the full
 // terminal width minus its prompt (0 or less means unlimited).
 func (m *Model) renameInputWidth() int {
-	return m.width - len(m.renameInput.Prompt) - 1
+	// At least 1: a narrower input panics drawing its placeholder.
+	return max(m.width-len(m.renameInput.Prompt)-1, 1)
 }

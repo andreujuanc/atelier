@@ -206,10 +206,11 @@ func TestPasteRouting(t *testing.T) {
 		t.Fatalf("notes %q", got)
 	}
 	key(m, "esc") // unsaved: asks
-	paste(m, "y")
-	if m.notes == nil || m.notes.ask != askDiscard || m.notes.ta.Value() != "line 1\nline 2" {
-		t.Fatal("paste answered the question or reached the editor")
+	paste(m, "y") // as in v1: not the key y, so no: back to editing
+	if m.notes == nil || m.notes.ask != askNone || m.notes.ta.Value() != "line 1\nline 2" {
+		t.Fatal("paste discarded the notes or reached the editor")
 	}
+	key(m, "esc")
 	key(m, "y")
 
 	key(m, "?")
@@ -305,5 +306,32 @@ func TestHelpColumns(t *testing.T) {
 	}
 	if !strings.Contains(v, "quit") || !strings.Contains(v, "uncommitted") {
 		t.Errorf("bottom of the reference cut:\n%s", v)
+	}
+}
+
+// TestWideCharsUnderDialogs: wide characters under a dialog's edges never
+// make a line wider than the screen (nor shift the box).
+func TestWideCharsUnderDialogs(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), notesText: map[string]string{
+		"beta": strings.Repeat("漢字かな🙂", 40)}}
+	for i := range fb.tasks {
+		fb.tasks[i].Task.Title = strings.Repeat("タスク🙂", 12)
+		fb.tasks[i].Task.Description = strings.Repeat("説明🙂", 30)
+		fb.tasks[i].Task.Branch = strings.Repeat("枝", 40)
+	}
+	m, _ := newTest(t, fb)
+	for _, k := range []string{"?", "n", "d"} {
+		key(m, k)
+		for w := 20; w <= 130; w++ {
+			m.Update(tea.WindowSizeMsg{Width: w, Height: 30})
+			checkView(t, m, w, 30)
+		}
+		key(m, "esc")
+		m.mode, m.confirm = modeNormal, nil
+	}
+	for w := 1; w <= 8; w++ { // tiny, with a busy task
+		m.busy[2] = "pr beta"
+		m.Update(tea.WindowSizeMsg{Width: w, Height: 4})
+		checkView(t, m, w, 4)
 	}
 }

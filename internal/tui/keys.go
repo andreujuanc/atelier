@@ -54,7 +54,17 @@ func (m *Model) handlePaste(msg tea.PasteMsg) tea.Cmd {
 		m.renameInput, cmd = m.renameInput.Update(msg)
 		return cmd
 	case modeNotes:
-		if m.notes != nil && m.notes.ask == askNone {
+		e := m.notes
+		switch {
+		case e == nil:
+		case e.ask != askNone:
+			// As in v1, where a paste was a key that is not y: the answer
+			// is no, back to editing (the text is not inserted).
+			e.ask = askNone
+			if !m.statusErr {
+				m.setStatus("back to editing the notes of " + e.slug)
+			}
+		default:
 			return m.notesUpdate(msg)
 		}
 	}
