@@ -773,6 +773,33 @@ func TestGateListsOnlyTheTask(t *testing.T) {
 	}
 }
 
+// TestGateNullJSON: JSON null where the gate expects an object (filters,
+// build labels, a request body) is read as an empty one, as dockerd reads
+// it, and still gets the task's label.
+func TestGateNullJSON(t *testing.T) {
+	c := newGate(t)
+	own := LabelTask + "=" + testID
+	for _, tc := range []struct{ method, uri, body, saw, want string }{
+		{"GET", "/containers/json?filters=null", "", "GET /containers/json", `"label":{"` + own + `":true}`},
+		{"POST", "/build?labels=null", "", "POST /build", `"` + LabelTask + `":"` + testID + `"`},
+	} {
+		if status, out := c.do(tc.method, tc.uri, tc.body); status >= 400 {
+			t.Errorf("%s %s: status %d (%s), want it forwarded", tc.method, tc.uri, status, out)
+		}
+		if got := c.d.saw(tc.saw); !strings.Contains(got, tc.want) {
+			t.Errorf("%s %s reached the daemon as %q, want %s", tc.method, tc.uri, got, tc.want)
+		}
+	}
+	for _, uri := range []string{"/containers/create", "/volumes/create", "/networks/create"} {
+		if status, out := c.do("POST", uri, "null"); status != http.StatusCreated {
+			t.Errorf("POST %s null: status %d (%s), want it forwarded", uri, status, out)
+		}
+		if b := c.d.body("POST " + uri); !strings.Contains(b, `"`+LabelTask+`":"`+testID+`"`) {
+			t.Errorf("POST %s null reached the daemon as %s, want the task's label", uri, b)
+		}
+	}
+}
+
 func TestGateRefusesEverythingElse(t *testing.T) {
 	c := newGate(t)
 	for _, tc := range []struct{ method, uri, body string }{

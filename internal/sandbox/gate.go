@@ -347,6 +347,9 @@ func decodeBody(r *http.Request) (map[string]any, error) {
 	if err := dec.Decode(&body); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("unreadable request body: %v", err)
 	}
+	if body == nil { // "null"
+		body = map[string]any{}
+	}
 	return body, nil
 }
 
@@ -475,6 +478,9 @@ func gateList(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 		if err := json.Unmarshal([]byte(s), &filters); err != nil {
 			g.deny(w, r, http.StatusBadRequest, "unreadable filters")
 			return
+		}
+		if filters == nil { // "null"
+			filters = map[string]any{}
 		}
 	}
 	own := LabelTask + "=" + g.ID
