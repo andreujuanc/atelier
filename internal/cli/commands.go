@@ -647,9 +647,9 @@ func (c *cli) prCmd() *cobra.Command {
 
 func (c *cli) finishCmd(verb string) *cobra.Command {
 	var force bool
-	short := "Finish a task: kill tmux, remove worktrees (branches kept), status done"
+	short := "Finish a task: kill tmux, remove worktrees and the branches with nothing unpushed, status done"
 	if verb == "cancel" {
-		short = "Cancel a task: kill tmux, remove worktrees (branches kept), status cancelled"
+		short = "Cancel a task: kill tmux, remove worktrees and the branches with nothing unpushed, status cancelled"
 	}
 	cmd := &cobra.Command{
 		Use:   verb + " <task> [--force]",

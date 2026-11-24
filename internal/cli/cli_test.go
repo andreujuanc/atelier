@@ -234,6 +234,11 @@ func TestRootAndDoctor(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "Usage:") {
 		t.Fatalf("root: %d %s", code, out)
 	}
+	// done and cancel delete a task branch that has nothing unpushed
+	// (docs/tasks.md); the help must not say branches are kept.
+	if strings.Contains(out, "branches kept") || !strings.Contains(out, "remove worktrees and the branches with nothing unpushed") {
+		t.Errorf("root help on done/cancel branches:\n%s", out)
+	}
 	code, out, _ = atl(t, "doctor")
 	if !strings.Contains(out, "repos dir") || !strings.Contains(out, "database") {
 		t.Fatalf("doctor: %d %s", code, out)
