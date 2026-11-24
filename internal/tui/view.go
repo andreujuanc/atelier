@@ -1117,36 +1117,7 @@ func (m *Model) formLines(w, h int) []string {
 			label = keyStyle.Render(fmt.Sprintf("%-12s", fieldLabels[i]))
 			focusRow = len(out)
 		}
-		var val string
-		switch i {
-		case fieldBacklog:
-			val = dimStyle.Render("[ ]")
-			if f.backlog {
-				val = keyStyle.Render("[x]")
-			}
-			val += dimStyle.Render(" space / ctrl+b toggles")
-		case fieldBase:
-			on, off := keyStyle.Render("●"), dimStyle.Render("○")
-			auto, prod := on+" auto (dev → develop → default)", off+dimStyle.Render(" production patch (default branch)")
-			if f.prodBase {
-				auto, prod = off+dimStyle.Render(" auto (dev → develop → default)"), on+" production patch (default branch)"
-			}
-			val = auto + "\n" + prod
-		case fieldRepos:
-			switch {
-			case len(f.repos) > 0:
-				val = styledSummary(f.repos)
-			case f.project() != "" && f.project() != f.preProject:
-				val = dimStyle.Render("project " + clean(f.project()) + "'s repos")
-			default:
-				val = dimStyle.Render("none")
-			}
-			if i == f.focus {
-				val += dimStyle.Render("  ⏎ pick")
-			}
-		default:
-			val = f.inputs[i].View()
-		}
+		val := f.fieldView(i)
 		for j, v := range strings.Split(val, "\n") {
 			if j == 0 {
 				add(cursor + " " + label + v)
@@ -1192,6 +1163,42 @@ func (m *Model) formLines(w, h int) []string {
 		out = out[start : start+h]
 	}
 	return out
+}
+
+// fieldView draws the value of form field i (more than one line for the
+// base choice).
+func (f *newForm) fieldView(i int) string {
+	var val string
+	switch i {
+	case fieldBacklog:
+		val = dimStyle.Render("[ ]")
+		if f.backlog {
+			val = keyStyle.Render("[x]")
+		}
+		val += dimStyle.Render(" space / ctrl+b toggles")
+	case fieldBase:
+		on, off := keyStyle.Render("●"), dimStyle.Render("○")
+		auto, prod := on+" auto (dev → develop → default)", off+dimStyle.Render(" production patch (default branch)")
+		if f.prodBase {
+			auto, prod = off+dimStyle.Render(" auto (dev → develop → default)"), on+" production patch (default branch)"
+		}
+		val = auto + "\n" + prod
+	case fieldRepos:
+		switch {
+		case len(f.repos) > 0:
+			val = styledSummary(f.repos)
+		case f.project() != "" && f.project() != f.preProject:
+			val = dimStyle.Render("project " + clean(f.project()) + "'s repos")
+		default:
+			val = dimStyle.Render("none")
+		}
+		if i == f.focus {
+			val += dimStyle.Render("  ⏎ pick")
+		}
+	default:
+		val = f.inputs[i].View()
+	}
+	return val
 }
 
 // listWindow is the range of rows the list shows in h lines.
