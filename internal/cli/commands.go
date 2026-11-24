@@ -680,7 +680,11 @@ func (c *cli) finishCmd(verb string) *cobra.Command {
 			// Closing kills the task's tmux session: run from a window
 			// of it, this process gets its SIGHUP and would die with the
 			// task half closed (worktrees left, status still open).
-			signal.Ignore(syscall.SIGHUP)
+			// Caught, not ignored: an ignored signal stays ignored in
+			// what atl starts (teardown and its background processes).
+			hup := make(chan os.Signal, 1)
+			signal.Notify(hup, syscall.SIGHUP)
+			defer signal.Stop(hup)
 			t, err := finish(cmd.Context(), a[0], force)
 			if err != nil {
 				return err

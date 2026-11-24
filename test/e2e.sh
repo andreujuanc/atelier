@@ -569,8 +569,17 @@ expect_eq "worktrees of api after the second cancel" "$(git -C "$ATL_REPOS/api" 
 
 # A shell in a window of the task's own tmux session runs atl done: closing
 # kills that session, which hangs up on the shell and atl; atl still finishes.
+# Its teardown gets SIGHUP's default disposition (not atl's ignoring it):
+# it records the mask of ignored signals of its shell.
 step "done from the task's own tmux session"
-out="$(atl new "Self close" --repo api --no-fetch)" || fail "atl new (self close) failed: $out"
+cat >"$WS/config/projects/selfclose.toml" <<'EOF'
+teardown = 'grep "^SigIgn:" /proc/$$/status >"$E2E_OUT/self-close-sigign"'
+
+[[repos]]
+name = "api"
+mode = "rw"
+EOF
+out="$(atl new "Self close" --project selfclose --no-fetch)" || fail "atl new (self close) failed: $out"
 out="$(atl session self-close)" || fail "atl session self-close failed: $out"
 tm new-window -d -t "=atl-self-close:" "atl done self-close >'$E2E_OUT/self-close.log' 2>&1; sleep 60" ||
 	fail "start a shell window in atl-self-close"
@@ -578,5 +587,8 @@ self_closed() { [[ "$(task_field self-close status)" == done ]]; }
 wait_for "atl done run from the task's own tmux session" self_closed
 [[ ! -e "$ATL_TASKS/self-close" ]] || fail "self-close dir still exists: $(cat "$E2E_OUT/self-close.log")"
 expect_eq "worktrees of api after done from inside" "$(git -C "$ATL_REPOS/api" worktree list --porcelain | grep -c '^worktree ')" "1"
+sigign="$(sed -n 's/^SigIgn:[[:space:]]*//p' "$E2E_OUT/self-close-sigign")"
+[[ -n $sigign ]] || fail "teardown did not record its ignored signals: $(cat "$E2E_OUT/self-close.log")"
+((((16#$sigign) & 1) == 0)) || fail "teardown inherited an ignored SIGHUP (SigIgn $sigign)"
 
 echo "E2E OK"
