@@ -106,7 +106,7 @@ func (e *notesEditor) dirty() bool {
 // while the task is busy (normalKey checks that).
 func (m *Model) openNotes(t *app.TaskView) tea.Cmd {
 	if m.quitRequested {
-		m.setStatus(m.quitText(len(m.busyOps())))
+		m.setStatus(m.quitText(m.opsRunning()))
 		return nil
 	}
 	id, slug, be, ctx := t.Task.ID, t.Task.Slug, m.be, m.ctx

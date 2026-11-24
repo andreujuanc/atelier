@@ -111,8 +111,8 @@ func NewWorkspacePicker(ctx context.Context, s WorkspaceSelector) *WorkspacePick
 // Chosen is the workspace the user opened ("" until then, or after quit).
 func (m *WorkspacePicker) Chosen() string { return m.chosen }
 
-// Init loads the list.
-func (m *WorkspacePicker) Init() tea.Cmd { return m.load() }
+// Init loads the list and asks for the terminal's background (the theme).
+func (m *WorkspacePicker) Init() tea.Cmd { return tea.Batch(m.load(), tea.RequestBackgroundColor) }
 
 func (m *WorkspacePicker) load() tea.Cmd {
 	m.loading = true
@@ -161,6 +161,13 @@ func (m *WorkspacePicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.paste(msg)
 	case tea.KeyPressMsg:
 		return m, m.handleKey(msg)
+	case tea.BackgroundColorMsg:
+		if msg.IsDark() != isDark {
+			applyTheme(msg.IsDark())
+			styleInput(&m.filterInput)
+			styleInput(&m.nameInput)
+		}
+		return m, nil
 	case wsLoadedMsg:
 		m.loading, m.loaded = false, true
 		if msg.err != nil {
@@ -404,19 +411,7 @@ func (m *WorkspacePicker) move(delta int) {
 }
 
 func (m *WorkspacePicker) clampOffset() {
-	h := m.listHeight()
-	if m.sel < m.offset {
-		m.offset = m.sel
-	}
-	if h > 0 && m.sel >= m.offset+h {
-		m.offset = m.sel - h + 1
-	}
-	if m.offset > len(m.vis)-h {
-		m.offset = len(m.vis) - h
-	}
-	if m.offset < 0 {
-		m.offset = 0
-	}
+	m.offset = scrollOffset(m.sel, m.offset, len(m.vis), m.listHeight())
 }
 
 // --- view ---
@@ -462,11 +457,15 @@ func (m *WorkspacePicker) render() string {
 	lines := []string{trunc(head, w)}
 	var body []string
 	title := "Workspaces"
+	iw := w // the list's width: inside the box, or the whole screen
+	if m.boxed() {
+		iw = w - 4
+	}
 	if m.mode == wsAdopt && m.adopt != nil {
 		title = "Adopt"
-		body = m.adoptLines(w-4, m.listHeight())
+		body = m.adoptLines(iw, m.listHeight())
 	} else {
-		body = m.listLines(w-4, m.listHeight())
+		body = m.listLines(iw, m.listHeight())
 	}
 	if m.boxed() {
 		right := ""

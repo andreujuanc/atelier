@@ -1,13 +1,13 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -374,11 +374,11 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	w.buf = append(w.buf, p...)
 	for {
-		i := strings.IndexByte(string(w.buf), '\n')
+		i := bytes.IndexByte(w.buf, '\n')
 		if i < 0 {
 			break
 		}
-		line := strings.TrimSpace(string(w.buf[:i]))
+		line := string(bytes.TrimSpace(w.buf[:i]))
 		w.buf = w.buf[i+1:]
 		if line != "" {
 			w.send(line)
@@ -393,4 +393,20 @@ func (b *trackedBackend) AddCheck(ctx context.Context, ref string, repos []app.R
 	}
 	defer b.tr.end()
 	return b.Backend.AddCheck(ctx, ref, repos)
+}
+
+func (b *trackedBackend) Rename(ctx context.Context, ref, title string) (*model.Task, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.Rename(ctx, ref, title)
+}
+
+func (b *trackedBackend) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.DirtyTasks(ctx)
 }

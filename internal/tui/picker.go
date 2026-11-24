@@ -43,17 +43,32 @@ func newPicker(title string, sel []app.RepoArg, locked map[string]model.Mode) *p
 	return p
 }
 
-// setAvailable sets the repos found on disk (loading done).
+// setAvailable sets the repos found on disk (loading done). A cursor the
+// user moved stays on its repo if it is still listed.
 func (p *picker) setAvailable(names []string, err error) {
 	p.loading = false
 	if err != nil {
 		p.err = err.Error()
 		return
 	}
+	cur := p.current()
 	p.err = ""
 	p.available = names
 	p.initCursor()
+	if p.moved {
+		p.cursorTo(cur)
+	}
 	p.clamp()
+}
+
+// cursorTo moves the cursor to the visible row of repo name, if any.
+func (p *picker) cursorTo(name string) {
+	for i, n := range p.visible() {
+		if n == name {
+			p.cursor = i
+			return
+		}
+	}
 }
 
 // initCursor puts the cursor on the first unlocked row unless the user has
@@ -175,11 +190,7 @@ func (p *picker) setFilter(f string) {
 	p.msg, p.moved = "", true
 	p.filter = f
 	p.cursor = 0
-	for i, n := range p.visible() {
-		if n == cur {
-			p.cursor = i
-		}
-	}
+	p.cursorTo(cur)
 }
 
 // pickResult is what a key did to the picker.
@@ -334,18 +345,7 @@ func (p *picker) lines(w, h int) []string {
 	case len(vis) == 0:
 		list = []string{dimStyle.Render(trunc("no git repos found in $ATL_REPOS", w))}
 	default:
-		if p.cursor < p.offset {
-			p.offset = p.cursor
-		}
-		if p.cursor >= p.offset+listH {
-			p.offset = p.cursor - listH + 1
-		}
-		if max := len(vis) - listH; p.offset > max {
-			p.offset = max
-		}
-		if p.offset < 0 {
-			p.offset = 0
-		}
+		p.offset = scrollOffset(p.cursor, p.offset, len(vis), listH)
 		for i := p.offset; i < len(vis) && i < p.offset+listH; i++ {
 			list = append(list, p.row(vis[i], i == p.cursor, w))
 		}

@@ -208,7 +208,10 @@ type Model struct {
 	detailInflight int
 	detailApplied  int
 
-	listing    bool
+	listing bool
+	// relist: the list in flight was asked for before a change (reload);
+	// its result is dropped for a fresh one.
+	relist     bool
 	recovering bool
 	recoverErr string
 
@@ -444,11 +447,14 @@ func (m *Model) detailCmd(id int64, slug string) tea.Cmd {
 	}
 }
 
-// reload asks for a fresh list (unless one is in flight) and the selected
-// task's detail.
+// reload asks for a fresh list and the selected task's detail. A list in
+// flight may predate what changed: its result is dropped and the list
+// asked for again (see listMsg).
 func (m *Model) reload() tea.Cmd {
 	var cmds []tea.Cmd
-	if !m.listing {
+	if m.listing {
+		m.relist = true
+	} else {
 		m.listing = true
 		cmds = append(cmds, m.listCmd())
 	}
@@ -653,14 +659,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = modeConfirm
 	}
 	if m.quitRequested {
-		n := len(m.busyOps())
+		n := m.opsRunning()
 		if n == 0 {
 			return m, tea.Quit
 		}
 		m.setStatus(m.quitText(n))
 	}
 	// The busy spinner turns while an operation runs.
-	if !m.spinning && (len(m.busyOps()) > 0 || m.restart != nil) {
+	if !m.spinning && (m.opsRunning() > 0 || m.restart != nil) {
 		m.spinning = true
 		cmd = tea.Batch(cmd, m.after(spinEvery, spinTickMsg{}))
 	}
@@ -682,7 +688,7 @@ func (m *Model) quitText(n int) string {
 // requestQuit quits now if nothing is in flight; otherwise the first
 // request quits once all operations end and a second ctrl+c forces.
 func (m *Model) requestQuit(key string) tea.Cmd {
-	if len(m.busyOps()) == 0 {
+	if m.opsRunning() == 0 {
 		return tea.Quit
 	}
 	if m.quitRequested && key == "ctrl+c" {
@@ -715,7 +721,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return nil
 	case spinTickMsg:
 		m.spinFrame++
-		if len(m.busyOps()) == 0 && m.restart == nil {
+		if m.opsRunning() == 0 && m.restart == nil {
 			m.spinning = false
 			return nil
 		}
@@ -760,6 +766,12 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 
 	case listMsg:
 		m.listing = false
+		if m.relist {
+			// Read before a change reload was asked for: list again.
+			m.relist = false
+			m.listing = true
+			return m.listCmd()
+		}
 		if msg.err != nil {
 			m.setErr(fmt.Errorf("list: %w", msg.err))
 			return nil
@@ -888,14 +900,13 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 	case finishMsg:
 		delete(m.busy, msg.id)
 		if msg.err != nil {
+			m.setErr(fmt.Errorf("%s: %w", msg.verb, msg.err))
 			if !msg.force && isDirtyErr(msg.err) {
 				// Changes the dialog did not show: ask again, now saying
 				// they will be deleted. Never forced without that.
-				m.setErr(fmt.Errorf("%s: %w", msg.verb, msg.err))
 				m.showConfirm(&confirmState{verb: msg.verb, id: msg.id, slug: msg.slug, dirty: true})
 				return nil
 			}
-			m.setErr(fmt.Errorf("%s: %w", msg.verb, msg.err))
 			return m.reload()
 		}
 		m.setOK(fmt.Sprintf("%s %s", msg.slug, map[string]string{"done": "done", "cancel": "cancelled"}[msg.verb]))
@@ -918,7 +929,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			return m.reload()
 		}
 		if msg.cmd != nil {
-			if m.mode != modeNormal || m.quitRequested {
+			if !m.canTakeOver() {
 				// Don't attach over the form/filter/editor: the keys
 				// typed there would go to Claude. Its window is running.
 				m.setStatus("open " + msg.slug + ": ready — press enter again")
@@ -929,7 +940,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		if len(msg.choices) == 0 { // defensive: the backend returns one or the other
 			return m.reload()
 		}
-		if m.mode != modeNormal || m.quitRequested {
+		if !m.canTakeOver() {
 			// Don't yank the user out of the form/filter/another prompt.
 			m.setStatus("open " + msg.slug + ": it has sessions to choose from — press enter again")
 			return nil
@@ -943,7 +954,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.setErr(fmt.Errorf("assistant: %w", msg.err))
 			return nil
 		}
-		if m.mode != modeNormal || m.quitRequested {
+		if !m.canTakeOver() {
 			// As for open: don't attach over another mode.
 			text := "assistant ready — press A again"
 			if msg.hint != "" {
@@ -1003,7 +1014,7 @@ func isDirtyErr(err error) bool {
 // showConfirm opens the done/cancel dialog c, or queues it while another
 // mode has the keyboard (Update shows it once back in normal mode).
 func (m *Model) showConfirm(c *confirmState) {
-	if m.mode != modeNormal || m.quitRequested {
+	if !m.canTakeOver() {
 		// Don't yank the user out of the form/filter/another prompt.
 		if m.form != nil {
 			m.lastForm = m.form
@@ -1068,10 +1079,11 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.requestQuit(key)
 	}
 	// Bubble Tea may deliver fast-typed letters as one multi-rune event
-	// ("jjj"): in normal mode replay them one key at a time (the mode may
-	// change on the way, e.g. "/abc"). Pastes arrive as tea.PasteMsg and
-	// are ignored there.
-	if rs := []rune(msg.Text); m.mode == modeNormal && len(rs) > 1 && msg.Mod&(tea.ModAlt|tea.ModCtrl) == 0 {
+	// ("jjj"): in normal mode and the session picker (j/k move there too)
+	// replay them one key at a time (the mode may change on the way, e.g.
+	// "/abc"). Pastes arrive as tea.PasteMsg and are ignored there.
+	replay := m.mode == modeNormal || m.mode == modeSessions
+	if rs := []rune(msg.Text); replay && len(rs) > 1 && msg.Mod&(tea.ModAlt|tea.ModCtrl) == 0 {
 		var cmds []tea.Cmd
 		for _, r := range rs {
 			cmds = append(cmds, m.handleKey(runeKey(r)))
@@ -1206,8 +1218,7 @@ func (m *Model) sessionsKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.setStatus("open " + p.slug + " cancelled")
 		return nil
 	}
-	if op, busy := m.busy[p.taskID]; busy {
-		m.setStatus("busy: " + op + "…")
+	if m.refuseBusy(p.taskID) {
 		return nil
 	}
 	id, slug, be, ctx := p.taskID, p.slug, m.be, m.ctx
@@ -1257,8 +1268,7 @@ func (m *Model) pickerKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.setStatus("add: nothing selected")
 		return nil
 	}
-	if op, busy := m.busy[t.Task.ID]; busy {
-		m.setStatus("busy: " + op + "…")
+	if m.refuseBusy(t.Task.ID) {
 		return nil
 	}
 	return m.addRun(t.Task.ID, t.Task.Slug, sel, false)
@@ -1322,8 +1332,8 @@ func (m *Model) confirmKey(key string) tea.Cmd {
 	m.confirm, m.mode = nil, modeNormal
 	// Forced only when the dialog said the uncommitted changes go too.
 	force := c.dirty
-	if _, busy := m.busy[c.id]; busy {
-		m.setStatus("busy: " + m.busy[c.id])
+	if op, busy := m.busy[c.id]; busy {
+		m.setStatus("busy: " + op)
 		return nil
 	}
 	m.busy[c.id] = c.verb + " " + c.slug
@@ -1345,7 +1355,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		// The pending quit fires in any mode: input opened now would be
 		// thrown away.
 		if m.quitRequested {
-			m.setStatus(m.quitText(len(m.busyOps())))
+			m.setStatus(m.quitText(m.opsRunning()))
 			return nil
 		}
 	}
@@ -1410,8 +1420,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 	slug := t.Task.Slug
 	switch key {
 	case "enter", "s", "r", "d", "c", "p", "a", "m", "t", "1", "2", "3", "4", "5":
-		if op, busy := m.busy[t.Task.ID]; busy {
-			m.setStatus("busy: " + op + "…")
+		if m.refuseBusy(t.Task.ID) {
 			return nil
 		}
 	}
@@ -1545,6 +1554,33 @@ func (m *Model) busyOps() []string {
 	}
 	sort.Strings(ops)
 	return ops
+}
+
+// opsRunning is the number of operations in flight (len(busyOps())).
+func (m *Model) opsRunning() int {
+	n := len(m.busy)
+	if m.creating {
+		n++
+	}
+	if m.assisting {
+		n++
+	}
+	return n
+}
+
+// canTakeOver reports whether an async result may take the screen
+// (attach, open a dialog): only in normal mode with no quit pending, else
+// it would steal the keys typed in the form, filter or editor.
+func (m *Model) canTakeOver() bool { return m.mode == modeNormal && !m.quitRequested }
+
+// refuseBusy reports whether task id has an operation in flight, saying
+// so on the status line.
+func (m *Model) refuseBusy(id int64) bool {
+	op, busy := m.busy[id]
+	if busy {
+		m.setStatus("busy: " + op + "…")
+	}
+	return busy
 }
 
 // renameInputWidth is the visible width of the `t` title input: the full
