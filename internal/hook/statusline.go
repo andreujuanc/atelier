@@ -17,6 +17,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/palette"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
+	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
 // `atl statusline` is the command of Claude Code's status line in task
@@ -69,7 +70,7 @@ func runStatusLine(stdin io.Reader, stdout, stderr io.Writer, env func(string) s
 			code = 0
 		}
 	}()
-	p, err := config.Resolve()
+	p, err := workspace.Paths()
 	if err != nil {
 		logError(p, stderr, EventStatusLine, "", err)
 		return 0

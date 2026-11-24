@@ -66,6 +66,36 @@ func Select(flag string) (*Selection, error) {
 	return &Selection{Name: name, Dir: filepath.Join(root, name), By: ByCwd}, nil
 }
 
+// EnvDir returns the directory $ATL_WORKSPACE selects, resolved as Select
+// resolves it (a name is a directory under the root, anything else a path);
+// "" when the variable is unset. It does not check the directory.
+func EnvDir() (string, error) {
+	v := os.Getenv(Var)
+	if v == "" {
+		return "", nil
+	}
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	s, err := byNameOrPath(root, v, ByEnv)
+	if err != nil {
+		return "", err
+	}
+	return s.Dir, nil
+}
+
+// Paths is config.Resolve with $ATL_WORKSPACE read as the CLI reads it
+// (EnvDir): for commands that run without selecting a workspace (the
+// hooks, the status line), whose $ATL_WORKSPACE may be a name.
+func Paths() (config.Paths, error) {
+	dir, err := EnvDir()
+	if err != nil {
+		return config.Paths{}, err
+	}
+	return config.ResolveIn(dir)
+}
+
 // byNameOrPath resolves v, a workspace name or a path (anything with a '/'
 // or a leading "~"), to a directory.
 func byNameOrPath(root, v, by string) (*Selection, error) {

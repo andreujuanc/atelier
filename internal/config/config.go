@@ -29,7 +29,13 @@ type Paths struct {
 // never creates directories. $ATL_WORKSPACE, when set, must be an existing
 // directory: a typo or a missing mount is an error, never a fresh empty
 // database somewhere else.
-func Resolve() (Paths, error) {
+func Resolve() (Paths, error) { return ResolveIn(os.Getenv("ATL_WORKSPACE")) }
+
+// ResolveIn is Resolve with workspace, a path ("" for none), in place of
+// $ATL_WORKSPACE: the workspace that variable names once resolved as the
+// CLI does (a name is a directory under the workspaces root, see
+// workspace.EnvDir).
+func ResolveIn(workspace string) (Paths, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return Paths{}, fmt.Errorf("resolve home directory: %w", err)
@@ -48,9 +54,9 @@ func Resolve() (Paths, error) {
 		return abs, nil
 	}
 	var p Paths
-	if os.Getenv("ATL_WORKSPACE") != "" {
-		if p.Workspace, err = get("ATL_WORKSPACE", ""); err != nil {
-			return Paths{}, err
+	if workspace != "" {
+		if p.Workspace, err = filepath.Abs(ExpandHome(workspace, home)); err != nil {
+			return Paths{}, fmt.Errorf("resolve $ATL_WORKSPACE (%q): %w", workspace, err)
 		}
 		fi, err := os.Stat(p.Workspace)
 		if err != nil {
