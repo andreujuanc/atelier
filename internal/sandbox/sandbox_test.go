@@ -16,13 +16,34 @@ import (
 	"time"
 )
 
+// Sessions of the session scripts' tests ("7", "17", "8" in their
+// comments). The scripts find a session's processes in all of /proc, so
+// another run of these tests at the same time (another checkout's go test
+// on the same machine) must not share them: they carry this process's PID.
+// s17 ends with s7's digits, which the scripts must not take for s7.
+var (
+	s7  = int64(os.Getpid())*10 + 7
+	s17 = s7 + pow10(len(str(s7)))
+	s8  = s7 + 1
+)
+
+func str(session int64) string { return strconv.FormatInt(session, 10) }
+
+func pow10(n int) int64 {
+	p := int64(1)
+	for range n {
+		p *= 10
+	}
+	return p
+}
+
 // TestKillSessionArgs: the script docker exec runs in the container ends
 // every process whose environment has ATL_SESSION=<the session>, children
 // included, and nothing else (not session 17 for session 7). It is run
 // here with sh, as docker exec would run it in the container.
 func TestKillSessionArgs(t *testing.T) {
-	args := KillSessionArgs(oldID, 7)
-	if !slices.Equal(args[:4], []string{"exec", oldID, "sh", "-c"}) || args[len(args)-1] != "7" {
+	args := KillSessionArgs(oldID, s7)
+	if !slices.Equal(args[:4], []string{"exec", oldID, "sh", "-c"}) || args[len(args)-1] != str(s7) {
 		t.Fatalf("args = %q", args)
 	}
 	start := func(session string) *exec.Cmd {
@@ -35,7 +56,7 @@ func TestKillSessionArgs(t *testing.T) {
 		t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
 		return cmd
 	}
-	mine, other := start("7"), start("17")
+	mine, other := start(str(s7)), start(str(s17))
 	time.Sleep(200 * time.Millisecond)
 	count := func(session string) int {
 		n := 0
@@ -49,7 +70,7 @@ func TestKillSessionArgs(t *testing.T) {
 		}
 		return n
 	}
-	if n := count("7"); n < 3 {
+	if n := count(str(s7)); n < 3 {
 		t.Fatalf("session 7 has %d processes, want its sh and two sleeps", n)
 	}
 	out, err := exec.Command("sh", append([]string{"-c", args[4]}, args[5:]...)...).CombinedOutput()
@@ -60,10 +81,10 @@ func TestKillSessionArgs(t *testing.T) {
 		t.Error("session 7's process exited normally, want killed")
 	}
 	time.Sleep(100 * time.Millisecond)
-	if n := count("7"); n != 0 {
+	if n := count(str(s7)); n != 0 {
 		t.Errorf("%d processes of session 7 left", n)
 	}
-	if n := count("17"); n < 3 || other.ProcessState != nil {
+	if n := count(str(s17)); n < 3 || other.ProcessState != nil {
 		t.Errorf("session 17 lost processes: %d left", n)
 	}
 }
@@ -83,8 +104,8 @@ func aliveProc(pid int) bool {
 // are never touched; a root that outlives the wait (a /clear) means the
 // session goes on.
 func TestEndSessionCmd(t *testing.T) {
-	cmd := EndSessionCmd(7)
-	if !slices.Equal(cmd[:2], []string{"sh", "-c"}) || !slices.Equal(cmd[3:], []string{"atl-end-session", "end", "7"}) {
+	cmd := EndSessionCmd(s7)
+	if !slices.Equal(cmd[:2], []string{"sh", "-c"}) || !slices.Equal(cmd[3:], []string{"atl-end-session", "end", str(s7)}) {
 		t.Fatalf("cmd = %q", cmd[3:])
 	}
 	env := func(session string) []string { return append(os.Environ(), "ATL_SESSION="+session) }
@@ -118,15 +139,15 @@ func TestEndSessionCmd(t *testing.T) {
 		}
 		return c
 	}
-	claude7, left7 := root("7"), leftover("7")
-	claude17, left17 := root("17"), leftover("17")
-	claude8, left8 := root("8"), leftover("8")
+	claude7, left7 := root(str(s7)), leftover(str(s7))
+	claude17, left17 := root(str(s17)), leftover(str(s17))
+	claude8, left8 := root(str(s8)), leftover(str(s8))
 	time.Sleep(200 * time.Millisecond)
 
 	// Session 8 had a /clear: its Claude outlives the wait.
-	clear8 := end("8", 2)
+	clear8 := end(str(s8), 2)
 	// Session 7 ends: nothing goes while its Claude still runs.
-	end7 := end("7", 30)
+	end7 := end(str(s7), 30)
 	time.Sleep(1500 * time.Millisecond)
 	if !aliveProc(left7) || claude7.ProcessState != nil {
 		t.Fatal("session 7 was touched while its Claude ran")
