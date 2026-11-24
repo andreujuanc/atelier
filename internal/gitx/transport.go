@@ -1,12 +1,15 @@
 package gitx
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
@@ -14,6 +17,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // Origin is where a repo's origin points, as its config says it: the values
@@ -125,18 +130,85 @@ func configList(ctx context.Context, dir, key string) ([]string, error) {
 // git from running anything that config names (see transportArgs), and the
 // branch goes to origin's URLs, never to what the repo's config says (see
 // newTransport).
+//
+// The commit pushed is the one the branch's ref names, read here
+// (branchCommit), not by git: git follows a ref file (or packed-refs, or a
+// directory on the way) that is a symlink, and the task could make it one
+// to a branch of any other repo where atl runs, and list that repo's
+// objects as alternates: git would push that repo's history to origin,
+// where the task fetches it.
 func PushBranch(ctx context.Context, dir string, origin Origin, branch string, force bool, out io.Writer) error {
 	t, err := newTransport(ctx, dir, origin, true)
 	if err != nil {
 		return err
 	}
 	ref := "refs/heads/" + branch
+	commit, err := branchCommit(ctx, dir, ref)
+	if err != nil {
+		return err
+	}
 	args := append(t.args, "push", "--no-follow-tags", "--recurse-submodules=no")
 	if force {
 		args = append(args, "--force-with-lease")
 	}
-	args = append(args, "--receive-pack="+packProgram(true, t.local), t.name, ref+":"+ref)
+	args = append(args, "--receive-pack="+packProgram(true, t.local), t.name, commit+":"+ref)
 	return runTransport(ctx, dir, out, args)
+}
+
+// branchCommit returns the commit id ref (a branch, refs/heads/...) names
+// in the repo at dir: its loose ref file in the repo's common git dir, else
+// its line in packed-refs, both read without following a symlink (see
+// package nofollow). A symbolic ref is refused.
+func branchCommit(ctx context.Context, dir, ref string) (string, error) {
+	common, err := revParsePath(ctx, dir, "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	d, err := nofollow.Open(common)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", ref, err)
+	}
+	defer d.Close()
+	data, err := d.ReadFile(ref, 1024)
+	if err == nil {
+		id := strings.TrimSuffix(string(data), "\n")
+		if !objectID.MatchString(id) {
+			return "", fmt.Errorf("read %s: not a commit id: %q", ref, firstChars(id, 80))
+		}
+		return id, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("read %s: %w", ref, err)
+	}
+	f, err := d.OpenFile("packed-refs")
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("no branch %s", ref)
+	}
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", ref, err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(nil, 64<<10)
+	for sc.Scan() {
+		if id, name, ok := strings.Cut(sc.Text(), " "); ok && name == ref && objectID.MatchString(id) {
+			return id, nil
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("read %s: packed-refs: %w", ref, err)
+	}
+	return "", fmt.Errorf("no branch %s", ref)
+}
+
+// objectID matches a full object id, SHA-1 or SHA-256.
+var objectID = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
+
+func firstChars(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 // FetchOrigin is `git fetch origin` in the repo at dir, from origin's URL,

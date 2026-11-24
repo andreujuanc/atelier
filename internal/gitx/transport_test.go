@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -823,5 +825,52 @@ func TestFailureLine(t *testing.T) {
 		if got := failureLine(c.out); got != c.want {
 			t.Errorf("failureLine(%q) = %q, want %q", c.out, got, c.want)
 		}
+	}
+}
+
+// TestPushBranchPushesOnlyWhatTheRepoHas: a task can write the clone's git
+// dir: make its branch's ref file a symlink to another repo's ref on the
+// host (git follows it where atl runs; the task cannot) and list that
+// repo's objects as alternates. A push of the branch must not send that
+// repo's history to origin, from where the task would fetch it.
+func TestPushBranchPushesOnlyWhatTheRepoHas(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	secret := filepath.Join(t.TempDir(), "secret")
+	git(t, f.root, "init", "-q", "-b", "main", secret)
+	commitFile(t, secret, "creds", "hunter2\n", "the user's private work")
+	writeFile(t, filepath.Join(f.repo, ".git", "objects", "info", "alternates"), filepath.Join(secret, ".git", "objects")+"\n")
+	pushed := func() string {
+		out, _ := exec.Command("git", "-C", f.origin, "log", "--format=%s", "atl/x").CombinedOutput()
+		return string(out)
+	}
+
+	// The loose ref, a symlink.
+	ref := filepath.Join(f.repo, ".git", "refs", "heads", "atl", "x")
+	must(t, os.MkdirAll(filepath.Dir(ref), 0o755))
+	must(t, os.Symlink(filepath.Join(secret, ".git", "refs", "heads", "main"), ref))
+	err := PushBranch(ctx, f.repo, to(f.origin), "atl/x", false, io.Discard)
+	if strings.Contains(pushed(), "private") || err == nil {
+		t.Fatalf("a symlinked ref: pushed %q (%v)", pushed(), err)
+	}
+	// A directory on the way, a symlink.
+	must(t, os.Remove(ref))
+	must(t, os.Remove(filepath.Dir(ref)))
+	must(t, os.Symlink(filepath.Join(secret, ".git", "refs", "heads"), filepath.Dir(ref)))
+	git(t, secret, "branch", "x")
+	err = PushBranch(ctx, f.repo, to(f.origin), "atl/x", false, io.Discard)
+	if strings.Contains(pushed(), "private") || err == nil {
+		t.Fatalf("a symlinked ref dir: pushed %q (%v)", pushed(), err)
+	}
+	// packed-refs, a symlink.
+	must(t, os.Remove(filepath.Dir(ref)))
+	git(t, secret, "branch", "-m", "x", "atl/x")
+	git(t, secret, "pack-refs", "--all")
+	packed := filepath.Join(f.repo, ".git", "packed-refs")
+	must(t, os.Remove(packed))
+	must(t, os.Symlink(filepath.Join(secret, ".git", "packed-refs"), packed))
+	err = PushBranch(ctx, f.repo, to(f.origin), "atl/x", false, io.Discard)
+	if strings.Contains(pushed(), "private") || err == nil {
+		t.Fatalf("a symlinked packed-refs: pushed %q (%v)", pushed(), err)
 	}
 }
