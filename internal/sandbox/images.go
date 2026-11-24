@@ -230,6 +230,9 @@ func (g *Gate) buildTags(r *http.Request) error {
 		if err := json.Unmarshal([]byte(s), &labels); err != nil {
 			return errors.New("unreadable build labels")
 		}
+		if labels == nil { // "null"
+			labels = map[string]string{}
+		}
 	}
 	labels[LabelTask] = g.ID
 	delete(labels, LabelAgent)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -346,7 +347,28 @@ func decodeBody(r *http.Request) (map[string]any, error) {
 	if err := dec.Decode(&body); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("unreadable request body: %v", err)
 	}
+	if body == nil { // "null"
+		body = map[string]any{}
+	}
 	return body, nil
+}
+
+// fieldKeys refuses an object of a request body that has a key dockerd
+// would take for one of fields, the names the gate reads it by, without
+// being spelled exactly so. dockerd decodes request bodies with
+// encoding/json, which matches a key to a field in any case, Unicode case
+// folding included ("hoſtconfig" is HostConfig), and lets a later spelling
+// add to or override what an earlier one set; the gate, reading a map,
+// sees only the exact name. Docker's clients send the exact names.
+func fieldKeys(obj map[string]any, fields ...string) error {
+	for k := range obj {
+		for _, f := range fields {
+			if k != f && strings.EqualFold(k, f) {
+				return fmt.Errorf("setting %q is not accepted: spell it %s", k, f)
+			}
+		}
+	}
+	return nil
 }
 
 var errNotFound = errors.New("not found")
@@ -457,6 +479,9 @@ func gateList(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 			g.deny(w, r, http.StatusBadRequest, "unreadable filters")
 			return
 		}
+		if filters == nil { // "null"
+			filters = map[string]any{}
+		}
 	}
 	own := LabelTask + "=" + g.ID
 	switch v := filters["label"].(type) {
@@ -490,6 +515,12 @@ func gateContainer(g *Gate, w http.ResponseWriter, r *http.Request, m []string) 
 		return
 	case who == "agent" && !agentActions[action]:
 		g.deny(w, r, http.StatusForbidden, "this is the task's own container: it cannot be stopped, removed or renamed from inside")
+		return
+	}
+	if action == "start" && (r.ContentLength > 7 || r.ContentLength == -1) {
+		// What dockerd reads as a HostConfig: Docker 24 and older apply
+		// it for API versions before 1.24; later ones refuse it.
+		g.deny(w, r, http.StatusForbidden, "a container start takes no settings; they go in the create")
 		return
 	}
 	if action == "rename" {
@@ -575,6 +606,10 @@ func gateExecCreate(g *Gate, w http.ResponseWriter, r *http.Request, m []string)
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := fieldKeys(body, "Privileged"); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	if !isZero(body["Privileged"]) {
 		g.deny(w, r, http.StatusForbidden, "privileged exec is not allowed")
 		return
@@ -639,6 +674,10 @@ func gateVolumeCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []strin
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := fieldKeys(body, "Driver", "DriverOpts", "ClusterVolumeSpec", "Labels"); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	// The local driver's options can bind any host path (type=none,o=bind,device=/).
 	if d, _ := body["Driver"].(string); !oneOf(d, "", "local") || !isZero(body["DriverOpts"]) || !isZero(body["ClusterVolumeSpec"]) {
 		g.deny(w, r, http.StatusForbidden, "volume drivers and driver options are not allowed")
@@ -657,6 +696,10 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 	body, err := decodeBody(r)
 	if err != nil {
 		g.deny(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := fieldKeys(body, slices.Collect(maps.Keys(networkKeys))...); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
 		return
 	}
 	for k, v := range body {
@@ -746,6 +789,14 @@ func gateNetworkConnect(g *Gate, w http.ResponseWriter, r *http.Request, m []str
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	err = fieldKeys(body, "Container", "EndpointConfig")
+	if ep, ok := body["EndpointConfig"].(map[string]any); ok && err == nil {
+		err = fieldKeys(ep, "NetworkID")
+	}
+	if err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	nid, ok := g.checkOwned(w, r, "networks", m[1])
 	if !ok {
 		return
@@ -807,8 +858,36 @@ var hostAllowed = map[string]bool{
 	"ExtraHosts": true, "Dns": true, "DnsOptions": true, "DnsSearch": true, "CapDrop": true,
 }
 
+// createFields are the top-level fields of a container create: the
+// container's Config (MacAddress: up to API 1.43), HostConfig and
+// NetworkingConfig. Any other is refused unless unset (see checkCreate).
+var createFields = []string{
+	"Hostname", "Domainname", "User", "AttachStdin", "AttachStdout", "AttachStderr", "ExposedPorts", "Tty",
+	"OpenStdin", "StdinOnce", "Env", "Cmd", "Healthcheck", "ArgsEscaped", "Image", "Volumes", "WorkingDir",
+	"Entrypoint", "NetworkDisabled", "MacAddress", "OnBuild", "Labels", "StopSignal", "StopTimeout", "Shell",
+	"HostConfig", "NetworkingConfig",
+}
+
+// hostChecked are the HostConfig settings checkCreate checks by value.
+var hostChecked = []string{"Binds", "Mounts", "NetworkMode", "VolumesFrom", "LogConfig", "IpcMode", "CgroupnsMode", "MaskedPaths", "ReadonlyPaths"}
+
 func (g *Gate) checkCreate(body map[string]any) error {
+	if err := fieldKeys(body, "HostConfig", "NetworkingConfig", "Labels"); err != nil {
+		return err
+	}
+	// Docker 24 and older also read HostConfig settings at the top level:
+	// all of them when there is no HostConfig, a few besides one.
+	for k, v := range body {
+		known := slices.ContainsFunc(createFields, func(f string) bool { return strings.EqualFold(k, f) })
+		paths := strings.EqualFold(k, "MaskedPaths") || strings.EqualFold(k, "ReadonlyPaths")
+		if !known && (!isZero(v) || paths && v != nil) {
+			return fmt.Errorf("container setting %s is not allowed here (host settings go in HostConfig)", k)
+		}
+	}
 	hc, _ := body["HostConfig"].(map[string]any)
+	if err := fieldKeys(hc, append(slices.Collect(maps.Keys(hostAllowed)), hostChecked...)...); err != nil {
+		return err
+	}
 	for k, v := range hc {
 		var err error
 		switch k {
@@ -836,6 +915,9 @@ func (g *Gate) checkCreate(body map[string]any) error {
 			}
 		case "LogConfig":
 			lc, _ := v.(map[string]any)
+			if err = fieldKeys(lc, "Type"); err != nil {
+				break
+			}
 			if t, _ := lc["Type"].(string); !oneOf(t, "", "json-file", "local", "none") {
 				err = fmt.Errorf("log driver %s is not allowed (json-file, local and none are)", t)
 			}
@@ -861,6 +943,9 @@ func (g *Gate) checkCreate(body map[string]any) error {
 		}
 	}
 	nc, _ := body["NetworkingConfig"].(map[string]any)
+	if err := fieldKeys(nc, "EndpointsConfig"); err != nil {
+		return err
+	}
 	endpoints, _ := nc["EndpointsConfig"].(map[string]any)
 	if nc != nil && endpoints == nil && !isZero(nc["EndpointsConfig"]) {
 		return errors.New("unreadable endpoint settings")
@@ -870,6 +955,9 @@ func (g *Gate) checkCreate(body map[string]any) error {
 		ep, ok := v.(map[string]any)
 		if !ok && v != nil {
 			return errors.New("unreadable endpoint settings")
+		}
+		if err := fieldKeys(ep, "NetworkID"); err != nil {
+			return err
 		}
 		id, err := g.network(name)
 		if err != nil {
@@ -979,13 +1067,22 @@ func (g *Gate) mounts(v any) error {
 	list, _ := v.([]any)
 	for _, item := range list {
 		m, _ := item.(map[string]any)
+		if err := fieldKeys(m, "Type", "Source", "ReadOnly", "BindOptions", "VolumeOptions"); err != nil {
+			return err
+		}
+		bindOpts, _ := m["BindOptions"].(map[string]any)
+		if err := fieldKeys(bindOpts, "Propagation", "ReadOnlyNonRecursive"); err != nil {
+			return err
+		}
+		volumeOpts, _ := m["VolumeOptions"].(map[string]any)
+		if err := fieldKeys(volumeOpts, "DriverConfig"); err != nil {
+			return err
+		}
 		src, _ := m["Source"].(string)
 		switch m["Type"] {
 		case "bind":
-			if opts, _ := m["BindOptions"].(map[string]any); opts != nil {
-				if p, _ := opts["Propagation"].(string); !oneOf(p, "", "private", "rprivate") {
-					return fmt.Errorf("mount propagation %s is not allowed", p)
-				}
+			if p, _ := bindOpts["Propagation"].(string); !oneOf(p, "", "private", "rprivate") {
+				return fmt.Errorf("mount propagation %s is not allowed", p)
 			}
 			if !strings.HasPrefix(src, "/") {
 				return fmt.Errorf("unreadable mount source %q", src)
@@ -999,7 +1096,7 @@ func (g *Gate) mounts(v any) error {
 				g.readOnlyMount(real, m)
 			}
 		case "volume":
-			if opts, _ := m["VolumeOptions"].(map[string]any); opts != nil && !isZero(opts["DriverConfig"]) {
+			if !isZero(volumeOpts["DriverConfig"]) {
 				return errors.New("volume drivers and driver options are not allowed")
 			}
 			if src != "" {

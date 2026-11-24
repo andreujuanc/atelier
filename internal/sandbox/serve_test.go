@@ -32,6 +32,14 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	// The tests do not see the atl task they may run in (go test in a task
+	// container has ATL_SANDBOX_ID, ATL_SESSION, ...); the gate above gets
+	// what TestStartReplacesStaleGate sets.
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "ATL_") {
+			os.Unsetenv(k)
+		}
+	}
 	os.Exit(m.Run())
 }
 

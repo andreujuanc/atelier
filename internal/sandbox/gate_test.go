@@ -365,6 +365,12 @@ func TestGateRefusesHostReachingContainers(t *testing.T) {
 			`"NetworkingConfig":{"EndpointsConfig":{"hostnet":{"NetworkID":"` + mynetID + `"}}}}`,
 		"syslog log driver": `{"HostConfig":{"LogConfig":{"Type":"syslog","Config":{"syslog-address":"tcp://127.0.0.1:22"}}}}`,
 		"gelf log driver":   `{"HostConfig":{"LogConfig":{"Type":"gelf","Config":{"gelf-address":"udp://127.0.0.1:1"}}}}`,
+		// Docker 24 and older read HostConfig settings at the top level
+		// (all of them without a HostConfig, some besides one).
+		"top-level privileged": `{"Image":"x","Privileged":true}`,
+		"top-level bind":       `{"Image":"x","Binds":["/:/host"]}`,
+		"top-level unmasked":   `{"Image":"x","maskedpaths":[]}`,
+		"top-level driver":     `{"Image":"x","HostConfig":{},"VolumeDriver":"evil"}`,
 	} {
 		status, out := c.do("POST", "/v1.45/containers/create", body)
 		if status != http.StatusForbidden || !strings.Contains(out, "atelier gate:") {
@@ -773,6 +779,33 @@ func TestGateListsOnlyTheTask(t *testing.T) {
 	}
 }
 
+// TestGateNullJSON: JSON null where the gate expects an object (filters,
+// build labels, a request body) is read as an empty one, as dockerd reads
+// it, and still gets the task's label.
+func TestGateNullJSON(t *testing.T) {
+	c := newGate(t)
+	own := LabelTask + "=" + testID
+	for _, tc := range []struct{ method, uri, body, saw, want string }{
+		{"GET", "/containers/json?filters=null", "", "GET /containers/json", `"label":{"` + own + `":true}`},
+		{"POST", "/build?labels=null", "", "POST /build", `"` + LabelTask + `":"` + testID + `"`},
+	} {
+		if status, out := c.do(tc.method, tc.uri, tc.body); status >= 400 {
+			t.Errorf("%s %s: status %d (%s), want it forwarded", tc.method, tc.uri, status, out)
+		}
+		if got := c.d.saw(tc.saw); !strings.Contains(got, tc.want) {
+			t.Errorf("%s %s reached the daemon as %q, want %s", tc.method, tc.uri, got, tc.want)
+		}
+	}
+	for _, uri := range []string{"/containers/create", "/volumes/create", "/networks/create"} {
+		if status, out := c.do("POST", uri, "null"); status != http.StatusCreated {
+			t.Errorf("POST %s null: status %d (%s), want it forwarded", uri, status, out)
+		}
+		if b := c.d.body("POST " + uri); !strings.Contains(b, `"`+LabelTask+`":"`+testID+`"`) {
+			t.Errorf("POST %s null reached the daemon as %s, want the task's label", uri, b)
+		}
+	}
+}
+
 func TestGateRefusesEverythingElse(t *testing.T) {
 	c := newGate(t)
 	for _, tc := range []struct{ method, uri, body string }{
@@ -797,6 +830,9 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/networks/create", `{"Name":"n","Driver":"host"}`},
 		{"POST", "/networks/create", `{"Name":"n","Options":{"com.docker.network.bridge.name":"docker0"}}`},
 		{"POST", "/networks/create", `{"Name":"n","ConfigFrom":{"Network":"hostnet"}}`},
+		// API versions before 1.24 (Docker 24 and older) apply a
+		// HostConfig sent with a start.
+		{"POST", "/v1.23/containers/mine/start", `{"Privileged":true,"Binds":["/:/host"]}`},
 	} {
 		before := len(c.d.requests)
 		if status, out := c.do(tc.method, tc.uri, tc.body); status != http.StatusForbidden {
@@ -816,6 +852,13 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/images/create?fromImage=postgres&tag=17", ""},
 		{"POST", "/build?networkmode=default", ""},
 		{"POST", "/volumes/create", `{"Name":"data"}`},
+		{"POST", "/containers/mine/start", ""},
+		{"POST", "/containers/mine/start", "{}"},
+		{"POST", "/containers/create", `{"Hostname":"h","Domainname":"d","User":"1000","AttachStdin":false,"AttachStdout":true,` +
+			`"AttachStderr":true,"ExposedPorts":{"5432/tcp":{}},"Tty":true,"OpenStdin":true,"StdinOnce":false,"Env":["A=1"],` +
+			`"Cmd":["x"],"Healthcheck":{"Test":["NONE"]},"ArgsEscaped":false,"Image":"postgres","Volumes":{"/d":{}},` +
+			`"WorkingDir":"/","Entrypoint":["sh"],"NetworkDisabled":false,"MacAddress":"","OnBuild":null,"Labels":{},` +
+			`"StopSignal":"SIGINT","StopTimeout":5,"Shell":["sh"],"HostConfig":{},"NetworkingConfig":{}}`},
 		{"POST", "/networks/create", `{"Name":"n","Driver":"bridge","IPAM":{"Config":[{"Subnet":"10.1.0.0/24"}]}}`},
 	} {
 		if status, out := c.do(tc.method, tc.uri, tc.body); status >= 400 {
@@ -828,6 +871,53 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 	}
 	if b := c.d.body("POST /networks/new1/connect"); !strings.Contains(b, `"`+agentID+`"`) {
 		t.Errorf("the task's own container was not joined to its new network: %q", b)
+	}
+}
+
+// TestGateKeysInAnyCase: dockerd decodes a request body with encoding/json,
+// which takes a key for a field in any case, Unicode folding included
+// ("hoſtconfig" is HostConfig), and lets a later spelling add to or
+// override what an earlier one set. A key the gate reads, in another
+// spelling, would reach the daemon unchecked: it is refused. Keys of
+// maps (labels, tmpfs paths) are not field names and stay as they are.
+func TestGateKeysInAnyCase(t *testing.T) {
+	c := newGate(t)
+	for _, tc := range []struct{ uri, body string }{
+		{"/containers/create", `{"Image":"x","hostconfig":{"Privileged":true}}`},
+		{"/containers/create", `{"Image":"x","HostConfig":{},"hoſtconfig":{"Binds":["/:/host"]}}`},
+		{"/containers/create", `{"HostConfig":{"maskedpaths":[]}}`},
+		{"/containers/create", `{"HostConfig":{"LogConfig":{"type":"syslog"}}}`},
+		{"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"volume","type":"bind","source":"/","Target":"/h"}]}}`},
+		{"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + c.root + `","Target":"/h","BindOptions":{"propagation":"shared"}}]}}`},
+		{"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"volume","Source":"myvol","Target":"/h","VolumeOptions":{"driverconfig":{"Name":"x"}}}]}}`},
+		{"/containers/create", `{"Labels":{},"labels":null}`},
+		{"/containers/create", `{"networkingconfig":{"EndpointsConfig":{"hostnet":{}}}}`},
+		{"/containers/create", `{"NetworkingConfig":{"endpointsconfig":{"hostnet":{}}}}`},
+		{"/containers/create", `{"NetworkingConfig":{"EndpointsConfig":{"mynet":{"networkid":"` + hostnetID + `"}}}}`},
+		{"/containers/mine/exec", `{"Cmd":["id"],"privileged":true}`},
+		{"/volumes/create", `{"Name":"evil","driveropts":{"type":"none","o":"bind","device":"/"}}`},
+		{"/networks/create", `{"Name":"n","labels":null}`},
+		{"/networks/mynet/connect", `{"Container":"mine","container":"other"}`},
+		{"/networks/mynet/connect", `{"Container":"mine","endpointconfig":{"NetworkID":"` + hostnetID + `"}}`},
+		{"/networks/mynet/connect", `{"Container":"mine","EndpointConfig":{"networkid":"` + hostnetID + `"}}`},
+	} {
+		c.d.mu.Lock()
+		before := len(c.d.requests)
+		c.d.mu.Unlock()
+		if status, out := c.do("POST", tc.uri, tc.body); status != http.StatusForbidden || !strings.Contains(out, "atelier gate:") {
+			t.Errorf("POST %s %s: status %d (%s), want a refusal", tc.uri, tc.body, status, out)
+		}
+		c.d.mu.Lock()
+		for _, r := range c.d.requests[before:] {
+			if !strings.HasPrefix(r, "GET ") {
+				t.Errorf("POST %s %s: %s reached the daemon", tc.uri, tc.body, r)
+			}
+		}
+		c.d.mu.Unlock()
+	}
+	body := `{"Labels":{"labels":"1","Type":"x"},"HostConfig":{"Tmpfs":{"/hostconfig":""}},"Volumes":{"/source":{}}}`
+	if status, out := c.do("POST", "/containers/create", body); status != http.StatusCreated {
+		t.Errorf("create with such map keys: status %d (%s), want it forwarded", status, out)
 	}
 }
 
