@@ -111,8 +111,8 @@ func NewWorkspacePicker(ctx context.Context, s WorkspaceSelector) *WorkspacePick
 // Chosen is the workspace the user opened ("" until then, or after quit).
 func (m *WorkspacePicker) Chosen() string { return m.chosen }
 
-// Init loads the list.
-func (m *WorkspacePicker) Init() tea.Cmd { return m.load() }
+// Init loads the list and asks for the terminal's background (the theme).
+func (m *WorkspacePicker) Init() tea.Cmd { return tea.Batch(m.load(), tea.RequestBackgroundColor) }
 
 func (m *WorkspacePicker) load() tea.Cmd {
 	m.loading = true
@@ -161,6 +161,13 @@ func (m *WorkspacePicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.paste(msg)
 	case tea.KeyPressMsg:
 		return m, m.handleKey(msg)
+	case tea.BackgroundColorMsg:
+		if msg.IsDark() != isDark {
+			applyTheme(msg.IsDark())
+			styleInput(&m.filterInput)
+			styleInput(&m.nameInput)
+		}
+		return m, nil
 	case wsLoadedMsg:
 		m.loading, m.loaded = false, true
 		if msg.err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image/color"
 	"strings"
 	"testing"
 
@@ -528,5 +529,21 @@ func TestWorkspacePickerNarrow(t *testing.T) {
 		if !found {
 			t.Errorf("%v: no alpha row:\n%s", size, wsView(m))
 		}
+	}
+}
+
+// TestWorkspacePickerTheme: the selector's colours follow the terminal's
+// background as the task list's do (its inputs too).
+func TestWorkspacePickerTheme(t *testing.T) {
+	t.Cleanup(func() { applyTheme(true) })
+	m := newWSTest(t, &fakeWorkspaces{rows: sampleWorkspaces()}, "")
+	dark := m.nameInput.Styles().Focused.Prompt.GetForeground()
+	m.Update(tea.BackgroundColorMsg{Color: color.White})
+	if isDark || m.nameInput.Styles().Focused.Prompt.GetForeground() == dark {
+		t.Fatal("a light background kept the dark colours")
+	}
+	m.Update(tea.BackgroundColorMsg{Color: color.Black})
+	if !isDark || m.nameInput.Styles().Focused.Prompt.GetForeground() != dark {
+		t.Fatal("a dark background did not bring the dark colours back")
 	}
 }
