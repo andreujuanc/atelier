@@ -565,4 +565,18 @@ out="$(atl cancel second-task 2>&1)" || fail "atl cancel (after reopen) failed: 
 [[ ! -e "$S" ]] || fail "second-task dir still exists"
 expect_eq "worktrees of api after the second cancel" "$(git -C "$ATL_REPOS/api" worktree list --porcelain | grep -c '^worktree ')" "1"
 
+# ---- done from inside the task's tmux session ------------------------------
+
+# A shell in a window of the task's own tmux session runs atl done: closing
+# kills that session, which hangs up on the shell and atl; atl still finishes.
+step "done from the task's own tmux session"
+out="$(atl new "Self close" --repo api --no-fetch)" || fail "atl new (self close) failed: $out"
+out="$(atl session self-close)" || fail "atl session self-close failed: $out"
+tm new-window -d -t "=atl-self-close:" "atl done self-close >'$E2E_OUT/self-close.log' 2>&1; sleep 60" ||
+	fail "start a shell window in atl-self-close"
+self_closed() { [[ "$(task_field self-close status)" == done ]]; }
+wait_for "atl done run from the task's own tmux session" self_closed
+[[ ! -e "$ATL_TASKS/self-close" ]] || fail "self-close dir still exists: $(cat "$E2E_OUT/self-close.log")"
+expect_eq "worktrees of api after done from inside" "$(git -C "$ATL_REPOS/api" worktree list --porcelain | grep -c '^worktree ')" "1"
+
 echo "E2E OK"
