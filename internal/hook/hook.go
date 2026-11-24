@@ -186,13 +186,35 @@ func (d db) serve(event string, data []byte, readErr error, landings []candidate
 		if event == EventPreToolUse {
 			return d.guardPartial(stderr, env, event, data, false, landings)
 		}
-		return 0
+		if !typeErrorOnly(err, data) {
+			return 0
+		}
+		// The rest of the input decoded: a field of an unexpected type
+		// (left empty) must not cost the session its state change.
 	}
 	if !knownEvent(event) {
 		return 0
 	}
 	in.landings = landings
 	return d.handleMain(stdout, stderr, env, event, in)
+}
+
+// typeErrorOnly reports whether err, from json.Unmarshal of data into an
+// Input, only says that some field had an unexpected type (json.Unmarshal
+// then decodes the others), data is a JSON object, and its session_id, if
+// any, is a string: the session can still be told apart.
+func typeErrorOnly(err error, data []byte) bool {
+	var te *json.UnmarshalTypeError
+	if !errors.As(err, &te) {
+		return false
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) != nil || obj == nil {
+		return false
+	}
+	var sid string
+	raw, ok := obj["session_id"]
+	return !ok || json.Unmarshal(raw, &sid) == nil
 }
 
 // handleMain opens the store (unless d has one) and runs Handle, mapping its
