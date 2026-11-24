@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -745,5 +746,69 @@ func TestCreateWriteFails(t *testing.T) {
 	}
 	if _, err := Load(dir); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCreateKilledMidWrite: atl killed while it writes a new workspace's
+// atelier.toml (here: half written, then SIGKILL) leaves no atelier.toml,
+// neither a partial one (which would not load and make a retry call the
+// workspace existing) nor an empty one (which would load as the defaults):
+// a retry makes the workspace with its settings.
+func TestCreateKilledMidWrite(t *testing.T) {
+	if root := os.Getenv("CRASHTEST_WS_ROOT"); root != "" {
+		writeFile = func(f *os.File, b []byte) (int, error) {
+			f.Write(b[:len(b)/2])
+			syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			select {}
+		}
+		Create(root, "killed", Config{Repos: "/srv/repos"})
+		t.Fatal("not killed")
+	}
+	root := env(t)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCreateKilledMidWrite$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "CRASHTEST_WS_ROOT="+root)
+	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+		t.Fatalf("child not killed: %v\n%s", err, out)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "killed", File)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("%s left by the killed write: %v", File, err)
+	}
+	dir, _, err := create(root, "killed", Config{Repos: "/srv/repos"})
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	ws, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Config.Repos != "/srv/repos" {
+		t.Fatalf("repos %q", ws.Config.Repos)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, tmpPrefix+"*")); len(left) > 0 {
+		t.Fatalf("the killed write's temporary file left: %v", left)
+	}
+}
+
+// TestCreateWithoutHardLinks: on a file system without hard links,
+// atelier.toml is written in place, whole, and a second create is refused.
+func TestCreateWithoutHardLinks(t *testing.T) {
+	root := env(t)
+	l := link
+	t.Cleanup(func() { link = l })
+	link = func(string, string) error { return &os.LinkError{Op: "link", Err: syscall.EPERM} }
+	dir, _, err := create(root, "nolinks", Config{Repos: "/srv/repos"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws, err := Load(dir); err != nil || ws.Config.Repos != "/srv/repos" {
+		t.Fatalf("load: %+v, %v", ws, err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, tmpPrefix+"*")); len(left) > 0 {
+		t.Fatalf("temporary files left: %v", left)
+	}
+	if err := (&Plan{Name: "nolinks", Dir: dir}).Write(); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("second write: %v", err)
 	}
 }
