@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -367,10 +369,16 @@ func noContainer(err error) bool {
 // variables named in auth (see sandboxAuth). All go by name only: docker
 // exec takes their values from the window's environment, so a token is on
 // no command line and not in the container's stored config, and a new one
-// reaches the next session without a new container.
+// reaches the next session without a new container. But for env's
+// tmux.PaneVars (a project's PATH, SHELL), which are the container's and
+// which tmux would not give the window anyway (see sandboxWindowEnv): they
+// go by value.
 func (a *App) sandboxArgv(container, dir string, env, auth map[string]string, argv []string) []string {
 	keys := make([]string, 0, len(env)+len(auth))
-	for k := range env {
+	for k, v := range env {
+		if slices.Contains(tmux.PaneVars, k) {
+			k += "=" + v
+		}
 		keys = append(keys, k)
 	}
 	for k := range auth {
@@ -378,4 +386,15 @@ func (a *App) sandboxArgv(container, dir string, env, auth map[string]string, ar
 	}
 	sort.Strings(keys)
 	return sandbox.ExecArgv(container, dir, keys, argv)
+}
+
+// sandboxWindowEnv is env without its tmux.PaneVars, for the window of a
+// sandboxed session: what runs there (sh, tmux, docker) runs where atl runs,
+// with atl's PATH and SHELL; sandboxArgv passes env's to the container.
+func sandboxWindowEnv(env map[string]string) map[string]string {
+	out := maps.Clone(env)
+	for _, k := range tmux.PaneVars {
+		delete(out, k)
+	}
+	return out
 }

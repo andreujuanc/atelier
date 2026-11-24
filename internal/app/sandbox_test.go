@@ -1314,3 +1314,42 @@ func TestInsideSandboxRefusesToLaunchAndRecover(t *testing.T) {
 		t.Error("session marked stopped from inside a task container")
 	}
 }
+
+// TestSandboxProjectPath: in a sandboxed task the project's PATH and SHELL
+// are the container's: docker exec gets them by value, while the window
+// that runs docker exec where atl runs keeps atl's own (a container PATH
+// need not hold docker, tmux or sh there). Other project variables still
+// reach docker exec by name, from the window's environment.
+func TestSandboxProjectPath(t *testing.T) {
+	e, _ := sandboxEnv(t)
+	ctx := context.Background()
+	pf := e.app.Paths.ProjectFile("shop")
+	if err := os.MkdirAll(filepath.Dir(pf), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "[env]\nPATH = \"/opt/in-container/bin\"\nSHELL = \"/bin/in-container-sh\"\nFOO = \"bar\"\n"
+	if err := os.WriteFile(pf, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := &model.Task{Slug: "boxed", Title: "boxed", Status: model.StatusActive, Branch: "atl/boxed", Project: "shop"}
+	if err := e.app.Store.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(e.app.Paths.TaskDir("boxed"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := e.app.NewSession(ctx, "boxed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s.ID) // the stub claude ran: the window started docker exec
+	cmd := e.tmux(t, "display-message", "-p", "-t", s.TmuxTarget, "#{pane_start_command}")
+	for _, want := range []string{"-e PATH=/opt/in-container/bin ", "-e SHELL=/bin/in-container-sh ", "-e FOO "} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("window command lacks %q: %s", want, cmd)
+		}
+	}
+	if strings.HasPrefix(cmd, "env ") {
+		t.Errorf("window command runs with the project's PATH: %s", cmd)
+	}
+}

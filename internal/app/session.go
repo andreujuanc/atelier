@@ -121,6 +121,7 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 		// The window starts docker exec so that Claude has the window's
 		// size from its first frame on (sandbox.WindowArgv).
 		argv = sandbox.WindowArgv(attachFollows(ctx), a.sandboxArgv(container, dir, env, auth, argv))
+		env = sandboxWindowEnv(env)
 	}
 	return a.Tmux.NewWindow(ctx, tmux.WindowSpec{
 		Session:   tmux.SessionName(t.Slug),

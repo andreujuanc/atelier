@@ -506,16 +506,16 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	return id, nil
 }
 
-// paneVars are the variables tmux sets in a new pane after its -e ones:
+// PaneVars are the variables tmux sets in a new pane after its -e ones:
 // PATH (the client's, or the session's) and SHELL (default-shell).
-var paneVars = []string{"PATH", "SHELL"}
+var PaneVars = []string{"PATH", "SHELL"}
 
-// withPaneEnv returns argv run by env(1) with env's paneVars, which -e
+// withPaneEnv returns argv run by env(1) with env's PaneVars, which -e
 // cannot set; argv unchanged if env has none of them. env then looks argv[0]
 // up on that PATH.
 func withPaneEnv(env map[string]string, argv []string) ([]string, error) {
 	var set []string
-	for _, k := range paneVars {
+	for _, k := range PaneVars {
 		if v, ok := env[k]; ok {
 			set = append(set, k+"="+v)
 		}

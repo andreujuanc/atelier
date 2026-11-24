@@ -186,7 +186,8 @@ func (s Spec) runArgs(hash string) []string {
 // ExecArgv is the command for a tmux window that runs argv in the task
 // container, named by the full ID Ensure returned (not by its name, which
 // is only checked there), in workdir. The variables named in envKeys are
-// passed on from the window's environment. The atl binary of the run dir
+// passed on from the window's environment; an entry NAME=VALUE sets NAME to
+// VALUE. The atl binary of the run dir
 // comes first on PATH, so `atl` in the container is the atl that made it,
 // and so does its wl-copy, the copy relay, which $WAYLAND_DISPLAY (set to
 // CopyDisplay) makes Claude Code use (see CopyMain).
