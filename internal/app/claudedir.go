@@ -132,15 +132,16 @@ func (a *App) pruneClaudeDir(t *model.Task) {
 		}
 	}
 	projects := filepath.Join(dir, "projects")
-	err = filepath.WalkDir(projects, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || d.Type().IsRegular() {
-			return err
+	// One entry that cannot be read or removed does not stop the walk.
+	filepath.WalkDir(projects, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && !d.Type().IsRegular() {
+			err = os.Remove(path)
 		}
-		return os.Remove(path)
+		if err != nil && !(path == projects && errors.Is(err, os.ErrNotExist)) {
+			a.warnf("task %s: %v", t.Slug, err)
+		}
+		return nil
 	})
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		a.warnf("task %s: %v", t.Slug, err)
-	}
 	os.Remove(projects) // only if empty
 	os.Remove(dir)
 }
