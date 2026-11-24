@@ -119,7 +119,7 @@ func TestAddReposRestartsSandboxedSessions(t *testing.T) {
 	if len(fd.find("rm")) != 1 {
 		t.Fatalf("container not replaced: %v", fd.changes())
 	}
-	if argv := e.argv(t, s.ID); !slices.Equal(argv, []string{"--resume", "cid-1", "--add-dir", p.RepoPath("docs")}) {
+	if argv := e.argv(t, s.ID); !slices.Equal(argv, []string{"--resume=cid-1", "--add-dir", p.RepoPath("docs")}) {
 		t.Fatalf("resumed argv %q", argv)
 	}
 	if got := e.session(t, s.ID); got.TmuxTarget == oldTarget || !got.State.Live() {
@@ -223,7 +223,7 @@ func TestAddReposWithoutSandbox(t *testing.T) {
 	if err != nil || res.Restarted != 1 {
 		t.Fatalf("ro idle = %+v, %v", res, err)
 	}
-	if argv := e.argv(t, s.ID); !slices.Equal(argv, []string{"--resume", "cid-2", "--add-dir", p.RepoPath("docs")}) {
+	if argv := e.argv(t, s.ID); !slices.Equal(argv, []string{"--resume=cid-2", "--add-dir", p.RepoPath("docs")}) {
 		t.Fatalf("resumed argv %q", argv)
 	}
 }

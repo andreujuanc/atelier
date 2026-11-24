@@ -362,7 +362,7 @@ func TestOpenSessionResumesEnded(t *testing.T) {
 	if !reflect.DeepEqual(cmd.Args, wantArgs) {
 		t.Errorf("attach cmd = %v", cmd.Args)
 	}
-	want := []string{"--resume", "cid-e", "--add-dir", e.app.Paths.RepoPath("docs")}
+	want := []string{"--resume=cid-e", "--add-dir", e.app.Paths.RepoPath("docs")}
 	if argv := e.argv(t, ended.ID); !reflect.DeepEqual(argv, want) {
 		t.Errorf("argv = %q, want %q", argv, want)
 	}
@@ -673,7 +673,7 @@ func TestOpenResumableOnlyFromTaskDir(t *testing.T) {
 	if _, err := e.app.OpenSession(ctx, "t", launched.ID); err != nil {
 		t.Fatal(err)
 	}
-	if argv := e.argv(t, launched.ID); len(argv) < 2 || argv[0] != "--resume" || argv[1] != "cid-l" {
+	if argv := e.argv(t, launched.ID); len(argv) < 1 || argv[0] != "--resume=cid-l" {
 		t.Errorf("argv = %q", argv)
 	}
 }

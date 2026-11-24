@@ -14,7 +14,9 @@ log="${E2E_LOG:-${ATL_TASK_DIR:-$PWD}/.e2e-claude.log}"
 
 sid="" source="startup" prev=""
 for a in "$@"; do
-	if [[ "$prev" == "--resume" ]]; then
+	if [[ "$a" == --resume=* ]]; then
+		sid="${a#--resume=}" source="resume"
+	elif [[ "$prev" == "--resume" ]]; then
 		sid="$a" source="resume"
 	fi
 	prev="$a"
