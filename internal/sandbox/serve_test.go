@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -184,5 +185,38 @@ func TestServeRunDirIsPrivate(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestStopStalePidFile: a gate killed with SIGKILL (or a reboot) leaves its
+// pid file. Stop must not signal the process that pid names now, even an
+// `atl gate` (another task's gate, after the pid was reused): no gate holds
+// the run dir's lock.
+func TestStopStalePidFile(t *testing.T) {
+	runDir := t.TempDir()
+	// Another gate: a process whose command line has a "gate" argument.
+	other := exec.Command("/bin/sh", "-c", "sleep 30", "atl", "gate", "other")
+	if err := other.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- other.Wait() }()
+	t.Cleanup(func() { other.Process.Kill(); <-exited })
+	if err := os.WriteFile(pidPath(runDir), []byte(strconv.Itoa(other.Process.Pid)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, lockFile := range []bool{false, true} { // the dead gate's lock file is there, or not
+		if lockFile {
+			if err := os.WriteFile(lockPath(runDir), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		Stop(runDir)
+		select {
+		case err := <-exited:
+			exited <- err
+			t.Fatalf("Stop (lock file %v) signalled the process a stale pid file names: %v", lockFile, err)
+		case <-time.After(300 * time.Millisecond):
+		}
 	}
 }
