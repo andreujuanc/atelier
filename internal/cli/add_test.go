@@ -33,7 +33,7 @@ func TestReposAndAdd(t *testing.T) {
 	if code != 0 || out != "fix\tdocs\tro\t"+filepath.Join(repos, "docs")+"\n" {
 		t.Fatalf("add ro: %d %q %s", code, out, errs)
 	}
-	if !strings.Contains(errs, "need a new session (s) to see docs") {
+	if !strings.Contains(errs, "added docs (ro) to fix") {
 		t.Fatalf("add ro note: %q", errs)
 	}
 	code, out, errs = atl(t, "add", "fi", "web", "--no-fetch")
@@ -54,7 +54,6 @@ func TestReposAndAdd(t *testing.T) {
 	// Usage errors: exit 2.
 	for _, a := range [][]string{
 		{"add", "fix"},
-		{"add", "fix", "web", "more"},
 		{"add", "fix", "web:rx"},
 		{"add", "fix", ":ro"},
 		{"add", "fix", "web", "--bogus"},
@@ -71,6 +70,7 @@ func TestReposAndAdd(t *testing.T) {
 		{[]string{"add", "fix", "web"}, "already has repo web"},
 		{[]string{"add", "fix", "notes:ro"}, "not a git repository"},
 		{[]string{"add", "nope", "docs"}, "not found"},
+		{[]string{"add", "fix", "web", "more"}, "more does not exist"}, // several repos: each reported
 	} {
 		if code, _, errs := atl(t, c.args...); code != 1 || !strings.Contains(errs, c.want) {
 			t.Errorf("%v: exit %d %s", c.args, code, errs)

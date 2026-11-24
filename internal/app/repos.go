@@ -135,6 +135,10 @@ func lockFile(ctx context.Context, path string, wait time.Duration, busy string)
 // Adding a repo the task has as ro again as rw upgrades it: the worktree is
 // created as above and the same repo row becomes rw. Any other repeat is an
 // error.
+//
+// It refuses (ErrRestartNeeded), before anything changes, while the task
+// has sessions that would not see the repo (see addNeedsRestart): AddRepos
+// is the call that restarts them around the add.
 func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) (*model.Task, error) {
 	if err := outsideSandbox("add a repo"); err != nil {
 		return nil, err
@@ -152,26 +156,32 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 		return nil, err
 	}
 	defer unlock()
+	return a.addRepoLocked(ctx, t.ID, name, mode, noFetch)
+}
+
+// addRepoLocked is AddRepo for the task with id, under the task's lock,
+// with name and mode checked (validRepoArg).
+func (a *App) addRepoLocked(ctx context.Context, id int64, name string, mode model.Mode, noFetch bool) (*model.Task, error) {
 	// Re-read under the lock: another AddRepo may have just finished.
-	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
+	t, err := a.Store.GetTask(ctx, id)
+	if err != nil {
 		return nil, err
 	}
 	if !t.Status.Open() {
 		return nil, fmt.Errorf("task %s is %s; repos can only be added to open tasks", t.Slug, t.Status)
 	}
-	upgrade := false // ro → rw: same row, now with a worktree
-	for _, x := range t.Repos {
-		if x.Name == name {
-			if x.Mode != model.ModeRO || mode != model.ModeRW {
-				return nil, fmt.Errorf("task %s already has repo %s (%s)", t.Slug, name, x.Mode)
-			}
-			upgrade = true
-		}
-	}
-	repo := a.Paths.RepoPath(name)
-	if err := checkRepo(ctx, name, repo); err != nil {
+	upgrade, err := a.checkAdd(ctx, t, name, mode)
+	if err != nil {
 		return nil, err
 	}
+	// A repo the running sessions would not see is never added under them:
+	// AddRepos restarts them around the add.
+	if need, err := a.addNeedsRestart(ctx, t, []RepoArg{{Name: name, Mode: mode}}); err != nil {
+		return nil, err
+	} else if need {
+		return nil, fmt.Errorf("task %s has running sessions: %w", t.Slug, ErrRestartNeeded)
+	}
+	repo := a.Paths.RepoPath(name)
 	tr := model.TaskRepo{Name: name, Mode: mode}
 	wt := a.Paths.WorktreePath(t.Slug, name)
 	createdBranch := false
@@ -252,30 +262,19 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 			a.warnf("setup for %s in task %s failed (repo kept): %v", name, t.Slug, err)
 		}
 	}
-	if a.sandboxedSessionsRun(ctx, t) {
-		// A running container cannot get a new mount: neither the repo (ro)
-		// nor its clone's git database (rw) is in there.
-		msg := fmt.Sprintf("added %s (%s) to %s", name, mode, t.Slug)
-		if upgrade {
-			msg = fmt.Sprintf("upgraded %s to rw in %s", name, t.Slug)
-		}
-		if mode == model.ModeRW {
-			msg += ": worktree at " + wt
-		}
-		fmt.Fprintln(a.out(), msg)
-		a.warnf("the sessions running now in %s do not see %s: their container was made before; close them, then start or resume a session to get a container that does",
-			t.Slug, name)
-		return t, nil
+	msg := fmt.Sprintf("added %s (%s) to %s", name, mode, t.Slug)
+	if upgrade {
+		msg = fmt.Sprintf("upgraded %s to rw in %s", name, t.Slug)
 	}
 	if mode == model.ModeRW {
-		if upgrade {
-			fmt.Fprintf(a.out(), "upgraded %s to rw in %s: worktree at %s; running sessions can already see it\n", name, t.Slug, wt)
-		} else {
-			fmt.Fprintf(a.out(), "added %s (rw) to %s: worktree at %s; running sessions can already see it\n", name, t.Slug, wt)
-		}
-	} else {
-		// ro repos reach Claude only through --add-dir at launch.
-		fmt.Fprintf(a.out(), "added %s (ro) to %s: running Claude sessions need a new session (s) to see %s\n", name, t.Slug, name)
+		msg += ": worktree at " + wt
+	}
+	fmt.Fprintln(a.out(), msg)
+	if need, err := a.addNeedsRestart(ctx, t, []RepoArg{{Name: name, Mode: mode}}); err == nil && need {
+		// A session started while the repo was being added (the check
+		// above found none): it may not see it.
+		a.warnf("a session started in %s while %s was being added may not see it; restart the task's sessions (close them, then r)",
+			t.Slug, name)
 	}
 	return t, nil
 }
@@ -302,4 +301,28 @@ func (a *App) undoWorktree(ctx context.Context, name, wt, branch string, removeW
 			a.warnf("rollback: delete branch %s in %s: %v", branch, name, derr)
 		}
 	}
+}
+
+// checkAdd checks that repo name can be added to t in mode: not in the task
+// yet, or there as ro and now rw (an upgrade, which it reports); a usable
+// git repository; for rw, no file at its worktree path.
+func (a *App) checkAdd(ctx context.Context, t *model.Task, name string, mode model.Mode) (upgrade bool, err error) {
+	for _, x := range t.Repos {
+		if x.Name == name {
+			if x.Mode != model.ModeRO || mode != model.ModeRW {
+				return false, fmt.Errorf("task %s already has repo %s (%s)", t.Slug, name, x.Mode)
+			}
+			upgrade = true
+		}
+	}
+	if err := checkRepo(ctx, name, a.Paths.RepoPath(name)); err != nil {
+		return false, err
+	}
+	if mode == model.ModeRW {
+		wt := a.Paths.WorktreePath(t.Slug, name)
+		if _, err := os.Lstat(wt); err == nil {
+			return false, fmt.Errorf("repo %s: %s already exists; remove it first", name, wt)
+		}
+	}
+	return upgrade, nil
 }

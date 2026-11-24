@@ -327,12 +327,12 @@ func (b *trackedBackend) AvailableRepos(ctx context.Context) ([]string, error) {
 	return b.Backend.AvailableRepos(ctx)
 }
 
-func (b *trackedBackend) AddRepo(ctx context.Context, ref string, r app.RepoArg, noFetch bool) (*model.Task, error) {
+func (b *trackedBackend) AddRepos(ctx context.Context, ref string, repos []app.RepoArg, o app.AddOpts) (*app.AddResult, error) {
 	if !b.tr.begin() {
 		return nil, errStopped
 	}
 	defer b.tr.end()
-	return b.Backend.AddRepo(ctx, ref, r, noFetch)
+	return b.Backend.AddRepos(ctx, ref, repos, o)
 }
 
 func (b *trackedBackend) Assistant(ctx context.Context, slug string) (*exec.Cmd, string, error) {
@@ -385,4 +385,12 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+func (b *trackedBackend) AddCheck(ctx context.Context, ref string, repos []app.RepoArg) ([]string, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.AddCheck(ctx, ref, repos)
 }

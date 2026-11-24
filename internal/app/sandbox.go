@@ -289,20 +289,6 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) 
 	return container, nil
 }
 
-// sandboxedSessionsRun reports whether the sandbox is on and the task's
-// container exists with live sessions in it: a change to the task's repos
-// does not reach them (mounts cannot be added to a running container).
-func (a *App) sandboxedSessionsRun(ctx context.Context, t *model.Task) bool {
-	if a.Sandbox == nil {
-		return false
-	}
-	if live, err := a.hasLiveWindow(ctx, t, tmux.SessionName(t.Slug)); err != nil || !live {
-		return false
-	}
-	_, err := sandbox.Agent(ctx, a.docker(), a.sandboxID(t))
-	return err == nil
-}
-
 func (a *App) gateLog(t *model.Task) string {
 	return filepath.Join(a.Paths.StateDir, "gate-"+t.Slug+".log")
 }

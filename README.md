@@ -106,7 +106,7 @@ running, idle, stopped). Colours follow the terminal's light or dark background.
 | `enter` | open: new session if none, else a picker of new / live / resumable sessions |
 | `s` | new session in the task |
 | `r` | resume stopped sessions |
-| `a` | add repos to the task (or upgrade ro → rw) |
+| `a` | add repos to the task (or upgrade ro → rw); live sessions are restarted to see them |
 | `m` | edit the task's notes (`ctrl+s` save, `esc` leave) |
 | `t` | rename (title only) |
 | `d` / `c` | done / cancel (asks first) |
@@ -131,7 +131,7 @@ atl                                  # TUI (workspace selector if no workspace i
 atl new "Fix login" --project shop   # create a task; prints "<slug>\t<dir>"
 atl new "Spike" --repo api:rw --repo docs:ro -m "why" [--backlog] [--no-fetch]
 atl new "Hotfix" --project shop --base default   # base: auto (default) | default | production | <branch>
-atl add <task> web[:rw|ro] [--no-fetch]          # add a repo; docs:rw upgrades ro → rw
+atl add <task> web[:rw|ro]... [--no-fetch] [--force-restart]   # add repos (restarts live sessions); docs:rw upgrades ro → rw
 atl ls [--status active,review|all] [--json]
 atl show <task> [--json | --notes]   # repos (dirty, ahead, pushed), sessions, notes
 atl open <task> [--session ID | --new]           # attach (resume or start Claude)

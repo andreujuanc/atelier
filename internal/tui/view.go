@@ -871,6 +871,8 @@ func (m *Model) helpLine(w int) string {
 			{"enter", "save"}, {"esc", "cancel"}}
 	case modeConfirm:
 		items = []helpItem{{"space", "tick/untick"}, {"enter", "confirm (box ticked)"}, {"esc/n", "cancel"}}
+	case modeRestart:
+		items = []helpItem{{"space", "tick/untick"}, {"enter", "force restart (box ticked)"}, {"esc/n", "cancel"}}
 	default:
 		s := helpStyled(listHelp, w)
 		for _, l := range legends {
@@ -900,6 +902,8 @@ func (m *Model) overlay(w, h int) *dialog {
 		return m.sessPick.dialog(w, h, m.now())
 	case m.mode == modeConfirm && m.confirm != nil:
 		return m.confirm.dialog(w, h)
+	case m.mode == modeRestart && m.restart != nil:
+		return m.restart.dialog(w, h, m.spinner())
 	case m.mode == modeHelp:
 		return helpDialog(w, h)
 	}

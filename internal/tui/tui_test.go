@@ -38,13 +38,17 @@ type fakeBackend struct {
 	projects []string
 	newTask  *model.Task
 	// repos is AvailableRepos' result; projRepos ProjectRepos' per project.
-	repos      []string
-	projRepos  map[string][]app.RepoArg
-	addErr     map[string]error    // AddRepo error per repo name
-	addOut     func(r app.RepoArg) // called by AddRepo (to write App.Out)
-	notesText  map[string]string   // notes per slug (Get, GetNotes, SetNotes)
-	notesErr   error               // GetNotes' error
-	setErr     error               // SetNotes' error (other than a conflict)
+	repos     []string
+	projRepos map[string][]app.RepoArg
+	addErr    map[string]error    // AddRepos error per repo name
+	addOut    func(r app.RepoArg) // called by AddRepos per repo (to write App.Out)
+	// addBusy, if set, is what runs in the task: AddRepos without force
+	// refuses with an *app.BusyError while it returns something.
+	addBusy    func() []string
+	addRestart int               // AddRepos' Restarted when it adds
+	notesText  map[string]string // notes per slug (Get, GetNotes, SetNotes)
+	notesErr   error             // GetNotes' error
+	setErr     error             // SetNotes' error (other than a conflict)
 	renameErr  error
 	assistErr  error
 	assistHint string
@@ -241,22 +245,45 @@ func (f *fakeBackend) AvailableRepos(ctx context.Context) ([]string, error) {
 	return f.repos, nil
 }
 
-func (f *fakeBackend) AddRepo(ctx context.Context, ref string, r app.RepoArg, noFetch bool) (*model.Task, error) {
-	f.rec("AddRepo", ref, r, noFetch)
-	if f.addOut != nil {
-		f.addOut(r)
+func (f *fakeBackend) AddCheck(ctx context.Context, ref string, repos []app.RepoArg) ([]string, error) {
+	f.rec("AddCheck", ref, repos)
+	if f.addBusy == nil {
+		return nil, nil
 	}
-	if err := f.addErr[r.Name]; err != nil {
-		return nil, err
-	}
-	for i := range f.tasks {
-		if f.tasks[i].Task.Slug == ref {
-			f.tasks[i].Task.Repos = append(f.tasks[i].Task.Repos, model.TaskRepo{Name: r.Name, Mode: r.Mode})
-			t := f.tasks[i].Task
-			return &t, nil
+	return f.addBusy(), nil
+}
+
+func (f *fakeBackend) AddRepos(ctx context.Context, ref string, repos []app.RepoArg, o app.AddOpts) (*app.AddResult, error) {
+	f.rec("AddRepos", ref, repos, o.Force)
+	if f.addBusy != nil && !o.Force {
+		if running := f.addBusy(); len(running) > 0 {
+			return nil, &app.BusyError{Slug: ref, Running: running}
 		}
 	}
-	return nil, fmt.Errorf("task %s not found", ref)
+	var task *app.TaskView
+	for i := range f.tasks {
+		if f.tasks[i].Task.Slug == ref {
+			task = &f.tasks[i]
+		}
+	}
+	if task == nil {
+		return nil, fmt.Errorf("task %s not found", ref)
+	}
+	res := &app.AddResult{Restarted: f.addRestart}
+	for _, r := range repos {
+		if f.addOut != nil {
+			f.addOut(r)
+		}
+		if err := f.addErr[r.Name]; err != nil {
+			res.Failed = append(res.Failed, fmt.Errorf("%s: %w", r.Name, err))
+			continue
+		}
+		task.Task.Repos = append(task.Task.Repos, model.TaskRepo{Name: r.Name, Mode: r.Mode})
+		res.Added = append(res.Added, r)
+	}
+	t := task.Task
+	res.Task = &t
+	return res, nil
 }
 
 func (f *fakeBackend) GetNotes(ctx context.Context, ref string) (string, error) {
@@ -1273,49 +1300,44 @@ func TestAddRepoFlow(t *testing.T) {
 	if !strings.Contains(plainView(m), "selected: lib(ro) web(rw)") {
 		t.Fatalf("summary:\n%s", plainView(m))
 	}
-	// Run step by step to watch progress.
 	cmd := press(m, "enter")
-	if m.mode != modeNormal || !strings.Contains(m.busy[2], "add lib (1/2) to beta") {
+	if m.mode != modeNormal || m.busy[2] != "add lib(ro) web(rw) to beta" {
 		t.Fatalf("busy %q", m.busy[2])
 	}
-	if !strings.Contains(plainView(m), "working… add lib (1/2) to beta") {
+	if !strings.Contains(plainView(m), "working… add lib(ro) web(rw) to beta") {
 		t.Fatalf("no progress:\n%s", plainView(m))
-	}
-	_, next := m.Update(cmd())
-	if !strings.Contains(m.busy[2], "add web (2/2) to beta") {
-		t.Fatalf("busy after step 1: %q", m.busy[2])
 	}
 	// another op on the task waits
 	key(m, "a")
 	if m.mode != modeNormal || !strings.Contains(m.status, "busy") {
 		t.Fatalf("a while busy: mode %d status %q", m.mode, m.status)
 	}
-	drain(m, next)
+	drain(m, cmd)
 	var got []string
 	for _, c := range fb.calls {
-		if c.name == "AddRepo" {
+		if c.name == "AddRepos" {
 			got = append(got, fmt.Sprintf("%v %v %v", c.args[0], c.args[1], c.args[2]))
 		}
 	}
-	if want := []string{"beta {lib ro} false", "beta {web rw} false"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("AddRepo calls %v", got)
+	if want := []string{"beta [{lib ro} {web rw}] false"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("AddRepos calls %v", got)
 	}
 	if _, busy := m.busy[2]; busy {
 		t.Fatal("still busy")
 	}
-	if !m.statusErr || !strings.Contains(m.status, "added lib(ro) to beta; start a new session (s) to see lib") ||
+	if !m.statusErr || !strings.Contains(m.status, "added lib(ro) to beta; failed") ||
 		!strings.Contains(m.status, "failed: web: repo web: boom") {
 		t.Fatalf("status %q", m.status)
 	}
 
 	// esc cancels; enter with nothing selected does nothing
-	n := fb.count("AddRepo")
+	n := fb.count("AddRepos")
 	key(m, "a")
 	key(m, "esc")
 	key(m, "a")
 	key(m, "enter")
-	if fb.count("AddRepo") != n || m.mode != modeNormal || !strings.Contains(m.status, "nothing selected") {
-		t.Fatalf("cancel/empty: %d calls, status %q", fb.count("AddRepo")-n, m.status)
+	if fb.count("AddRepos") != n || m.mode != modeNormal || !strings.Contains(m.status, "nothing selected") {
+		t.Fatalf("cancel/empty: %d calls, status %q", fb.count("AddRepos")-n, m.status)
 	}
 }
 
@@ -1922,7 +1944,7 @@ func TestMultiRuneKeys(t *testing.T) {
 	}
 }
 
-// AddRepo's output lines travel through the ordered queue; the summary of
+// AddRepos' output lines travel through the ordered queue; the summary of
 // the `a` run must land after them, and no later progress line may hide an
 // error summary.
 func TestAddSummaryAfterOutput(t *testing.T) {
@@ -1943,7 +1965,7 @@ func TestAddSummaryAfterOutput(t *testing.T) {
 		send("fetching " + r.Name + "...")
 		send("added " + r.Name + " (rw) to beta: worktree at /x")
 	}
-	// run cmd (one AddRepo step) as the program would: its result is
+	// run cmd (the AddRepos call) as the program would: its result is
 	// handled after whatever the queue delivered while it ran, and lines
 	// the queue delivers later after it
 	feed := func() {
@@ -3023,5 +3045,210 @@ func TestRenameLongLegacyTitle(t *testing.T) {
 	// the new-task form's title input has the same cap
 	if f := newTaskForm(nil); f.inputs[fieldTitle].CharLimit != model.MaxTitleLen {
 		t.Fatalf("form title CharLimit = %d", f.inputs[fieldTitle].CharLimit)
+	}
+}
+
+// An `a` run whose restart is refused while things run opens the restart
+// dialog: it checks again on each tick and adds once nothing runs.
+func TestAddRestartWaits(t *testing.T) {
+	running := []string{"session claude-1: Claude is working", "session claude-1 runs npm run dev"}
+	fb := &fakeBackend{tasks: sampleTasks(), repos: []string{"api", "docs", "lib", "web"}, addRestart: 1,
+		addBusy: func() []string { return running }}
+	m, sched := newTest(t, fb) // beta selected
+	key(m, "a")
+	key(m, " ") // lib rw
+	key(m, "enter")
+	if m.mode != modeRestart || m.restart == nil {
+		t.Fatalf("no restart dialog: mode %d status %q", m.mode, m.status)
+	}
+	v := plainView(m)
+	for _, want := range []string{"Restart needed", "Cannot add lib(rw) to beta yet", "• session claude-1: Claude is working",
+		"• session claude-1 runs npm run dev", "Waiting", "[ ] Force restart (ends what runs)", "enter force restart"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("dialog lacks %q:\n%s", want, v)
+		}
+	}
+	if _, busy := m.busy[2]; busy {
+		t.Fatal("busy while waiting between checks")
+	}
+	tick := func() {
+		t.Helper()
+		var last tea.Msg
+		for _, x := range *sched {
+			if _, ok := x.(restartTickMsg); ok {
+				last = x
+			}
+		}
+		if last == nil {
+			t.Fatal("no check scheduled")
+		}
+		*sched = nil
+		_, cmd := m.Update(last)
+		drain(m, cmd)
+	}
+	running = running[:1]
+	tick()
+	if m.mode != modeRestart || strings.Contains(plainView(m), "npm run dev") {
+		t.Fatalf("check did not refresh the list: mode %d\n%s", m.mode, plainView(m))
+	}
+	// keys other than space/enter/esc do nothing; enter unticked hints
+	key(m, "q")
+	key(m, "enter")
+	if m.mode != modeRestart || !strings.Contains(plainView(m), "Tick the box with space") {
+		t.Fatalf("enter unticked:\n%s", plainView(m))
+	}
+	running = nil
+	tick()
+	if m.mode != modeNormal || m.restart != nil {
+		t.Fatalf("dialog still open once idle: mode %d", m.mode)
+	}
+	if m.statusErr || m.status != "added lib(rw) to beta; restarted 1 session(s)" {
+		t.Fatalf("status %q", m.status)
+	}
+	// checks only read: AddRepos ran first and once nothing ran
+	if n, c := fb.count("AddRepos"), fb.count("AddCheck"); n != 2 || c != 2 {
+		t.Fatalf("AddRepos calls: %d, AddCheck calls: %d", n, c)
+	}
+	// a stale tick does nothing
+	_, cmd := m.Update(restartTickMsg{id: 2, seq: 1})
+	drain(m, cmd)
+	if fb.count("AddCheck") != 2 {
+		t.Fatal("stale tick ran a check")
+	}
+}
+
+// Ticking the box and enter forces the restart; esc gives up with nothing
+// changed.
+func TestAddRestartForceAndCancel(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), repos: []string{"api", "docs", "lib", "web"}, addRestart: 2,
+		addBusy: func() []string { return []string{"process 42: bash"} }}
+	m, sched := newTest(t, fb)
+	key(m, "a")
+	key(m, " ")
+	key(m, "enter")
+	if m.mode != modeRestart {
+		t.Fatalf("mode %d", m.mode)
+	}
+	key(m, "esc")
+	if m.mode != modeNormal || m.restart != nil || !strings.Contains(m.status, "cancelled; nothing changed") {
+		t.Fatalf("esc: mode %d status %q", m.mode, m.status)
+	}
+	for _, x := range *sched {
+		if tk, ok := x.(restartTickMsg); ok {
+			_, cmd := m.Update(tk)
+			drain(m, cmd)
+		}
+	}
+	if n := fb.count("AddRepos"); n != 1 {
+		t.Fatalf("a tick after esc ran a check: %d calls", n)
+	}
+
+	key(m, "a")
+	key(m, " ")
+	key(m, "enter")
+	key(m, " ")
+	if !strings.Contains(plainView(m), "[x] Force restart") {
+		t.Fatalf("box not ticked:\n%s", plainView(m))
+	}
+	cmd := press(m, "enter")
+	if m.mode != modeRestart || !strings.Contains(plainView(m), "Restarting the sessions") {
+		t.Fatalf("forced restart not shown:\n%s", plainView(m))
+	}
+	key(m, "esc") // ignored while the restart runs
+	if m.mode != modeRestart {
+		t.Fatal("esc closed the dialog during the restart")
+	}
+	drain(m, cmd)
+	if m.mode != modeNormal || m.status != "added lib(rw) to beta; restarted 2 session(s)" {
+		t.Fatalf("after force: mode %d status %q", m.mode, m.status)
+	}
+	last := fb.calls[len(fb.calls)-1]
+	for i := len(fb.calls) - 1; i >= 0; i-- {
+		if fb.calls[i].name == "AddRepos" {
+			last = fb.calls[i]
+			break
+		}
+	}
+	if last.args[2] != true {
+		t.Fatalf("last AddRepos not forced: %v", last.args)
+	}
+}
+
+// The restart dialog fits a short terminal: the list gives way, the box
+// stays.
+func TestRestartDialogShort(t *testing.T) {
+	r := &restartState{slug: "beta", repos: []app.RepoArg{{Name: "lib", Mode: model.ModeRW}}}
+	for i := 0; i < 20; i++ {
+		r.running = append(r.running, fmt.Sprintf("process %d: sleep 100", i))
+	}
+	lines := r.lines(60, 12, "⠋")
+	got := ansi.Strip(strings.Join(lines, "\n"))
+	if len(lines) > 12 || !strings.Contains(got, "Force restart") || !strings.Contains(got, "more") ||
+		!strings.Contains(got, "process 0: sleep 100") {
+		t.Fatalf("%d lines:\n%s", len(lines), got)
+	}
+}
+
+// Esc while a check is in flight gives up for good: the check only reads,
+// and its result (even "nothing runs") adds nothing. A check that finds
+// the task idle runs AddRepos, which may find something started meanwhile:
+// the dialog waits again, keys held while AddRepos ran.
+func TestAddRestartCheckInFlight(t *testing.T) {
+	running := []string{"process 42: bash"}
+	fb := &fakeBackend{tasks: sampleTasks(), repos: []string{"api", "docs", "lib", "web"},
+		addBusy: func() []string { return running }}
+	m, sched := newTest(t, fb)
+	lastTick := func() tea.Msg {
+		t.Helper()
+		var last tea.Msg
+		for _, x := range *sched {
+			if _, ok := x.(restartTickMsg); ok {
+				last = x
+			}
+		}
+		*sched = nil
+		if last == nil {
+			t.Fatal("no check scheduled")
+		}
+		return last
+	}
+	key(m, "a")
+	key(m, " ")
+	key(m, "enter")
+	_, check := m.Update(lastTick()) // the check starts
+	running = nil
+	key(m, "esc")
+	if m.mode != modeNormal || m.restart != nil {
+		t.Fatalf("esc: mode %d", m.mode)
+	}
+	drain(m, check) // finds nothing running: too late, nothing happens
+	if n := fb.count("AddRepos"); n != 1 || !strings.Contains(m.status, "cancelled; nothing changed") {
+		t.Fatalf("a check after esc added: %d AddRepos calls, status %q", n, m.status)
+	}
+
+	// Again; this time the check finds the task idle, but AddRepos does not.
+	running = []string{"process 42: bash"}
+	key(m, "a")
+	key(m, " ")
+	key(m, "enter")
+	_, check = m.Update(lastTick())
+	running = nil
+	add := check().(restartCheckMsg)
+	_, addCmd := m.Update(add)
+	if m.restart == nil || !m.restart.adding || !strings.Contains(plainView(m), "Restarting the sessions") {
+		t.Fatalf("idle check did not add:\n%s", plainView(m))
+	}
+	key(m, "esc") // held while AddRepos runs
+	if m.mode != modeRestart {
+		t.Fatal("esc closed the dialog while AddRepos ran")
+	}
+	running = []string{"session claude-1: Claude is working"}
+	drain(m, addCmd)
+	if m.mode != modeRestart || m.restart.adding || !strings.Contains(plainView(m), "Claude is working") {
+		t.Fatalf("refused AddRepos did not wait again: mode %d\n%s", m.mode, plainView(m))
+	}
+	key(m, "esc")
+	if m.mode != modeNormal {
+		t.Fatal("esc did not close the dialog after the refused add")
 	}
 }

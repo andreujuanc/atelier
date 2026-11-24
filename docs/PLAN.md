@@ -480,7 +480,7 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 | `atl` | TUI |
 | `atl new <title...> [--project P] [--repo name:rw\|ro ...] [--backlog] [--no-fetch] [-m/--description D]` | create task; prints slug + task dir |
 | `atl ls [--status S[,S...]\|all] [--json]` | default: open statuses. Text columns: `ID SLUG STATUS PROJECT SESSIONS TITLE` (sessions like `2 (1 waiting)`) |
-| `atl add <task> <name>[:rw\|ro] [--no-fetch]` | add a repo to an open task; `:rw` on a repo the task has as ro upgrades it (worktree, same row via `Store.UpgradeTaskRepo`); any other repeat is refused; prints `slug\trepo\tmode\tpath` |
+| `atl add <task> <name>[:rw\|ro]... [--no-fetch] [--force-restart]` | add repos to an open task (`App.AddRepos`); `:rw` on a repo the task has as ro upgrades it (worktree, same row via `Store.UpgradeTaskRepo`); any other repeat is refused; prints `slug\trepo\tmode\tpath` per repo added. Live sessions that would not see a repo (sandboxed, or ro) are restarted around the adds; refused (`BusyError`, nothing changed) while things run unless `--force-restart`; `App.AddRepo` alone refuses under such sessions (`ErrRestartNeeded`) |
 | `atl repos` | list repos available under `$ATL_REPOS` |
 | `atl open <task> [--session ID \| --new]` | `App.Open` (no flags; unchanged), `App.OpenSession` (`--session`) or `App.OpenNew` (`--new`), then run attach cmd with stdio attached. The flags are mutually exclusive (usage error) |
 | `atl session <task>` | new Claude session (does not attach; prints window) |

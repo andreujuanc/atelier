@@ -38,7 +38,12 @@ type Backend interface {
 	// ProjectRepos returns project name's repos with their default modes.
 	ProjectRepos(name string) ([]app.RepoArg, error)
 	AvailableRepos(ctx context.Context) ([]string, error)
-	AddRepo(ctx context.Context, ref string, r app.RepoArg, noFetch bool) (*model.Task, error)
+	// AddRepos adds repos to the task, restarting its sessions if they would
+	// not see them (app.AddRepos); *app.BusyError while things run there.
+	AddRepos(ctx context.Context, ref string, repos []app.RepoArg, o app.AddOpts) (*app.AddResult, error)
+	// AddCheck is what AddRepos without force would find running there
+	// (app.AddCheck); it changes nothing.
+	AddCheck(ctx context.Context, ref string, repos []app.RepoArg) ([]string, error)
 	// GetNotes returns the task's notes text.
 	GetNotes(ctx context.Context, ref string) (string, error)
 	// SetNotes replaces the task's notes with text if they are still base
