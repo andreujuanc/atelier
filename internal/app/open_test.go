@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -116,6 +117,45 @@ func TestReadTranscriptInfo(t *testing.T) {
 
 	if _, err := readTranscriptInfoAt(filepath.Join(dir, "missing.jsonl")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("missing transcript: %v", err)
+	}
+}
+
+// shrunkFile is a transcript that was cut short after it was stat'ed:
+// Stat still reports size, but only what the Reader holds is there.
+type shrunkFile struct {
+	*bytes.Reader
+	size int64
+}
+
+func (f shrunkFile) Stat() (fs.FileInfo, error) { return shrunkInfo(f.size), nil }
+
+type shrunkInfo int64
+
+func (s shrunkInfo) Name() string       { return "shrunk.jsonl" }
+func (s shrunkInfo) Size() int64        { return int64(s) }
+func (s shrunkInfo) Mode() fs.FileMode  { return 0o644 }
+func (s shrunkInfo) ModTime() time.Time { return time.Time{} }
+func (s shrunkInfo) IsDir() bool        { return false }
+func (s shrunkInfo) Sys() any           { return nil }
+
+// A large transcript cut short between its stat and the read of its tail
+// still gives its last line, even one not ended by a newline yet: only
+// the bytes read are scanned, not the rest of the buffer.
+func TestReadTranscriptInfoShrunk(t *testing.T) {
+	filler := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + strings.Repeat("x", 1000) + `"}]}}` + "\n"
+	var b strings.Builder
+	b.WriteString(`{"type":"user","message":{"role":"user","content":"first"}}` + "\n")
+	for b.Len() < 3*transcriptWindow {
+		b.WriteString(filler)
+	}
+	b.WriteString(`{"type":"user","message":{"role":"user","content":"last"}}`) // no newline yet
+	data := []byte(b.String())
+	info, err := readTranscriptInfo(shrunkFile{bytes.NewReader(data), int64(len(data)) + 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (transcriptInfo{FirstPrompt: "first", LastPrompt: "last"}); info != want {
+		t.Fatalf("info = %+v, want %+v", info, want)
 	}
 }
 
