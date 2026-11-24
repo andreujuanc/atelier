@@ -370,6 +370,30 @@ func TestReopenSandboxed(t *testing.T) {
 	}
 }
 
+// A task closed with `atl status` keeps its worktree, registered in git;
+// removed by hand afterwards, the reopen still makes it again (git would
+// refuse a path it still has registered, "missing but already registered").
+func TestReopenWorktreeRemovedByHand(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "by hand", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := e.commitIn(t, task.Slug, "api", "work")
+	if err := e.app.SetStatus(ctx, task.Slug, model.StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(e.app.Paths.TaskDir(task.Slug)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.app.SetStatus(ctx, task.Slug, model.StatusActive); err != nil {
+		t.Fatal(err)
+	}
+	reopened(t, e, task.Slug, model.StatusActive, head)
+}
+
 // SetStatus decides under the per-task lock: a change made while done (or
 // another operation) holds it waits, and then sees the task as that left
 // it. Here the task was closed meanwhile, so active reopens it rather than

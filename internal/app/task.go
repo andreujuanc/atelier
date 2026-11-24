@@ -658,6 +658,22 @@ func (a *App) reopen(ctx context.Context, t *model.Task, to model.Status) error 
 	if a.Sandbox != nil || fileExists(a.Paths.RunDir(t.Slug)) {
 		a.removeSandbox(ctx, t)
 	}
+	// A worktree removed by hand (the task closed with `atl status`, say)
+	// is still registered in git, which refuses to add it again until it
+	// is pruned. Only a path still missing is pruned, and only now that
+	// nothing of the task runs to put something there.
+	for _, c := range plan {
+		if c.Keep {
+			continue
+		}
+		wt := a.Paths.WorktreePath(t.Slug, c.Repo.Name)
+		if _, err := os.Lstat(wt); !errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err := gitx.RemoveWorktree(ctx, a.Paths.RepoPath(c.Repo.Name), wt, false); err != nil {
+			return fail(fmt.Errorf("repo %s: prune worktrees: %w", c.Repo.Name, err))
+		}
+	}
 	undo, err := a.buildTaskDir(ctx, t, plan, true)
 	if err != nil {
 		return fail(err)
