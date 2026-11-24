@@ -17,13 +17,21 @@ import (
 	"github.com/andreujuanc/atelier/internal/store"
 )
 
-// TestMain lets tests re-exec the test binary as `atl hook <args>`.
+// TestMain lets tests re-exec the test binary as `atl hook <args>`. The
+// tests themselves run without any ATL_* variable of the environment they
+// run in (e.g. inside an atelier task, whose ATL_SANDBOX_ID would send the
+// hooks to a gate), so neither they nor the processes they start see it.
 func TestMain(m *testing.M) {
 	switch os.Getenv("ATL_HOOK_TEST_MAIN") {
 	case "1":
 		os.Exit(Main(strings.Fields(os.Getenv("ATL_HOOK_TEST_ARGS"))))
 	case "statusline":
 		os.Exit(StatusLineMain())
+	}
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "ATL_") {
+			os.Unsetenv(k)
+		}
 	}
 	os.Exit(m.Run())
 }
