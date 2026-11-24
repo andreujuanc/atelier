@@ -958,7 +958,7 @@ func gateContainerCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []st
 }
 
 // HostConfig settings that are harmless whatever their value. Every other
-// setting must be unset (zero) or pass its own check in checkCreate, so a
+// setting must be unset (zero) or pass its own check in checkHostConfig, so a
 // setting this list does not know is refused.
 var hostAllowed = map[string]bool{
 	"PortBindings": true, "PublishAllPorts": true, "RestartPolicy": true, "AutoRemove": true,
@@ -979,9 +979,11 @@ var createFields = []string{
 	"HostConfig", "NetworkingConfig",
 }
 
-// hostChecked are the HostConfig settings checkCreate checks by value.
+// hostChecked are the HostConfig settings checkHostConfig checks by value.
 var hostChecked = []string{"Binds", "Mounts", "NetworkMode", "VolumesFrom", "LogConfig", "IpcMode", "CgroupnsMode", "MaskedPaths", "ReadonlyPaths"}
 
+// checkCreate checks a container create's body, changing in it what the
+// gate forwards otherwise (see checkHostConfig and checkNetworking).
 func (g *Gate) checkCreate(body map[string]any) error {
 	if err := fieldKeys(body, "HostConfig", "NetworkingConfig", "Labels"); err != nil {
 		return err
@@ -996,6 +998,18 @@ func (g *Gate) checkCreate(body map[string]any) error {
 		}
 	}
 	hc, _ := body["HostConfig"].(map[string]any)
+	if err := g.checkHostConfig(hc); err != nil {
+		return err
+	}
+	nc, _ := body["NetworkingConfig"].(map[string]any)
+	return g.checkNetworking(nc)
+}
+
+// checkHostConfig checks a container create's HostConfig: each setting is
+// harmless (hostAllowed), passes its own check here or is unset. What the
+// gate forwards otherwise (a mount made read-only, objects by full ID) is
+// changed in hc.
+func (g *Gate) checkHostConfig(hc map[string]any) error {
 	if err := fieldKeys(hc, append(slices.Collect(maps.Keys(hostAllowed)), hostChecked...)...); err != nil {
 		return err
 	}
@@ -1053,7 +1067,13 @@ func (g *Gate) checkCreate(body map[string]any) error {
 			return err
 		}
 	}
-	nc, _ := body["NetworkingConfig"].(map[string]any)
+	return nil
+}
+
+// checkNetworking checks a container create's NetworkingConfig: each
+// network its endpoints name must be one the container may join (see
+// network), and is rewritten to its full ID.
+func (g *Gate) checkNetworking(nc map[string]any) error {
 	if err := fieldKeys(nc, "EndpointsConfig"); err != nil {
 		return err
 	}
