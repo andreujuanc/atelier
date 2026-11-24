@@ -1,13 +1,13 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -374,11 +374,11 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	w.buf = append(w.buf, p...)
 	for {
-		i := strings.IndexByte(string(w.buf), '\n')
+		i := bytes.IndexByte(w.buf, '\n')
 		if i < 0 {
 			break
 		}
-		line := strings.TrimSpace(string(w.buf[:i]))
+		line := string(bytes.TrimSpace(w.buf[:i]))
 		w.buf = w.buf[i+1:]
 		if line != "" {
 			w.send(line)
