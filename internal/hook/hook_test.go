@@ -819,3 +819,60 @@ func TestTranscriptPath(t *testing.T) {
 		t.Fatalf("fresh = %+v, %v", fresh, err)
 	}
 }
+
+// TestStopBackground: a Stop records the background work still in flight
+// (what an add's restart would cut off); the next state change clears it.
+func TestStopBackground(t *testing.T) {
+	ctx := context.Background()
+	f := setup(t)
+	s := f.session(t, model.StateRunning, "cid")
+	env := envOf(map[string]string{"ATL_SESSION": itoa(s.ID), "ATL_TASK": "fix"})
+	stop := func(raw string) {
+		t.Helper()
+		var in Input
+		if err := json.Unmarshal([]byte(raw), &in); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := Handle(ctx, EventStop, in, env, f.st, f.p, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop(`{"session_id":"cid","hook_event_name":"Stop","background_tasks":[
+		{"id":"a1","type":"subagent","status":"running","description":"Review the diff","agent_type":"general-purpose"},
+		{"id":"b2","type":"shell","status":"running","description":"","command":"npm run dev\u001b[2J"},
+		{"id":"c3","type":"monitor","status":"pending","description":"Watch CI\nnow"},
+		{"id":"d4","type":"dream","status":"running","description":"memory"},
+		{"id":"e5","type":"auto-mode scan","status":"running"},
+		{"id":"f6","type":"memory save","status":"running"},
+		{"id":"g7","type":"subagent","status":"completed","description":"done already"}]}`)
+	want := []string{"subagent: Review the diff", "shell: npm run dev [2J", "monitor: Watch CI now"}
+	if g := f.get(t, s.ID); g.State != model.StateIdle || g.Background != strings.Join(want, "\n") {
+		t.Fatalf("after Stop: %s %q, want idle %q", g.State, g.Background, want)
+	}
+	// A later Stop reports the current list: the subagent ended.
+	stop(`{"session_id":"cid","background_tasks":[{"id":"c3","type":"monitor","status":"running","description":"Watch CI"}]}`)
+	if g := f.get(t, s.ID); g.Background != "monitor: Watch CI" {
+		t.Fatalf("after second Stop: %q", g.Background)
+	}
+	// A prompt clears it (the session is running: busy anyway).
+	if _, _, err := Handle(ctx, EventUserPromptSubmit, Input{SessionID: "cid"}, env, f.st, f.p, now); err != nil {
+		t.Fatal(err)
+	}
+	if g := f.get(t, s.ID); g.Background != "" {
+		t.Fatalf("after a prompt: %q", g.Background)
+	}
+	// An older Claude Code without the field: nothing in flight known.
+	stop(`{"session_id":"cid"}`)
+	if g := f.get(t, s.ID); g.State != model.StateIdle || g.Background != "" {
+		t.Fatalf("Stop without background_tasks: %s %q", g.State, g.Background)
+	}
+	// Capped: a container cannot grow the row without bound.
+	var many []BackgroundTask
+	for i := 0; i < 50; i++ {
+		many = append(many, BackgroundTask{Type: "subagent", Status: "running", Description: strings.Repeat("x", 500)})
+	}
+	got := backgroundLines(many)
+	if len(got) != maxBackground || got[len(got)-1] != "… and 31 more" || len([]rune(got[0])) != maxBackgroundLine {
+		t.Fatalf("capped: %d lines, last %q, first %d runes", len(got), got[len(got)-1], len([]rune(got[0])))
+	}
+}

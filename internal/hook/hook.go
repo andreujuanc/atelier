@@ -43,6 +43,9 @@ type Input struct {
 	ToolName         string          `json:"tool_name"`
 	ToolInput        json.RawMessage `json:"tool_input"`      // file_path / notebook_path
 	TranscriptPath   string          `json:"transcript_path"` // every event: the session's transcript JSONL
+	// BackgroundTasks (Stop) is the background work Claude still has in
+	// flight as it goes idle (absent from older Claude Code versions).
+	BackgroundTasks []BackgroundTask `json:"background_tasks"`
 
 	// landings are where the tool targets land as the task container
 	// resolves them (PreToolUse through a sandboxed task's gate): the ro
@@ -529,7 +532,7 @@ func transitionState(ctx context.Context, event string, in Input, id int64, st *
 		}
 		return st.TouchSession(ctx, id, now)
 	case EventStop:
-		return st.SetSessionState(ctx, id, model.StateIdle, now)
+		return st.SetIdle(ctx, id, strings.Join(backgroundLines(in.BackgroundTasks), "\n"), now)
 	case EventSessionEnd:
 		return st.SetSessionState(ctx, id, model.StateEnded, now)
 	}
@@ -738,4 +741,79 @@ func within(root, path string) (string, bool) {
 		return path[len(prefix):], true
 	}
 	return "", false
+}
+
+// BackgroundTask is one entry of a Stop hook's background_tasks: work that
+// runs on in the session's Claude process after its turn ended (a
+// background subagent or workflow, a background shell, a monitor, ...).
+// Claude Code lists running and pending work only.
+type BackgroundTask struct {
+	ID          string `json:"id"`
+	Type        string `json:"type"` // subagent, workflow, shell, monitor, MCP task, teammate, cloud session, ...
+	Status      string `json:"status"`
+	Description string `json:"description"`
+	AgentType   string `json:"agent_type"` // subagent
+	Command     string `json:"command"`    // shell
+	Name        string `json:"name"`       // workflow
+}
+
+// Limits of what backgroundLines keeps: a sandboxed task's container
+// sends the hook input, so it must not grow a session row without bound.
+const (
+	maxBackground     = 20
+	maxBackgroundLine = 160
+)
+
+// backgroundLines describes, one line each, the background work of tasks
+// that a restart of the session would cut off. Claude Code's own
+// housekeeping (a dream, an auto-mode scan, a memory save) is left out: it
+// ends without starting a turn, so no Stop would report it gone, and losing
+// it loses nothing of the user's. So is work no longer running or pending.
+// Each line is "<type>: <what>", without control characters, at most
+// maxBackgroundLine runes; at most maxBackground lines, the last one
+// saying how many more there are.
+func backgroundLines(tasks []BackgroundTask) []string {
+	var out []string
+	for _, t := range tasks {
+		switch t.Type {
+		case "dream", "auto-mode scan", "auto_mode_scan", "memory save", "post_turn_memory":
+			continue
+		}
+		switch t.Status {
+		case "", "running", "pending":
+		default:
+			continue
+		}
+		what := t.Description
+		if what == "" {
+			what = firstNonEmpty(t.Command, t.Name, t.AgentType, t.ID)
+		}
+		typ := t.Type
+		if typ == "" {
+			typ = "task"
+		}
+		out = append(out, clip(oneLine(typ+": "+what), maxBackgroundLine))
+	}
+	if len(out) > maxBackground {
+		out = append(out[:maxBackground-1], fmt.Sprintf("… and %d more", len(out)-maxBackground+1))
+	}
+	return out
+}
+
+func firstNonEmpty(s ...string) string {
+	for _, v := range s {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// clip cuts s to at most n runes, the last one an ellipsis when cut.
+func clip(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
 }

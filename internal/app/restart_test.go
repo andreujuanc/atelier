@@ -90,11 +90,24 @@ func TestAddReposRestartsSandboxedSessions(t *testing.T) {
 		t.Fatalf("a refused AddRepos changed things: repos %v, rm %v", got, fd.find("rm"))
 	}
 
-	// Idle: restarted around the add.
-	if err := e.app.Store.SetSessionState(ctx, s.ID, model.StateIdle, e.app.now()); err != nil {
+	// Idle, but a background subagent still works (in Claude's own process,
+	// so only its Stop hook tells): busy.
+	if err := e.app.Store.SetIdle(ctx, s.ID, "subagent: Review the diff", e.app.now()); err != nil {
 		t.Fatal(err)
 	}
 	fd.ps = idle
+	_, err = e.app.AddRepos(ctx, "boxed", []RepoArg{{"docs", model.ModeRO}}, AddOpts{NoFetch: true})
+	if !errors.As(err, &busy) || !slices.Equal(busy.Running, []string{"session " + name + " works in the background: subagent: Review the diff"}) {
+		t.Fatalf("AddRepos with a background subagent: %v", err)
+	}
+	if running, err := e.app.AddCheck(ctx, "boxed", []RepoArg{{"docs", model.ModeRO}}); err != nil || len(running) != 1 {
+		t.Fatalf("AddCheck with a background subagent: %q, %v", running, err)
+	}
+
+	// Idle: restarted around the add.
+	if err := e.app.Store.SetIdle(ctx, s.ID, "", e.app.now()); err != nil {
+		t.Fatal(err)
+	}
 	os.Remove(filepath.Join(e.out, "argv-"+sid))
 	res, err := e.app.AddRepos(ctx, "boxed", []RepoArg{{"docs", model.ModeRO}}, AddOpts{NoFetch: true})
 	if err != nil || len(res.Added) != 1 || len(res.Failed) != 0 || res.Restarted != 1 {

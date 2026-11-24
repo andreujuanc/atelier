@@ -183,6 +183,12 @@ type Session struct {
 	CreatedAt       time.Time
 	LastEventAt     time.Time
 	TranscriptPath  string // Claude Code transcript JSONL ("" until a hook reports it)
+	// Background is the background work (a subagent, a background shell, a
+	// monitor, ...) Claude still had in flight when the session last went
+	// idle, one description per line ("": none), as its Stop hook reported
+	// it. Any other state change clears it: it only means something for an
+	// idle session. (A string keeps Session comparable.)
+	Background string
 }
 
 // Note authors.

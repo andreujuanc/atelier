@@ -10,14 +10,14 @@ import (
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
-const sessionCols = `id, task_id, claude_session_id, tmux_target, name, state, created_at, last_event_at, transcript_path`
+const sessionCols = `id, task_id, claude_session_id, tmux_target, name, state, created_at, last_event_at, transcript_path, background`
 
 func scanSession(sc scanner) (*model.Session, error) {
 	var ss model.Session
 	var state string
 	var created, last int64
 	if err := sc.Scan(&ss.ID, &ss.TaskID, &ss.ClaudeSessionID, &ss.TmuxTarget, &ss.Name,
-		&state, &created, &last, &ss.TranscriptPath); err != nil {
+		&state, &created, &last, &ss.TranscriptPath, &ss.Background); err != nil {
 		return nil, err
 	}
 	ss.State = model.SessionState(state)
@@ -146,7 +146,7 @@ func (s *Store) UpdateSession(ctx context.Context, sess *model.Session) error {
 	}
 	last := normTime(sess.LastEventAt)
 	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET claude_session_id = ?, tmux_target = ?,
-		name = ?, state = ?, last_event_at = ? WHERE id = ?`,
+		name = ?, state = ?, last_event_at = ?, background = '' WHERE id = ?`,
 		sess.ClaudeSessionID, sess.TmuxTarget, sess.Name, string(sess.State), toMS(last), sess.ID)
 	if err != nil {
 		return err
@@ -158,13 +158,27 @@ func (s *Store) UpdateSession(ctx context.Context, sess *model.Session) error {
 	return nil
 }
 
+// Every state change clears a session's background (see
+// model.Session.Background), except SetIdle, which sets it.
+
 // SetSessionState sets a session's state and last_event_at (now if at is zero).
 func (s *Store) SetSessionState(ctx context.Context, id int64, st model.SessionState, at time.Time) error {
 	if !st.Valid() {
 		return fmt.Errorf("store: invalid session state %q", st)
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET state = ?, last_event_at = ? WHERE id = ?`,
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET state = ?, last_event_at = ?, background = '' WHERE id = ?`,
 		string(st), toMS(normTime(at)), id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res, "session", id)
+}
+
+// SetIdle sets a session idle (last_event_at = at, now if zero) with the
+// background work its Claude still has in flight, one per line ("": none).
+func (s *Store) SetIdle(ctx context.Context, id int64, background string, at time.Time) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET state = 'idle', last_event_at = ?, background = ? WHERE id = ?`,
+		toMS(normTime(at)), background, id)
 	if err != nil {
 		return err
 	}
@@ -208,7 +222,7 @@ func (s *Store) ListLaunchedLive(ctx context.Context) ([]Launch, error) {
 // observed — even into a window that reuses the old window id — or ended
 // meanwhile is left alone. It reports whether the row changed.
 func (s *Store) MarkStoppedIfLaunch(ctx context.Context, l Launch, at time.Time) (bool, error) {
-	return s.changed(ctx, `UPDATE sessions SET state = 'stopped', last_event_at = ?
+	return s.changed(ctx, `UPDATE sessions SET state = 'stopped', last_event_at = ?, background = ''
 		WHERE id = ? AND state IN ('running', 'waiting', 'idle') AND tmux_target != ''
 		AND tmux_target = ? AND launch_seq = ?`, toMS(normTime(at)), l.ID, l.Target, l.Seq)
 }
@@ -235,7 +249,7 @@ func (s *Store) ClaimFrom(ctx context.Context, id int64, from model.SessionState
 		return false, fmt.Errorf("store: cannot claim a session for resume from state %q", from)
 	}
 	return s.changed(ctx, `UPDATE sessions SET state = 'idle', tmux_target = '', launch_seq = launch_seq + 1,
-		last_event_at = ? WHERE id = ? AND state = ?`, toMS(normTime(at)), id, string(from))
+		last_event_at = ?, background = '' WHERE id = ? AND state = ?`, toMS(normTime(at)), id, string(from))
 }
 
 // SetSessionLaunch records the tmux window and name of a launched session and
@@ -266,7 +280,7 @@ func (s *Store) changed(ctx context.Context, query string, args ...any) (bool, e
 // or ended session).
 func (s *Store) SetClaudeSession(ctx context.Context, id int64, claudeSessionID string, at time.Time) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET claude_session_id = ?, state = 'idle',
-		last_event_at = ? WHERE id = ?`, claudeSessionID, toMS(normTime(at)), id)
+		last_event_at = ?, background = '' WHERE id = ?`, claudeSessionID, toMS(normTime(at)), id)
 	if err != nil {
 		return err
 	}
@@ -292,7 +306,7 @@ func (s *Store) SetStateIf(ctx context.Context, id int64, from, to model.Session
 	if !from.Valid() || !to.Valid() {
 		return false, fmt.Errorf("store: invalid session state transition %q -> %q", from, to)
 	}
-	return s.changed(ctx, `UPDATE sessions SET state = ?, last_event_at = ? WHERE id = ? AND state = ?`,
+	return s.changed(ctx, `UPDATE sessions SET state = ?, last_event_at = ?, background = '' WHERE id = ? AND state = ?`,
 		string(to), toMS(normTime(at)), id, string(from))
 }
 

@@ -261,7 +261,9 @@ func (a *App) liveSessions(ctx context.Context, t *model.Task) ([]model.Session,
 
 // taskActivity says, one line each, what runs in t that a restart of its
 // sessions would end or lose: a live session in the middle of a turn
-// (Claude works or waits for a permission answer), one that has not
+// (Claude works or waits for a permission answer), an idle one whose
+// Claude still has background work in flight (a background subagent,
+// shell, monitor, ...: as its last Stop hook reported it), one that has not
 // reported its Claude id yet (it could not be resumed), and what runs in
 // the task's container besides idle sessions (sandbox.ParseActivity:
 // commands of Claude's Bash tool, in the foreground or the background,
@@ -269,9 +271,9 @@ func (a *App) liveSessions(ctx context.Context, t *model.Task) ([]model.Session,
 // whose Claude is not found in the container is a line too: then what it
 // runs cannot be told. Empty: nothing.
 //
-// Not seen: background subagents of an idle Claude (they run inside its
-// process) and, with the sandbox off, what an idle session left running
-// on this machine.
+// Not seen: with the sandbox off, what an idle session left running on
+// this machine (its background shells are, from its Stop hook); and the
+// background work of a Claude Code too old to report it.
 func (a *App) taskActivity(ctx context.Context, t *model.Task) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -291,6 +293,14 @@ func (a *App) taskActivity(ctx context.Context, t *model.Task) ([]string, error)
 			out = append(out, "session "+name+": Claude waits for a permission answer")
 		case s.ClaudeSessionID == "":
 			out = append(out, "session "+name+": has not reported its Claude session yet, so it could not be resumed")
+		}
+		if s.State == model.StateIdle {
+			for _, b := range strings.Split(s.Background, "\n") {
+				if b == "" {
+					continue
+				}
+				out = append(out, "session "+name+" works in the background: "+firstChars(cleanLine(b), 80))
+			}
 		}
 	}
 	c, err := a.agentContainer(ctx, t)
