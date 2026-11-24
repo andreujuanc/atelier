@@ -77,7 +77,7 @@ func TestOpenReadOnlyCurrent(t *testing.T) {
 	s, path := openTest(t)
 	ctx := context.Background()
 	task := mkTask(t, s, "keep", model.StatusActive, 0)
-	s.Close() // last connection: WAL checkpointed into the main file
+	s.Close()
 	before := snap(t, path)
 
 	ro, err := OpenReadOnly(path, 250*time.Millisecond)

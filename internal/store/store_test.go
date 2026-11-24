@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -939,3 +940,131 @@ func TestOpenWaitsForWALSwitch(t *testing.T) {
 	}
 	s.Close()
 }
+
+// fileSize returns the size of the file at path, 0 if it does not exist.
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Size()
+}
+
+// TestCloseSkipsCheckpoint: the last connection to close (a hook while the
+// TUI is not running) leaves the committed writes in the WAL instead of
+// checkpointing them into the database file, and they stay visible.
+func TestCloseSkipsCheckpoint(t *testing.T) {
+	s, path := openTest(t)
+	mkTask(t, s, "in-wal", model.StatusActive, 0)
+	s.Close()
+	if fileSize(t, path+"-wal") == 0 {
+		t.Fatal("close checkpointed the WAL into the database file")
+	}
+	ctx := context.Background()
+	ro, err := OpenReadOnly(path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ro.GetTaskBySlug(ctx, "in-wal"); err != nil {
+		t.Errorf("read-only read: %v", err)
+	}
+	ro.Close()
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if _, err := s2.GetTaskBySlug(ctx, "in-wal"); err != nil {
+		t.Errorf("read after reopen: %v", err)
+	}
+}
+
+// TestWALBoundedAcrossOpens: although no connection checkpoints on close,
+// many open-write-close cycles with no other connection open (one hook
+// after another) keep the WAL bounded, and checkpoint it into the database
+// file.
+func TestWALBoundedAcrossOpens(t *testing.T) {
+	s, path := openTest(t)
+	ctx := context.Background()
+	task := mkTask(t, s, "busy", model.StatusActive, 0)
+	s.Close()
+	const write = 32 << 10
+	var maxWAL int64
+	text := ""
+	for i := 0; i < 400; i++ { // ~13MB of notes, several times the bound
+		st, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text = fmt.Sprintf("%04d %s", i, strings.Repeat(string(rune('a'+i%26)), write))
+		if _, err := st.ReplaceNotes(ctx, task.ID, text); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		maxWAL = max(maxWAL, fileSize(t, path+"-wal"))
+	}
+	// One write past the bound is let in before Close truncates the WAL.
+	if limit := int64(walTruncateSize + 4*write); maxWAL > limit {
+		t.Errorf("WAL grew to %d bytes, want at most %d", maxWAL, limit)
+	}
+	if n := fileSize(t, path); n < write {
+		t.Errorf("database file is %d bytes: the WAL was never checkpointed into it", n)
+	}
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if got, err := st.GetNotes(ctx, task.ID); err != nil || got != text {
+		t.Errorf("notes after the cycles: %d bytes, %v; want the last write", len(got), err)
+	}
+}
+
+// benchHookCycle measures what one `atl hook` does with the database:
+// open, one small write, close; keepOpen: while another Store (the TUI)
+// has the database open.
+func benchHookCycle(b *testing.B, keepOpen bool) {
+	path := filepath.Join(b.TempDir(), "atelier.db")
+	s, err := Open(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx := context.Background()
+	task := &model.Task{Slug: "b", Title: "b", Status: model.StatusActive, Branch: "atl/b"}
+	if err := s.CreateTask(ctx, task); err != nil {
+		b.Fatal(err)
+	}
+	sess := &model.Session{TaskID: task.ID, State: model.StateRunning}
+	if err := s.CreateSession(ctx, sess); err != nil {
+		b.Fatal(err)
+	}
+	if keepOpen {
+		// s (the TUI) keeps the database open throughout
+		if err := s.db.PingContext(ctx); err != nil {
+			b.Fatal(err)
+		}
+		defer s.Close()
+	} else {
+		s.Close()
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		st, err := Open(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := st.TouchSession(ctx, sess.ID, time.Time{}); err != nil {
+			b.Fatal(err)
+		}
+		st.Close()
+	}
+}
+
+func BenchmarkHookCycleAlone(b *testing.B)   { benchHookCycle(b, false) }
+func BenchmarkHookCycleTUIOpen(b *testing.B) { benchHookCycle(b, true) }
