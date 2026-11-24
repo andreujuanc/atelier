@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
@@ -619,6 +620,22 @@ func TestOpenLiveWindowOfPastRow(t *testing.T) {
 	untouched("Resume")
 	if got := e.session(t, s.ID); got.State != model.StateIdle || got.TmuxTarget != win {
 		t.Errorf("after Resume: %+v, want idle in %s", got, win)
+	}
+	// That Claude, adopted rather than launched again, still ends the
+	// session when it exits: the launch it was started at stays current.
+	launch := ""
+	for _, kv := range strings.Split(readFile(t, filepath.Join(e.out, "env-"+tag)), "\n") {
+		if v, ok := strings.CutPrefix(kv, "ATL_LAUNCH="); ok {
+			launch = v
+		}
+	}
+	env := map[string]string{"ATL_SESSION": tag, "ATL_TASK": "t", "ATL_LAUNCH": launch}
+	in := hook.Input{SessionID: "cid-1", Cwd: e.app.Paths.TaskDir("t")}
+	if _, _, err := hook.Handle(ctx, hook.EventSessionEnd, in, func(k string) string { return env[k] }, e.app.Store, e.app.Paths, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.session(t, s.ID).State; got != model.StateEnded {
+		t.Errorf("the adopted Claude's SessionEnd (ATL_LAUNCH=%q) left the session %s", launch, got)
 	}
 }
 

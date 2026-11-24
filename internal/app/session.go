@@ -272,7 +272,7 @@ func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir st
 		tags, err = a.Tmux.TaggedWindows(bg)
 	}
 	if live, ok := tags[strconv.FormatInt(id, 10)]; ok && err == nil {
-		if err := a.Store.SetSessionLaunch(bg, id, live, s.Name); err != nil {
+		if err := a.Store.AdoptLaunch(bg, id, live, s.Name); err != nil {
 			return "", fmt.Errorf("record live window %s: %w", live, err)
 		}
 		return live, nil

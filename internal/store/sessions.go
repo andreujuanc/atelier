@@ -248,6 +248,16 @@ func (s *Store) SetSessionLaunch(ctx context.Context, id int64, tmuxTarget, name
 		launch_seq = launch_seq + 1 WHERE id = ?`, tmuxTarget, name, id)
 }
 
+// AdoptLaunch records, for a session the caller has just claimed for a
+// resume (ClaimFrom), the tmux window and name of the Claude still running
+// from its last launch, which it adopts rather than launching one: the
+// claim's bump of the launch sequence is undone, back to that launch's
+// record, so that Claude's $ATL_LAUNCH stays current (see EndLive).
+func (s *Store) AdoptLaunch(ctx context.Context, id int64, tmuxTarget, name string) error {
+	return s.execOne(ctx, "session", id, `UPDATE sessions SET tmux_target = ?, name = ?,
+		launch_seq = launch_seq - 1 WHERE id = ?`, tmuxTarget, name, id)
+}
+
 // changed runs a conditional UPDATE and reports whether it changed a row.
 func (s *Store) changed(ctx context.Context, query string, args ...any) (bool, error) {
 	res, err := s.db.ExecContext(ctx, query, args...)

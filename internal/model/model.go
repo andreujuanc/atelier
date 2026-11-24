@@ -190,7 +190,8 @@ type Session struct {
 	// idle session. (A string keeps Session comparable.)
 	Background string
 	// LaunchSeq numbers the session's launches: bumped when it is claimed
-	// for a resume and when a window is recorded for it. A Claude is
+	// for a resume (undone if the resume adopts a window still running)
+	// and when a window is recorded for it. A Claude is
 	// started with the value at its launch as $ATL_LAUNCH.
 	LaunchSeq int64
 }
