@@ -63,6 +63,33 @@ func (a *App) checkLaunchable(t *model.Task) (string, error) {
 	return dir, nil
 }
 
+// lockLaunch takes the per-task lock for a launch in t and re-reads the
+// task under it, returning it and its dir if it is still launchable
+// (checkLaunchable). done and cancel hold the lock until the task is
+// closed, so no session is launched into a task being closed: its window
+// and container would outlive the task. The caller keeps the lock until its
+// launch is recorded, and must not hold it already (flock is per open
+// file: that would deadlock); AddRepos, which does, launches under its own.
+func (a *App) lockLaunch(ctx context.Context, t *model.Task) (*model.Task, string, func(), error) {
+	if _, err := a.checkLaunchable(t); err != nil {
+		return nil, "", nil, err
+	}
+	unlock, err := a.lockTask(ctx, t.ID)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
+		unlock()
+		return nil, "", nil, err
+	}
+	dir, err := a.checkLaunchable(t)
+	if err != nil {
+		unlock()
+		return nil, "", nil, err
+	}
+	return t, dir, unlock, nil
+}
+
 // launch refreshes the task dir and starts a Claude window for s in the
 // task's tmux session, returning the window id.
 func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, resumeID string) (string, error) {
@@ -117,10 +144,11 @@ func (a *App) NewSession(ctx context.Context, ref string) (*model.Session, error
 	if err != nil {
 		return nil, err
 	}
-	dir, err := a.checkLaunchable(t)
+	t, dir, unlock, err := a.lockLaunch(ctx, t)
 	if err != nil {
 		return nil, err
 	}
+	defer unlock()
 	now := a.now()
 	s := &model.Session{TaskID: t.ID, State: model.StateIdle, CreatedAt: now, LastEventAt: now}
 	if err := a.Store.CreateSession(ctx, s); err != nil {
@@ -191,10 +219,11 @@ func (a *App) Resume(ctx context.Context, ref string) (int, error) {
 	if len(stopped) == 0 {
 		return 0, nil
 	}
-	dir, err := a.checkLaunchable(t)
+	t, dir, unlock, err := a.lockLaunch(ctx, t)
 	if err != nil {
 		return 0, err
 	}
+	defer unlock()
 	n := 0
 	var errs []error
 	for _, c := range stopped {

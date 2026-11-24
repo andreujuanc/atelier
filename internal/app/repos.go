@@ -70,7 +70,7 @@ func (a *App) AvailableRepos(ctx context.Context) ([]string, error) {
 }
 
 // taskLockWait is how long lockTask waits for another operation on the
-// same task (AddRepo, done/cancel, a CLAUDE.md rewrite) to finish.
+// same task (AddRepo, done/cancel, a CLAUDE.md rewrite, a launch) to finish.
 const taskLockWait = 30 * time.Second
 
 // lockTask takes an exclusive flock on <StateDir>/locks/task-<id>.lock,
