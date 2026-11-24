@@ -466,15 +466,6 @@ func (s *script) answer(prefix, out string, err error) {
 	}{out, err}
 }
 
-func (s *script) verbs() string {
-	var v []string
-	for _, c := range s.calls {
-		first, _, _ := strings.Cut(c, " ")
-		v = append(v, first)
-	}
-	return strings.Join(v, " ")
-}
-
 // agentDaemon is a Runner for Ensure: a daemon with at most the one
 // container named atl-<id>.
 type agentDaemon struct {
