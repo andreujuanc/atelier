@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -373,4 +374,95 @@ func TestGateLeaksNothing(t *testing.T) {
 	if n := settles(func() int { return openFDs(t) }, baseFD); n > baseFD {
 		t.Errorf("%d open fds after Serve returned, %d before", n, baseFD)
 	}
+}
+
+// TestServeWaitsForRequestsUnderWay: once stopped, Serve returns (and
+// frees the run dir's lock, which StopAndWait waits for) only after the
+// requests it took are answered: a container create it relayed lands
+// before whoever stopped it lists the task's containers.
+func TestServeWaitsForRequestsUnderWay(t *testing.T) {
+	arrived := make(chan struct{}, 1)
+	var answered atomic.Bool
+	upstream := filepath.Join(t.TempDir(), "daemon.sock")
+	l, err := net.Listen("unix", upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slow := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		time.Sleep(300 * time.Millisecond)
+		answered.Store(true)
+		w.WriteHeader(http.StatusCreated)
+		io.WriteString(w, `{"Id":"new"}`)
+	})}
+	go slow.Serve(l)
+	t.Cleanup(func() { slow.Close() })
+
+	runDir := filepath.Join(t.TempDir(), "run")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan bool, 1)
+	go func() {
+		Serve(ctx, &Gate{ID: testID, Root: t.TempDir(), Upstream: upstream}, nil, runDir)
+		served <- answered.Load()
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !Alive(runDir) {
+		if time.Now().After(deadline) {
+			t.Fatal("gate never came up")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	go func() {
+		c, err := net.Dial("unix", SocketPath(runDir))
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		io.WriteString(c, "POST /containers/create HTTP/1.1\r\nHost: d\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"Image\":\"x\"}")
+		io.Copy(io.Discard, c)
+	}()
+	<-arrived
+	cancel()
+	if !<-served {
+		t.Error("Serve returned before the request it relayed was answered")
+	}
+}
+
+// TestServeTakesALockProbedMeanwhile: Stop and StopAndWait probe the run
+// dir's lock by taking it for a moment; a gate starting then must still
+// serve, not take it for another gate's.
+func TestServeTakesALockProbedMeanwhile(t *testing.T) {
+	_, upstream := newDaemon(t)
+	runDir := filepath.Join(t.TempDir(), "run")
+	if err := MakeRunDir(runDir); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := os.OpenFile(lockPath(runDir), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, &Gate{ID: testID, Root: t.TempDir(), Upstream: upstream}, nil, runDir) }()
+	time.Sleep(100 * time.Millisecond)
+	probe.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for !Alive(runDir) {
+		select {
+		case err := <-done:
+			t.Fatalf("Serve returned (%v) instead of serving", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("gate never came up")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
 }
