@@ -120,7 +120,7 @@ func (m *Model) addDone(msg addDoneMsg) tea.Cmd {
 				return m.dialogAdd(r)
 			}
 			return m.restartTick(r)
-		case m.mode != modeNormal || m.quitRequested:
+		case !m.canTakeOver():
 			m.setStatusErr(firstLine("add to "+msg.slug+" not done: "+busy.Error()), true)
 			return nil
 		}
