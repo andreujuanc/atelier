@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/sandbox"
@@ -367,4 +368,41 @@ func TestReopenSandboxed(t *testing.T) {
 	if n := len(fd.find("run")); n != runs+1 {
 		t.Fatalf("docker run calls %d, want a new container (%d)", n, runs+1)
 	}
+}
+
+// SetStatus decides under the per-task lock: a change made while done (or
+// another operation) holds it waits, and then sees the task as that left
+// it. Here the task was closed meanwhile, so active reopens it rather than
+// marking a task without its worktrees active.
+func TestSetStatusWaitsForLock(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "racing", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := e.commitIn(t, task.Slug, "api", "work")
+	unlock, err := e.app.lockTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- e.app.SetStatus(ctx, task.Slug, model.StatusReview) }()
+	select {
+	case err := <-done:
+		unlock()
+		t.Fatalf("SetStatus did not wait for the lock: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// What Done does under the lock.
+	if err := e.app.finishTask(ctx, task, false, model.StatusDone); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	reopened(t, e, task.Slug, model.StatusReview, head)
 }

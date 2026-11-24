@@ -595,7 +595,9 @@ func (a *App) Get(ctx context.Context, ref string) (*TaskView, error) {
 // SetStatus changes a task's status. Between open statuses, between closed
 // ones (done ↔ cancelled) and from open to closed it changes nothing else
 // (closing with cleanup is Done/Cancel). From closed to open it reopens the
-// task (see reopen).
+// task (see reopen). It decides under the per-task lock, as done, cancel
+// and reopen hold it: an open status set while done runs would otherwise
+// mark the task it just closed open, without its worktrees.
 func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error {
 	if !st.Valid() {
 		return fmt.Errorf("invalid status %q", st)
@@ -604,15 +606,23 @@ func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error 
 	if err != nil {
 		return err
 	}
+	unlock, err := a.lockTask(ctx, t.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
+		return err
+	}
 	if t.Status.Open() || !st.Open() {
 		return a.Store.SetTaskStatus(ctx, t.ID, st)
 	}
-	return a.reopen(ctx, t.ID, st)
+	return a.reopen(ctx, t, st)
 }
 
-// reopen brings closed task id back to the state a new task has, and then
-// sets its status to the open status to; under the per-task lock, like
-// finish. For each rw repo it makes the worktree on the task branch
+// reopen brings closed task t back to the state a new task has, and then
+// sets its status to the open status to; the caller holds the per-task
+// lock (SetStatus). For each rw repo it makes the worktree on the task branch
 // (buildTaskDir): on the local branch if the canonical clone still has it
 // (done/cancel keep a branch with unpushed commits); else, after a fetch,
 // on a new one from origin/<branch> if origin has it; else on a new one
@@ -624,21 +634,9 @@ func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error 
 // project's setup in each new worktree (a failure is a warning). If a step
 // fails, what this call made is undone, the task stays closed and the error
 // says what failed.
-func (a *App) reopen(ctx context.Context, id int64, to model.Status) error {
+func (a *App) reopen(ctx context.Context, t *model.Task, to model.Status) error {
 	if err := outsideSandbox("reopen a task"); err != nil {
 		return err
-	}
-	unlock, err := a.lockTask(ctx, id)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	t, err := a.Store.GetTask(ctx, id)
-	if err != nil {
-		return err
-	}
-	if t.Status.Open() { // reopened meanwhile
-		return a.Store.SetTaskStatus(ctx, t.ID, to)
 	}
 	fail := func(err error) error {
 		return fmt.Errorf("reopen task %s: %w (it stays %s)", t.Slug, err, t.Status)
