@@ -7,6 +7,10 @@ import (
 	"reflect"
 	"unsafe"
 
+	// modernc.org/libc must stay at the version modernc.org/sqlite requires
+	// (go.mod): the driver is transpiled against it, and noCheckpointOnClose
+	// calls into both. TestCloseSkipsCheckpoint and TestConnHandleGuard
+	// check the pair after an upgrade.
 	"modernc.org/libc"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"

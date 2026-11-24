@@ -26,8 +26,9 @@ var (
 // Store is a handle on the atelier database. It is safe for concurrent use.
 type Store struct {
 	db *sql.DB
-	// wal is the path of the database's -wal file, or "" for a
-	// read-only store (see Close).
+	// wal is the path of the database's -wal file (next to the database
+	// file a symlinked path resolves to), or "" for a read-only store (see
+	// Close).
 	wal string
 }
 
@@ -151,11 +152,19 @@ func OpenWithTimeout(path string, busy time.Duration) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: open %s: set WAL mode: %w", path, err)
 	}
-	s := &Store{db: db, wal: path + "-wal"}
+	s := &Store{db: db}
 	if err := s.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate %s: %w", path, err)
 	}
+	// The database file as SQLite resolved it (following symlinks), next to
+	// which it keeps the WAL.
+	var file string
+	if err := db.QueryRowContext(context.Background(), "SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&file); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	}
+	s.wal = file + "-wal"
 	return s, nil
 }
 

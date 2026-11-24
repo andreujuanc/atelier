@@ -987,9 +987,44 @@ func TestCloseSkipsCheckpoint(t *testing.T) {
 // TestWALBoundedAcrossOpens: although no connection checkpoints on close,
 // many open-write-close cycles with no other connection open (one hook
 // after another) keep the WAL bounded, and checkpoint it into the database
-// file.
+// file. Also when the database path is a symlink, where SQLite keeps the
+// WAL next to the symlink's target.
 func TestWALBoundedAcrossOpens(t *testing.T) {
-	s, path := openTest(t)
+	t.Run("plain", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "atelier.db")
+		walBoundedAcrossOpens(t, path, path)
+	})
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		real := filepath.Join(dir, "real", "atelier.db")
+		if err := os.MkdirAll(filepath.Dir(real), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(dir, "atelier.db")
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		walBoundedAcrossOpens(t, link, real)
+	})
+	t.Run("symlinked dir", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "real"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(dir, "real"), filepath.Join(dir, "data")); err != nil {
+			t.Fatal(err)
+		}
+		walBoundedAcrossOpens(t, filepath.Join(dir, "data", "atelier.db"), filepath.Join(dir, "real", "atelier.db"))
+	})
+}
+
+// walBoundedAcrossOpens runs open-write-close cycles on the database at
+// path, whose file (where SQLite keeps the WAL) is real.
+func walBoundedAcrossOpens(t *testing.T, path, real string) {
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	task := mkTask(t, s, "busy", model.StatusActive, 0)
 	s.Close()
@@ -1008,13 +1043,13 @@ func TestWALBoundedAcrossOpens(t *testing.T) {
 		if err := st.Close(); err != nil {
 			t.Fatal(err)
 		}
-		maxWAL = max(maxWAL, fileSize(t, path+"-wal"))
+		maxWAL = max(maxWAL, fileSize(t, real+"-wal"))
 	}
 	// One write past the bound is let in before Close truncates the WAL.
 	if limit := int64(walTruncateSize + 4*write); maxWAL > limit {
 		t.Errorf("WAL grew to %d bytes, want at most %d", maxWAL, limit)
 	}
-	if n := fileSize(t, path); n < write {
+	if n := fileSize(t, real); n < write {
 		t.Errorf("database file is %d bytes: the WAL was never checkpointed into it", n)
 	}
 	st, err := Open(path)
