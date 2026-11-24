@@ -498,3 +498,17 @@ func TestStartupRecover(t *testing.T) {
 		t.Fatalf("session state after startup recover = %s, want stopped", got)
 	}
 }
+
+// TestLsSanitizesTitle: `atl new` keeps control characters other than
+// whitespace in a title (ESC included); `atl ls` must not print them to
+// the terminal, as `atl show` does not.
+func TestLsSanitizesTitle(t *testing.T) {
+	setup(t)
+	if code, _, errs := atl(t, "new", "Red \x1b[31malert\x07", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	code, out, errs := atl(t, "ls")
+	if code != 0 || strings.ContainsAny(out, "\x1b\x07") || !strings.Contains(out, "Red [31malert\n") {
+		t.Fatalf("ls: %d %q %s", code, out, errs)
+	}
+}

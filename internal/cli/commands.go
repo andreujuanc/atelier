@@ -363,7 +363,7 @@ func (c *cli) lsCmd() *cobra.Command {
 			for _, v := range views {
 				t := v.Task
 				fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", t.ID, t.Slug, t.Status, orDash(t.Project),
-					sessionsSummary(v.Sessions), t.Title)
+					sessionsSummary(v.Sessions), sanitize(t.Title))
 			}
 			return tw.Flush()
 		},
