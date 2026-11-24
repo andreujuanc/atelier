@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/andreujuanc/atelier/internal/model"
+	"modernc.org/libc"
 )
 
 func openTest(t *testing.T) (*Store, string) {
@@ -1068,3 +1069,112 @@ func benchHookCycle(b *testing.B, keepOpen bool) {
 
 func BenchmarkHookCycleAlone(b *testing.B)   { benchHookCycle(b, false) }
 func BenchmarkHookCycleTUIOpen(b *testing.B) { benchHookCycle(b, true) }
+
+// TestCloseCheckpointBounded: Close's checkpoint of a grown WAL does not
+// wait out the store's busy timeout while another connection (the TUI)
+// holds a read transaction; the WAL is truncated by a later Close once the
+// reader is done.
+func TestCloseCheckpointBounded(t *testing.T) {
+	tui, path := openTest(t)
+	ctx := context.Background()
+	task := mkTask(t, tui, "busy", model.StatusActive, 0)
+	reader, err := tui.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, err := reader.ExecContext(ctx, "BEGIN DEFERRED"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ExecContext(ctx, "SELECT count(*) FROM tasks"); err != nil { // takes the snapshot
+		t.Fatal(err)
+	}
+	cycle := func(i int) time.Duration {
+		t.Helper()
+		st, err := OpenWithTimeout(path, 3*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ReplaceNotes(ctx, task.ID, fmt.Sprintf("%04d %s", i, strings.Repeat(string(rune('a'+i%26)), 32<<10))); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return time.Since(start)
+	}
+	var slowest time.Duration
+	for i := 0; i < 60; i++ { // well past walTruncateSize
+		slowest = max(slowest, cycle(i))
+	}
+	if n := fileSize(t, path+"-wal"); n <= walTruncateSize {
+		t.Fatalf("WAL is %d bytes; the test needs it past %d", n, walTruncateSize)
+	}
+	if slowest > 250*time.Millisecond {
+		t.Errorf("Close took %v while a reader held the WAL; want about %v at most", slowest, walCheckpointBusy)
+	}
+	if _, err := reader.ExecContext(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	cycle(60)
+	if n := fileSize(t, path+"-wal"); n != 0 {
+		t.Errorf("WAL is %d bytes after the reader finished; want it truncated", n)
+	}
+}
+
+// TestConnHandleGuard: the driver connection's unexported fields are read
+// only from the driver's own connection type with the expected layout.
+func TestConnHandleGuard(t *testing.T) {
+	s, _ := openTest(t)
+	c, err := s.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var real any
+	if err := c.Raw(func(dc any) error { real = dc; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if db, tls, ok := connHandle(real); !ok || db == 0 || tls == nil {
+		t.Fatalf("driver connection rejected: %#x, %p, %v", db, tls, ok)
+	}
+	if _, _, ok := connHandle(reflect.Zero(reflect.TypeOf(real)).Interface()); ok {
+		t.Error("nil driver connection accepted")
+	}
+
+	type conn struct {
+		db  uintptr
+		tls *libc.TLS
+	}
+	if !connLayout(reflect.TypeFor[conn]()) {
+		t.Error("expected layout rejected")
+	}
+	tls := libc.NewTLS()
+	defer tls.Close()
+	if _, _, ok := connHandle(&conn{db: 1, tls: tls}); ok {
+		t.Error("a type other than the driver's accepted")
+	}
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[struct {
+			db  int64
+			tls *libc.TLS
+		}](),
+		reflect.TypeFor[struct {
+			db  uintptr
+			tls uintptr
+		}](),
+		reflect.TypeFor[struct {
+			db  uintptr
+			tls *int
+		}](),
+		reflect.TypeFor[struct{ db uintptr }](),
+		reflect.TypeFor[struct{ conn }](),
+		reflect.TypeFor[*conn](),
+		reflect.TypeFor[uintptr](),
+	} {
+		if connLayout(typ) {
+			t.Errorf("layout %v accepted", typ)
+		}
+	}
+}

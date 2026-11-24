@@ -242,21 +242,44 @@ func OpenReadOnly(path string, busy time.Duration) (*Store, error) {
 // Close checkpoints the WAL and truncates it.
 const walTruncateSize = 1 << 20
 
+// walCheckpointBusy bounds how long that checkpoint waits on another
+// connection's lock or read transaction, well within a hook's latency
+// budget.
+const walCheckpointBusy = 20 * time.Millisecond
+
 // Close closes the database. A read-write store first checkpoints the WAL
 // into the database file and truncates it, if it has grown past
 // walTruncateSize: its connections do not checkpoint on close (see
 // noCheckpointOnClose), and when no other connection has the database
 // open the next one to open it recovers the WAL by reading all of it and
 // forgets what was already checkpointed, so SQLite's automatic checkpoint
-// could never restart it and it would grow without bound. A failed
-// checkpoint (e.g. busy) is left to the next Close.
+// could never restart it and it would grow without bound. The checkpoint
+// waits at most walCheckpointBusy for other connections; one that cannot
+// finish (busy) is left to a later Close.
 func (s *Store) Close() error {
 	if s.wal != "" {
-		if fi, err := os.Stat(s.wal); err == nil && fi.Size() > walTruncateSize {
-			_, _ = s.db.ExecContext(context.Background(), "PRAGMA wal_checkpoint(TRUNCATE)")
-		}
+		s.truncateWAL(context.Background())
 	}
 	return s.db.Close()
+}
+
+// truncateWAL checkpoints the WAL and truncates it if the -wal file is
+// larger than walTruncateSize, waiting at most walCheckpointBusy on locks.
+// It is best effort: on any failure the WAL is left as it is.
+func (s *Store) truncateWAL(ctx context.Context) {
+	if fi, err := os.Stat(s.wal); err != nil || fi.Size() <= walTruncateSize {
+		return
+	}
+	c, err := s.db.Conn(ctx)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	// busy_timeout is per connection, and Close closes this one right after.
+	if _, err := c.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", walCheckpointBusy.Milliseconds())); err != nil {
+		return
+	}
+	_, _ = c.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
 }
 
 // migrate applies pending migrations. The common case (schema current) is
