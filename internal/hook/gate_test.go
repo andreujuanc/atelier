@@ -236,8 +236,8 @@ func TestHookThroughGate(t *testing.T) {
 	}
 }
 
-// TestGateSessionEnd: the gate is told each session a SessionEnd records as
-// ended (it then ends what the session leaves running in the container),
+// TestGateSessionEnd: the gate is told each session a SessionEnd is for
+// (it then ends what the session leaves running in the container),
 // and nothing for other events or a SessionEnd that matches no session.
 func TestGateSessionEnd(t *testing.T) {
 	f := setup(t)

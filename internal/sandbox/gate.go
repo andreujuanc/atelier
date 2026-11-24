@@ -841,9 +841,9 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 // EndSession starts, detached in the task's own container (by the ID its
 // labels were checked on), EndSessionCmd for session: once the session's
 // Claude has exited, what it left running there is ended; while it runs,
-// nothing. The gate calls it when a SessionEnd hook of the task recorded
-// the session as ended. The exec runs as the container's user and is not
-// the task's (it is not in g.execs).
+// nothing. The gate calls it for each SessionEnd hook of the task for
+// the session (see hook.TaskServer.OnSessionEnd). The exec runs as the
+// container's user and is not the task's (it is not in g.execs).
 func (g *Gate) EndSession(session int64) error {
 	g.init()
 	agent := g.agentID()

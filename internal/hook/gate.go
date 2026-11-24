@@ -208,11 +208,14 @@ func OpenTaskServer(p config.Paths, id int64, slug string) (*TaskServer, error) 
 func (s *TaskServer) Close() error { return s.d.st.Close() }
 
 // OnSessionEnd sets f to be told, in the request's goroutine, the id of
-// each session of the task that a SessionEnd hook has recorded as ended.
-// The gate has it end what the session leaves running in the container
-// once its Claude is gone (sandbox.EndSessionCmd). Claude also reports a
-// SessionEnd for /clear and goes on, and the task can send one for any
-// session: f must leave a session alone while it runs.
+// each session of the task a SessionEnd hook is for, whether or not it set
+// the session ended (a session atl stopped, or launched again since, keeps
+// its state: see store.EndLive). The gate has it end what the session
+// leaves running in the container once its Claude is gone
+// (sandbox.EndSessionCmd). Claude also reports a SessionEnd for /clear and
+// goes on, a killed Claude's can come after a resume has started the next
+// one, and the task can send one for any session: f must leave a session
+// alone while it runs.
 func (s *TaskServer) OnSessionEnd(f func(session int64)) { s.d.ended = f }
 
 // SetROMounts sets the host paths the task has read-only (the gate's

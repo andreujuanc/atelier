@@ -67,8 +67,8 @@ type db struct {
 	// place a transcript path from the task may point into (see
 	// transcriptIn), since atl reads that file later where it runs.
 	claudeDir string
-	// ended, if set, is told each session a SessionEnd set ended (see
-	// TaskServer.OnSessionEnd).
+	// ended, if set, is told each session a SessionEnd is for, whether it
+	// set it ended or not (see TaskServer.OnSessionEnd).
 	ended func(session int64)
 	// roMounts are, with scope, the host paths the task has read-only
 	// ($ATL_SANDBOX_MOUNTS): its session context names them.
