@@ -237,10 +237,10 @@ func writeShow(w io.Writer, d *app.TaskDetail) {
 			fmt.Fprintf(w, "    title       %s\n", sanitize(title))
 		}
 		if s.ClaudeSessionID != "" {
-			fmt.Fprintf(w, "    claude id   %s\n", s.ClaudeSessionID)
+			fmt.Fprintf(w, "    claude id   %s\n", sanitize(s.ClaudeSessionID))
 		}
 		if s.TranscriptPath != "" {
-			fmt.Fprintf(w, "    transcript  %s\n", s.TranscriptPath)
+			fmt.Fprintf(w, "    transcript  %s\n", sanitize(s.TranscriptPath))
 		}
 	}
 
