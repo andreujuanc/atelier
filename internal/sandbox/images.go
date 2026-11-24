@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // BoxImage is the default name of atelier's box image ($ATL_BOX_IMAGE of
@@ -42,7 +43,9 @@ func (r imageRef) same(o imageRef) bool {
 var (
 	refDomain = regexp.MustCompile(`^(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))*(?::[0-9]+)?$`)
 	refPath   = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$`)
-	refTag    = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+	// Compiled on first use (its counted repetition is costly to build), not
+	// by every atl process (each hook) at start.
+	refTag    = sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`) })
 	refDigest = regexp.MustCompile(`^[a-z0-9]+(?:[.+_-][a-z0-9]+)*:[a-zA-Z0-9=_-]{32,}$`)
 )
 
@@ -62,7 +65,7 @@ func parseImageRef(s string) (imageRef, error) {
 	}
 	if i := strings.LastIndexByte(rest, ':'); i > strings.LastIndexByte(rest, '/') {
 		rest, r.tag = rest[:i], rest[i+1:]
-		if !refTag.MatchString(r.tag) {
+		if !refTag().MatchString(r.tag) {
 			return imageRef{}, fmt.Errorf("invalid image reference %q", s)
 		}
 	}
