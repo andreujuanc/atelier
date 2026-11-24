@@ -221,7 +221,8 @@ func TestWriteSettingsMerge(t *testing.T) {
 }
 
 func TestWriteSettingsInvalidJSON(t *testing.T) {
-	for _, bad := range []string{`{"permissions": `, `[1,2]`, `{"hooks": []}`, `{"hooks": {"Stop": {}}}`, `null`} {
+	for _, bad := range []string{`{"permissions": `, `[1,2]`, `{"hooks": []}`, `{"hooks": {"Stop": {}}}`, `null`,
+		`{"model": "x"} {}`, `{"model": "x"} garbage`, `{"model": "x"}]`} {
 		dir := t.TempDir()
 		path := filepath.Join(dir, ".claude", "settings.json")
 		os.MkdirAll(filepath.Dir(path), 0o755)
