@@ -27,6 +27,8 @@ func TestMain(m *testing.M) {
 		os.Exit(Main(strings.Fields(os.Getenv("ATL_HOOK_TEST_ARGS"))))
 	case "statusline":
 		os.Exit(StatusLineMain())
+	case "noop": // the bare start of a re-exec (see checkLatency)
+		os.Exit(0)
 	}
 	for _, kv := range os.Environ() {
 		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "ATL_") {
@@ -662,6 +664,51 @@ func runMain(t *testing.T, args, stdin string) (exit int, stdout, stderr string,
 	return exit, out.String(), errb.String(), wall
 }
 
+// latencyLimit bounds the median wall time a re-exec'd hook or status line
+// adds to a bare start of the test binary.
+const latencyLimit = 200 * time.Millisecond
+
+// checkLatency fails t if one call of measure (a re-exec of the test
+// binary as the hook or status line; it returns the wall time) takes more
+// than latencyLimit over a bare re-exec, in median. Each round runs 7
+// calls, each next to a bare re-exec, after a warm-up. A loaded machine
+// (go test runs packages in parallel) slows process starts and the
+// database alike, so a round over the limit is run again, up to 3 rounds:
+// a real slowdown fails them all.
+func checkLatency(t *testing.T, name string, measure func() time.Duration) {
+	t.Helper()
+	bare := func() time.Duration {
+		cmd := exec.Command(os.Args[0])
+		cmd.Env = append(os.Environ(), "ATL_HOOK_TEST_MAIN=noop")
+		start := time.Now()
+		if err := cmd.Run(); err != nil {
+			t.Fatal(err)
+		}
+		return time.Since(start)
+	}
+	median := func(d []time.Duration) time.Duration {
+		sort.Slice(d, func(i, j int) bool { return d[i] < d[j] })
+		return d[len(d)/2]
+	}
+	measure() // warm the page cache
+	var excess time.Duration
+	for round := 1; round <= 3; round++ {
+		var walls, bases []time.Duration
+		for i := 0; i < 7; i++ {
+			bases = append(bases, bare())
+			walls = append(walls, measure())
+		}
+		m, b := median(walls), median(bases)
+		excess = m - b
+		t.Logf("%s wall time (re-exec of test binary), round %d: min %v, median %v, max %v; bare start median %v",
+			name, round, walls[0], m, walls[len(walls)-1], b)
+		if excess <= latencyLimit {
+			return
+		}
+	}
+	t.Errorf("%s: median latency over a bare start %v exceeds %v in 3 rounds", name, excess, latencyLimit)
+}
+
 func readLog(t *testing.T, p config.Paths) string {
 	t.Helper()
 	b, err := os.ReadFile(p.HookLog())
@@ -746,21 +793,13 @@ func TestMainProcess(t *testing.T) {
 			t.Skip("race-instrumented binaries start too slowly to measure hook latency")
 		}
 		in := `{"session_id":"c-main","cwd":"` + f.p.TaskDir("fix") + `","hook_event_name":"SessionStart","source":"startup","transcript_path":"/tmp/t.jsonl"}`
-		runMain(t, "SessionStart", in) // warm the page cache
-		var walls []time.Duration
-		for i := 0; i < 7; i++ {
+		checkLatency(t, "SessionStart hook", func() time.Duration {
 			exit, out, errOut, wall := runMain(t, "SessionStart", in)
 			if exit != 0 || errOut != "" || !strings.Contains(sessionStartContext(t, out), "- Slug: fix") {
 				t.Fatalf("exit=%d stdout=%q stderr=%q", exit, out, errOut)
 			}
-			walls = append(walls, wall)
-		}
-		sort.Slice(walls, func(i, j int) bool { return walls[i] < walls[j] })
-		median := walls[len(walls)/2]
-		t.Logf("SessionStart hook wall time (re-exec of test binary): min %v, median %v, max %v", walls[0], median, walls[len(walls)-1])
-		if median > 200*time.Millisecond {
-			t.Errorf("median hook latency %v exceeds 200ms", median)
-		}
+			return wall
+		})
 		if strings.Contains(readLog(t, f.p), "SessionStart") {
 			t.Errorf("unexpected errors logged: %s", readLog(t, f.p))
 		}
