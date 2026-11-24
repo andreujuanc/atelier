@@ -38,6 +38,9 @@ type daemon struct {
 	// did not exist when the create reached the daemon (which would create
 	// them itself, without the task's label).
 	volumesMissing []string
+	// attached are the daemon's ends of attach streams, in the order they
+	// came: a quiet container, until the test writes to one or closes it.
+	attached []net.Conn
 }
 
 type object struct {
@@ -82,7 +85,14 @@ func newDaemon(t *testing.T) (*daemon, string) {
 	}
 	srv := &http.Server{Handler: d}
 	go srv.Serve(l)
-	t.Cleanup(func() { srv.Close() })
+	t.Cleanup(func() {
+		srv.Close()
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for _, conn := range d.attached {
+			conn.Close()
+		}
+	})
 	return d, sock
 }
 
@@ -174,6 +184,16 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		io.WriteString(w, `{}`)
+	case r.Method == "POST" && len(parts) == 3 && parts[2] == "attach" && obj != nil:
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		d.mu.Lock()
+		d.attached = append(d.attached, conn)
+		d.mu.Unlock()
+		io.WriteString(conn, "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\n"+
+			"Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
 	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/create"):
 		w.WriteHeader(http.StatusCreated)
 		io.WriteString(w, `{"Id":"new1"}`)
@@ -592,6 +612,68 @@ func TestGateForgetsGoneExecs(t *testing.T) {
 	}
 	if status, out := c.do("GET", "/exec/"+kept+"/json", ""); status != http.StatusOK {
 		t.Errorf("an exec the daemon still knows: %d %s", status, out)
+	}
+}
+
+// TestGateAttachEndsWithTheClient: an attach stream lasts as long as its
+// client. One that only stops sending (docker run without -i) still gets
+// what the container prints; one that hangs up ends the stream, even of a
+// container that prints nothing, instead of holding the gate's handler and
+// the daemon's attach until the container writes or exits.
+func TestGateAttachEndsWithTheClient(t *testing.T) {
+	d, upstream := newDaemon(t)
+	g := &Gate{ID: testID, Root: t.TempDir(), Upstream: upstream}
+	ended := make(chan struct{}, 2)
+	sock := filepath.Join(t.TempDir(), "gate.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.ServeHTTP(w, r)
+		ended <- struct{}{}
+	})}
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+	attach := func() (client *net.UnixConn, in *bufio.Reader, container net.Conn) {
+		t.Helper()
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		io.WriteString(conn, "POST /v1.45/containers/mine/attach?stream=1&stdout=1 HTTP/1.1\r\nHost: d\r\n"+
+			"Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+		in = bufio.NewReader(conn)
+		resp, err := http.ReadResponse(in, nil)
+		if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("attach: %v %v", resp, err)
+		}
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return conn.(*net.UnixConn), in, d.attached[len(d.attached)-1]
+	}
+
+	client, in, container := attach()
+	client.CloseWrite()
+	time.Sleep(3 * hangupCheck)
+	io.WriteString(container, "late\n")
+	if line, err := in.ReadString('\n'); line != "late\n" {
+		t.Errorf("after the client stopped sending, it got %q, %v; want the container's output", line, err)
+	}
+	container.Close()
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream did not end with the container's")
+	}
+
+	client, _, _ = attach()
+	client.Close()
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream of a quiet container outlived its client")
 	}
 }
 

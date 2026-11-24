@@ -21,6 +21,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Labels the gate puts on Docker objects. Their value is the sandbox ID.
@@ -335,13 +338,61 @@ func (g *Gate) stream(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(conn, "HTTP/1.1 %s\r\n", resp.Status)
 	resp.Header.Write(conn)
 	io.WriteString(conn, "\r\n")
+	done := make(chan struct{})
+	defer close(done)
 	go func() { // client to daemon; when the client is done sending, say so and keep reading
 		io.Copy(back, client)
 		if c, ok := back.(*net.UnixConn); ok {
 			c.CloseWrite()
 		}
+		// ...until it hangs up: a quiet container would otherwise hold
+		// the stream until it next prints or exits.
+		if awaitHangup(conn, done) {
+			back.Close()
+		}
 	}()
 	io.Copy(conn, fromBack)
+}
+
+// hangupCheck is how often awaitHangup looks.
+const hangupCheck = 500 * time.Millisecond
+
+// awaitHangup waits until conn, a client that has stopped sending, hangs
+// up altogether, and reports whether it did; false once done is closed. A
+// unix socket tells that apart from a client that only shut its sending
+// side and still reads (docker run without -i): POLLHUP. Other conns are
+// not watched.
+func awaitHangup(conn net.Conn, done <-chan struct{}) bool {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return false
+	}
+	rc, err := uc.SyscallConn()
+	if err != nil {
+		return false
+	}
+	tick := time.NewTicker(hangupCheck)
+	defer tick.Stop()
+	for {
+		hup := false
+		err := rc.Control(func(fd uintptr) {
+			fds := []unix.PollFd{{Fd: int32(fd)}}
+			if n, _ := unix.Poll(fds, 0); n > 0 {
+				hup = fds[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0
+			}
+		})
+		switch {
+		case err != nil:
+			return false
+		case hup:
+			return true
+		}
+		select {
+		case <-done:
+			return false
+		case <-tick.C:
+		}
+	}
 }
 
 func decodeBody(r *http.Request) (map[string]any, error) {
