@@ -242,11 +242,12 @@ func TestWriteSettingsInvalidJSON(t *testing.T) {
 
 // TestWriteSettingsNullHooks: "hooks": null, or null for an event's list,
 // is no hooks, not an invalid file: the user's other keys and hooks are
-// kept and nothing is backed up.
+// kept, nothing is backed up and no null is written back.
 func TestWriteSettingsNullHooks(t *testing.T) {
 	for _, settings := range []string{
 		`{"model": "x", "hooks": null}`,
 		`{"model": "x", "hooks": {"Stop": null, "PreCompact": [{"hooks": [{"type": "command", "command": "mine"}]}]}}`,
+		`{"model": "x", "hooks": {"PreCompact": null}}`,
 	} {
 		dir := t.TempDir()
 		path := filepath.Join(dir, ".claude", "settings.json")
@@ -261,6 +262,9 @@ func TestWriteSettingsNullHooks(t *testing.T) {
 		checkAtelierHooks(t, sf, "/bin/atl")
 		if raw["model"] != "x" || strings.Contains(settings, "mine") && !strings.Contains(text, `"mine"`) {
 			t.Errorf("%s: user settings lost:\n%s", settings, text)
+		}
+		if strings.Contains(text, "null") {
+			t.Errorf("%s: null written back:\n%s", settings, text)
 		}
 		if _, err := os.Stat(path + ".bak"); err == nil {
 			t.Errorf("%s: backed up as invalid", settings)
