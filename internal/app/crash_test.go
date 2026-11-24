@@ -236,8 +236,15 @@ func TestRecoverAfterKilledNewSession(t *testing.T) {
 	}
 }
 
-// worktreeAddCall matches the git call that adds rw repo name's worktree.
-func worktreeAddCall(name string) string { return `*" worktree add "*/` + name + `" "*` }
+// atl adds a worktree itself (gitx.AddWorktree). worktreeAddCall matches
+// the git call in rw repo name's clone right before it makes anything of
+// the worktree (the new branch, or the check that the branch is free);
+// worktreeCheckoutCall the checkout that ends the add (after it, only the
+// registration's lock is left to remove).
+func worktreeAddCall(name string) string {
+	return `*"/repos/` + name + ` "*" branch --quiet "*|*"/repos/` + name + ` worktree list "*`
+}
+func worktreeCheckoutCall(name string) string { return `*"/` + name + ` "*" reset --hard "*` }
 
 // atl removes a worktree itself (gitx.RemoveWorktree), after git calls in
 // it. worktreeCheckCall matches the check of rw repo name's worktree (the
@@ -305,7 +312,7 @@ func TestKilledNewTask(t *testing.T) {
 	for _, kill := range []killPoint{
 		{Cmd: "git", Args: worktreeAddCall("api")},
 		{Cmd: "git", Args: worktreeAddCall("web")},
-		{Cmd: "git", Args: worktreeAddCall("web"), After: true},
+		{Cmd: "git", Args: worktreeCheckoutCall("web"), After: true},
 	} {
 		t.Run(fmt.Sprintf("%+v", kill), func(t *testing.T) {
 			e := newTaskEnv(t)
@@ -335,8 +342,8 @@ func TestKilledNewTask(t *testing.T) {
 func TestKilledAddRepo(t *testing.T) {
 	for i, kill := range []killPoint{
 		{Cmd: "git", Args: worktreeAddCall("web")},
-		{Cmd: "git", Args: worktreeAddCall("web"), After: true},
-		{Cmd: "git", Args: worktreeAddCall("web"), After: true},
+		{Cmd: "git", Args: worktreeCheckoutCall("web"), After: true},
+		{Cmd: "git", Args: worktreeCheckoutCall("web"), After: true},
 	} {
 		t.Run(fmt.Sprintf("%d %+v", i, kill), func(t *testing.T) {
 			e := newTaskEnv(t)
@@ -412,7 +419,7 @@ func TestKilledReopen(t *testing.T) {
 	for _, kill := range []killPoint{
 		{Cmd: "git", Args: worktreeAddCall("api")},
 		{Cmd: "git", Args: worktreeAddCall("web")},
-		{Cmd: "git", Args: worktreeAddCall("web"), After: true},
+		{Cmd: "git", Args: worktreeCheckoutCall("web"), After: true},
 	} {
 		t.Run(fmt.Sprintf("%+v", kill), func(t *testing.T) {
 			e := newTaskEnv(t)

@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -463,34 +464,167 @@ func RevParse(ctx context.Context, repo, rev string) (string, error) {
 // askpass and ssh command are the user's own here (as for a push), and the
 // LFS server must be the pinned origin's (see lfsHazards).
 func AddWorktree(ctx context.Context, repo, path, branch, startPoint string, origin Origin) error {
-	return addWorktree(ctx, repo, path, origin, func(abs string) []string {
-		return []string{"-b", branch, abs, startPoint}
+	return addWorktree(ctx, repo, path, branch, origin, func(cfg []string) error {
+		// As `git worktree add -b` does it.
+		_, err := run(ctx, repo, append(cfg, "branch", "--quiet", branch, startPoint)...)
+		return err
 	})
 }
 
 // AddBranchWorktree creates a new worktree at path on the existing local
-// branch, with the checks of AddWorktree. git refuses a branch that another
-// worktree has checked out.
+// branch, with the checks of AddWorktree. A branch that another worktree
+// has checked out is refused, as git does.
 func AddBranchWorktree(ctx context.Context, repo, path, branch string, origin Origin) error {
-	return addWorktree(ctx, repo, path, origin, func(abs string) []string {
-		return []string{abs, branch}
+	return addWorktree(ctx, repo, path, branch, origin, func([]string) error {
+		out, err := run(ctx, repo, "worktree", "list", "--porcelain", "-z")
+		if err != nil {
+			return err
+		}
+		for _, f := range strings.Split(out, "\x00") {
+			if f == "branch refs/heads/"+branch {
+				return &Error{Args: []string{"worktree", "add", path, branch}, ExitCode: 128,
+					Stderr: fmt.Sprintf("fatal: '%s' is already used by a worktree", branch)}
+			}
+		}
+		return nil
 	})
 }
 
-// addWorktree runs `git worktree add` with what args returns for the
-// absolute path, after the checks of AddWorktree.
-func addWorktree(ctx context.Context, repo, path string, origin Origin, args func(abs string) []string) error {
+// addWorktree adds a worktree at path on branch, as `git worktree add` does,
+// after the checks of AddWorktree and once branch (made ready by the
+// caller's) can be checked out: it makes the worktree dir, registers it in
+// repo (<repo>/.git/worktrees/<id>: gitdir, commondir, HEAD; locked while
+// it is made) and checks branch out there with `git reset --hard`.
+//
+// git worktree add is not run: when it fails after it made the
+// registration dir, it deletes that dir and the worktree by path (an lstat,
+// then an opendir per entry). Every task with the repo rw writes its git
+// dir, so a neighbouring task could make the checkout fail (an index.lock
+// in the new registration dir) and swap a directory there for a symlink as
+// the deletion starts: git would delete on the host what it points to.
+// Here the registration is made, and a failed add undone, through file
+// descriptors (package nofollow, RemoveWorktree).
+func addWorktree(ctx context.Context, repo, path, branch string, origin Origin, prepare func(cfg []string) error) error {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("add worktree %s: %w", path, err)
+	}
+	fail := func(msg string) error {
+		return &Error{Args: []string{"worktree", "add", abs}, ExitCode: 128, Stderr: "fatal: " + msg}
 	}
 	cfg := userTransportArgs(ctx, repo)
 	if err := checkHazards(ctx, repo, opCheckout, &origin, cfg); err != nil {
 		return err
 	}
-	full := append(cfg, "worktree", "add")
-	_, err = run(ctx, repo, append(full, args(abs)...)...)
-	return err
+	if entries, err := os.ReadDir(abs); err == nil && len(entries) > 0 || err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fail(fmt.Sprintf("'%s' already exists", abs))
+	}
+	gitDir, err := nofollow.Open(filepath.Join(repo, ".git"))
+	if err != nil {
+		return fmt.Errorf("add worktree %s: %w", abs, err)
+	}
+	defer gitDir.Close()
+	if ids, err := worktreeIDs(gitDir, abs); err != nil {
+		return fmt.Errorf("add worktree %s: %w", abs, err)
+	} else if len(ids) > 0 {
+		return fail(fmt.Sprintf("'%s' is a missing but already registered worktree", abs))
+	}
+	if err := prepare(cfg); err != nil {
+		return err
+	}
+	made := false
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return fmt.Errorf("add worktree %s: %w", abs, err)
+	}
+	if err := os.Mkdir(abs, 0o755); err == nil {
+		made = true
+	} else if !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("add worktree %s: %w", abs, err)
+	}
+	id, err := register(gitDir, abs, branch)
+	if err == nil {
+		err = linkWorktree(gitDir, abs, id)
+	}
+	if err == nil {
+		_, err = run(ctx, abs, append(cfg, "reset", "--hard", "--no-recurse-submodules", "--quiet")...)
+	}
+	if err == nil {
+		err = gitDir.Remove("worktrees/" + id + "/locked")
+	}
+	if err != nil {
+		// Undone as git would, without following a symlink: the worktree
+		// dir (only if made here) and the registration.
+		if id != "" {
+			gitDir.RemoveAll("worktrees/" + id)
+		}
+		if made {
+			os.RemoveAll(abs)
+		}
+		return err
+	}
+	return nil
+}
+
+// register makes the registration of a new worktree at path, on branch, in
+// gitDir (a repo's own git dir): worktrees/<id>, id the first free of
+// path's base name, and that name with 1, 2, ... after it, as git names
+// it. It is locked ("initializing") until the worktree is checked out.
+func register(gitDir *nofollow.Dir, path, branch string) (id string, err error) {
+	if err := gitDir.MkdirAll("worktrees", 0o755); err != nil {
+		return "", fmt.Errorf("add worktree %s: %w", path, err)
+	}
+	name := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, filepath.Base(path))
+	for i := 0; ; i++ {
+		id = name
+		if i > 0 {
+			id = name + strconv.Itoa(i)
+		}
+		err := gitDir.Mkdir("worktrees/"+id, 0o755)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrExist) || i >= 1000 {
+			return "", fmt.Errorf("add worktree %s: %w", path, err)
+		}
+	}
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return id, fmt.Errorf("add worktree %s: %w", path, err)
+	}
+	for _, f := range []struct{ name, content string }{
+		{"locked", "initializing"},
+		{"gitdir", real + "/.git\n"},
+		{"commondir", "../..\n"},
+		{"HEAD", "ref: refs/heads/" + branch + "\n"},
+	} {
+		if err := gitDir.WriteFile("worktrees/"+id+"/"+f.name, []byte(f.content), 0o644); err != nil {
+			return id, fmt.Errorf("add worktree %s: %w", path, err)
+		}
+	}
+	return id, nil
+}
+
+// linkWorktree writes the .git file of the worktree at path, which points
+// to its registration id in gitDir (without following a symlink there).
+func linkWorktree(gitDir *nofollow.Dir, path, id string) error {
+	common := gitDir.Path()
+	if real, err := filepath.EvalSymlinks(common); err == nil {
+		common = real
+	}
+	wt, err := nofollow.Open(path)
+	if err != nil {
+		return fmt.Errorf("add worktree %s: %w", path, err)
+	}
+	defer wt.Close()
+	if err := wt.WriteFile(".git", []byte("gitdir: "+filepath.Join(common, "worktrees", id)+"\n"), 0o644); err != nil {
+		return fmt.Errorf("add worktree %s: %w", path, err)
+	}
+	return nil
 }
 
 // RemoveWorktree removes the worktree at path (with force even if it has

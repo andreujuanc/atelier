@@ -274,6 +274,20 @@ func (d *Dir) MkdirAll(rel string, perm os.FileMode) error {
 	return nil
 }
 
+// Mkdir creates the directory rel, mode perm (before the umask); one that
+// exists already (anything at rel) is an error, fs.ErrExist.
+func (d *Dir) Mkdir(rel string, perm os.FileMode) error {
+	fd, base, err := d.parent("mkdir", rel)
+	if err != nil {
+		return err
+	}
+	defer d.closeParent(fd)
+	if err := unix.Mkdirat(fd, base, uint32(perm.Perm())); err != nil {
+		return pathErr("mkdir", d.join(rel), err)
+	}
+	return nil
+}
+
 // Remove removes the file, symlink or empty directory rel, without
 // following a symlink.
 func (d *Dir) Remove(rel string) error {

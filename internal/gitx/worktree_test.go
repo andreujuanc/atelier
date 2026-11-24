@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -218,4 +219,99 @@ func TestReplaceRefsAreNotRead(t *testing.T) {
 	if _, subject, _, err := LastCommit(ctx, wt); err != nil || strings.Contains(subject, "private") {
 		t.Errorf("last commit = %q, %v", subject, err)
 	}
+}
+
+// TestAddWorktreeFailureFollowsNoSwappedDir: a task with the repo rw (it
+// writes the clone's git dir) watches worktrees/ while atl adds a worktree
+// for another task. In the registration dir that appears it makes the
+// checkout fail (index.lock) and plants a directory that it swaps for a
+// symlink to the user's files once the clean-up of the failed add deletes
+// in it. The add fails, and deletes nothing outside the repo.
+func TestAddWorktreeFailureFollowsNoSwappedDir(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	base, err := RevParse(ctx, f.repo, "origin/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim := t.TempDir()
+	var names []string
+	for i := range 40 {
+		name := fmt.Sprintf("t%02d", i)
+		names = append(names, name)
+		writeFile(t, filepath.Join(victim, name, "keep"), "mine\n")
+	}
+	admin := filepath.Join(f.repo, ".git", "worktrees")
+	must(t, os.MkdirAll(admin, 0o755))
+	trap := filepath.Join(f.repo, ".git", "trap") // built ahead, moved in at once
+	for i := range 3000 {
+		writeFile(t, filepath.Join(trap, fmt.Sprintf("f%04d", i)), "")
+	}
+	for _, name := range names {
+		writeFile(t, filepath.Join(trap, name, "keep"), "")
+	}
+	stop := plantOnAdd(t, admin, trap, victim)
+	err = AddWorktree(ctx, f.repo, filepath.Join(f.root, "wt-new"), "atl/new", base, to(f.origin))
+	stop()
+	for _, name := range names {
+		if _, err := os.Stat(filepath.Join(victim, name, "keep")); err != nil {
+			t.Fatalf("a file outside the repo was deleted: %v", err)
+		}
+	}
+	if err == nil {
+		t.Fatal("the add went through a failed checkout")
+	}
+}
+
+// plantOnAdd watches admin; in the first directory made there it moves
+// trap (as "a") and an index.lock; at the first deletion in the trap it
+// swaps it for a symlink to target. stop ends the watch.
+func plantOnAdd(t *testing.T, admin, trap, target string) (stop func()) {
+	t.Helper()
+	fd, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wAdmin, err := unix.InotifyAddWatch(fd, admin, unix.IN_CREATE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wTrap, err := unix.InotifyAddWatch(fd, trap, unix.IN_DELETE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, ended := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(ended)
+		defer unix.Close(fd)
+		buf := make([]byte, 64<<10)
+		planted := ""
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if n, _ := unix.Poll([]unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}, 10); n <= 0 {
+				continue
+			}
+			n, _ := unix.Read(fd, buf)
+			for off := 0; off+unix.SizeofInotifyEvent <= n; {
+				ev := (*unix.InotifyEvent)(unsafe.Pointer(&buf[off]))
+				name := strings.TrimRight(string(buf[off+unix.SizeofInotifyEvent:off+unix.SizeofInotifyEvent+int(ev.Len)]), "\x00")
+				off += unix.SizeofInotifyEvent + int(ev.Len)
+				switch {
+				case int(ev.Wd) == wAdmin && ev.Mask&unix.IN_ISDIR != 0 && planted == "":
+					planted = filepath.Join(admin, name, "a")
+					os.Rename(trap, planted)
+					os.WriteFile(filepath.Join(admin, name, "index.lock"), nil, 0o644)
+				case int(ev.Wd) == wTrap && planted != "":
+					os.Rename(planted, planted+".aside")
+					os.Symlink(target, planted)
+					return
+				}
+			}
+		}
+	}()
+	return func() { close(done); <-ended }
 }

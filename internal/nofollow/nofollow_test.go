@@ -184,3 +184,24 @@ func TestRemoveAllDoesNotFollowSymlinks(t *testing.T) {
 	unchanged(t, victim, "the user's file\n")
 	unchanged(t, filepath.Join(victimDir, "f"), "the user's other file\n")
 }
+
+// Mkdir makes a new directory only: not over anything, not through a
+// symlink.
+func TestMkdir(t *testing.T) {
+	d, root, _, victimDir := setup(t)
+	must(t, d.Mkdir("new", 0o755))
+	if fi, err := os.Lstat(filepath.Join(root, "new")); err != nil || !fi.IsDir() {
+		t.Fatalf("new: %v, %v", fi, err)
+	}
+	for _, rel := range []string{"new", "sub", "link", "dirlink"} {
+		if err := d.Mkdir(rel, 0o755); !errors.Is(err, fs.ErrExist) {
+			t.Errorf("Mkdir(%s) = %v, want ErrExist", rel, err)
+		}
+	}
+	if err := d.Mkdir("dirlink/x", 0o755); !errors.Is(err, ErrSymlink) {
+		t.Errorf("Mkdir(dirlink/x) = %v, want ErrSymlink", err)
+	}
+	if _, err := os.Stat(filepath.Join(victimDir, "x")); err == nil {
+		t.Error("a directory was made through the symlink")
+	}
+}
