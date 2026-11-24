@@ -10,7 +10,7 @@
 #   ATL_BUILD_BOX      0: build only the task image (atl on the host needs
 #                      nothing else); default 1
 set -eu
-here=$(cd "$(dirname "$0")" && pwd)
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 box=${ATL_BOX_IMAGE:-atelier}
 task=${ATL_SANDBOX_IMAGE:-atelier-task}
 build_box=${ATL_BUILD_BOX:-1}
