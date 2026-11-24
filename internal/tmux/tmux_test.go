@@ -672,3 +672,33 @@ func TestArgsEndingInSemicolon(t *testing.T) {
 		}
 	}
 }
+
+// TestNewWindowFormatChars: tmux expands formats (#{...}, #(command)) in a
+// new window's directory, name and session name; atl's are taken as they
+// are.
+func TestNewWindowFormatChars(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "a#{session_name}##b")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pwdFile := filepath.Join(filepath.Dir(dir), "pwd")
+	script := fmt.Sprintf("pwd > %s.tmp && mv %s.tmp %s; exec sleep 300", pwdFile, pwdFile, pwdFile)
+	for _, session := range []string{"atl-#{host}", "atl-#{host}"} { // new-session, then new-window
+		if _, err := c.NewWindow(ctx, WindowSpec{Session: session, Name: "w#{window_id}", Dir: dir, Argv: []string{"sh", "-c", script}}); err != nil {
+			t.Fatalf("NewWindow: %v", err)
+		}
+		realDir, _ := filepath.EvalSymlinks(dir)
+		if got := strings.TrimSpace(waitFile(t, pwdFile)); got != dir && got != realDir {
+			t.Errorf("window dir = %q, want %q", got, dir)
+		}
+		os.Remove(pwdFile)
+	}
+	if !c.HasSession(ctx, "atl-#{host}") {
+		t.Error("session atl-#{host} missing")
+	}
+	if names, err := c.run(ctx, "list-windows", "-t", "=atl-#{host}", "-F", "#{window_name}"); err != nil || names != "w#{window_id}\nw#{window_id}" {
+		t.Errorf("window names = %q, %v", names, err)
+	}
+}

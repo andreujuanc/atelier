@@ -426,18 +426,21 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	if err != nil {
 		return "", err
 	}
+	// tmux expands formats (#{...}, #(command)) in a new session's name and
+	// a new window's name and directory: "##" there is a "#".
+	noFormat := func(s string) string { return strings.ReplaceAll(s, "#", "##") }
 	build := func(exists bool) [][]string {
 		var args []string
 		if exists {
 			args = []string{"new-window", "-t", "=" + spec.Session + ":"}
 		} else {
-			args = []string{"new-session", "-d", "-s", spec.Session}
+			args = []string{"new-session", "-d", "-s", noFormat(spec.Session)}
 		}
 		if spec.Name != "" {
-			args = append(args, "-n", spec.Name)
+			args = append(args, "-n", noFormat(spec.Name))
 		}
 		if spec.Dir != "" {
-			args = append(args, "-c", spec.Dir)
+			args = append(args, "-c", noFormat(spec.Dir))
 		}
 		keys := make([]string, 0, len(spec.Env))
 		for k := range spec.Env {
