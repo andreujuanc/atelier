@@ -260,23 +260,32 @@ func refuseOversized(stderr io.Writer, tool string) int {
 
 // partialInput recovers session_id, cwd, tool_name and tool_input's
 // file_path/notebook_path from a possibly truncated or malformed hook JSON
-// object by decoding it token by token and stopping at the first error.
+// object by decoding it token by token and stopping at the first syntax
+// error (a value of the wrong type is ignored, as json.Unmarshal does).
 // Other values (e.g. a huge "content" string) are skipped without being
 // kept. As with json.Unmarshal, a duplicate key's last value wins (as far
 // as the input could be read). ok reports whether a target path was found.
 func partialInput(data []byte) (in Input, ok bool) {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	str := func(dst *string) error {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return err
+		}
+		_ = json.Unmarshal(raw, dst) // not a string: left as it was
+		return nil
+	}
 	var targets map[string]string
 	_ = walkObject(dec, func(key string) error {
 		switch key {
 		case "session_id":
-			return dec.Decode(&in.SessionID)
+			return str(&in.SessionID)
 		case "cwd":
-			return dec.Decode(&in.Cwd)
+			return str(&in.Cwd)
 		case "tool_name":
-			return dec.Decode(&in.ToolName)
+			return str(&in.ToolName)
 		case "hook_event_name":
-			return dec.Decode(&in.HookEventName)
+			return str(&in.HookEventName)
 		case "tool_input":
 			targets = map[string]string{} // a later tool_input replaces an earlier one
 			return walkObject(dec, func(key string) error {
