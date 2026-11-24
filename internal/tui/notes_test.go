@@ -710,3 +710,39 @@ func TestWrappedNotesCache(t *testing.T) {
 		}
 	}
 }
+
+// TestNotesTooManyLines: notes with more lines than the editor takes are
+// not opened (atl notes --set is the way), nor reloaded into an open
+// editor, which keeps the user's text; a reload that fails keeps it too.
+func TestNotesTooManyLines(t *testing.T) {
+	long := strings.Repeat("x\n", maxEditLines)
+	fb := &fakeBackend{tasks: sampleTasks(), notesText: map[string]string{"gamma": long}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+	key(m, "m")
+	if m.mode != modeNormal || m.notes != nil || !m.statusErr || !strings.Contains(m.status, "too many lines") ||
+		!strings.Contains(m.status, "atl notes gamma --set") || len(m.busy) != 0 {
+		t.Fatalf("open: mode %v status %q busy %v", m.mode, m.status, m.busy)
+	}
+
+	fb.notesText["gamma"] = "short"
+	key(m, "m")
+	if m.mode != modeNotes {
+		t.Fatalf("short notes not opened: mode %v status %q", m.mode, m.status)
+	}
+	typeText(m, "mine ")
+	edited := m.notes.ta.Value()
+	fb.notesText["gamma"] = long
+	key(m, "ctrl+r")
+	if m.mode != modeNotes || m.notes.ta.Value() != edited || !m.statusErr || !strings.Contains(m.status, "reload notes: too many lines") {
+		t.Fatalf("reload of long notes: mode %v value %q status %q", m.mode, m.notes.ta.Value(), m.status)
+	}
+	fb.notesErr = errors.New("boom")
+	key(m, "ctrl+r")
+	if m.mode != modeNotes || m.notes.ta.Value() != edited || !strings.Contains(m.status, "reload notes: boom") {
+		t.Fatalf("failed reload: mode %v value %q status %q", m.mode, m.notes.ta.Value(), m.status)
+	}
+	if m.notes.loading {
+		t.Fatal("still loading after the reload answered")
+	}
+}
