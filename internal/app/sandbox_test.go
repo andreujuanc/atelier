@@ -261,7 +261,6 @@ type fakeDocker struct {
 	down    bool            // the daemon cannot be reached
 	ps      string          // what the activity probe prints (sandbox.ActivityArgs)
 	onRm    func()          // called on docker rm
-	noHome  bool            // $HOME in the container is not the user's to write to, until made as root
 }
 
 // fakeContainerID is the full ID of fakeDocker's container.
@@ -319,12 +318,6 @@ func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 	case "exec":
 		if args[len(args)-1] == "atl-activity" {
 			return f.ps, nil
-		}
-		if f.noHome && slices.Contains(args, "sh") {
-			if args[1] != "-u" {
-				return "", errors.New("docker exec: exit status 1")
-			}
-			f.noHome = false
 		}
 	}
 	return "", nil
@@ -1364,10 +1357,10 @@ func TestSandboxProjectPath(t *testing.T) {
 // TestSandboxMakesHome: the task container's $HOME is the host user's home
 // dir, which an image built for /home/<user> lacks when the host keeps it
 // elsewhere (/var/home/<user>): the new container gets it, made as root and
-// handed to the user, before the session starts.
+// handed to the user (with what docker made below it for mount points),
+// before the session starts.
 func TestSandboxMakesHome(t *testing.T) {
 	e, fd := sandboxEnv(t)
-	fd.noHome = true
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
@@ -1392,7 +1385,7 @@ func TestSandboxMakesHome(t *testing.T) {
 		}
 	}
 	owner := strconv.Itoa(os.Getuid()) + ":" + strconv.Itoa(os.Getgid())
-	if len(root) < 4 || !slices.Equal(root[:4], []string{"exec", "-u", "0", fakeContainerID}) || root[len(root)-1] != owner || fd.noHome {
-		t.Fatalf("home made with %q (calls %q); want, after docker run, as root in the new container, for %s", root, verbs, owner)
+	if len(root) < 4 || !slices.Equal(root[:4], []string{"exec", "-u", "0", fakeContainerID}) || len(root) < 9 || root[8] != owner || !slices.Contains(root, e.app.Paths.TaskDir("boxed")) {
+		t.Fatalf("home made with %q (calls %q); want, after docker run, as root in the new container, for %s, with the mount points", root, verbs, owner)
 	}
 }

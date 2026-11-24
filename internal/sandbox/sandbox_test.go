@@ -490,16 +490,12 @@ func (s *script) answer(prefix, out string, err error) {
 // agentDaemon is a Runner for Ensure: a daemon with at most the one
 // container named atl-<id>.
 type agentDaemon struct {
-	t      *testing.T
-	c      *container // nil: none
-	calls  []string
-	runErr error      // what docker run fails with
-	winner *container // the container another atl made when run fails with a name conflict
-	// noHome: $HOME is not a directory the container's user can write to
-	// (docker exec as that user fails), until made as root; rootErr is what
-	// docker exec as root fails with.
-	noHome  bool
-	rootErr error
+	t       *testing.T
+	c       *container // nil: none
+	calls   []string
+	runErr  error      // what docker run fails with
+	winner  *container // the container another atl made when run fails with a name conflict
+	rootErr error      // what docker exec fails with
 	execs   [][]string // the docker exec calls
 }
 
@@ -541,15 +537,7 @@ func (d *agentDaemon) run(_ context.Context, args ...string) (string, error) {
 		}
 	case "exec":
 		d.execs = append(d.execs, args)
-		if args[1] != "-u" {
-			if d.noHome {
-				return "", errors.New("docker exec: exit status 1")
-			}
-		} else if d.rootErr != nil {
-			return "", d.rootErr
-		} else {
-			d.noHome = false
-		}
+		return "", d.rootErr
 	}
 	return "", nil
 }
@@ -636,84 +624,164 @@ func TestEnsure(t *testing.T) {
 
 // TestEnsureMakesHome: $HOME is the home dir of the user running atl,
 // which the image has only when built for that path (atelier's images put
-// it in /home/<user>; a host may have it in /var/home/<user>). A new
-// container whose $HOME is not a directory its user can write to gets one,
-// made as root and handed to the user; one where it is gets nothing. If
-// that fails, the container is removed, so that the next try makes it again.
+// it in /home/<user>; a host may have it in /var/home/<user>). Ensure runs
+// homeScript as root in the container it returns, with the user and the
+// mount points: in a new one (removed if that fails, so that the next try
+// makes it again); in the winner's of a name race (kept if that fails, it is
+// theirs); and in one it reuses, once per process (it may predate makeHome,
+// or its creator may have died first), kept if that fails and checked again
+// next time. Not in one kept although it predates a change.
 func TestEnsureMakesHome(t *testing.T) {
 	spec := testSpec()
 	spec.Env["HOME"] = "/var/home/u"
+	spec.Mounts = append(spec.Mounts, Mount{Src: "/var/home/u/ws/t", Dst: "/var/home/u/ws/t"})
 	ctx := context.Background()
 	idle := func() bool { return false }
-
-	d := &agentDaemon{t: t}
-	if id, _, err := Ensure(ctx, d.run, spec, idle, nil); err != nil || d.verbs() != "inspect run exec" || id != newID {
-		t.Fatalf("home usable: %q, %.4s…, %v", d.verbs(), id, err)
-	}
-	if got := d.execs[0][:2]; !slices.Equal(got, []string{"exec", newID}) {
-		t.Errorf("the check runs %q, want it as the container's user, in the new container", got)
-	}
-
-	d = &agentDaemon{t: t, noHome: true}
-	if id, _, err := Ensure(ctx, d.run, spec, idle, nil); err != nil || d.verbs() != "inspect run exec exec" || id != newID || d.noHome {
-		t.Fatalf("home missing: %q, %.4s…, %v, still missing %v", d.verbs(), id, err, d.noHome)
-	}
-	root := d.execs[1]
-	if !slices.Equal(root[:4], []string{"exec", "-u", "0", newID}) || root[len(root)-1] != spec.User {
-		t.Fatalf("made with %q, want as root in the new container, for %s", root, spec.User)
-	}
-	// The scripts do what they say, with a real sh: the check fails on a
-	// missing home, the root script makes it (here owned by the user
-	// running the test, root being out of reach), and the check passes.
-	home := filepath.Join(t.TempDir(), "var", "home", "u")
-	sh := func(argv []string) error {
-		cmd := exec.Command(argv[0], argv[1:]...)
-		cmd.Env = append(os.Environ(), "HOME="+home)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%v: %s", err, out)
-		}
-		return nil
-	}
-	check := d.execs[0][2:]
-	if err := sh(check); err == nil {
-		t.Error("the check passes on a missing home")
-	}
-	owner := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
-	if err := sh(append(slices.Clone(root[4:len(root)-1]), owner)); err != nil {
-		t.Fatalf("the root script: %v", err)
-	}
-	if err := sh(check); err != nil {
-		t.Errorf("the check fails on the home made: %v", err)
-	}
-
-	d = &agentDaemon{t: t, noHome: true, rootErr: errors.New("docker exec: chown: not permitted")}
-	if _, _, err := Ensure(ctx, d.run, spec, idle, nil); err == nil || !strings.Contains(err.Error(), "/var/home/u") ||
-		d.verbs() != "inspect run exec exec rm" || d.c != nil {
-		t.Errorf("home not made: %q, %v; want an error that names it, and the container removed", d.verbs(), err)
-	}
-
-	// Lost the name race to another atl that has not made the home yet (or
-	// died before it did): the loser makes it, in the winner's container,
-	// and leaves that container alone when it cannot.
+	busy := func() bool { return true }
+	failed := errors.New("docker exec: chown: not permitted")
 	conflict := errors.New(`docker run: Conflict. The container name "/atl-t-abc123" is already in use`)
-	d = &agentDaemon{t: t, runErr: conflict, winner: atlsContainer(spec, true, spec.Hash()), noHome: true}
-	if id, _, err := Ensure(ctx, d.run, spec, idle, nil); err != nil || d.verbs() != "inspect run inspect exec exec" || id != oldID || d.noHome {
-		t.Errorf("name race, home missing: %q, %.4s…, %v, still missing %v", d.verbs(), id, err, d.noHome)
-	} else if root := d.execs[1]; !slices.Equal(root[:4], []string{"exec", "-u", "0", oldID}) {
-		t.Errorf("name race: home made with %q, want as root in the winner's container", root)
-	}
-	d = &agentDaemon{t: t, runErr: conflict, winner: atlsContainer(spec, false, spec.Hash()), noHome: true,
-		rootErr: errors.New("docker exec: chown: not permitted")}
-	if _, _, err := Ensure(ctx, d.run, spec, idle, nil); err == nil || d.verbs() != "inspect run inspect start exec exec" || d.c == nil {
-		t.Errorf("name race, home not made: %q, %v; want an error, and the winner's container kept", d.verbs(), err)
+	wantExec := func(name string, d *agentDaemon, id string) {
+		t.Helper()
+		want := []string{"exec", "-u", "0", id, "sh", "-c", homeScript, "sh", "1000:1000", "/tasks/t", RunMount, "/var/home/u/ws/t"}
+		if len(d.execs) != 1 || !slices.Equal(d.execs[0], want) {
+			t.Errorf("%s: docker exec %q, want once %q", name, d.execs, want)
+		}
 	}
 
-	// Without $HOME in the spec, nothing to check.
-	d = &agentDaemon{t: t, noHome: true}
+	for _, tc := range []struct {
+		name    string
+		d       *agentDaemon
+		busy    func() bool
+		want    string // the calls
+		exec    string // the container the home is made in; "" none
+		wantErr bool
+		kept    bool // the container is there afterwards
+	}{
+		{"new", &agentDaemon{}, idle, "inspect run exec", newID, false, true},
+		{"new, home not made", &agentDaemon{rootErr: failed}, idle, "inspect run exec rm", newID, true, false},
+		{"name race", &agentDaemon{runErr: conflict, winner: atlsContainer(spec, true, spec.Hash())}, idle,
+			"inspect run inspect exec", oldID, false, true},
+		{"name race, home not made", &agentDaemon{runErr: conflict, winner: atlsContainer(spec, false, spec.Hash()), rootErr: failed}, idle,
+			"inspect run inspect start exec", oldID, true, true},
+		{"reused, running", &agentDaemon{c: atlsContainer(spec, true, spec.Hash())}, busy, "inspect exec", oldID, false, true},
+		{"reused, stopped", &agentDaemon{c: atlsContainer(spec, false, spec.Hash())}, idle, "inspect start exec", oldID, false, true},
+		{"reused, home not made", &agentDaemon{c: atlsContainer(spec, true, spec.Hash()), rootErr: failed}, idle,
+			"inspect exec", oldID, true, true},
+		{"kept, predates a change", &agentDaemon{c: atlsContainer(spec, true, "old")}, busy, "inspect", "", false, true},
+	} {
+		homesMade.Clear()
+		d := tc.d
+		d.t = t
+		id, _, err := Ensure(ctx, d.run, spec, tc.busy, nil)
+		if (err != nil) != tc.wantErr || d.verbs() != tc.want || (d.c != nil) != tc.kept {
+			t.Errorf("%s: calls %q, err %v, kept %v; want %q, an error %v, kept %v", tc.name, d.verbs(), err, d.c != nil, tc.want, tc.wantErr, tc.kept)
+		}
+		if tc.wantErr && (id != "" || !strings.Contains(err.Error(), "/var/home/u")) {
+			t.Errorf("%s: %.4s…, %v; want no container, and an error that names the home", tc.name, id, err)
+		}
+		if tc.exec != "" {
+			wantExec(tc.name, d, tc.exec)
+		} else if len(d.execs) != 0 {
+			t.Errorf("%s: docker exec %q", tc.name, d.execs)
+		}
+		// Once made, not again in this process; if not, again (in a new
+		// container if it was removed).
+		d.calls, d.execs, d.rootErr = nil, nil, nil
+		if _, _, err := Ensure(ctx, d.run, spec, tc.busy, nil); err != nil {
+			t.Errorf("%s, again: %v", tc.name, err)
+		}
+		if again := len(d.execs) != 0; again != tc.wantErr {
+			t.Errorf("%s, again: docker exec %q", tc.name, d.execs)
+		}
+	}
+
+	// Without $HOME in the spec, nothing to make.
+	homesMade.Clear()
+	d := &agentDaemon{t: t}
 	if _, _, err := Ensure(ctx, d.run, testSpec(), idle, nil); err != nil || d.verbs() != "inspect run" {
 		t.Errorf("no $HOME: %q, %v", d.verbs(), err)
 	}
+}
+
+// TestHomeScript runs homeScript with a real sh, in a temp dir that stands
+// for the container's file system, chown stubbed (it logs what it is
+// given): as root in a container, -O is true of root-owned files; here,
+// of the test user's, which the stand-in user 4242 is not.
+func TestHomeScript(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	log := filepath.Join(root, "chown.log")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := "#!/bin/sh\necho \"$*\" >> '" + log + "'\n"
+	if err := os.WriteFile(filepath.Join(bin, "chown"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "var", "home", "u")
+	in := func(p string) string { return filepath.Join(home, p) }
+	script := func(user string, mounts ...string) []string {
+		t.Helper()
+		os.Remove(log)
+		cmd := exec.Command("sh", append([]string{"-c", homeScript, "sh", user}, mounts...)...)
+		cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+bin+":"+os.Getenv("PATH"))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("homeScript: %v: %s", err, out)
+		}
+		b, _ := os.ReadFile(log)
+		var got []string
+		for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+			if l != "" && !slices.Contains(got, l) {
+				got = append(got, l)
+			}
+		}
+		slices.Sort(got)
+		return got
+	}
+	chowned := func(paths ...string) []string {
+		var out []string
+		for _, p := range paths {
+			out = append(out, "-h -- 4242:4242 "+p)
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	// A mount at or above $HOME: its files are the host's; nothing done.
+	if got := script("4242:4242", filepath.Join(root, "var")); len(got) != 0 || fileExists(home) {
+		t.Errorf("mount above $HOME: %q, home made %v", got, fileExists(home))
+	}
+	// A missing $HOME is made, and handed to the user.
+	if got, want := script("4242:4242", "/tasks/t"), chowned(home); !slices.Equal(got, want) || !fileExists(home) {
+		t.Errorf("missing $HOME: %q, made %v; want %q", got, fileExists(home), want)
+	}
+
+	// What docker makes for mounts below $HOME: the directories between are
+	// handed to the user, not the mount points, nor what lies in a mount,
+	// nor anything through a symlink.
+	elsewhere := filepath.Join(root, "elsewhere")
+	for _, d := range []string{in("ws/tasks/t"), in("ws/repos/api/.git"), in("m/sub/inner"), filepath.Join(elsewhere, "x", "y"), filepath.Join(root, "other", "z")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(elsewhere, in("link")); err != nil {
+		t.Fatal(err)
+	}
+	mounts := []string{in("ws/tasks/t"), in("ws/repos/api/.git"), in("m"), in("m/sub/inner"), in("link/x/y"), filepath.Join(root, "other", "z"), RunMount}
+	want := chowned(home, in("ws"), in("ws/tasks"), in("ws/repos"), in("ws/repos/api"))
+	if got := script("4242:4242", mounts...); !slices.Equal(got, want) {
+		t.Errorf("chowned:\n got %q\nwant %q", got, want)
+	}
+	// What is the user's already is left alone.
+	if got := script(fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), mounts...); len(got) != 0 {
+		t.Errorf("the user's already: chowned %q", got)
+	}
+}
+
+func fileExists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
 }
 
 // container is a fake daemon's only container, for Runners that answer

@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -421,8 +422,13 @@ func IsNoSuch(err error) bool { return noSuch(err) }
 // fresh, if not nil, runs right before a container is created, when no
 // container of the task exists (any old one was removed): what it prepares
 // for the container cannot be touched by the task meanwhile. Its error stops
-// the creation. A new container gets a usable $HOME (makeHome) before it is
-// returned.
+// the creation.
+//
+// The container returned has a usable $HOME (makeHome): made when the
+// container is created, and checked once per atl process when it is
+// reused, since it may predate makeHome or its creator may have died first.
+// Not in a container kept although it predates a change: its mounts are
+// not the spec's.
 func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh func() error) (container string, stale bool, err error) {
 	create := func() (string, error) {
 		if fresh != nil {
@@ -447,7 +453,7 @@ func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh 
 					return "", err
 				}
 			}
-			if err := spec.makeHome(ctx, run, c.ID); err != nil {
+			if err := spec.makeHomeOnce(ctx, run, c.ID); err != nil {
 				return "", err
 			}
 			return c.ID, nil
@@ -469,6 +475,7 @@ func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh 
 			}
 			return "", err
 		}
+		homesMade.Store(id, true)
 		return id, nil
 	}
 	c, err := Agent(ctx, run, spec.ID)
@@ -494,28 +501,88 @@ func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh 
 			return "", false, err
 		}
 	}
+	if err := spec.makeHomeOnce(ctx, run, c.ID); err != nil {
+		return "", false, err
+	}
 	return c.ID, false, nil
 }
 
-// makeHome makes the spec's $HOME, in the new container id, a directory the
-// spec's user can write to, unless it is one already. $HOME is the home dir
-// of the user running atl, which the image has only when built for that
-// path: atelier's images put the user's home in /home/<user>, so on a host
-// where it is elsewhere (/var/home/<user>, /Users/<user>) it would be
-// missing, or a root-owned directory docker made to mount something below
-// it, and what writes to ~/.cache, ~/.npm or ~/.config would fail. Without
-// $HOME or a user in the spec it does nothing.
+// homeScript makes $HOME a directory of the user $1 ("uid:gid"), and hands
+// that user the root-owned directories strictly between $HOME and the mount
+// points $2... below it (docker makes them, as root, to mount something
+// there). It runs as root in the container, and only ever changes the
+// container's own file system: nothing when a mount is $HOME or above it;
+// never a mount point, nor anything in a mount; never through a symlink
+// (it stops at one, and chown -h). It changes nothing that is right already.
+const homeScript = `set -f
+u=$1 uid=${1%%:*}
+shift
+owns() { set -- $(ls -dn -- "$1"); [ "$3" = "$uid" ]; }
+for o do
+	case $HOME in "$o" | "$o"/*) exit 0 ;; esac
+done
+if [ ! -e "$HOME" ] && [ ! -L "$HOME" ]; then
+	mkdir -p -- "$HOME" || exit
+fi
+if [ ! -L "$HOME" ] && ! owns "$HOME"; then
+	chown -h -- "$u" "$HOME" || exit
+fi
+for m do
+	case $m in "$HOME"/*) ;; *) continue ;; esac
+	d=$HOME rest=${m#"$HOME"/}
+	while :; do
+		case $rest in */*) ;; *) break ;; esac
+		d=$d/${rest%%/*} rest=${rest#*/}
+		if [ -L "$d" ] || [ ! -d "$d" ]; then break; fi
+		in=
+		for o do
+			case $d in "$o" | "$o"/*) in=1 ;; esac
+		done
+		if [ -n "$in" ]; then break; fi
+		if [ -O "$d" ] && ! owns "$d"; then
+			chown -h -- "$u" "$d" || exit
+		fi
+	done
+done
+`
+
+// makeHome makes the spec's $HOME, in container id, a directory the spec's
+// user owns, with the root-owned directories docker made below it for mount
+// points handed to that user too (homeScript). $HOME is the home dir of the
+// user running atl, which the image has only when built for that path:
+// atelier's images put the user's home in /home/<user>, so on a host where
+// it is elsewhere (/var/home/<user>, /Users/<user>) it would be missing, or
+// a root-owned directory docker made to mount something below it, and what
+// writes to ~/.cache, ~/.npm or ~/.config would fail. Without $HOME or a
+// user in the spec it does nothing.
 func (s Spec) makeHome(ctx context.Context, run Runner, id string) error {
 	home := s.Env["HOME"]
 	if home == "" || s.User == "" {
 		return nil
 	}
-	if _, err := run(ctx, "exec", id, "sh", "-c", `[ -d "$HOME" ] && [ -w "$HOME" ]`); err == nil {
-		return nil
+	args := []string{"exec", "-u", "0", id, "sh", "-c", homeScript, "sh", s.User}
+	for _, m := range s.Mounts {
+		args = append(args, m.Dst)
 	}
-	if _, err := run(ctx, "exec", "-u", "0", id, "sh", "-c", `mkdir -p -- "$HOME" && chown -- "$1" "$HOME"`, "sh", s.User); err != nil {
+	if _, err := run(ctx, args...); err != nil {
 		return fmt.Errorf("make the home dir %s in the container: %w", home, err)
 	}
+	return nil
+}
+
+// homesMade holds the IDs of the containers whose home makeHome made in
+// this process, so that Ensure checks a container it reuses only once.
+var homesMade sync.Map
+
+// makeHomeOnce is makeHome, unless it already ran for container id.
+func (s Spec) makeHomeOnce(ctx context.Context, run Runner, id string) error {
+	if _, ok := homesMade.Load(id); ok {
+		return nil
+	}
+	if err := s.makeHome(ctx, run, id); err != nil {
+		return err
+	}
+	homesMade.Store(id, true)
 	return nil
 }
 
