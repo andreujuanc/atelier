@@ -17,6 +17,14 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	// The tests may run inside an atelier task (or its container), whose
+	// ATL_* variables change what atl does (e.g. it refuses most commands
+	// inside a task container): start from none; tests set what they need.
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "ATL_") {
+			os.Unsetenv(k)
+		}
+	}
 	dir, err := os.MkdirTemp("", "cli-test-git")
 	if err != nil {
 		panic(err)
