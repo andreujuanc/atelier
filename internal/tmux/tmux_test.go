@@ -448,6 +448,30 @@ func TestAttachCmdSameServer(t *testing.T) {
 	}
 }
 
+// TestAttachCmdStartsServerWithoutSessionVars: attach-session starts the
+// server when none runs (which stays if its config, e.g. the user's, makes
+// a session); like every server atl starts, it does not take the session's
+// variables into its global environment.
+func TestAttachCmdStartsServerWithoutSessionVars(t *testing.T) {
+	c := freshClient(t)
+	c.config = filepath.Join(t.TempDir(), "tmux.conf")
+	if err := os.WriteFile(c.config, []byte("new-session -d -s keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ATL_SESSION", "7")
+	t.Setenv("CLAUDECODE", "1")
+	_ = c.AttachCmd("keep").Run() // no terminal: fails once the server runs
+	env, err := c.run(context.Background(), "show-environment", "-g")
+	if err != nil {
+		t.Fatalf("no server after attach-session: %v", err)
+	}
+	for _, line := range strings.Split(env, "\n") {
+		if strings.HasPrefix(line, "ATL_SESSION=") || strings.HasPrefix(line, "CLAUDECODE=") {
+			t.Errorf("server started by attach-session has %s", line)
+		}
+	}
+}
+
 func TestNewClientFromEnv(t *testing.T) {
 	t.Setenv("ATL_TMUX_SOCKET", "abc")
 	if New().Socket != "abc" {
@@ -663,7 +687,14 @@ func TestArgsEndingInSemicolon(t *testing.T) {
 	if e, err := c.run(ctx, "show-environment", "-t", "=atl-x", "E"); err == nil && e != "" && e != "E=v;" {
 		t.Errorf("session env = %q", e)
 	}
-	for _, text := range []string{"text;", `text\;`} {
+	// tmux takes a final `\;` for ";" whatever comes before it: any number
+	// of backslashes before a final ";" reach the command as they are.
+	texts := []string{"text;", ";", "text;;"}
+	for n := 1; n <= 3; n++ {
+		bs := strings.Repeat(`\`, n)
+		texts = append(texts, "text"+bs+";", bs+";", "text"+bs+";;")
+	}
+	for _, text := range texts {
 		if err := c.SetBuffer(ctx, text); err != nil {
 			t.Fatal(err)
 		}

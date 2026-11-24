@@ -200,8 +200,9 @@ type Model struct {
 	// again once visible (e.g. when the filter is cleared).
 	stickyID int64
 
-	detail   *app.TaskView
-	detailAt time.Time
+	detail    *app.TaskView
+	detailAt  time.Time
+	notesWrap notesWrap // the detail's notes, wrapped (wrappedNotes)
 	// detailSeq numbers detail requests; detailInflight is the latest one
 	// still outstanding (0: none); detailApplied the latest one shown.
 	detailSeq      int
