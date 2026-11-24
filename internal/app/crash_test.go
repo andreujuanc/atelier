@@ -416,3 +416,34 @@ func TestKilledReopen(t *testing.T) {
 		})
 	}
 }
+
+// TestDoneLockedWorktree: a git killed while it added a task's worktree
+// leaves the worktree locked ("initializing"); done removes it, with its
+// dir there or gone, and its branch, and the task reopens.
+func TestDoneLockedWorktree(t *testing.T) {
+	for _, gone := range []bool{false, true} {
+		t.Run(fmt.Sprintf("gone=%v", gone), func(t *testing.T) {
+			e := newTaskEnv(t)
+			ctx := context.Background()
+			e.addRepo(t, "api", "main")
+			if _, err := e.app.NewTask(ctx, NewTaskOpts{Title: "x", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}}); err != nil {
+				t.Fatal(err)
+			}
+			wt := e.app.Paths.WorktreePath("x", "api")
+			git(t, e.canonical("api"), "worktree", "lock", "--reason", "initializing", wt)
+			if gone {
+				if err := os.RemoveAll(wt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := e.app.Done(ctx, "x", false); err != nil {
+				t.Fatal(err)
+			}
+			assertClosedClean(t, e, "x", "api")
+			if err := e.app.SetStatus(ctx, "x", model.StatusActive); err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			assertOpenWhole(t, e, "x", "api")
+		})
+	}
+}

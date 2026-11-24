@@ -494,26 +494,66 @@ func addWorktree(ctx context.Context, repo, path string, origin Origin, args fun
 // Without force it refuses, as git does, a worktree with changes (IsDirty)
 // or with checked-out submodules; git's own check is `git status`, which
 // reads files through the repo's filters, so it is IsDirty's instead and git
-// is always told --force. A locked worktree is still refused by git.
+// is always told --force. A locked worktree is removed too, after the same
+// checks (git is told --force twice; prune would keep its metadata): atl
+// removes only its tasks' own worktrees, and a git killed while it added one
+// leaves it locked ("initializing").
 func RemoveWorktree(ctx context.Context, repo, path string, force bool) error {
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("remove worktree: %w", err)
 	}
-	if _, err := os.Stat(path); err == nil {
-		if !force {
-			if err := removable(ctx, path); err != nil {
-				return err
-			}
-		}
-		if _, err := run(ctx, repo, "worktree", "remove", "--force", path); err != nil {
+	_, err = os.Stat(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove worktree %s: %w", path, err)
+	}
+	if err == nil && !force {
+		if err := removable(ctx, path); err != nil {
 			return err
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove worktree %s: %w", path, err)
+	}
+	locked, lerr := lockedWorktree(ctx, repo, path)
+	if lerr != nil {
+		return lerr
+	}
+	if err == nil || locked {
+		args := []string{"worktree", "remove", "--force", path}
+		if locked {
+			args = []string{"worktree", "remove", "--force", "--force", path}
+		}
+		if _, err := run(ctx, repo, args...); err != nil {
+			return err
+		}
 	}
 	_, err = run(ctx, repo, "worktree", "prune")
 	return err
+}
+
+// lockedWorktree reports whether repo has a locked worktree at path (which
+// need not exist any more).
+func lockedWorktree(ctx context.Context, repo, path string) (bool, error) {
+	out, err := run(ctx, repo, "worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return false, err
+	}
+	at := false
+	for _, f := range strings.Split(out, "\x00") {
+		if p, ok := strings.CutPrefix(f, "worktree "); ok {
+			at = sameMaybeMissing(p, path)
+		} else if at && (f == "locked" || strings.HasPrefix(f, "locked ")) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// sameMaybeMissing is samePath for paths that may no longer exist: their
+// parent dirs are compared with symlinks resolved.
+func sameMaybeMissing(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) || samePath(a, b) {
+		return true
+	}
+	return filepath.Base(a) == filepath.Base(b) && samePath(filepath.Dir(a), filepath.Dir(b))
 }
 
 // removable is git's check before `worktree remove` without --force, made
