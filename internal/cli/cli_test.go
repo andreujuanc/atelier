@@ -504,14 +504,23 @@ func TestStartupRecover(t *testing.T) {
 	}
 }
 
-// TestLsSanitizesTitle: `atl new` keeps control characters other than
-// whitespace in a title (ESC included); `atl ls` must not print them to
-// the terminal, as `atl show` does not.
+// TestLsSanitizesTitle: a task stored before `atl new` refused control
+// characters in titles may still have one (ESC included); `atl ls` must not
+// print them to the terminal, as `atl show` does not.
 func TestLsSanitizesTitle(t *testing.T) {
 	setup(t)
-	if code, _, errs := atl(t, "new", "Red \x1b[31malert\x07", "--repo", "api", "--no-fetch"); code != 0 {
+	if code, _, errs := atl(t, "new", "red", "--repo", "api", "--no-fetch"); code != 0 {
 		t.Fatalf("new: %d %s", code, errs)
 	}
+	st, err := store.Open(testDB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(context.Background(), &model.Task{Slug: "red-alert", Title: "Red \x1b[31malert\x07",
+		Status: model.StatusActive, Branch: "atl/red-alert", PortOffset: 100}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
 	code, out, errs := atl(t, "ls")
 	if code != 0 || strings.ContainsAny(out, "\x1b\x07") || !strings.Contains(out, "Red [31malert\n") {
 		t.Fatalf("ls: %d %q %s", code, out, errs)
