@@ -228,16 +228,34 @@ func wrap(ctx context.Context, args []string, stderr string, err error) error {
 	return &Error{Args: args, Stderr: strings.TrimSpace(stderr), ExitCode: code, Err: err}
 }
 
-// run executes git in dir and returns trimmed stdout.
-func run(ctx context.Context, dir string, args ...string) (string, error) {
+// output executes git in dir, with input (if not "") on its stdin, and
+// returns its stdout as it is.
+func output(ctx context.Context, dir, input string, args ...string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := command(ctx, dir, args...)
+	if input != "" {
+		cmd.Stdin = strings.NewReader(input)
+	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return "", wrap(ctx, args, stderr.String(), err)
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	return stdout.String(), nil
+}
+
+// run executes git in dir and returns trimmed stdout.
+func run(ctx context.Context, dir string, args ...string) (string, error) {
+	out, err := output(ctx, dir, "", args...)
+	return strings.TrimSpace(out), err
+}
+
+// revParsePath is the one path `git rev-parse <opts>` prints in dir, as it
+// is: only the newline git ends it with is removed (a path may end in
+// whitespace, or have a newline in it).
+func revParsePath(ctx context.Context, dir string, opts ...string) (string, error) {
+	out, err := output(ctx, dir, "", append([]string{"rev-parse"}, opts...)...)
+	return strings.TrimSuffix(out, "\n"), err
 }
 
 // ConfigValue returns the value git uses for config key in dir (a repo, or
@@ -249,19 +267,6 @@ func ConfigValue(ctx context.Context, dir, key string) string {
 		return ""
 	}
 	return out
-}
-
-// runInput is run with input fed to git's stdin.
-func runInput(ctx context.Context, dir, input string, args ...string) (string, error) {
-	var stdout, stderr bytes.Buffer
-	cmd := command(ctx, dir, args...)
-	cmd.Stdin = strings.NewReader(input)
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", wrap(ctx, args, stderr.String(), err)
-	}
-	return strings.TrimSpace(stdout.String()), nil
 }
 
 func samePath(a, b string) bool {
@@ -295,10 +300,10 @@ func IsRepo(path string) bool {
 		return false
 	}
 	if bare == "true" {
-		gd, err := run(ctx, path, "rev-parse", "--absolute-git-dir")
+		gd, err := revParsePath(ctx, path, "--absolute-git-dir")
 		return err == nil && samePath(gd, path)
 	}
-	top, err := run(ctx, path, "rev-parse", "--show-toplevel")
+	top, err := revParsePath(ctx, path, "--show-toplevel")
 	return err == nil && top != "" && samePath(top, path)
 }
 
@@ -321,11 +326,15 @@ func CheckWorktree(ctx context.Context, path, repo string) error {
 		}
 		return fmt.Errorf("%s is %s, not a worktree of %s", path, what, repo)
 	}
-	out, err := run(ctx, path, "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel")
+	// One path per call: a path may have a newline in it.
+	common, err := revParsePath(ctx, path, "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return fmt.Errorf("%s is not a worktree of %s: %w", path, repo, err)
 	}
-	common, top, _ := strings.Cut(out, "\n")
+	top, err := revParsePath(ctx, path, "--show-toplevel")
+	if err != nil {
+		return fmt.Errorf("%s is not a worktree of %s: %w", path, repo, err)
+	}
 	if !samePath(common, filepath.Join(repo, ".git")) {
 		return fmt.Errorf("%s is not a worktree of %s: its git dir is in %s", path, repo, common)
 	}
@@ -633,11 +642,11 @@ func UniqueCommitsAt(ctx context.Context, repo, branch, tip string) (int, error)
 		done[e.oid] = true
 		in.WriteString("^" + e.oid + "\n")
 	}
-	out, err = runInput(ctx, repo, in.String(), "rev-list", "--count", "--stdin")
+	out, err = output(ctx, repo, in.String(), "rev-list", "--count", "--stdin")
 	if err != nil {
 		return 0, err
 	}
-	n, err := strconv.Atoi(out)
+	n, err := strconv.Atoi(strings.TrimSpace(out))
 	if err != nil {
 		return 0, fmt.Errorf("git rev-list: unexpected output %q", out)
 	}

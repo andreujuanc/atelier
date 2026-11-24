@@ -208,7 +208,7 @@ func readIndex(ctx context.Context, worktree string) (*gitIndex, error) {
 		}
 		ix.entries = append(ix.entries, e)
 	}
-	path, err := run(ctx, worktree, "rev-parse", "--git-path", "index")
+	path, err := revParsePath(ctx, worktree, "--git-path", "index")
 	if err != nil {
 		return nil, err
 	}
