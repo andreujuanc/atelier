@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 
 	"github.com/andreujuanc/atelier/internal/gen"
 	"github.com/andreujuanc/atelier/internal/gitx"
@@ -525,7 +526,16 @@ func (p *prefixWriter) Write(b []byte) (int, error) {
 		case i >= 0:
 			line, p.buf = p.buf[:i], p.buf[i+1:]
 		case len(p.buf) > maxPartialLine:
-			line, p.buf = p.buf[:maxPartialLine], p.buf[maxPartialLine:]
+			// Cut before a UTF-8 character, not inside one (if there is
+			// one within its length; otherwise it is not UTF-8 anyway).
+			cut := maxPartialLine
+			for k := cut; k > maxPartialLine-utf8.UTFMax; k-- {
+				if utf8.RuneStart(p.buf[k]) {
+					cut = k
+					break
+				}
+			}
+			line, p.buf = p.buf[:cut], p.buf[cut:]
 		default:
 			return len(b), nil
 		}
