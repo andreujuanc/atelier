@@ -574,3 +574,16 @@ func TestSetupTokenCustomImageNotPulled(t *testing.T) {
 		t.Error("token window started")
 	}
 }
+
+// TestTokenRECompiles: tokenRE compiles on first use (sync.OnceValue), not
+// at start; a bad pattern would panic when a token is first read instead.
+func TestTokenRECompiles(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("tokenRE: %v", r)
+		}
+	}()
+	if !tokenRE().MatchString(storedTestToken) {
+		t.Error("tokenRE does not match a token of the shape claude setup-token prints")
+	}
+}

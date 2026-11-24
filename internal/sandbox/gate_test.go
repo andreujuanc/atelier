@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -1337,4 +1338,23 @@ func TestServeOneGatePerRunDir(t *testing.T) {
 			t.Errorf("socket %s left behind: %v", sock, err)
 		}
 	}
+}
+
+// TestGatePatternsCompile: the gate's route patterns and refTag compile
+// on first use (sync.OnceValue), not at start; a bad one would panic on a
+// task's first request instead. All are compiled here.
+func TestGatePatternsCompile(t *testing.T) {
+	compile := func(name string, re func() *regexp.Regexp) {
+		t.Helper()
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("%s: %v", name, r)
+			}
+		}()
+		re()
+	}
+	for i, rt := range gateRoutes {
+		compile(fmt.Sprintf("gateRoutes[%d] (%s)", i, rt.methods), rt.re)
+	}
+	compile("refTag", refTag)
 }
