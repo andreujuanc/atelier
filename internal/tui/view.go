@@ -93,13 +93,15 @@ type layout struct {
 	listW, detailW int
 	// what the panes hold inside their borders
 	listInW, listInH, detailInW, detailInH int
+	help                                   []string // the help lines under the status line
 }
 
 func (m *Model) layout() layout {
 	w, h := m.width, m.height
 	var l layout
 	l.header = h >= 10
-	l.bodyH = h - 1 - len(m.helpLines(w))
+	l.help = m.helpLines(w)
+	l.bodyH = h - 1 - len(l.help)
 	if l.header {
 		l.bodyH--
 	}
@@ -211,7 +213,6 @@ func (m *Model) render() string {
 		return ""
 	}
 	l := m.layout()
-	help := m.helpLines(w)
 	var lines []string
 	if l.header {
 		lines = append(lines, m.headerLine(w))
@@ -220,7 +221,7 @@ func (m *Model) render() string {
 	if over := m.overlay(w, len(lines)); over != nil {
 		lines = composite(lines, over, w)
 	}
-	lines = append(append(lines, m.statusLine(w)), help...)
+	lines = append(append(lines, m.statusLine(w)), l.help...)
 	if len(lines) > h {
 		lines = lines[len(lines)-h:]
 	}
@@ -298,12 +299,9 @@ func (m *Model) detailPane(l layout, w, h int, focused bool) []string {
 		return m.detailLines(w, h)
 	}
 	inner := m.detailLines(w-4, h-2)
-	title := ""
+	title, right := "", ""
 	if t := m.notesTask(); t != nil {
 		title = t.Task.Slug
-	}
-	right := ""
-	if t := m.notesTask(); t != nil {
 		if op, ok := m.busy[t.Task.ID]; ok {
 			right = keyStyle.Render(m.spinner()) + " " + dimStyle.Render(trunc(clean(op), max(w/3, 8)))
 		}
