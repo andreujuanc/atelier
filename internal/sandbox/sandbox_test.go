@@ -495,6 +495,12 @@ type agentDaemon struct {
 	calls  []string
 	runErr error      // what docker run fails with
 	winner *container // the container another atl made when run fails with a name conflict
+	// noHome: $HOME is not a directory the container's user can write to
+	// (docker exec as that user fails), until made as root; rootErr is what
+	// docker exec as root fails with.
+	noHome  bool
+	rootErr error
+	execs   [][]string // the docker exec calls
 }
 
 const (
@@ -532,6 +538,17 @@ func (d *agentDaemon) run(_ context.Context, args ...string) (string, error) {
 	case "start":
 		if d.c != nil && args[len(args)-1] == d.c.Id {
 			d.c.State.Running = true
+		}
+	case "exec":
+		d.execs = append(d.execs, args)
+		if args[1] != "-u" {
+			if d.noHome {
+				return "", errors.New("docker exec: exit status 1")
+			}
+		} else if d.rootErr != nil {
+			return "", d.rootErr
+		} else {
+			d.noHome = false
 		}
 	}
 	return "", nil
@@ -614,6 +631,72 @@ func TestEnsure(t *testing.T) {
 	d = &agentDaemon{t: t}
 	if _, _, err := Ensure(ctx, d.run, spec, idle, func() error { return errors.New("no") }); err == nil || d.verbs() != "inspect" {
 		t.Errorf("failed fresh: %q, %v", d.verbs(), err)
+	}
+}
+
+// TestEnsureMakesHome: $HOME is the home dir of the user running atl,
+// which the image has only when built for that path (atelier's images put
+// it in /home/<user>; a host may have it in /var/home/<user>). A new
+// container whose $HOME is not a directory its user can write to gets one,
+// made as root and handed to the user; one where it is gets nothing. If
+// that fails, the container is removed, so that the next try makes it again.
+func TestEnsureMakesHome(t *testing.T) {
+	spec := testSpec()
+	spec.Env["HOME"] = "/var/home/u"
+	ctx := context.Background()
+	idle := func() bool { return false }
+
+	d := &agentDaemon{t: t}
+	if id, _, err := Ensure(ctx, d.run, spec, idle, nil); err != nil || d.verbs() != "inspect run exec" || id != newID {
+		t.Fatalf("home usable: %q, %.4s…, %v", d.verbs(), id, err)
+	}
+	if got := d.execs[0][:2]; !slices.Equal(got, []string{"exec", newID}) {
+		t.Errorf("the check runs %q, want it as the container's user, in the new container", got)
+	}
+
+	d = &agentDaemon{t: t, noHome: true}
+	if id, _, err := Ensure(ctx, d.run, spec, idle, nil); err != nil || d.verbs() != "inspect run exec exec" || id != newID || d.noHome {
+		t.Fatalf("home missing: %q, %.4s…, %v, still missing %v", d.verbs(), id, err, d.noHome)
+	}
+	root := d.execs[1]
+	if !slices.Equal(root[:4], []string{"exec", "-u", "0", newID}) || root[len(root)-1] != spec.User {
+		t.Fatalf("made with %q, want as root in the new container, for %s", root, spec.User)
+	}
+	// The scripts do what they say, with a real sh: the check fails on a
+	// missing home, the root script makes it (here owned by the user
+	// running the test, root being out of reach), and the check passes.
+	home := filepath.Join(t.TempDir(), "var", "home", "u")
+	sh := func(argv []string) error {
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Env = append(os.Environ(), "HOME="+home)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%v: %s", err, out)
+		}
+		return nil
+	}
+	check := d.execs[0][2:]
+	if err := sh(check); err == nil {
+		t.Error("the check passes on a missing home")
+	}
+	owner := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	if err := sh(append(slices.Clone(root[4:len(root)-1]), owner)); err != nil {
+		t.Fatalf("the root script: %v", err)
+	}
+	if err := sh(check); err != nil {
+		t.Errorf("the check fails on the home made: %v", err)
+	}
+
+	d = &agentDaemon{t: t, noHome: true, rootErr: errors.New("docker exec: chown: not permitted")}
+	if _, _, err := Ensure(ctx, d.run, spec, idle, nil); err == nil || !strings.Contains(err.Error(), "/var/home/u") ||
+		d.verbs() != "inspect run exec exec rm" || d.c != nil {
+		t.Errorf("home not made: %q, %v; want an error that names it, and the container removed", d.verbs(), err)
+	}
+
+	// Without $HOME in the spec, nothing to check.
+	d = &agentDaemon{t: t, noHome: true}
+	if _, _, err := Ensure(ctx, d.run, testSpec(), idle, nil); err != nil || d.verbs() != "inspect run" {
+		t.Errorf("no $HOME: %q, %v", d.verbs(), err)
 	}
 }
 
