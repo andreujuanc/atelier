@@ -37,7 +37,8 @@ Run the steps below there (later: `git pull` there, then again).
 Without Go (the Dockerfile's `build` stage writes `/out/atl`):
 
 ```bash
-docker build --target build -t atl-build . \
+mkdir -p ~/.local/bin \
+  && docker build --target build -t atl-build . \
   && id=$(docker create atl-build) \
   && docker cp "$id:/out/atl" ~/.local/bin/atl \
   && docker rm "$id"
