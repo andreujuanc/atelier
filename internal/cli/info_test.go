@@ -102,7 +102,7 @@ func TestShowNotesTranscript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess := &model.Session{TaskID: task.ID, State: model.StateIdle, Name: "claude-1", ClaudeSessionID: "cid", TranscriptPath: transcript}
+	sess := &model.Session{TaskID: task.ID, State: model.StateIdle, ClaudeSessionID: "cid", TranscriptPath: transcript}
 	if err := st.CreateSession(context.Background(), sess); err != nil {
 		t.Fatal(err)
 	}

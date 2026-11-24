@@ -500,9 +500,11 @@ func addWorktree(ctx context.Context, repo, path string, origin Origin, args fun
 //
 // Without force it refuses, as git does, a worktree with changes (IsDirty)
 // or with checked-out submodules; git's own check is `git status`, which
-// reads files through the repo's filters, so it is IsDirty's instead. Like
-// git, it refuses a locked worktree, and leaves a missing one's
-// registration while it is locked.
+// reads files through the repo's filters, so it is IsDirty's instead. A
+// locked worktree is removed too, after the same checks, and so is a
+// missing one's registration (git worktree prune would keep it): atl
+// removes only its tasks' own worktrees, and a git killed while it added
+// one leaves it locked ("initializing"), its branch taken.
 //
 // git deletes nothing here: `git worktree remove` and `git worktree prune`
 // delete a directory by path, an lstat and then an opendir per entry, and
@@ -531,19 +533,10 @@ func RemoveWorktree(ctx context.Context, repo, path string, force bool) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove worktree %s: %w", path, err)
 	}
-	locked := func(id string) bool {
-		_, err := gitDir.Lstat("worktrees/" + id + "/locked")
-		return err == nil
-	}
 	if exists {
-		fail := func(msg string) error {
-			return &Error{Args: []string{"worktree", "remove", path}, ExitCode: 128, Stderr: "fatal: " + msg}
-		}
 		if len(ids) == 0 {
-			return fail(fmt.Sprintf("'%s' is not a working tree", path))
-		}
-		if slices.ContainsFunc(ids, locked) {
-			return fail("cannot remove a locked working tree")
+			return &Error{Args: []string{"worktree", "remove", path}, ExitCode: 128,
+				Stderr: fmt.Sprintf("fatal: '%s' is not a working tree", path)}
 		}
 		if !force {
 			if err := removable(ctx, path); err != nil {
@@ -555,9 +548,6 @@ func RemoveWorktree(ctx context.Context, repo, path string, force bool) error {
 		}
 	}
 	for _, id := range ids {
-		if !exists && locked(id) {
-			continue // as git worktree prune leaves it
-		}
 		if err := gitDir.RemoveAll("worktrees/" + id); err != nil {
 			return fmt.Errorf("remove worktree %s: %w", path, err)
 		}

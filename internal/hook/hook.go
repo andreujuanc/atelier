@@ -31,6 +31,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
+	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
 // Input is the JSON Claude Code passes to a hook on stdin (fields used by atelier).
@@ -141,7 +142,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, env func(stri
 		}
 	}()
 
-	p, err := config.Resolve()
+	p, err := workspace.Paths()
 	if err != nil {
 		logError(p, stderr, event, "", err)
 		if event == EventAssistantGuard {

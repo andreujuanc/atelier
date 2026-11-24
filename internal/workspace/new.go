@@ -359,27 +359,84 @@ func (p *Plan) Write() error {
 			return err
 		}
 	}
-	f, err := os.OpenFile(filepath.Join(p.Dir, File), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	final := filepath.Join(p.Dir, File)
+	exists := fmt.Errorf("workspace %s already exists (it has %s)", p.Dir, File)
+	if _, err := os.Lstat(final); err == nil {
+		return exists
+	}
+	// Written whole and synced under a temporary name first, then published
+	// under its own without replacing one there: atl killed (or the box
+	// losing power) on the way leaves no partial or empty atelier.toml,
+	// which would make a retry call the workspace existing, or load as the
+	// defaults.
+	tmp, err := os.CreateTemp(p.Dir, tmpPrefix+"*")
 	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("workspace %s already exists (it has %s)", p.Dir, File)
-		}
 		return err
 	}
-	_, err = writeFile(f, buf.Bytes())
+	defer os.Remove(tmp.Name()) // after the publish, only its temporary name
+	_, err = writeFile(tmp, buf.Bytes())
+	if err == nil {
+		err = tmp.Chmod(0o644)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := link(tmp.Name(), final); errors.Is(err, os.ErrExist) {
+		return exists
+	} else if err != nil {
+		// No hard links here: claim the name, then write it (a kill in
+		// between leaves it empty, as before).
+		if err := writeExcl(final, buf.Bytes()); errors.Is(err, os.ErrExist) {
+			return exists
+		} else if err != nil {
+			return err
+		}
+	}
+	// Those a killed write left.
+	if old, err := filepath.Glob(filepath.Join(p.Dir, tmpPrefix+"*")); err == nil {
+		for _, f := range old {
+			os.Remove(f)
+		}
+	}
+	return nil
+}
+
+// tmpPrefix starts the name of the temporary file Plan.Write writes
+// atelier.toml to.
+const tmpPrefix = "." + File + ".tmp"
+
+// writeExcl creates path, which must not exist, with data, synced; on a
+// failure after the create it removes it (it is ours: O_EXCL).
+func writeExcl(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = writeFile(f, data)
+	if err == nil {
+		err = f.Sync()
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		// The file is ours (O_EXCL): a partial one would make a retry
-		// fail as an existing workspace that does not load.
-		os.Remove(f.Name())
+		os.Remove(path)
 	}
 	return err
 }
 
 // writeFile writes atelier.toml's content; a var so tests can fail it.
 var writeFile = (*os.File).Write
+
+// link makes a hard link; a var so tests can fail it as a file system
+// without hard links does.
+var link = os.Link
 
 // HasDB reports whether dir has a database (data/atelier.db), as the
 // workspace of a devcontainer box does.

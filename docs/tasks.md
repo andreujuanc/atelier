@@ -14,6 +14,10 @@
 
 The slug never changes, also after `atl rename`. `atl add` of an rw repo whose clone already
 has `atl/<slug>` (or `atl/<slug>/…`), locally or under `origin/`, fails and keeps that branch.
+One exception: what an `atl add` of that repo killed before it recorded the repo left behind
+(a worktree of the clone at `<task dir>/<repo>`, on `atl/<slug>`, with no uncommitted changes
+and no commit that another branch or remote-tracking ref lacks) is removed, worktree and
+branch, and the add goes on. If that worktree holds work, the add fails and keeps it.
 
 Titles: trimmed, spaces collapsed, at most 200 characters, no control characters.
 `atl rename` (TUI `t`) changes only the title and rewrites the task's `CLAUDE.md`.
@@ -87,9 +91,10 @@ reported: `kept branch atl/<slug> in <repo> (N unpushed commit(s))`.
 - Refused even with `--force`: a worktree whose HEAD has commits no branch, remote-tracking
   ref or tag reaches (detached HEAD, rebase in progress). Put them on a branch first.
 
-TUI dialog: lists what will be deleted. If a worktree has uncommitted changes, tick
-`[ ] Delete them` with `space`, then `enter` (equivalent to `--force`); `esc` or `n`
-cancels. Changes that appear after the dialog opened make the close refuse.
+TUI dialog: says what will be deleted. To confirm, tick `[ ] Delete them` with `space`, then
+`enter`; `esc` or `n` cancels. If it says a worktree has uncommitted changes, confirming
+discards them (as `--force`). Changes that appear after the dialog opened make the close
+refuse, and the dialog comes back saying so.
 
 The task's Claude dir keeps its transcripts after closing; delete
 `<workspace>/run/claude/<hash>` yourself when no longer needed.

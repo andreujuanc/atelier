@@ -283,10 +283,11 @@ func awaitUnlocked(runDir string, wait time.Duration) error {
 }
 
 // Stop ends the gate serving runDir, if any: it signals the process named in
-// the pid file (only if that process is an `atl gate`) and removes the
-// socket, which a gate that missed the signal notices by itself.
+// the pid file (only if a gate holds runDir's lock, so the file is not one a
+// killed gate left, and only if that process is an `atl gate`) and removes
+// the socket, which a gate that missed the signal notices by itself.
 func Stop(runDir string) {
-	if data, err := os.ReadFile(pidPath(runDir)); err == nil {
+	if data, err := os.ReadFile(pidPath(runDir)); err == nil && locked(runDir) {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 1 {
 			if cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil &&
 				strings.Contains(string(cmdline), "\x00gate\x00") {
@@ -297,15 +298,31 @@ func Stop(runDir string) {
 	os.Remove(socketPath(runDir))
 }
 
-// StopAndWait is Stop, then waits up to wait until the gate has exited (it
-// holds the run dir's lock until then), so that it answers no request any
-// more. Without a gate there is nothing to wait for.
+// StopAndWait is Stop, then waits up to wait until the gate has stopped
+// serving (it holds the run dir's lock until then), so that it takes no
+// request any more. Without a gate holding the lock there is nothing to
+// wait for (and Stop signalled nothing).
 func StopAndWait(runDir string, wait time.Duration) error {
 	Stop(runDir)
-	if _, err := os.Stat(lockPath(runDir)); errors.Is(err, os.ErrNotExist) {
+	if !locked(runDir) {
 		return nil
 	}
 	return awaitUnlocked(runDir, wait)
+}
+
+// locked reports whether a gate holds runDir's lock, as Serve does while it
+// serves (and a gate that died does not): false only if the lock is
+// missing or free.
+func locked(runDir string) bool {
+	f, err := os.OpenFile(lockPath(runDir), os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	defer f.Close() // releases the lock if it was free
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil
 }
 
 // NewLogger returns the logger a gate process writes to (its stderr, which

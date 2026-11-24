@@ -207,6 +207,9 @@ func (a *App) addRepoLocked(ctx context.Context, id int64, name string, mode mod
 	if !t.Status.Open() {
 		return nil, fmt.Errorf("task %s is %s; repos can only be added to open tasks", t.Slug, t.Status)
 	}
+	if err := a.undoKilledAdd(ctx, t, name, mode); err != nil {
+		return nil, err
+	}
 	upgrade, err := a.checkAdd(ctx, t, name, mode)
 	if err != nil {
 		return nil, err
@@ -402,4 +405,48 @@ func (a *App) checkAdd(ctx context.Context, t *model.Task, name string, mode mod
 		}
 	}
 	return upgrade, nil
+}
+
+// undoKilledAdd removes what an add of rw repo name to t left when its atl
+// was killed after it made the worktree and before it recorded the repo
+// (which is otherwise refused forever: the path and the task branch are
+// taken), as that add would have undone it on a failure: a worktree at the
+// repo's path in the task dir, of the repo's clone, on the task branch,
+// clean and with no commit that another branch or remote-tracking ref lacks.
+// Anything else there is left alone (checkAdd refuses it). It is called
+// under the task's lock, before checkAdd.
+func (a *App) undoKilledAdd(ctx context.Context, t *model.Task, name string, mode model.Mode) error {
+	if mode != model.ModeRW {
+		return nil
+	}
+	for _, r := range t.Repos {
+		if r.Name == name && r.Mode == model.ModeRW {
+			return nil
+		}
+	}
+	repo, wt := a.Paths.RepoPath(name), a.Paths.WorktreePath(t.Slug, name)
+	if _, err := os.Lstat(wt); err != nil || gitx.CheckWorktree(ctx, wt, repo) != nil {
+		return nil
+	}
+	if b, err := gitx.CurrentBranch(ctx, wt); err != nil || b != t.Branch {
+		return nil
+	}
+	tip, err := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
+	if err != nil {
+		return nil
+	}
+	if n, err := gitx.UniqueCommitsAt(ctx, repo, t.Branch, tip); err != nil || n > 0 {
+		return nil
+	}
+	if dirty, err := gitx.IsDirty(ctx, wt); err != nil || dirty {
+		return nil
+	}
+	fmt.Fprintf(a.out(), "repo %s: removing %s and branch %s, left by an add that did not finish\n", name, wt, t.Branch)
+	if err := gitx.RemoveWorktree(ctx, repo, wt, false); err != nil {
+		return fmt.Errorf("repo %s: remove the worktree an unfinished add left: %w", name, err)
+	}
+	if err := gitx.DeleteBranchIfAt(ctx, repo, t.Branch, tip); err != nil {
+		return fmt.Errorf("repo %s: delete the branch an unfinished add left: %w", name, err)
+	}
+	return nil
 }

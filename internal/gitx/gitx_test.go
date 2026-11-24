@@ -735,21 +735,6 @@ func TestRemoveWorktree(t *testing.T) {
 		}
 	})
 
-	t.Run("locked", func(t *testing.T) {
-		wt, _ := f.addWorktree(t, ctx, "locked")
-		git(t, f.repo, "worktree", "lock", wt)
-		if err := RemoveWorktree(ctx, f.repo, wt, true); err == nil || !strings.Contains(err.Error(), "locked") {
-			t.Fatalf("locked worktree: %v, want refused", err)
-		}
-		if _, err := os.Stat(wt); err != nil || !listed(wt) {
-			t.Fatalf("locked worktree removed: %v", err)
-		}
-		git(t, f.repo, "worktree", "unlock", wt)
-		if err := RemoveWorktree(ctx, f.repo, wt, true); err != nil || listed(wt) {
-			t.Fatalf("unlocked worktree: %v, listed %v", err, listed(wt))
-		}
-	})
-
 	t.Run("already deleted", func(t *testing.T) {
 		wt, _ := f.addWorktree(t, ctx, "gone")
 		if err := os.RemoveAll(wt); err != nil {
@@ -1162,4 +1147,46 @@ func TestIntegrationBranch(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+}
+
+// TestRemoveLockedWorktree: a git killed while it added a worktree leaves
+// it locked ("initializing"). RemoveWorktree removes it anyway, its dir
+// there or gone (prune keeps a locked one), still refusing changes without
+// force; then the branch is free and the path can be added again.
+func TestRemoveLockedWorktree(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	base, err := RevParse(ctx, f.repo, "origin/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, gone := range []bool{false, true} {
+		wt := filepath.Join(f.root, "locked")
+		if err := AddWorktree(ctx, f.repo, wt, "atl/locked", base, to(f.origin)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := run(ctx, f.repo, "worktree", "lock", "--reason", "initializing", wt); err != nil {
+			t.Fatal(err)
+		}
+		if !gone {
+			if err := os.WriteFile(filepath.Join(wt, "new.txt"), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := RemoveWorktree(ctx, f.repo, wt, false); err == nil {
+				t.Fatal("removed a locked worktree with changes without force")
+			}
+			os.Remove(filepath.Join(wt, "new.txt"))
+		} else if err := os.RemoveAll(wt); err != nil {
+			t.Fatal(err)
+		}
+		if err := RemoveWorktree(ctx, f.repo, wt, false); err != nil {
+			t.Fatalf("gone=%v: %v", gone, err)
+		}
+		if _, err := os.Stat(wt); !os.IsNotExist(err) {
+			t.Fatalf("gone=%v: worktree still exists: %v", gone, err)
+		}
+		if err := DeleteBranch(ctx, f.repo, "atl/locked"); err != nil {
+			t.Fatalf("gone=%v: branch still used: %v", gone, err)
+		}
+	}
 }

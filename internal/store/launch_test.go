@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -65,5 +66,53 @@ func TestLaunchCAS(t *testing.T) {
 	}
 	if ok, err := s.MarkStoppedIfLaunch(ctx, Launch{ID: 9999, Target: "@1"}, at); ok || err != nil {
 		t.Fatalf("MarkStoppedIfLaunch(unknown) = %v, %v", ok, err)
+	}
+}
+
+// TestUnrecordedLaunches checks CreateNamedSession, ListUnrecordedLaunches
+// and MarkStoppedIfUnrecorded: a live row atl made or claimed for a launch
+// and has not recorded a window for is listed, a hook's row is not, and the
+// compare-and-set misses a row recorded since.
+func TestUnrecordedLaunches(t *testing.T) {
+	s, _ := openTest(t)
+	ctx := context.Background()
+	task := mkTask(t, s, "t", model.StatusActive, 0)
+	named := &model.Session{TaskID: task.ID, State: model.StateIdle}
+	if err := s.CreateNamedSession(ctx, named, func(id int64) string { return fmt.Sprintf("w-%d", id) }); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetSession(ctx, named.ID); named.Name != fmt.Sprintf("w-%d", named.ID) || got.Name != named.Name {
+		t.Fatalf("named %+v, stored %+v", named, got)
+	}
+	hook := &model.Session{TaskID: task.ID, ClaudeSessionID: "c", State: model.StateIdle}
+	if err := s.CreateSession(ctx, hook); err != nil {
+		t.Fatal(err)
+	}
+	claimed := &model.Session{TaskID: task.ID, ClaudeSessionID: "d", State: model.StateStopped}
+	if err := s.CreateSession(ctx, claimed); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.ClaimStopped(ctx, claimed.ID, time.Time{}); !ok || err != nil {
+		t.Fatalf("ClaimStopped = %v, %v", ok, err)
+	}
+	got, err := s.ListUnrecordedLaunches(ctx)
+	want := []Unrecorded{{ID: named.ID, TaskID: task.ID, Slug: "t", Name: named.Name}, {ID: claimed.ID, TaskID: task.ID, Slug: "t", Seq: 1}}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListUnrecordedLaunches = %+v, %v; want %+v", got, err, want)
+	}
+	if err := s.SetSessionLaunch(ctx, named.ID, "@1", named.Name); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.MarkStoppedIfUnrecorded(ctx, got[0], time.Time{}); ok || err != nil {
+		t.Fatalf("MarkStoppedIfUnrecorded(recorded since) = %v, %v", ok, err)
+	}
+	if ok, err := s.MarkStoppedIfUnrecorded(ctx, got[1], time.Time{}); !ok || err != nil {
+		t.Fatalf("MarkStoppedIfUnrecorded = %v, %v", ok, err)
+	}
+	if st, _ := s.GetSession(ctx, claimed.ID); st.State != model.StateStopped || st.ClaudeSessionID != "d" {
+		t.Fatalf("claimed %+v", st)
+	}
+	if got, err := s.ListUnrecordedLaunches(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("ListUnrecordedLaunches = %+v, %v", got, err)
 	}
 }
