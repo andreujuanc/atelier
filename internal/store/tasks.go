@@ -430,9 +430,6 @@ func (s *Store) TouchTask(ctx context.Context, id int64) error {
 	return s.execOne(ctx, "task", id, `UPDATE tasks SET updated_at = ? WHERE id = ?`, toMS(now()), id)
 }
 
-// maxSlugLen mirrors the ≤40-char slug limit enforced by model.Slugify.
-const maxSlugLen = 40
-
 // UniqueSlug returns base if no task uses it, else the first free of
 // base-2, base-3, ... Results never exceed 40 chars: base is trimmed (along
 // with any trailing "-") to make room for the suffix.
@@ -456,11 +453,11 @@ func uniqueSlug(ctx context.Context, q querier, base string, also func(string) (
 		}
 		return also(slug)
 	}
-	c := trimSlug(base, maxSlugLen)
+	c := trimSlug(base, model.MaxSlugLen)
 	for i := 1; ; i++ {
 		if i > 1 {
 			suffix := fmt.Sprintf("-%d", i)
-			c = trimSlug(base, maxSlugLen-len(suffix)) + suffix
+			c = trimSlug(base, model.MaxSlugLen-len(suffix)) + suffix
 		}
 		t, err := taken(c)
 		if err != nil {
