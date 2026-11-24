@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"syscall"
 
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/sandbox"
@@ -65,18 +66,18 @@ func (a *App) checkLaunchable(t *model.Task) (string, error) {
 	return dir, nil
 }
 
-// lockLaunch takes the per-task lock for a launch in t and re-reads the
-// task under it, returning it and its dir if it is still launchable
-// (checkLaunchable). done and cancel hold the lock until the task is
-// closed, so no session is launched into a task being closed: its window
-// and container would outlive the task. The caller keeps the lock until its
-// launch is recorded, and must not hold it already (flock is per open
-// file: that would deadlock); AddRepos, which does, launches under its own.
+// lockLaunch takes the task's launch lock shared for a launch in t (see
+// lockLaunches) and re-reads the task under it, returning it and its dir if
+// it is still launchable (checkLaunchable). Closing the task holds the lock
+// exclusive until the task is closed, so no session is launched into a
+// task being closed: its window and container would outlive the task. The
+// caller keeps the lock until its launch is recorded. AddRepos launches
+// under the task's lock instead, which keeps done and cancel out too.
 func (a *App) lockLaunch(ctx context.Context, t *model.Task) (*model.Task, string, func(), error) {
 	if _, err := a.checkLaunchable(t); err != nil {
 		return nil, "", nil, err
 	}
-	unlock, err := a.lockTask(ctx, t.ID)
+	unlock, err := a.launchLock(ctx, t.ID, syscall.LOCK_SH)
 	if err != nil {
 		return nil, "", nil, err
 	}

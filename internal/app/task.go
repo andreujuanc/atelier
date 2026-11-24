@@ -615,6 +615,14 @@ func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error 
 	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
 		return err
 	}
+	if t.Status.Open() && !st.Open() {
+		// Closing it: no session is launched into it (see lockLaunches).
+		unlockLaunches, err := a.lockLaunches(ctx, t.ID)
+		if err != nil {
+			return err
+		}
+		defer unlockLaunches()
+	}
 	if t.Status.Open() || !st.Open() {
 		return a.Store.SetTaskStatus(ctx, t.ID, st)
 	}
@@ -860,6 +868,12 @@ func (a *App) finish(ctx context.Context, ref string, force bool, to model.Statu
 		return nil, err
 	}
 	defer unlock()
+	// And no session is launched into it from here on (see lockLaunches).
+	unlockLaunches, err := a.lockLaunches(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockLaunches()
 	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
 		return nil, err
 	}

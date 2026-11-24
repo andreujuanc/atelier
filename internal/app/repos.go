@@ -70,27 +70,57 @@ func (a *App) AvailableRepos(ctx context.Context) ([]string, error) {
 }
 
 // taskLockWait is how long lockTask waits for another operation on the
-// same task (AddRepo, done/cancel, a CLAUDE.md rewrite, a launch) to finish.
+// same task (AddRepo, done/cancel, a CLAUDE.md rewrite) to finish, and
+// lockLaunches for the task's launches.
 const taskLockWait = 30 * time.Second
 
 // lockTask takes an exclusive flock on <StateDir>/locks/task-<id>.lock,
 // waiting up to taskLockWait (or until ctx ends). The returned func
 // releases it.
 func (a *App) lockTask(ctx context.Context, id int64) (func(), error) {
-	dir := filepath.Join(a.Paths.StateDir, "locks")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create lock dir: %w", err)
+	path, err := a.lockPath(fmt.Sprintf("task-%d.lock", id))
+	if err != nil {
+		return nil, err
 	}
-	path := filepath.Join(dir, fmt.Sprintf("task-%d.lock", id))
-	return lockFile(ctx, path, taskLockWait, "another operation on this task is in progress")
+	return lockFile(ctx, path, syscall.LOCK_EX, taskLockWait, "another operation on this task is in progress")
 }
 
-// lockFile takes an exclusive flock on path (created if missing), waiting
-// up to wait (or until ctx ends); busy describes the holder in the timeout
-// error. The returned func releases it. It follows no symlink at path and
-// takes only a regular file (never a pipe or device: it does not wait to
-// open one).
-func lockFile(ctx context.Context, path string, wait time.Duration, busy string) (func(), error) {
+// lockLaunches takes task id's launch lock exclusive: it waits for the
+// launches under way, up to taskLockWait (or until ctx ends), and keeps new
+// ones out until the returned func releases it. The launch lock
+// (<StateDir>/locks/task-<id>.launch.lock) is apart from the task's lock
+// (lockTask): each launch holds it shared (lockLaunch), and closing the
+// task holds it exclusive until the task is closed. So no session is
+// launched into a task being closed, and a slow launch (a docker run, an
+// image pull) holds up nothing else.
+func (a *App) lockLaunches(ctx context.Context, id int64) (func(), error) {
+	return a.launchLock(ctx, id, syscall.LOCK_EX)
+}
+
+// launchLock takes task id's launch lock (see lockLaunches) of kind how.
+func (a *App) launchLock(ctx context.Context, id int64, how int) (func(), error) {
+	path, err := a.lockPath(fmt.Sprintf("task-%d.launch.lock", id))
+	if err != nil {
+		return nil, err
+	}
+	return lockFile(ctx, path, how, taskLockWait, "the task is being closed, or a session is being started in it")
+}
+
+// lockPath is the path of lock file name in <StateDir>/locks, made if missing.
+func (a *App) lockPath(name string) (string, error) {
+	dir := filepath.Join(a.Paths.StateDir, "locks")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create lock dir: %w", err)
+	}
+	return filepath.Join(dir, name), nil
+}
+
+// lockFile takes a flock of kind how (syscall.LOCK_EX or LOCK_SH) on path
+// (created if missing), waiting up to wait (or until ctx ends); busy
+// describes the holder in the timeout error. The returned func releases
+// it. It follows no symlink at path and takes only a regular file (never a
+// pipe or device: it does not wait to open one).
+func lockFile(ctx context.Context, path string, how int, wait time.Duration, busy string) (func(), error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock: %w", err)
@@ -102,7 +132,7 @@ func lockFile(ctx context.Context, path string, wait time.Duration, busy string)
 	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
 		if err == nil {
 			return func() {
 				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
