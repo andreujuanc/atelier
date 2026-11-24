@@ -524,6 +524,18 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 	}
 
 	add(rule("Repos", w))
+	out = append(out, m.repoLines(task, w)...)
+	add(rule("Sessions", w))
+	out = append(out, m.sessionLines(t.Sessions, w)...)
+	return out
+}
+
+// repoLines lists task's repos at width w for the details pane: with
+// their state (missing, dirty, ...) once the details read for the task
+// have it.
+func (m *Model) repoLines(task model.Task, w int) []string {
+	var out []string
+	add := func(s string) { out = append(out, trunc(s, w)) }
 	var status []app.RepoStatus
 	if m.detail != nil && m.detail.Task.ID == task.ID {
 		status = m.detail.RepoStatus
@@ -565,17 +577,22 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 	if len(task.Repos) == 0 && len(status) == 0 {
 		add(dimStyle.Render(" none"))
 	}
+	return out
+}
 
-	add(rule("Sessions", w))
-	if len(t.Sessions) == 0 {
+// sessionLines lists sessions at width w for the details pane.
+func (m *Model) sessionLines(sessions []model.Session, w int) []string {
+	var out []string
+	add := func(s string) { out = append(out, trunc(s, w)) }
+	if len(sessions) == 0 {
 		add(dimStyle.Render(" none — ") + keyStyle.Render("s") + dimStyle.Render(" starts one"))
 	}
 	now := m.now()
 	sessW := 0
-	for _, s := range t.Sessions {
+	for _, s := range sessions {
 		sessW = max(sessW, ansi.StringWidth(sessionName(s)))
 	}
-	for _, s := range t.Sessions {
+	for _, s := range sessions {
 		age := "-"
 		if !s.LastEventAt.IsZero() {
 			age = humanAge(now.Sub(s.LastEventAt))
