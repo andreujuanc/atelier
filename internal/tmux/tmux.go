@@ -426,6 +426,10 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	if err != nil {
 		return "", err
 	}
+	argv, err := withPaneEnv(spec.Env, spec.Argv)
+	if err != nil {
+		return "", err
+	}
 	// tmux expands formats (#{...}, #(command)) in a new session's name and
 	// a new window's name and directory: "##" there is a "#".
 	noFormat := func(s string) string { return strings.ReplaceAll(s, "#", "##") }
@@ -451,7 +455,7 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 			args = append(args, "-e", k+"="+spec.Env[k])
 		}
 		args = append(args, "-P", "-F", "#{window_id}", "--")
-		args = append(args, commandArgs(spec.Argv)...)
+		args = append(args, commandArgs(argv)...)
 		if script != "" {
 			// One invocation: if it starts the server, the variables are
 			// set in it before the window is created.
@@ -500,6 +504,30 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 		return id, fmt.Errorf("tmux: tag window %s in session %s: %w", id, spec.Session, err)
 	}
 	return id, nil
+}
+
+// paneVars are the variables tmux sets in a new pane after its -e ones:
+// PATH (the client's, or the session's) and SHELL (default-shell).
+var paneVars = []string{"PATH", "SHELL"}
+
+// withPaneEnv returns argv run by env(1) with env's paneVars, which -e
+// cannot set; argv unchanged if env has none of them. env then looks argv[0]
+// up on that PATH.
+func withPaneEnv(env map[string]string, argv []string) ([]string, error) {
+	var set []string
+	for _, k := range paneVars {
+		if v, ok := env[k]; ok {
+			set = append(set, k+"="+v)
+		}
+	}
+	if len(set) == 0 {
+		return argv, nil
+	}
+	if strings.Contains(argv[0], "=") {
+		// env would take it for a variable.
+		return nil, fmt.Errorf("tmux: new window: command %q contains '='", argv[0])
+	}
+	return append(append([]string{"env"}, set...), argv...), nil
 }
 
 // commandArgs adapts argv for tmux: with several arguments tmux executes them
