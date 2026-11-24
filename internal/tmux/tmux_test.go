@@ -630,3 +630,45 @@ func TestServerEnv(t *testing.T) {
 		t.Error("without a socket name TMUX picks the server; it must stay")
 	}
 }
+
+// TestArgsEndingInSemicolon: tmux splits its command line into commands at
+// every argument that ends in ";", so such an argument (a word of a prompt,
+// a value) would lose its ";" and what follows it would run as tmux
+// commands. Each one reaches its command as it is.
+func TestArgsEndingInSemicolon(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out")
+	args := []string{"do it;", `a\;`, ";", "kill-server"}
+	script := `for a; do printf '[%s]' "$a"; done > ` + out + `.tmp; echo >> ` + out + `.tmp; mv ` + out + `.tmp ` + out + `; exec sleep 300`
+	_, err := c.NewWindow(ctx, WindowSpec{
+		Session: "atl-x", Name: "w;", Dir: dir,
+		Env:       map[string]string{"E": "v;"},
+		GlobalEnv: map[string]string{"G": "g"},
+		Argv:      append([]string{"sh", "-c", script, "sh"}, args...),
+	})
+	if err != nil {
+		t.Fatalf("NewWindow: %v", err)
+	}
+	if got, want := strings.TrimSpace(waitFile(t, out)), `[do it;][a\;][;][kill-server]`; got != want {
+		t.Errorf("argv = %s, want %s", got, want)
+	}
+	if !c.HasSession(ctx, "atl-x") {
+		t.Fatal("session gone: part of an argument ran as a tmux command")
+	}
+	if names, err := c.run(ctx, "list-windows", "-t", "=atl-x", "-F", "#{window_name}"); err != nil || names != "w;" {
+		t.Errorf("window name = %q, %v", names, err)
+	}
+	if e, err := c.run(ctx, "show-environment", "-t", "=atl-x", "E"); err == nil && e != "" && e != "E=v;" {
+		t.Errorf("session env = %q", e)
+	}
+	for _, text := range []string{"text;", `text\;`} {
+		if err := c.SetBuffer(ctx, text); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := c.run(ctx, "show-buffer"); err != nil || got != text {
+			t.Errorf("show-buffer = %q, %v; want %q", got, err, text)
+		}
+	}
+}

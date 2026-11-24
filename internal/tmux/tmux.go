@@ -207,15 +207,34 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Err }
 
-func (c *Client) args(args ...string) []string {
-	var pre []string
+// args is tmux's command line for one tmux command.
+func (c *Client) args(args ...string) []string { return c.cmdline(args) }
+
+// cmdline is tmux's command line for the tmux commands cmds, run in one
+// invocation. tmux splits its command line into commands at every argument
+// that ends in ";" (the ";" dropped), and takes a final "\;" for ";": so
+// the commands are separated by ";" here, and an argument that ends in ";"
+// gets a "\" before that ";", which makes it reach its command as it is.
+func (c *Client) cmdline(cmds ...[]string) []string {
+	var out []string
 	if c.config != "" {
-		pre = append(pre, "-f", c.config)
+		out = append(out, "-f", c.config)
 	}
 	if c.Socket != "" {
-		pre = append(pre, "-L", c.Socket)
+		out = append(out, "-L", c.Socket)
 	}
-	return append(pre, args...)
+	for i, cmd := range cmds {
+		if i > 0 {
+			out = append(out, ";")
+		}
+		for _, a := range cmd {
+			if s, ok := strings.CutSuffix(a, ";"); ok {
+				a = s + `\;`
+			}
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // run executes tmux and returns trimmed stdout.
@@ -225,8 +244,16 @@ func (c *Client) run(ctx context.Context, args ...string) (string, error) {
 
 // runIn is run with stdin as tmux's standard input.
 func (c *Client) runIn(ctx context.Context, stdin string, args ...string) (string, error) {
+	out, err := c.runCmds(ctx, stdin, args)
+	return strings.TrimSpace(out), err
+}
+
+// runCmds runs the tmux commands cmds in one tmux invocation (see cmdline),
+// with stdin as its standard input, and returns its stdout as it is. An
+// *Error's Args are the commands' arguments, separated by ";".
+func (c *Client) runCmds(ctx context.Context, stdin string, cmds ...[]string) (string, error) {
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "tmux", c.args(args...)...)
+	cmd := exec.CommandContext(ctx, "tmux", c.cmdline(cmds...)...)
 	cmd.Env = c.serverEnv()
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -239,9 +266,16 @@ func (c *Client) runIn(ctx context.Context, stdin string, args ...string) (strin
 		if cerr := ctx.Err(); cerr != nil {
 			err = cerr
 		}
-		return strings.TrimSpace(stdout.String()), &Error{Args: args, Stderr: strings.TrimSpace(stderr.String()), Err: err}
+		var args []string
+		for i, a := range cmds {
+			if i > 0 {
+				args = append(args, ";")
+			}
+			args = append(args, a...)
+		}
+		return stdout.String(), &Error{Args: args, Stderr: strings.TrimSpace(stderr.String()), Err: err}
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	return stdout.String(), nil
 }
 
 // sessionVars are what a tmux server started from inside a session (a
@@ -392,17 +426,12 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	if err != nil {
 		return "", err
 	}
-	build := func(exists bool) []string {
+	build := func(exists bool) [][]string {
 		var args []string
-		if script != "" {
-			// One invocation: if it starts the server, the variables are
-			// set in it before the window is created.
-			args = []string{"source-file", "-", ";"}
-		}
 		if exists {
-			args = append(args, "new-window", "-t", "="+spec.Session+":")
+			args = []string{"new-window", "-t", "=" + spec.Session + ":"}
 		} else {
-			args = append(args, "new-session", "-d", "-s", spec.Session)
+			args = []string{"new-session", "-d", "-s", spec.Session}
 		}
 		if spec.Name != "" {
 			args = append(args, "-n", spec.Name)
@@ -419,7 +448,13 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 			args = append(args, "-e", k+"="+spec.Env[k])
 		}
 		args = append(args, "-P", "-F", "#{window_id}", "--")
-		return append(args, commandArgs(spec.Argv)...)
+		args = append(args, commandArgs(spec.Argv)...)
+		if script != "" {
+			// One invocation: if it starts the server, the variables are
+			// set in it before the window is created.
+			return [][]string{{"source-file", "-"}, args}
+		}
+		return [][]string{args}
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -429,18 +464,18 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	defer cancel()
 
 	exists := c.HasSession(ctx, spec.Session)
-	out, err := c.runIn(ctx, script, build(exists)...)
+	out, err := c.runCmds(ctx, script, build(exists)...)
 	if serverExited(err) {
 		// Reached a server on its way out (just killed, or its last
 		// session just closed), which ran nothing: once more, with the
 		// server that is there now, or a new one.
 		exists = c.HasSession(ctx, spec.Session)
-		out, err = c.runIn(ctx, script, build(exists)...)
+		out, err = c.runCmds(ctx, script, build(exists)...)
 	}
 	var te *Error
-	if !exists && err != nil && out == "" && errors.As(err, &te) && strings.Contains(te.Stderr, "duplicate session") {
+	if !exists && err != nil && strings.TrimSpace(out) == "" && errors.As(err, &te) && strings.Contains(te.Stderr, "duplicate session") {
 		// Lost a race with another atl creating the same session.
-		out, err = c.runIn(ctx, script, build(true)...)
+		out, err = c.runCmds(ctx, script, build(true)...)
 	}
 	if err != nil {
 		return "", fmt.Errorf("tmux: launch window in session %s: %w", spec.Session, redact(err, spec.GlobalEnv))
