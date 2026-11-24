@@ -350,14 +350,18 @@ func (a *App) checkTasksDir() Check {
 
 func (a *App) checkReposDir() Check {
 	const name = "repos dir"
+	def := "~/repos"
+	if a.Paths.Workspace != "" {
+		def = filepath.Join(a.Paths.Workspace, "repos")
+	}
 	fi, err := os.Stat(a.Paths.Repos)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		return warn(name, a.Paths.Repos+" does not exist; clone repos there or set $ATL_REPOS (default ~/repos)")
+		return warn(name, a.Paths.Repos+" does not exist; clone repos there or set $ATL_REPOS (default "+def+")")
 	case err != nil:
 		return warn(name, err.Error())
 	case !fi.IsDir():
-		return warn(name, a.Paths.Repos+" is not a directory; set $ATL_REPOS (default ~/repos)")
+		return warn(name, a.Paths.Repos+" is not a directory; set $ATL_REPOS (default "+def+")")
 	}
 	return pass(name, a.Paths.Repos)
 }
