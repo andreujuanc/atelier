@@ -725,20 +725,15 @@ func (c *Client) KillSession(ctx context.Context, name string) error {
 // ($TMUX names its socket), attach-session otherwise. From inside another
 // server (another workspace's, or the user's own tmux) that is a nested
 // client, so TMUX is removed from its environment (tmux refuses to nest
-// while it is set). Stdio is left for the caller to wire.
+// while it is set). attach-session starts the server if none runs, so it
+// runs with serverEnv (which drops TMUX there: that case has a socket
+// name). Stdio is left for the caller to wire.
 func (c *Client) AttachCmd(name string) *exec.Cmd {
-	if os.Getenv("TMUX") == "" {
-		return exec.Command("tmux", c.args("attach-session", "-t", "="+name)...)
-	}
-	if c.inside() {
+	if os.Getenv("TMUX") != "" && c.inside() {
 		return exec.Command("tmux", c.args("switch-client", "-t", "="+name)...)
 	}
 	cmd := exec.Command("tmux", c.args("attach-session", "-t", "="+name)...)
-	for _, kv := range os.Environ() {
-		if k, _, _ := strings.Cut(kv, "="); k != "TMUX" && k != "TMUX_PANE" {
-			cmd.Env = append(cmd.Env, kv)
-		}
-	}
+	cmd.Env = c.serverEnv()
 	return cmd
 }
 
