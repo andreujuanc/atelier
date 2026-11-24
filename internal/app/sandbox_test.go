@@ -908,6 +908,20 @@ func TestSandboxTaskImage(t *testing.T) {
 	if n := len(fd.find("run")); n != 1 {
 		t.Errorf("docker run calls = %d, want 1 (docker may pull)", n)
 	}
+	// A project that does not load is said once, not again for the error.
+	broken := e.app.Paths.ProjectFile("broken")
+	if err := os.WriteFile(broken, []byte("image = \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task.Project = "broken"
+	e.app.Out.(*bytes.Buffer).Reset()
+	if _, err := e.app.ensureSandbox(ctx, task); err == nil || !strings.Contains(err.Error(), "task image mine:1 (from $ATL_SANDBOX_IMAGE)") {
+		t.Fatalf("ensureSandbox with a broken project: %v", err)
+	}
+	if n := strings.Count(e.app.Out.(*bytes.Buffer).String(), "using the default task image"); n != 1 {
+		t.Errorf("project warning said %d times:\n%s", n, e.app.Out.(*bytes.Buffer).String())
+	}
+	task.Project = ""
 
 	// Once it is there, the container starts.
 	fd.missing = nil

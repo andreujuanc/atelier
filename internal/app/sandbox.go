@@ -61,13 +61,18 @@ func outsideSandbox(what string) error {
 // passed to each session by name (see sandboxArgv), and the file `atl
 // token` stores it in (Paths.ClaudeToken) is in no mount.
 func (a *App) sandboxSpec(ctx context.Context, t *model.Task) (sandbox.Spec, error) {
+	image, _ := a.taskImage(t)
+	return a.sandboxSpecFor(ctx, t, image)
+}
+
+// sandboxSpecFor is sandboxSpec with the task image image (taskImage).
+func (a *App) sandboxSpecFor(ctx context.Context, t *model.Task, image string) (sandbox.Spec, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return sandbox.Spec{}, err
 	}
 	dir := a.Paths.TaskDir(t.Slug)
 	id := a.sandboxID(t)
-	image, _ := a.taskImage(t)
 	spec := sandbox.Spec{
 		ID:      id,
 		Image:   image,
@@ -262,7 +267,8 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) 
 	if err := startGate(a.AtlBin, t.Slug, t.ID, runDir, a.gateLog(t), a.Sandbox.Mounts); err != nil {
 		return "", err
 	}
-	spec, err := a.sandboxSpec(ctx, t)
+	image, from := a.taskImage(t)
+	spec, err := a.sandboxSpecFor(ctx, t, image)
 	if err != nil {
 		return "", err
 	}
@@ -286,7 +292,6 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) 
 			return "", err
 		}
 		if missing, ierr := sandbox.ImageMissing(ctx, a.docker(), spec.Image); ierr == nil && missing {
-			_, from := a.taskImage(t)
 			return "", missingImage(spec.Image, from)
 		}
 		return "", fmt.Errorf("task container (image %s): %w", spec.Image, err)
