@@ -121,7 +121,7 @@ running, idle, stopped). Colours follow the terminal's light or dark background.
 | `q` | quit (waits for running operations; `ctrl+c` again forces) |
 
 Repo picker: type to filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter`
-confirms, `esc` cancels.
+confirms, `esc` clears the filter, else cancels.
 
 ## CLI
 
