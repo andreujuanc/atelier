@@ -676,3 +676,51 @@ func TestGateLatency(t *testing.T) {
 		}
 	}
 }
+
+// TestTaskServerEdges: a task server opens only for a task that still has
+// its id and slug, and notices when the task goes; a note needs text and
+// is the user's unless it says otherwise; an unknown op is refused.
+func TestTaskServerEdges(t *testing.T) {
+	ctx := context.Background()
+	f := setup(t)
+	if _, err := OpenTaskServer(f.p, f.task.ID, "other"); err == nil || !strings.Contains(err.Error(), "is not other") {
+		t.Fatalf("open with another task's slug: %v", err)
+	}
+	if _, err := OpenTaskServer(f.p, 9999, "fix"); err == nil {
+		t.Fatal("open for a missing task: no error")
+	}
+	ts, err := OpenTaskServer(f.p, f.task.ID, "fix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+	do := func(req sandbox.ControlRequest, body string) (int, string, string) {
+		var out, errb bytes.Buffer
+		code := ts.Do(req, []byte(body), &out, &errb)
+		return code, out.String(), errb.String()
+	}
+	if code, _, errs := do(sandbox.ControlRequest{Op: "frobnicate"}, ""); code != 1 || !strings.Contains(errs, `unknown operation "frobnicate"`) {
+		t.Errorf("unknown op: %d %q", code, errs)
+	}
+	if code, _, errs := do(sandbox.ControlRequest{Op: sandbox.OpNote}, " \n\x01\t"); code != 1 || !strings.Contains(errs, "note is empty") {
+		t.Errorf("empty note: %d %q", code, errs)
+	}
+	if code, out, _ := do(sandbox.ControlRequest{Op: sandbox.OpNote}, "plain"); code != 0 || out != "note added\n" {
+		t.Errorf("note without author: %d %q", code, out)
+	}
+	if notes, err := f.st.GetNotes(ctx, f.task.ID); err != nil || !strings.HasSuffix(notes, "[user] plain") {
+		t.Errorf("notes %q, %v", notes, err)
+	}
+	if code, _, errs := do(sandbox.ControlRequest{Op: sandbox.OpHook, Event: EventAssistantGuard}, "{}"); code != 2 || errs == "" {
+		t.Errorf("assistant guard for a task container: %d %q", code, errs)
+	}
+	if gone, err := ts.Gone(ctx); err != nil || gone {
+		t.Fatalf("Gone = %v, %v", gone, err)
+	}
+	if err := f.st.DeleteTask(ctx, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := ts.Gone(ctx); err != nil || !gone {
+		t.Fatalf("Gone after delete = %v, %v", gone, err)
+	}
+}

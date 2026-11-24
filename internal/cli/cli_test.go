@@ -526,3 +526,32 @@ func TestLsSanitizesTitle(t *testing.T) {
 		t.Fatalf("ls: %d %q %s", code, out, errs)
 	}
 }
+
+// TestResumeAndDiff: atl resume prints how many sessions it resumed; atl
+// diff writes the diff of each rw repo straight to a stdout that is not a
+// terminal, without colour.
+func TestResumeAndDiff(t *testing.T) {
+	root := setup(t)
+	if code, _, errs := atl(t, "new", "Diffed", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	wt := filepath.Join(root, "tasks", "diffed", "api")
+	if err := os.WriteFile(filepath.Join(wt, "hello.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, wt, "add", "hello.txt")
+	git(t, wt, "commit", "-q", "-m", "hello")
+	code, out, errs := atl(t, "diff", "diffed")
+	if code != 0 || !strings.Contains(out, "+hello") || !strings.Contains(out, "hello.txt") || strings.Contains(out, "\x1b[") {
+		t.Fatalf("diff: %d %q %s", code, out, errs)
+	}
+	if code, _, errs := atl(t, "diff", "nope"); code != exitErr || !strings.Contains(errs, "nope") {
+		t.Fatalf("diff of a missing task: %d %s", code, errs)
+	}
+	if code, out, errs := atl(t, "resume", "diffed"); code != 0 || out != "0\n" {
+		t.Fatalf("resume with nothing stopped: %d %q %s", code, out, errs)
+	}
+	if code, _, errs := atl(t, "resume", "nope"); code != exitErr || !strings.Contains(errs, "nope") {
+		t.Fatalf("resume of a missing task: %d %s", code, errs)
+	}
+}
