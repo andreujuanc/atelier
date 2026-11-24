@@ -301,7 +301,10 @@ type loudTask struct{ started chan struct{} }
 
 func (l loudTask) Do(req ControlRequest, body []byte, stdout, stderr io.Writer) int {
 	l.started <- struct{}{}
-	stdout.Write(bytes.Repeat([]byte("x"), 4<<20))
+	chunk := bytes.Repeat([]byte("x"), 4<<10)
+	for range 1024 { // 4 MiB, in writes short enough for the write timeout
+		stdout.Write(chunk)
+	}
 	return 0
 }
 
@@ -338,5 +341,62 @@ func TestControlTaskClientStopsReading(t *testing.T) {
 	code, ran, err := Ask(sock, ControlRequest{Op: OpHook, Event: "Stop"}, body, io.Discard, io.Discard, 5*time.Second)
 	if err != nil || !ran || code != 0 {
 		t.Errorf("large hook input after clients that stopped reading: exit %d, ran %v, %v", code, ran, err)
+	}
+}
+
+// closeNotifier is a listener whose connections say on closed when the
+// server closes them.
+type closeNotifier struct {
+	net.Listener
+	closed chan struct{}
+}
+
+func (l closeNotifier) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return notifyConn{conn, l.closed}, nil
+}
+
+type notifyConn struct {
+	net.Conn
+	closed chan struct{}
+}
+
+func (c notifyConn) Close() error {
+	c.closed <- struct{}{}
+	return c.Conn.Close()
+}
+
+// TestControlPushClientStopsReading: a client of a push or fetch that stops
+// reading the reply holds the gate for one write timeout at most, however
+// much atl prints.
+func TestControlPushClientStopsReading(t *testing.T) {
+	dir := t.TempDir()
+	atl := filepath.Join(dir, "atl")
+	if err := os.WriteFile(atl, []byte("#!/bin/sh\nhead -c 4194304 /dev/zero | tr '\\0' x\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("unix", filepath.Join(dir, "atl.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	closed := make(chan struct{}, 4)
+	go (&Control{Slug: "t1", TaskID: 7, Atl: atl, WriteTimeout: 200 * time.Millisecond}).Serve(closeNotifier{l, closed})
+
+	for _, op := range []string{OpPush, OpFetch} {
+		conn, err := net.Dial("unix", l.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		fmt.Fprintf(conn, `{"op":%q}`+"\n", op) // and never read
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Errorf("%s: a client that stopped reading still holds the gate", op)
+		}
 	}
 }

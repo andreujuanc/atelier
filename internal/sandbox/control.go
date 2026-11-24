@@ -140,8 +140,8 @@ const maxAtlOutput = 16 << 20
 // a request beyond it is refused at once.
 const maxAtlRunning = 3
 
-// replyWriteTimeout bounds each reply write of an atl request or a task
-// operation.
+// replyWriteTimeout bounds each reply write of a push, a fetch, an atl
+// request or a task operation.
 const replyWriteTimeout = 30 * time.Second
 
 func (c *Control) writeTimeout() time.Duration {
@@ -188,8 +188,9 @@ type Control struct {
 	// CommandPath of the command it runs ("atl notes") and whether that
 	// reads stdin (notes --set); an error refuses the request.
 	Resolve func(argv []string) (path string, readsStdin bool, err error)
-	// WriteTimeout bounds each reply write of an atl request or a task
-	// operation (a client that stops reading); 0 → replyWriteTimeout.
+	// WriteTimeout bounds each reply write of a push, a fetch, an atl
+	// request or a task operation (a client that stops reading); 0 →
+	// replyWriteTimeout.
 	WriteTimeout time.Duration
 
 	atlOnce  sync.Once
@@ -331,8 +332,8 @@ type replyWriter struct {
 	broken   bool
 }
 
-// bound has each write from now on (an atl request's, a task operation's
-// replies) give up after perWrite on conn.
+// bound has each write from now on (the replies of all but a copy or a
+// refusal) give up after perWrite on conn.
 func (w *replyWriter) bound(conn net.Conn, perWrite time.Duration) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -412,6 +413,7 @@ func (c *Control) handle(conn net.Conn) {
 		refuse(req.Op + " is not served by this gate")
 		return
 	}
+	out.bound(conn, c.writeTimeout())
 	args := c.argv(req)
 	logArgs := strings.Join(args, " ")
 	c.logf("run   atl %s", logArgs)
