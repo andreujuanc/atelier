@@ -231,13 +231,7 @@ func (a *App) ensureAssistantSandbox(ctx context.Context, busy bool) (string, er
 	if a.Paths.Workspace == "" {
 		return "", errors.New("the assistant's container needs a workspace")
 	}
-	if _, err := a.checkDocker(ctx); err != nil {
-		return "", err
-	}
-	if err := a.checkAtlBin(a.AtlBin); err != nil {
-		return "", err
-	}
-	if _, err := a.claudeAuth(); err != nil {
+	if err := a.checkSandboxNeeds(ctx); err != nil {
 		return "", err
 	}
 	runDir := a.Paths.AssistantRunDir()

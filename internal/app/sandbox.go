@@ -206,6 +206,21 @@ func (a *App) checkAtlBin(path string) error {
 	return nil
 }
 
+// checkSandboxNeeds refuses, one line each and in this order, to start a
+// container without a Docker daemon (without one, `atl token` would not
+// help), an atl binary that runs in it (checkAtlBin) or a Claude Code token
+// (claudeAuth).
+func (a *App) checkSandboxNeeds(ctx context.Context) error {
+	if _, err := a.checkDocker(ctx); err != nil {
+		return err
+	}
+	if err := a.checkAtlBin(a.AtlBin); err != nil {
+		return err
+	}
+	_, err := a.claudeAuth()
+	return err
+}
+
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
@@ -222,13 +237,7 @@ func fileExists(path string) bool {
 // static Linux one, see checkAtlBin) or a token for Claude Code
 // (claudeAuth) nothing is started.
 func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) {
-	if _, err := a.checkDocker(ctx); err != nil {
-		return "", err
-	}
-	if err := a.checkAtlBin(a.AtlBin); err != nil {
-		return "", err
-	}
-	if _, err := a.claudeAuth(); err != nil {
+	if err := a.checkSandboxNeeds(ctx); err != nil {
 		return "", err
 	}
 	runDir := a.Paths.RunDir(t.Slug)
