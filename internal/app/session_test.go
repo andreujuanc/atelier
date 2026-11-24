@@ -918,9 +918,9 @@ func TestResumeLaunchFailure(t *testing.T) {
 }
 
 // No session is launched into a task done or cancel is closing: a launch
-// waits for the task's lock, which they hold until the task is closed, and
-// then finds the task closed. Otherwise its window (and, sandboxed, the
-// task's container) would outlive the task.
+// waits for the task's launch lock, which they hold until the task is
+// closed, and then finds the task closed. Otherwise its window (and,
+// sandboxed, the task's container) would outlive the task.
 func TestLaunchWaitsForClose(t *testing.T) {
 	launches := map[string]func(e *env, ctx context.Context, task *model.Task) error{
 		"NewSession": func(e *env, ctx context.Context, task *model.Task) error {
@@ -949,7 +949,7 @@ func TestLaunchWaitsForClose(t *testing.T) {
 			if err := e.app.Store.CreateSession(ctx, past); err != nil {
 				t.Fatal(err)
 			}
-			unlock, err := e.app.lockTask(ctx, task.ID) // as done holds it
+			unlock, err := e.app.lockLaunches(ctx, task.ID) // as done holds it
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -976,5 +976,64 @@ func TestLaunchWaitsForClose(t *testing.T) {
 				t.Fatalf("live sessions of a closed task: %+v, %v", live, err)
 			}
 		})
+	}
+}
+
+// A launch held up in its sandbox (a slow docker run or image pull) does
+// not hold up the task's other operations: rename and a status change go
+// through at once. Only closing the task waits for it.
+func TestSlowLaunchBlocksOnlyClose(t *testing.T) {
+	e, _ := sandboxEnv(t)
+	ctx := context.Background()
+	task := e.task(t, "t", model.StatusActive, true)
+	entered, release := make(chan struct{}), make(chan struct{})
+	e.app.StartGate = func(string, string, int64, string, string, []string) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	errc := make(chan error, 1)
+	go func() {
+		_, err := e.app.NewSession(ctx, task.Slug)
+		errc <- err
+	}()
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+			<-errc
+		}
+	}()
+	<-entered
+
+	quick, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if _, err := e.app.Rename(quick, task.Slug, "renamed meanwhile"); err != nil {
+		t.Fatalf("rename during a launch: %v", err)
+	}
+	if out := e.app.Out.(*bytes.Buffer).String(); strings.Contains(out, "CLAUDE.md not updated") {
+		t.Fatalf("rename during a launch: %s", out)
+	}
+	if err := e.app.SetOpenStatus(quick, task.Slug, model.StatusReview); err != nil {
+		t.Fatalf("status during a launch: %v", err)
+	}
+	short, cancel2 := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel2()
+	if _, err := e.app.Done(short, task.Slug, true); err == nil {
+		t.Fatal("done went ahead during a launch")
+	}
+	short2, cancel3 := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel3()
+	if err := e.app.SetStatus(short2, task.Slug, model.StatusDone); err == nil {
+		t.Fatal("status done went ahead during a launch")
+	}
+
+	close(release)
+	released = true
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.app.Done(ctx, task.Slug, true); err != nil {
+		t.Fatal(err)
 	}
 }

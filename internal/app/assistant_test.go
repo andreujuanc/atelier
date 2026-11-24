@@ -466,17 +466,17 @@ func TestLockFileNoFollow(t *testing.T) {
 	if err := os.Symlink(filepath.Join(dir, "target"), link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lockFile(context.Background(), link, time.Second, "busy"); err == nil || exists(filepath.Join(dir, "target")) {
+	if _, err := lockFile(context.Background(), link, syscall.LOCK_EX, time.Second, "busy"); err == nil || exists(filepath.Join(dir, "target")) {
 		t.Errorf("symlink: %v", err)
 	}
 	fifo := filepath.Join(dir, "fifo.lock")
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lockFile(context.Background(), fifo, time.Second, "busy"); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+	if _, err := lockFile(context.Background(), fifo, syscall.LOCK_EX, time.Second, "busy"); err == nil || !strings.Contains(err.Error(), "not a regular file") {
 		t.Errorf("fifo: %v", err)
 	}
-	unlock, err := lockFile(context.Background(), filepath.Join(dir, "plain.lock"), time.Second, "busy")
+	unlock, err := lockFile(context.Background(), filepath.Join(dir, "plain.lock"), syscall.LOCK_EX, time.Second, "busy")
 	if err != nil {
 		t.Fatal(err)
 	}

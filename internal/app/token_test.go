@@ -292,7 +292,7 @@ func TestDoctorClaudeToken(t *testing.T) {
 		{0, "ok", "0 days old"},
 		{100 * 24 * time.Hour, "ok", "100 days old"},
 		{334 * 24 * time.Hour, "ok", "334 days old"},
-		{335 * 24 * time.Hour, "warn", "expires by 2027-01-10"},
+		{335 * 24 * time.Hour, "warn", "expires by " + t0.Add(tokenLifetime).Local().Format(time.DateOnly)}, // a local date
 		{364 * 24 * time.Hour, "warn", "364 days old"},
 		{365 * 24 * time.Hour, "FAIL", "has expired"},
 	} {

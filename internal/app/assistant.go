@@ -81,7 +81,7 @@ func (a *App) Assistant(ctx context.Context, taskRef string) (attach *exec.Cmd, 
 	if err := os.MkdirAll(a.Paths.StateDir, 0o755); err != nil {
 		return nil, "", fmt.Errorf("assistant: %w", err)
 	}
-	unlock, err := lockFile(ctx, a.assistantLock(), assistantLockWait,
+	unlock, err := lockFile(ctx, a.assistantLock(), syscall.LOCK_EX, assistantLockWait,
 		"another atl is launching the assistant")
 	if err != nil {
 		return nil, "", fmt.Errorf("assistant: %w", err)
