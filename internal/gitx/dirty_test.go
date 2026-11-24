@@ -247,7 +247,7 @@ func TestIsDirtyOpensNoFIFO(t *testing.T) {
 	}
 	ix := &gitIndex{}
 	e := &indexEntry{mode: modeRegular | 0o644, oid: "d95f3ad14dee633a758d2e331151e950dd13e4ed", path: "sub/f", size: 8}
-	if changed, err := ix.changed(e, d, true); err != nil || !changed {
+	if changed, err := ix.changed(e, d, func() bool { return true }); err != nil || !changed {
 		t.Errorf("a tracked file reached through a symlinked directory: changed = %v, %v; want a change", changed, err)
 	}
 }

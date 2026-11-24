@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -118,6 +119,26 @@ func (s *Store) ClaudeIDInOtherTask(ctx context.Context, cid string, taskID int6
 func (s *Store) ListSessions(ctx context.Context, taskID int64) ([]model.Session, error) {
 	return s.querySessions(ctx, `SELECT `+sessionCols+` FROM sessions WHERE task_id = ?
 		ORDER BY created_at, id`, taskID)
+}
+
+// ListSessionsByTask returns the sessions of the tasks taskIDs by task id,
+// each task's ordered as ListSessions orders them: one query for what would
+// be one ListSessions per task.
+func (s *Store) ListSessionsByTask(ctx context.Context, taskIDs []int64) (map[int64][]model.Session, error) {
+	ids, err := json.Marshal(taskIDs)
+	if err != nil {
+		return nil, err
+	}
+	ss, err := s.querySessions(ctx, `SELECT `+sessionCols+` FROM sessions
+		WHERE task_id IN (SELECT value FROM json_each(?)) ORDER BY created_at, id`, string(ids))
+	if err != nil {
+		return nil, err
+	}
+	out := map[int64][]model.Session{}
+	for _, sess := range ss {
+		out[sess.TaskID] = append(out[sess.TaskID], sess)
+	}
+	return out, nil
 }
 
 // ListSessionsByState returns sessions in any of the given states (all

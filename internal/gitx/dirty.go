@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -84,10 +85,12 @@ func isDirty(ctx context.Context, worktree string, depth int) (bool, error) {
 		return false, err
 	}
 	defer d.Close()
-	fileMode := true
-	if v, err := run(ctx, worktree, "config", "--type=bool", "--get", "core.filemode"); err == nil {
-		fileMode = v != "false"
-	}
+	// core.filemode is read only for a file whose executable bit differs from
+	// its entry's: a clean worktree costs no git call for it.
+	fileMode := sync.OnceValue(func() bool {
+		v, err := run(ctx, worktree, "config", "--type=bool", "--get", "core.filemode")
+		return err != nil || v != "false"
+	})
 	for i := range ix.entries {
 		e := &ix.entries[i]
 		if e.stage != 0 || e.flags&ceIntentToAdd != 0 {
@@ -287,7 +290,7 @@ func parseIndexEntry(head string, r *bufio.Reader) (indexEntry, error) {
 // the entry's object. Anything that is not what the index has there (a
 // directory on the way that is a symlink; a FIFO, device or directory in
 // place of a file) is a change.
-func (ix *gitIndex) changed(e *indexEntry, d *nofollow.Dir, fileMode bool) (bool, error) {
+func (ix *gitIndex) changed(e *indexEntry, d *nofollow.Dir, fileMode func() bool) (bool, error) {
 	fi, err := d.Lstat(e.path)
 	if gone(err) {
 		return true, nil
@@ -300,7 +303,7 @@ func (ix *gitIndex) changed(e *indexEntry, d *nofollow.Dir, fileMode bool) (bool
 		if !fi.Mode().IsRegular() {
 			return true, nil
 		}
-		if fileMode && (e.mode&0o100 != 0) != (fi.Mode().Perm()&0o100 != 0) {
+		if (e.mode&0o100 != 0) != (fi.Mode().Perm()&0o100 != 0) && fileMode() {
 			return true, nil
 		}
 	case modeSymlink:

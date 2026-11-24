@@ -417,6 +417,14 @@ func TestSessions(t *testing.T) {
 	if err != nil || len(list) != 2 || list[0].ID != s2.ID || list[1].ID != s1.ID {
 		t.Errorf("ListSessions = %+v, %v", list, err)
 	}
+	third := mkTask(t, s, "t3", model.StatusActive, 200)
+	byTask, err := s.ListSessionsByTask(ctx, []int64{task.ID, third.ID})
+	if err != nil || len(byTask) != 1 || !reflect.DeepEqual(byTask[task.ID], list) {
+		t.Errorf("ListSessionsByTask(t1, t3) = %+v, %v; want t1: %+v", byTask, err, list)
+	}
+	if byTask, err := s.ListSessionsByTask(ctx, nil); err != nil || len(byTask) != 0 {
+		t.Errorf("ListSessionsByTask(none) = %+v, %v", byTask, err)
+	}
 
 	// Validation.
 	if err := s.CreateSession(ctx, &model.Session{TaskID: task.ID, State: "dead"}); err == nil {

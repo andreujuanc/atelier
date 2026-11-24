@@ -558,13 +558,17 @@ func (a *App) List(ctx context.Context, statuses ...model.Status) ([]TaskView, e
 	if err != nil {
 		return nil, err
 	}
+	ids := make([]int64, len(tasks))
+	for i, t := range tasks {
+		ids[i] = t.ID
+	}
+	sessions, err := a.Store.ListSessionsByTask(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]TaskView, 0, len(tasks))
 	for _, t := range tasks {
-		sessions, err := a.Store.ListSessions(ctx, t.ID)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, TaskView{Task: t, Sessions: sessions})
+		out = append(out, TaskView{Task: t, Sessions: sessions[t.ID]})
 	}
 	return out, nil
 }

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,7 +44,9 @@ const (
 // itself tells OAuth tokens by the prefix sk-ant-oat (sk-ant-oat01- today);
 // the rest is base64url.
 var (
-	tokenRE     = regexp.MustCompile(`^sk-ant-oat[0-9]{2}-[A-Za-z0-9_-]{32,512}$`)
+	// Compiled on first use: the counted repetition makes it the costliest
+	// regexp to build, which every atl process (each hook) would pay at start.
+	tokenRE     = sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile(`^sk-ant-oat[0-9]{2}-[A-Za-z0-9_-]{32,512}$`) })
 	tokenHeadRE = regexp.MustCompile(`^sk-ant-oat[0-9]{2}-[A-Za-z0-9_-]*$`)
 	tokenTailRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 )
@@ -71,7 +74,7 @@ func (a *App) loadToken() (st storedToken, ok bool, err error) {
 	if err != nil {
 		return st, false, fmt.Errorf("stored Claude Code token %s: %w", path, err)
 	}
-	if json.Unmarshal(data, &st) != nil || !tokenRE.MatchString(st.Token) {
+	if json.Unmarshal(data, &st) != nil || !tokenRE().MatchString(st.Token) {
 		return storedToken{}, false, fmt.Errorf("stored Claude Code token %s is not one atl wrote; run `atl token` again", path)
 	}
 	return st, true, nil
@@ -81,7 +84,7 @@ func (a *App) loadToken() (st storedToken, ok bool, err error) {
 // setup-token`, with the current time, in Paths.ClaudeToken (mode 0600,
 // replaced atomically). Neither the value nor any part of it is in an error.
 func (a *App) StoreToken(tok string) error {
-	if !tokenRE.MatchString(tok) {
+	if !tokenRE().MatchString(tok) {
 		return errors.New("that is not a Claude Code token from `claude setup-token` (sk-ant-oat01-…); nothing stored")
 	}
 	path := a.Paths.ClaudeToken()
@@ -404,7 +407,7 @@ func pickToken(screen string, width int) (tok string, ok bool) {
 			i++
 			more = len(next) == part
 		}
-		if tokenRE.MatchString(cand) {
+		if tokenRE().MatchString(cand) {
 			found[cand] = true
 		}
 	}

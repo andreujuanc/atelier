@@ -326,12 +326,7 @@ func CheckWorktree(ctx context.Context, path, repo string) error {
 		}
 		return fmt.Errorf("%s is %s, not a worktree of %s", path, what, repo)
 	}
-	// One path per call: a path may have a newline in it.
-	common, err := revParsePath(ctx, path, "--path-format=absolute", "--git-common-dir")
-	if err != nil {
-		return fmt.Errorf("%s is not a worktree of %s: %w", path, repo, err)
-	}
-	top, err := revParsePath(ctx, path, "--show-toplevel")
+	common, top, err := commonDirAndTop(ctx, path)
 	if err != nil {
 		return fmt.Errorf("%s is not a worktree of %s: %w", path, repo, err)
 	}
@@ -342,6 +337,26 @@ func CheckWorktree(ctx context.Context, path, repo string) error {
 		return fmt.Errorf("%s is not a worktree of %s: its work tree is %s", path, repo, top)
 	}
 	return nil
+}
+
+// commonDirAndTop returns the absolute git common dir and the top of the work
+// tree of dir. Both come from one `git rev-parse` when its output, a line
+// each, has no other newline; a path with a newline in it is asked for
+// alone (one path per call), as is either path when the joint call fails,
+// so its error is the one that call gives.
+func commonDirAndTop(ctx context.Context, dir string) (common, top string, err error) {
+	out, err := output(ctx, dir, "", "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel")
+	if err == nil && strings.Count(out, "\n") == 2 && strings.HasSuffix(out, "\n") {
+		common, top, _ = strings.Cut(strings.TrimSuffix(out, "\n"), "\n")
+		return common, top, nil
+	}
+	if common, err = revParsePath(ctx, dir, "--path-format=absolute", "--git-common-dir"); err != nil {
+		return "", "", err
+	}
+	if top, err = revParsePath(ctx, dir, "--show-toplevel"); err != nil {
+		return "", "", err
+	}
+	return common, top, nil
 }
 
 // CurrentBranch returns the checked-out branch name, or "" if HEAD is detached.

@@ -95,12 +95,12 @@ type gateHandler func(g *Gate, w http.ResponseWriter, r *http.Request, m []strin
 
 type gateRoute struct {
 	methods string
-	re      *regexp.Regexp
+	re      func() *regexp.Regexp // compiled on first use: not in every atl process (hooks)
 	h       gateHandler
 }
 
 func route(methods, pattern string, h gateHandler) gateRoute {
-	return gateRoute{methods, regexp.MustCompile("^" + pattern + "$"), h}
+	return gateRoute{methods, sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile("^" + pattern + "$") }), h}
 }
 
 // gateRoutes is everything a task may call, matched without the /v1.xx prefix.
@@ -190,7 +190,7 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if method != r.Method {
 				continue
 			}
-			if m := rt.re.FindStringSubmatch(path); m != nil {
+			if m := rt.re().FindStringSubmatch(path); m != nil {
 				rt.h(g, w, r, m)
 				return
 			}
