@@ -973,6 +973,9 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		// API versions before 1.24 (Docker 24 and older) apply a
 		// HostConfig sent with a start.
 		{"POST", "/v1.23/containers/mine/start", `{"Privileged":true,"Binds":["/:/host"]}`},
+		// Docker 17.09 and older (experimental) restore a checkpoint from
+		// any host directory.
+		{"POST", "/containers/mine/start?checkpoint=c1&checkpoint-dir=" + url.QueryEscape(c.root+"/cp"), ""},
 	} {
 		before := len(c.d.requests)
 		if status, out := c.do(tc.method, tc.uri, tc.body); status != http.StatusForbidden {

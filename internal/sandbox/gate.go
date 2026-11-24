@@ -578,6 +578,12 @@ func gateContainer(g *Gate, w http.ResponseWriter, r *http.Request, m []string) 
 		g.deny(w, r, http.StatusForbidden, "a container start takes no settings; they go in the create")
 		return
 	}
+	if action == "start" && slices.ContainsFunc(r.URL.Query()["checkpoint-dir"], func(s string) bool { return s != "" }) {
+		// Docker 17.09 and older (experimental) restore the container
+		// from a checkpoint in this host directory; later ones refuse it.
+		g.deny(w, r, http.StatusForbidden, "a checkpoint directory is not allowed")
+		return
+	}
 	if action == "rename" {
 		if err := checkName(r); err != nil {
 			g.deny(w, r, http.StatusForbidden, err.Error())
