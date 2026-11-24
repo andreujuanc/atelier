@@ -164,20 +164,32 @@ type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// getTask loads one task matching where/args, with repos.
+// readTx begins a read-only transaction: a plain (deferred) BEGIN, not
+// BEGIN IMMEDIATE, so it never takes the write lock, and its queries all
+// read one snapshot of the database.
+func (s *Store) readTx(ctx context.Context) (*sql.Tx, error) {
+	return s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+}
+
+// getTask loads one task matching where/args, with repos, from one snapshot.
 func (s *Store) getTask(ctx context.Context, desc, where string, args ...any) (*model.Task, error) {
-	t, err := s.getTaskBrief(ctx, desc, where, args...)
+	tx, err := s.readTx(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.loadRepos(ctx, []*model.Task{t}, "task_id = ?", t.ID); err != nil {
+	defer tx.Rollback()
+	t, err := getTaskBrief(ctx, tx, desc, where, args...)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadRepos(ctx, tx, []*model.Task{t}, "task_id = ?", t.ID); err != nil {
 		return nil, err
 	}
 	return t, nil
 }
 
 // loadRepos fills Repos for tasks, querying task_repos rows matching where.
-func (s *Store) loadRepos(ctx context.Context, tasks []*model.Task, where string, args ...any) error {
+func loadRepos(ctx context.Context, q querier, tasks []*model.Task, where string, args ...any) error {
 	if len(tasks) == 0 {
 		return nil
 	}
@@ -186,7 +198,7 @@ func (s *Store) loadRepos(ctx context.Context, tasks []*model.Task, where string
 		t.Repos = []model.TaskRepo{}
 		byID[t.ID] = t
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT task_id, name, mode, base_branch, base_commit
+	rows, err := q.QueryContext(ctx, `SELECT task_id, name, mode, base_branch, base_commit
 		FROM task_repos WHERE `+where+` ORDER BY task_id, position`, args...)
 	if err != nil {
 		return err
@@ -220,16 +232,16 @@ func (s *Store) GetTaskBySlug(ctx context.Context, slug string) (*model.Task, er
 // GetTaskBrief returns the task with the given id without its repos (Repos
 // is nil): one query, for hot paths such as `atl statusline`.
 func (s *Store) GetTaskBrief(ctx context.Context, id int64) (*model.Task, error) {
-	return s.getTaskBrief(ctx, strconv.FormatInt(id, 10), "id = ?", id)
+	return getTaskBrief(ctx, s.db, strconv.FormatInt(id, 10), "id = ?", id)
 }
 
 // GetTaskBriefBySlug is GetTaskBrief by slug.
 func (s *Store) GetTaskBriefBySlug(ctx context.Context, slug string) (*model.Task, error) {
-	return s.getTaskBrief(ctx, strconv.Quote(slug), "slug = ?", slug)
+	return getTaskBrief(ctx, s.db, strconv.Quote(slug), "slug = ?", slug)
 }
 
-func (s *Store) getTaskBrief(ctx context.Context, desc, where string, args ...any) (*model.Task, error) {
-	t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE `+where, args...))
+func getTaskBrief(ctx context.Context, q querier, desc, where string, args ...any) (*model.Task, error) {
+	t, err := scanTask(q.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE `+where, args...))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("task %s: %w", desc, ErrNotFound)
 	}
@@ -298,7 +310,7 @@ func isDigits(s string) bool {
 
 // ListTasks returns tasks with any of the given statuses (all tasks if none
 // given), ordered by status (model.AllStatuses order) then updated_at desc,
-// with repos loaded.
+// with repos loaded, all from one snapshot.
 func (s *Store) ListTasks(ctx context.Context, statuses ...model.Status) ([]model.Task, error) {
 	where := "1"
 	var args []any
@@ -311,7 +323,12 @@ func (s *Store) ListTasks(ctx context.Context, statuses ...model.Status) ([]mode
 		}
 		where = "status IN (" + placeholders(len(statuses)) + ")"
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE `+where+
+	tx, err := s.readTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE `+where+
 		` ORDER BY `+statusOrder+`, updated_at DESC, id DESC`, args...)
 	if err != nil {
 		return nil, err
@@ -329,7 +346,7 @@ func (s *Store) ListTasks(ctx context.Context, statuses ...model.Status) ([]mode
 		return nil, err
 	}
 	rows.Close()
-	if err := s.loadRepos(ctx, ptrs, "task_id IN (SELECT id FROM tasks WHERE "+where+")", args...); err != nil {
+	if err := loadRepos(ctx, tx, ptrs, "task_id IN (SELECT id FROM tasks WHERE "+where+")", args...); err != nil {
 		return nil, err
 	}
 	out := make([]model.Task, len(ptrs))
