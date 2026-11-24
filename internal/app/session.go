@@ -71,8 +71,8 @@ func (a *App) checkLaunchable(t *model.Task) (string, error) {
 // it is still launchable (checkLaunchable). Closing the task holds the lock
 // exclusive until the task is closed, so no session is launched into a
 // task being closed: its window and container would outlive the task. The
-// caller keeps the lock until its launch is recorded. AddRepos launches
-// under the task's lock instead, which keeps done and cancel out too.
+// caller keeps the lock until its launch is recorded. AddRepos, which holds
+// it exclusive, launches without it.
 func (a *App) lockLaunch(ctx context.Context, t *model.Task) (*model.Task, string, func(), error) {
 	if _, err := a.checkLaunchable(t); err != nil {
 		return nil, "", nil, err

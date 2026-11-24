@@ -94,6 +94,13 @@ func (a *App) AddRepos(ctx context.Context, ref string, repos []RepoArg, o AddOp
 		return nil, err
 	}
 	defer unlock()
+	// A launch under way has read the task's repos: it ends first, and
+	// none starts until the repo is in (see lockLaunches).
+	unlockLaunches, err := a.lockLaunches(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockLaunches()
 	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
 		return nil, err
 	}

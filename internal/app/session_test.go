@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1035,5 +1036,73 @@ func TestSlowLaunchBlocksOnlyClose(t *testing.T) {
 	}
 	if _, err := e.app.Done(ctx, task.Slug, true); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Adding a repo waits for a launch under way: the launch has read the
+// task's repos, so a repo added under it would not be seen by its session
+// (no --add-dir, no mount) and no restart would be asked for.
+func TestAddRepoWaitsForLaunch(t *testing.T) {
+	adds := map[string]func(e *env, ctx context.Context) error{
+		"AddRepo": func(e *env, ctx context.Context) error {
+			_, err := e.app.AddRepo(ctx, "t", RepoArg{Name: "docs", Mode: model.ModeRO}, true)
+			return err
+		},
+		"AddRepos": func(e *env, ctx context.Context) error {
+			_, err := e.app.AddRepos(ctx, "t", []RepoArg{{Name: "docs", Mode: model.ModeRO}}, AddOpts{NoFetch: true})
+			return err
+		},
+	}
+	for name, add := range adds {
+		t.Run(name, func(t *testing.T) {
+			e, _ := sandboxEnv(t)
+			ctx := context.Background()
+			task := e.task(t, "t", model.StatusActive, true)
+			gitInit(t, e.app.Paths.RepoPath("docs"))
+			entered, release := make(chan struct{}), make(chan struct{})
+			e.app.StartGate = func(string, string, int64, string, string, []string) error {
+				select {
+				case <-entered:
+				default:
+					close(entered)
+					<-release
+				}
+				return nil
+			}
+			launched := make(chan struct{})
+			go func() {
+				_, err := e.app.NewSession(ctx, task.Slug)
+				if err != nil {
+					t.Error(err)
+				}
+				close(launched)
+			}()
+			<-entered
+			added := make(chan error, 1)
+			go func() { added <- add(e, ctx) }()
+			select {
+			case err := <-added:
+				close(release)
+				<-launched
+				t.Fatalf("%s did not wait for the launch: %v", name, err)
+			case <-time.After(300 * time.Millisecond):
+			}
+			close(release)
+			<-launched
+			err := <-added
+			if name == "AddRepo" {
+				if !errors.Is(err, ErrRestartNeeded) {
+					t.Fatalf("AddRepo after the launch: %v", err)
+				}
+				return
+			}
+			// AddRepos restarts the session that started meanwhile, or says it is busy.
+			if err != nil {
+				var busy *BusyError
+				if !errors.As(err, &busy) {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 }

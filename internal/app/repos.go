@@ -89,10 +89,10 @@ func (a *App) lockTask(ctx context.Context, id int64) (func(), error) {
 // launches under way, up to taskLockWait (or until ctx ends), and keeps new
 // ones out until the returned func releases it. The launch lock
 // (<StateDir>/locks/task-<id>.launch.lock) is apart from the task's lock
-// (lockTask): each launch holds it shared (lockLaunch), and closing the
-// task holds it exclusive until the task is closed. So no session is
-// launched into a task being closed, and a slow launch (a docker run, an
-// image pull) holds up nothing else.
+// (lockTask): each launch holds it shared (lockLaunch); closing the task
+// and adding repos to it hold it exclusive (after lockTask). So no session
+// is launched into a task being closed or with repos it would not see,
+// and a slow launch (a docker run, an image pull) holds up only those.
 func (a *App) lockLaunches(ctx context.Context, id int64) (func(), error) {
 	return a.launchLock(ctx, id, syscall.LOCK_EX)
 }
@@ -186,6 +186,13 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 		return nil, err
 	}
 	defer unlock()
+	// A launch under way has read the task's repos: it ends first, and
+	// none starts until the repo is in (see lockLaunches).
+	unlockLaunches, err := a.lockLaunches(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockLaunches()
 	return a.addRepoLocked(ctx, t.ID, name, mode, noFetch)
 }
 
