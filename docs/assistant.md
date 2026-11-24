@@ -99,7 +99,7 @@ the edit is refused.
 
 | rule | commands |
 |---|---|
-| allowed | `atl ls`, `show`, `transcript`, `repos`, `help`; Read, Grep, Glob (the old `atl --help *` rule is removed) |
+| allowed | `atl ls`, `show`, `transcript`, `repos` (not `repos pin`), `help`; Read, Grep, Glob (the old `atl --help *` rule is removed) |
 | ask first | `atl new`, `add`, `status`, `session`, `resume`, `pr`, `note`, `notes`, `rename` (all of `atl notes`: it reads notes with `atl show <task> --notes`); `done`, `cancel`, `open` too, which only matters with the sandbox off (its gate refuses them) |
 | denied | `git commit`/`push`/`checkout`/`reset`/`rebase`/`merge`/`stash`/…, `rm`, `mv`, `cp`, `sed -i`, `tee` |
 | hook | Edit/Write/MultiEdit/NotebookEdit outside its dir, or on its own `CLAUDE.md`, `.mcp.json`, `.claude/`: blocked (fails closed) |

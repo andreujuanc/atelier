@@ -87,9 +87,10 @@ reported: `kept branch atl/<slug> in <repo> (N unpushed commit(s))`.
 - Refused even with `--force`: a worktree whose HEAD has commits no branch, remote-tracking
   ref or tag reaches (detached HEAD, rebase in progress). Put them on a branch first.
 
-TUI dialog: lists what will be deleted. If a worktree has uncommitted changes, tick
-`[ ] Delete them` with `space`, then `enter` (equivalent to `--force`); `esc` or `n`
-cancels. Changes that appear after the dialog opened make the close refuse.
+TUI dialog: says what will be deleted. To confirm, tick `[ ] Delete them` with `space`, then
+`enter`; `esc` or `n` cancels. If it says a worktree has uncommitted changes, confirming
+discards them (as `--force`). Changes that appear after the dialog opened make the close
+refuse, and the dialog comes back saying so.
 
 The task's Claude dir keeps its transcripts after closing; delete
 `<workspace>/run/claude/<hash>` yourself when no longer needed.
