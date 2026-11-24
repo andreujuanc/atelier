@@ -557,8 +557,6 @@ func TestLogErrorOneLine(t *testing.T) {
 	}
 }
 
-// TestGateLatency: a hook round trip through the gate (client and gate in
-// one process here) stays in the low milliseconds.
 // TestGateTranscriptPath: the gate records a transcript path only inside
 // the task's own Claude config dir, symlinks resolved; any other is
 // ignored (the event still counts) and logged.
@@ -646,6 +644,8 @@ func TestGateClaudeID(t *testing.T) {
 	}
 }
 
+// TestGateLatency: a hook round trip through the gate (client and gate in
+// one process here) stays in the low milliseconds.
 func TestGateLatency(t *testing.T) {
 	if raceEnabled {
 		t.Skip("race-instrumented code is too slow to measure")
