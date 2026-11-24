@@ -2075,6 +2075,35 @@ func TestPickerEscClearsFilter(t *testing.T) {
 	}
 }
 
+// The picker shows the last known repos at once and the refreshed list when
+// it arrives: a cursor the user moved stays on the same repo, so space never
+// toggles a repo the user did not highlight.
+func TestPickerRefreshKeepsCursor(t *testing.T) {
+	p := newPicker("Pick", nil, nil)
+	p.available = []string{"api", "lib", "web"} // shown until the refresh
+	p.initCursor()
+	p.update(keyMsg("down"))
+	if p.current() != "lib" {
+		t.Fatalf("cursor on %q", p.current())
+	}
+	p.setAvailable([]string{"api", "docs", "lib", "web"}, nil)
+	if p.current() != "lib" {
+		t.Fatalf("after the refresh the cursor is on %q, want lib", p.current())
+	}
+	p.update(keyMsg(" "))
+	if got := p.selection(); len(got) != 1 || got[0].Name != "lib" {
+		t.Fatalf("space selected %v", got)
+	}
+	// Its repo gone from disk: the cursor stays at its row, clamped.
+	p.update(keyMsg(" "))
+	p.update(keyMsg(" ")) // deselected again
+	p.update(keyMsg("end"))
+	p.setAvailable([]string{"api", "docs"}, nil)
+	if p.current() != "docs" {
+		t.Fatalf("after its repo went the cursor is on %q, want docs", p.current())
+	}
+}
+
 // Locked rows: the cursor marker is drawn on them, the cursor starts on
 // the first unlocked row (also when the repo list is already known) and
 // the "already in the task" hint survives moves.
