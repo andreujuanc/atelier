@@ -194,7 +194,7 @@ func (a *App) checkClaudeToken() Check {
 		}
 		return pass(name, detail)
 	}
-	age := a.now().Sub(auth.storedAt)
+	age := max(a.now().Sub(auth.storedAt), 0) // not negative if the clock was set back
 	days := int(age / (24 * time.Hour))
 	on := auth.storedAt.Local().Format(time.DateOnly)
 	switch {
