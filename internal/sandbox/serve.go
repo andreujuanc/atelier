@@ -52,6 +52,14 @@ func UpstreamSocket() string {
 	return "/var/run/docker.sock"
 }
 
+// lockProbeWait is how long a starting gate tries for the run dir's lock
+// before it takes it for another gate's; shutdownWait how long a stopped
+// gate lets the requests under way finish.
+const (
+	lockProbeWait = 500 * time.Millisecond
+	shutdownWait  = 10 * time.Second
+)
+
 // MaxSocketPath is the longest unix socket path Linux accepts (sun_path
 // holds 108 bytes including the final NUL).
 const MaxSocketPath = 107
@@ -85,11 +93,19 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 		return err
 	}
 	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil // another gate has it
+	// Another gate has it if it stays taken a moment: Stop and StopAndWait
+	// take it for an instant to see whether a gate holds it.
+	for give := time.Now().Add(lockProbeWait); ; time.Sleep(20 * time.Millisecond) {
+		err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
 		}
-		return err
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return err
+		}
+		if time.Now().After(give) {
+			return nil
+		}
 	}
 	if err := os.WriteFile(pidPath(runDir), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
 		return err
@@ -141,7 +157,9 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 	srv := &http.Server{Handler: g}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		tick := time.NewTicker(10 * time.Second)
 		defer tick.Stop()
 		for {
@@ -154,11 +172,21 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 					continue
 				}
 			}
-			srv.Close()
+			// No new request; those under way are answered first (for a
+			// while): a container create relayed now lands before whoever
+			// stopped the gate (StopAndWait) lists the task's containers.
+			sctx, scancel := context.WithTimeout(context.Background(), shutdownWait)
+			defer scancel()
+			if srv.Shutdown(sctx) != nil {
+				srv.Close()
+			}
 			return
 		}
 	}()
-	if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	err = srv.Serve(l)
+	cancel()
+	<-stopped
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil

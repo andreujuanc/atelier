@@ -6,14 +6,18 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // Origin is where a repo's origin points, as its config says it: the values
@@ -158,7 +162,7 @@ func PushBranch(ctx context.Context, dir string, origin Origin, branch string, f
 	if err := runTransport(ctx, dir, out, store.env, args); err != nil {
 		return err
 	}
-	return store.sync()
+	return store.sync(ctx, dir)
 }
 
 // branchCommit returns the commit id ref (a branch, refs/heads/...) names
@@ -168,7 +172,7 @@ func branchCommit(ctx context.Context, dir, ref string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return readRef(common, ref)
+	return refCommit(ctx, dir, common, ref)
 }
 
 // objectID matches a full object id, SHA-1 or SHA-256.
@@ -203,7 +207,7 @@ func FetchOrigin(ctx context.Context, dir string, origin Origin, out io.Writer) 
 	if err := runTransport(ctx, dir, out, store.env, args); err != nil {
 		return err
 	}
-	if err := store.sync(); err != nil {
+	if err := store.sync(ctx, dir); err != nil {
 		return err
 	}
 	t.setOriginHead(ctx, dir)
@@ -687,4 +691,108 @@ func failureLine(s string) string {
 		}
 	}
 	return lines[len(lines)-1]
+}
+
+// reftableName matches the name of a table of a reftable stack.
+var reftableName = regexp.MustCompile(`^0x[0-9a-f]{12,16}-0x[0-9a-f]{12,16}-[0-9a-f]{8}\.(ref|log)$`)
+
+// reftableCommit is refCommit for a repo whose refs are in reftable,
+// common the common git dir of the repo at dir. git follows a symlink in
+// place of the reftable dir or one of its tables (the task could point one
+// at another repo's), so the stack is copied, read without following
+// symlinks, into a temporary git dir of atl's (copyReftable), and git
+// reads ref there.
+func reftableCommit(ctx context.Context, dir string, common *nofollow.Dir, ref string) (string, error) {
+	priv, err := os.MkdirTemp("", "atl-refs-")
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", ref, err)
+	}
+	defer os.RemoveAll(priv)
+	if _, err := copyReftable(ctx, dir, common, priv); err != nil {
+		return "", fmt.Errorf("read %s: %w", ref, err)
+	}
+	refs, err := listRefs(ctx, priv, ref)
+	if err != nil {
+		return "", err
+	}
+	if id, ok := refs[ref]; ok {
+		return id, nil
+	}
+	return "", fmt.Errorf("no ref %s", ref)
+}
+
+// copyReftable makes priv (an empty directory) a bare git dir of the repo
+// at dir's object format whose reftable stack is a copy of the stack in
+// common (the repo's common git dir), read without following a symlink,
+// and returns the names of its tables, in order. Every table name is
+// checked: tables.list names files in its directory.
+func copyReftable(ctx context.Context, dir string, common *nofollow.Dir, priv string) ([]string, error) {
+	objFormat, err := run(ctx, dir, "rev-parse", "--show-object-format")
+	if err != nil {
+		return nil, err
+	}
+	list, err := common.ReadFile("reftable/tables.list", 1<<20)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := run(ctx, os.TempDir(), "init", "--bare", "--quiet", "--template=", "--ref-format=reftable", "--object-format="+objFormat, priv); err != nil {
+		return nil, err
+	}
+	stack := filepath.Join(priv, "reftable")
+	if err := os.RemoveAll(stack); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(stack, 0o700); err != nil {
+		return nil, err
+	}
+	tables := strings.Fields(string(list))
+	for _, name := range tables {
+		if !reftableName.MatchString(name) {
+			return nil, fmt.Errorf("unexpected table %q in reftable/tables.list", firstChars(name, 80))
+		}
+		if err := copyOut(common, "reftable/"+name, filepath.Join(stack, name)); err != nil {
+			return nil, err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(stack, "tables.list"), list, 0o600); err != nil {
+		return nil, err
+	}
+	return tables, nil
+}
+
+// listRefs returns the refs (not symbolic ones) of the git dir gitDir, one
+// of atl's own, that match patterns (all if none), as for-each-ref lists
+// them.
+func listRefs(ctx context.Context, gitDir string, patterns ...string) (map[string]string, error) {
+	out, err := run(ctx, gitDir, append([]string{"for-each-ref", "--format=%(refname)%00%(symref)%00%(objectname)"}, patterns...)...)
+	if err != nil {
+		return nil, err
+	}
+	refs := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(line, "\x00")
+		if len(f) == 3 && f[1] == "" && objectID.MatchString(f[2]) && plainRefName(f[0]) {
+			refs[f[0]] = f[2]
+		}
+	}
+	return refs, nil
+}
+
+// copyOut copies the regular file rel of d (not through a symlink) to the
+// new file dst.
+func copyOut(d *nofollow.Dir, rel, dst string) error {
+	in, err := d.OpenFile(rel)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }

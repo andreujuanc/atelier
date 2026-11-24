@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -265,7 +267,8 @@ func TestAddWorktreeFailureFollowsNoSwappedDir(t *testing.T) {
 }
 
 // plantOnAdd watches admin; in the first directory made there it moves
-// trap (as "a") and an index.lock; at the first deletion in the trap it
+// trap (as "a") and an index.lock and a directory where the index goes
+// (the add fails); at the first deletion in the trap it
 // swaps it for a symlink to target. stop ends the watch.
 func plantOnAdd(t *testing.T, admin, trap, target string) (stop func()) {
 	t.Helper()
@@ -306,6 +309,7 @@ func plantOnAdd(t *testing.T, admin, trap, target string) (stop func()) {
 					planted = filepath.Join(admin, name, "a")
 					os.Rename(trap, planted)
 					os.WriteFile(filepath.Join(admin, name, "index.lock"), nil, 0o644)
+					os.MkdirAll(filepath.Join(admin, name, "index", "x"), 0o755) // the index cannot be written
 				case int(ev.Wd) == wTrap && planted != "":
 					os.Rename(planted, planted+".aside")
 					os.Symlink(target, planted)
@@ -315,4 +319,180 @@ func plantOnAdd(t *testing.T, admin, trap, target string) (stop func()) {
 		}
 	}()
 	return func() { close(done); <-ended }
+}
+
+// onRegister runs f with the path of the first directory made in admin
+// (the registration of a worktree being added), as a neighbouring task
+// watching the shared git dir would. stop ends the watch.
+func onRegister(t *testing.T, admin string, f func(dir string)) (stop func()) {
+	t.Helper()
+	must(t, os.MkdirAll(admin, 0o755))
+	fd, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unix.InotifyAddWatch(fd, admin, unix.IN_CREATE); err != nil {
+		t.Fatal(err)
+	}
+	done, ended := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(ended)
+		defer unix.Close(fd)
+		buf := make([]byte, 64<<10)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if n, _ := unix.Poll([]unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}, 10); n <= 0 {
+				continue
+			}
+			n, _ := unix.Read(fd, buf)
+			for off := 0; off+unix.SizeofInotifyEvent <= n; {
+				ev := (*unix.InotifyEvent)(unsafe.Pointer(&buf[off]))
+				name := strings.TrimRight(string(buf[off+unix.SizeofInotifyEvent:off+unix.SizeofInotifyEvent+int(ev.Len)]), "\x00")
+				off += unix.SizeofInotifyEvent + int(ev.Len)
+				if ev.Mask&unix.IN_ISDIR != 0 {
+					f(filepath.Join(admin, name))
+					return
+				}
+			}
+		}
+	}()
+	return func() { close(done); <-ended }
+}
+
+// TestAddWorktreeRunsNoFilterSetMeanwhile: the checks of the repo's config
+// come before the checkout. A neighbouring task that names a filter for
+// every file (info/attributes) and defines it once the new worktree's
+// registration appears must not have it run where atl runs.
+func TestAddWorktreeRunsNoFilterSetMeanwhile(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	base, err := RevParse(ctx, f.repo, "origin/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "ran")
+	writeFile(t, filepath.Join(f.repo, ".git", "info", "attributes"), "* filter=pwn\n")
+	git(t, f.repo, "config", "extensions.worktreeConfig", "true")
+	stop := onRegister(t, filepath.Join(f.repo, ".git", "worktrees"), func(dir string) {
+		cfg, err := os.OpenFile(filepath.Join(f.repo, ".git", "config"), os.O_APPEND|os.O_WRONLY, 0)
+		if err == nil {
+			fmt.Fprintf(cfg, "[filter \"pwn\"]\n\tsmudge = touch %s; cat\n\tprocess = touch %s\n", marker, marker)
+			cfg.Close()
+		}
+		os.WriteFile(filepath.Join(dir, "config.worktree"), []byte("[filter \"pwn\"]\n\tsmudge = touch "+marker+"; cat\n"), 0o644)
+	})
+	wt := filepath.Join(f.root, "wt-x")
+	err = AddWorktree(ctx, f.repo, wt, "atl/x", base, to(f.origin))
+	stop()
+	if _, serr := os.Stat(marker); serr == nil {
+		t.Fatalf("the filter the task set ran (add: %v)", err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(wt, "README.md")); err != nil || string(b) != "hello\n" {
+		t.Errorf("README.md = %q, %v", b, err)
+	}
+}
+
+// TestAddWorktreeIntoAnEmptyDir: an add into an empty directory that
+// fails leaves the directory, empty, as git does.
+func TestAddWorktreeIntoAnEmptyDir(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	base, err := RevParse(ctx, f.repo, "origin/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(f.root, "wt-empty")
+	must(t, os.Mkdir(wt, 0o755))
+	stop := onRegister(t, filepath.Join(f.repo, ".git", "worktrees"), func(dir string) {
+		os.MkdirAll(filepath.Join(dir, "index", "x"), 0o755) // the index cannot be written
+	})
+	err = AddWorktree(ctx, f.repo, wt, "atl/x", base, to(f.origin))
+	stop()
+	if err == nil {
+		t.Fatal("the add succeeded")
+	}
+	entries, rerr := os.ReadDir(wt)
+	if rerr != nil || len(entries) != 0 {
+		t.Errorf("after the failed add: %v, %v; want the dir, empty", entries, rerr)
+	}
+	// And an add that succeeds afterwards.
+	must(t, os.RemoveAll(filepath.Join(f.repo, ".git", "worktrees")))
+	git(t, f.repo, "branch", "-D", "atl/x")
+	if err := AddWorktree(ctx, f.repo, wt, "atl/x", base, to(f.origin)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAddBranchWorktreeRefusesABranchInUse: as git does, a branch that
+// another worktree is rebasing or bisecting is refused too.
+func TestAddBranchWorktreeRefusesABranchInUse(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	git(t, f.repo, "branch", "atl/r")
+	git(t, f.repo, "branch", "atl/b")
+	git(t, f.repo, "branch", "atl/free")
+	other, _ := f.addWorktree(t, ctx, "other")
+	otherGit := git(t, other, "rev-parse", "--absolute-git-dir")
+	writeFile(t, filepath.Join(f.repo, ".git", "rebase-merge", "head-name"), "refs/heads/atl/r\n")
+	writeFile(t, filepath.Join(otherGit, "BISECT_START"), "atl/b\n")
+	for _, b := range []string{"atl/r", "atl/b", "atl/other", "main"} {
+		if err := AddBranchWorktree(ctx, f.repo, filepath.Join(f.root, "wt-"+filepath.Base(b)), b, to(f.origin)); err == nil {
+			t.Errorf("%s, in use: added", b)
+		}
+	}
+	if err := AddBranchWorktree(ctx, f.repo, filepath.Join(f.root, "wt-free"), "atl/free", to(f.origin)); err != nil {
+		t.Errorf("a free branch: %v", err)
+	}
+}
+
+// TestWorktreesInAReftableRepo: a clone whose refs are in reftable (git
+// 3's default) gets working worktrees, and its branches push.
+func TestWorktreesInAReftableRepo(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	if _, err := exec.Command("git", "init", "-q", "--ref-format=reftable", t.TempDir()).CombinedOutput(); err != nil {
+		t.Skip("git without reftable")
+	}
+	repo := filepath.Join(f.root, "rt")
+	git(t, f.root, "clone", "-q", "--ref-format=reftable", f.origin, repo)
+	base, err := RevParse(ctx, repo, "origin/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(f.root, "wt-rt")
+	if err := AddWorktree(ctx, repo, wt, "atl/rt", base, to(f.origin)); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(wt, "README.md")); err != nil || string(b) != "hello\n" {
+		t.Fatalf("README.md = %q, %v", b, err)
+	}
+	if br := git(t, wt, "branch", "--show-current"); br != "atl/rt" {
+		t.Errorf("branch %q", br)
+	}
+	if st := git(t, wt, "status", "--porcelain"); st != "" {
+		t.Errorf("status:\n%s", st)
+	}
+	commitFile(t, wt, "w.txt", "w\n", "work")
+	if err := PushBranch(ctx, repo, to(f.origin), "atl/rt", false, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := git(t, f.origin, "rev-parse", "atl/rt"), git(t, wt, "rev-parse", "HEAD"); got != want {
+		t.Errorf("origin atl/rt = %s, want %s", got, want)
+	}
+	if err := RemoveWorktree(ctx, repo, wt, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddBranchWorktree(ctx, repo, wt, "atl/rt", to(f.origin)); err != nil {
+		t.Fatal(err)
+	}
+	if st := git(t, wt, "status", "--porcelain"); st != "" {
+		t.Errorf("status after re-add:\n%s", st)
+	}
 }

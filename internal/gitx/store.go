@@ -73,27 +73,65 @@ func checkGitDirs(ctx context.Context, dir string) (gitDir, common string, err e
 	return gitDir, common, nil
 }
 
-// headCommit returns the commit HEAD names in gitDir (a repo's or a
-// worktree's git dir; refs are in common): its id, or the id of the branch
-// it names, each read without following a symlink (see readRef).
-func headCommit(gitDir, common string) (string, error) {
-	d, err := nofollow.Open(gitDir)
+// headCommit returns the commit HEAD names in the repo or worktree at dir,
+// whose git dir is gitDir and common git dir common: its id, or the id of
+// the branch it names (refCommit). In a files repo HEAD is read without
+// following a symlink. In a reftable repo it is in the worktree's own ref
+// store, which git reads: only the branch name or id it holds is taken
+// from there, the branch read as refCommit reads it.
+func headCommit(ctx context.Context, dir, gitDir, common string) (string, error) {
+	reftable, err := usesReftable(ctx, dir)
 	if err != nil {
-		return "", fmt.Errorf("read HEAD: %w", err)
+		return "", err
 	}
-	defer d.Close()
-	data, err := d.ReadFile("HEAD", 1024)
-	if err != nil {
-		return "", fmt.Errorf("read HEAD: %w", err)
+	var head string
+	if reftable {
+		if head, err = run(ctx, dir, "symbolic-ref", "--quiet", "HEAD"); err == nil {
+			head = "ref: " + head
+		} else if head, err = run(ctx, dir, "rev-parse", "--verify", "--quiet", "HEAD"); err != nil {
+			return "", fmt.Errorf("read HEAD: %w", err)
+		}
+	} else {
+		d, err := nofollow.Open(gitDir)
+		if err != nil {
+			return "", fmt.Errorf("read HEAD: %w", err)
+		}
+		defer d.Close()
+		data, err := d.ReadFile("HEAD", 1024)
+		if err != nil {
+			return "", fmt.Errorf("read HEAD: %w", err)
+		}
+		head = strings.TrimRight(string(data), " \t\r\n")
 	}
-	head := strings.TrimRight(string(data), " \t\r\n")
 	if ref, ok := strings.CutPrefix(head, "ref: "); ok {
-		return readRef(common, strings.TrimSpace(ref))
+		return refCommit(ctx, dir, common, strings.TrimSpace(ref))
 	}
 	if !objectID.MatchString(head) {
 		return "", fmt.Errorf("read HEAD: not a commit id: %q", firstChars(head, 80))
 	}
 	return head, nil
+}
+
+// refCommit returns the object id ref (refs/...) names in the repo at dir,
+// common its common git dir, read without following a symlink: git follows
+// one, to a ref of any repo where it runs. In a files repo that is its
+// loose ref file, else its line in packed-refs (readRef); in a reftable
+// repo, ref in a copy of its stack (reftableCommit). A symbolic ref is
+// refused.
+func refCommit(ctx context.Context, dir, common, ref string) (string, error) {
+	reftable, err := usesReftable(ctx, dir)
+	if err != nil {
+		return "", err
+	}
+	if !reftable {
+		return readRef(common, ref)
+	}
+	d, err := nofollow.Open(common)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", ref, err)
+	}
+	defer d.Close()
+	return reftableCommit(ctx, dir, d, ref)
 }
 
 // readRef returns the object id ref (refs/...) names in the git dir common:

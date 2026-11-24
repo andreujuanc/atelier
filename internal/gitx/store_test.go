@@ -255,3 +255,77 @@ func TestTransportKeepsTheUsersConditionalConfig(t *testing.T) {
 		t.Errorf("origin atl/x = %s, want %s", got, want)
 	}
 }
+
+// TestReftableTransport: in a reftable repo a push and a fetch run on a copy
+// of the stack and add their changes to the repo's as new tables, without
+// following a symlink: a reftable dir that is a symlink to another
+// reftable repo's is left alone, and so is a stack someone holds the lock
+// of. HEAD and its branch are read for LastCommit.
+func TestReftableTransport(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	if _, err := exec.Command("git", "init", "-q", "--ref-format=reftable", t.TempDir()).CombinedOutput(); err != nil {
+		t.Skip("git without reftable")
+	}
+	repo := filepath.Join(f.root, "rt")
+	git(t, f.root, "clone", "-q", "--ref-format=reftable", f.origin, repo)
+	base := git(t, repo, "rev-parse", "origin/main")
+	wt := filepath.Join(f.root, "wt-rt")
+	if err := AddWorktree(ctx, repo, wt, "atl/rt", base, to(f.origin)); err != nil {
+		t.Fatal(err)
+	}
+	commitFile(t, wt, "w.txt", "w\n", "work")
+	head := git(t, wt, "rev-parse", "HEAD")
+	if sha, subject, _, err := LastCommit(ctx, wt); err != nil || sha != head || subject != "work" {
+		t.Errorf("LastCommit = %s %q, %v", sha, subject, err)
+	}
+	if err := PushBranch(ctx, repo, to(f.origin), "atl/rt", false, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, repo, "rev-parse", "refs/remotes/origin/atl/rt"); got != head {
+		t.Errorf("origin/atl/rt = %s after the push, want %s", got, head)
+	}
+	tip := f.pushFromOtherClone(t, "new")
+	if err := FetchOrigin(ctx, repo, to(f.origin), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, repo, "rev-parse", "refs/remotes/origin/main"); got != tip {
+		t.Errorf("origin/main = %s after the fetch, want %s", got, tip)
+	}
+	if got := git(t, wt, "rev-parse", "HEAD"); got != head {
+		t.Errorf("the worktree's HEAD moved to %s", got)
+	}
+	git(t, repo, "fsck", "--no-progress")
+
+	// Someone holds the stack's lock: nothing is written.
+	lock := filepath.Join(repo, ".git", "reftable", "tables.list.lock")
+	writeFile(t, lock, "")
+	tip = f.pushFromOtherClone(t, "newer")
+	if err := FetchOrigin(ctx, repo, to(f.origin), io.Discard); err == nil {
+		t.Error("fetch under someone else's lock: no error")
+	}
+	must(t, os.Remove(lock))
+
+	// The reftable dir a symlink to another reftable repo's.
+	other := filepath.Join(t.TempDir(), "other")
+	git(t, f.root, "init", "-q", "--ref-format=reftable", "-b", "main", other)
+	commitFile(t, other, "o.txt", "o\n", "other")
+	otherList, err := os.ReadFile(filepath.Join(other, ".git", "reftable", "tables.list"))
+	must(t, err)
+	stack := filepath.Join(repo, ".git", "reftable")
+	must(t, os.Rename(stack, stack+".saved"))
+	must(t, os.Symlink(filepath.Join(other, ".git", "reftable"), stack))
+	FetchOrigin(ctx, repo, to(f.origin), io.Discard)
+	PushBranch(ctx, repo, to(f.origin), "atl/rt", true, io.Discard)
+	if list, _ := os.ReadFile(filepath.Join(other, ".git", "reftable", "tables.list")); string(list) != string(otherList) {
+		t.Errorf("the other repo's stack changed:\n%s\nwas:\n%s", list, otherList)
+	}
+	must(t, os.Remove(stack))
+	must(t, os.Rename(stack+".saved", stack))
+	if err := FetchOrigin(ctx, repo, to(f.origin), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, repo, "rev-parse", "refs/remotes/origin/main"); got != tip {
+		t.Errorf("origin/main = %s after the last fetch, want %s", got, tip)
+	}
+}

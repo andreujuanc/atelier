@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1448,6 +1449,23 @@ func TestGateNetworkAddresses(t *testing.T) {
 			t.Errorf("IPAM %s: status %d (%s), want it forwarded", ipam, status, out)
 		}
 	}
+	// A VPN that sends everything through it with two /1 routes (OpenVPN's
+	// def1) has, in effect, default routes: they take nothing more than
+	// the default route does.
+	c = newGateWith(t, func(g *Gate) {
+		g.HostRoutes = func() ([]netip.Prefix, error) {
+			return []netip.Prefix{netip.MustParsePrefix("0.0.0.0/1"), netip.MustParsePrefix("128.0.0.0/1"),
+				netip.MustParsePrefix("::/1"), netip.MustParsePrefix("8000::/1"), netip.MustParsePrefix("10.8.0.0/24")}, nil
+		}
+	})
+	for _, ipam := range []string{`{"Config":[{"Subnet":"10.1.0.0/24"}]}`, `{"Config":[{"Subnet":"fd12:3456:789a::/64"}]}`} {
+		if status, out := c.do("POST", "/networks/create", network(ipam)); status >= 400 {
+			t.Errorf("IPAM %s with a def1 VPN: status %d (%s), want it forwarded", ipam, status, out)
+		}
+	}
+	if status, _ := c.do("POST", "/networks/create", network(`{"Config":[{"Subnet":"10.8.0.0/25"}]}`)); status != http.StatusForbidden {
+		t.Errorf("the VPN's own subnet: status %d, want 403", status)
+	}
 	// Without the host's routes, no subnet is taken.
 	c = newGateWith(t, func(g *Gate) {
 		g.HostRoutes = func() ([]netip.Prefix, error) { return nil, errors.New("no /proc") }
@@ -1461,10 +1479,15 @@ func TestGateNetworkAddresses(t *testing.T) {
 }
 
 func TestParseRoutes(t *testing.T) {
+	// The kernel prints each address as a number in the host's byte order.
+	hex := func(a string) string {
+		b := netip.MustParseAddr(a).As4()
+		return fmt.Sprintf("%08X", binary.NativeEndian.Uint32(b[:]))
+	}
 	v4 := "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" +
-		"eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" +
-		"eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n" +
-		"docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n"
+		"eth0\t00000000\t" + hex("192.168.1.1") + "\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" +
+		"eth0\t" + hex("192.168.1.0") + "\t00000000\t0001\t0\t0\t100\t" + hex("255.255.255.0") + "\t0\t0\t0\n" +
+		"docker0\t" + hex("172.17.0.0") + "\t00000000\t0001\t0\t0\t0\t" + hex("255.255.0.0") + "\t0\t0\t0\n"
 	v6 := "fd7a115ca1e000000000000000000000 30 00000000000000000000000000000000 00 00000000000000000000000000000000 00000400 00000001 00000000 00000001 tailscale0\n" +
 		"00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003 eth0\n"
 	got, err := parseRoutes(v4, v6)

@@ -473,28 +473,74 @@ func AddWorktree(ctx context.Context, repo, path, branch, startPoint string, ori
 
 // AddBranchWorktree creates a new worktree at path on the existing local
 // branch, with the checks of AddWorktree. A branch that another worktree
-// has checked out is refused, as git does.
+// has checked out, or is rebasing or bisecting, is refused, as git does.
 func AddBranchWorktree(ctx context.Context, repo, path, branch string, origin Origin) error {
 	return addWorktree(ctx, repo, path, branch, origin, func([]string) error {
+		inUse := func() error {
+			return &Error{Args: []string{"worktree", "add", path, branch}, ExitCode: 128,
+				Stderr: fmt.Sprintf("fatal: '%s' is already used by a worktree", branch)}
+		}
 		out, err := run(ctx, repo, "worktree", "list", "--porcelain", "-z")
 		if err != nil {
 			return err
 		}
 		for _, f := range strings.Split(out, "\x00") {
 			if f == "branch refs/heads/"+branch {
-				return &Error{Args: []string{"worktree", "add", path, branch}, ExitCode: 128,
-					Stderr: fmt.Sprintf("fatal: '%s' is already used by a worktree", branch)}
+				return inUse()
 			}
+		}
+		busy, err := rebasingOrBisecting(repo, branch)
+		if err != nil {
+			return err
+		}
+		if busy {
+			return inUse()
 		}
 		return nil
 	})
 }
 
+// rebasingOrBisecting reports whether a worktree of repo (its main one or
+// a linked one) is rebasing branch (rebase-merge/head-name or
+// rebase-apply/head-name names it) or bisecting from it (BISECT_START), as
+// git's die_if_checked_out looks. Read without following symlinks.
+func rebasingOrBisecting(repo, branch string) (bool, error) {
+	gitDir, err := nofollow.Open(filepath.Join(repo, ".git"))
+	if err != nil {
+		return false, err
+	}
+	defer gitDir.Close()
+	dirs := []string{""}
+	ids, err := gitDir.ReadDirNames("worktrees")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	for _, id := range ids {
+		dirs = append(dirs, "worktrees/"+id+"/")
+	}
+	read := func(rel string) string {
+		data, err := gitDir.ReadFile(rel, 4096)
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(data))
+	}
+	for _, d := range dirs {
+		if read(d+"rebase-merge/head-name") == "refs/heads/"+branch ||
+			read(d+"rebase-apply/head-name") == "refs/heads/"+branch ||
+			read(d+"BISECT_START") == branch {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // addWorktree adds a worktree at path on branch, as `git worktree add` does,
 // after the checks of AddWorktree and once branch (made ready by the
 // caller's) can be checked out: it makes the worktree dir, registers it in
-// repo (<repo>/.git/worktrees/<id>: gitdir, commondir, HEAD; locked while
-// it is made) and checks branch out there with `git reset --hard`.
+// repo (<repo>/.git/worktrees/<id>: gitdir, commondir, HEAD, and for a
+// reftable repo the worktree's own ref store; locked while it is made) and
+// checks out there the commit branch names (see checkout).
 //
 // git worktree add is not run: when it fails after it made the
 // registration dir, it deletes that dir and the worktree by path (an lstat,
@@ -503,7 +549,8 @@ func AddBranchWorktree(ctx context.Context, repo, path, branch string, origin Or
 // in the new registration dir) and swap a directory there for a symlink as
 // the deletion starts: git would delete on the host what it points to.
 // Here the registration is made, and a failed add undone, through file
-// descriptors (package nofollow, RemoveWorktree).
+// descriptors (package nofollow, RemoveWorktree); a worktree dir that was
+// there (empty) is kept, emptied.
 func addWorktree(ctx context.Context, repo, path, branch string, origin Origin, prepare func(cfg []string) error) error {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -532,6 +579,15 @@ func addWorktree(ctx context.Context, repo, path, branch string, origin Origin, 
 	if err := prepare(cfg); err != nil {
 		return err
 	}
+	ref := "refs/heads/" + branch
+	commit, err := branchCommit(ctx, repo, ref)
+	if err != nil {
+		return err
+	}
+	reftable, err := usesReftable(ctx, repo)
+	if err != nil {
+		return err
+	}
 	made := false
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return fmt.Errorf("add worktree %s: %w", abs, err)
@@ -541,35 +597,153 @@ func addWorktree(ctx context.Context, repo, path, branch string, origin Origin, 
 	} else if !errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("add worktree %s: %w", abs, err)
 	}
-	id, err := register(gitDir, abs, branch)
+	id, err := register(gitDir, abs, branch, reftable)
 	if err == nil {
 		err = linkWorktree(gitDir, abs, id)
 	}
+	if err == nil && reftable {
+		// Into the worktree's own (reftable) ref store; no program runs.
+		_, err = run(ctx, abs, "symbolic-ref", "HEAD", ref)
+	}
 	if err == nil {
-		_, err = run(ctx, abs, append(cfg, "reset", "--hard", "--no-recurse-submodules", "--quiet")...)
+		err = checkout(ctx, repo, abs, commit, origin, cfg, func(index []byte) error {
+			return gitDir.WriteFile("worktrees/"+id+"/index", index, 0o644)
+		})
 	}
 	if err == nil {
 		err = gitDir.Remove("worktrees/" + id + "/locked")
 	}
 	if err != nil {
-		// Undone as git would, without following a symlink: the worktree
-		// dir (only if made here) and the registration.
+		// Undone as git would, without following a symlink: the
+		// registration, and the worktree dir if made here, else what is
+		// in it.
 		if id != "" {
 			gitDir.RemoveAll("worktrees/" + id)
 		}
 		if made {
 			os.RemoveAll(abs)
+		} else {
+			emptyDir(abs)
 		}
 		return err
 	}
 	return nil
 }
 
+// emptyDir removes what is in the directory dir, without following a
+// symlink.
+func emptyDir(dir string) {
+	d, err := nofollow.Open(dir)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	names, _ := d.ReadDirNames(".")
+	for _, n := range names {
+		d.RemoveAll(n)
+	}
+}
+
+// checkoutKeys are the settings of the repo's config that shape how files
+// are written, which checkout copies (none runs a program).
+var checkoutKeys = []string{"core.autocrlf", "core.eol", "core.safecrlf", "core.symlinks", "core.ignorecase",
+	"core.precomposeunicode", "core.filemode", "core.checkroundtripencoding"}
+
+// checkout writes the files of commit into the worktree dir wt (empty but
+// for its .git file) and hands their index to save (the worktree's, which
+// save writes without following a symlink: git would write through one):
+// first as read from the commit, before any file is written, so that an
+// atl killed meanwhile leaves the files git wrote, with an index git
+// compares them to; then with the files' stat data.
+//
+// It runs git (read-tree, checkout-index) with a git dir of its own: a temporary one
+// that borrows the objects of repo (alternates), with a config atl writes
+// (checkoutKeys copied from repo's, and git-lfs's filter and pinned origin
+// if repo uses git-lfs) and no info/. The repo's own config and
+// info/attributes, which a task writes, are not read: a filter it defines
+// after checkHazards looked (a neighbouring task that sees the new
+// worktree's registration appear) would run where atl runs. Filters still
+// come from the user's own config, as the attributes in the commit name
+// them.
+func checkout(ctx context.Context, repo, wt, commit string, origin Origin, cfg []string, save func(index []byte) error) error {
+	objFormat, err := run(ctx, repo, "rev-parse", "--show-object-format")
+	if err != nil {
+		return err
+	}
+	priv, err := os.MkdirTemp("", "atl-checkout-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(priv)
+	if _, err := run(ctx, os.TempDir(), "init", "--bare", "--quiet", "--template=", "--object-format="+objFormat, priv); err != nil {
+		return err
+	}
+	objects := filepath.Join(repo, ".git", "objects")
+	if err := os.WriteFile(filepath.Join(priv, "objects", "info", "alternates"), []byte(alternatesLine(objects)+"\n"), 0o644); err != nil {
+		return err
+	}
+	kv := [][2]string{{"core.bare", "false"}, {"core.splitIndex", "false"}}
+	for _, k := range checkoutKeys {
+		if v := ConfigValue(ctx, repo, k); v != "" {
+			kv = append(kv, [2]string{k, v})
+		}
+	}
+	if ConfigValue(ctx, repo, "filter.lfs.process") != "" || ConfigValue(ctx, repo, "filter.lfs.smudge") != "" {
+		kv = append(kv, [2]string{"filter.lfs.clean", lfsDefaults["filter.lfs.clean"][0]},
+			[2]string{"filter.lfs.smudge", lfsDefaults["filter.lfs.smudge"][0]},
+			[2]string{"filter.lfs.process", lfsDefaults["filter.lfs.process"][0]},
+			[2]string{"filter.lfs.required", "true"},
+			[2]string{"lfs.storage", filepath.Join(repo, ".git", "lfs")})
+		if len(origin.URLs) > 0 {
+			kv = append(kv, [2]string{"remote.origin.url", origin.URLs[0]})
+		}
+	}
+	for _, s := range kv {
+		if _, err := run(ctx, priv, "config", "--file", filepath.Join(priv, "config"), s[0], s[1]); err != nil {
+			return err
+		}
+	}
+	git := append([]string{"--git-dir=" + priv, "--work-tree=" + wt}, cfg...)
+	saveIndex := func() error {
+		index, err := os.ReadFile(filepath.Join(priv, "index"))
+		if err != nil {
+			return err
+		}
+		return save(index)
+	}
+	if _, err := run(ctx, "", append(git, "read-tree", commit)...); err != nil {
+		return err
+	}
+	if err := saveIndex(); err != nil {
+		return err
+	}
+	if _, err := run(ctx, "", append(git, "checkout-index", "--all", "--force", "-u")...); err != nil {
+		return err
+	}
+	return saveIndex()
+}
+
+// usesReftable reports whether repo keeps its refs in reftable (git
+// rev-parse --show-ref-format; a git too old to say has only files).
+func usesReftable(ctx context.Context, repo string) (bool, error) {
+	out, err := run(ctx, repo, "rev-parse", "--show-ref-format")
+	if err != nil {
+		var ge *Error
+		if errors.As(err, &ge) && ge.ExitCode > 0 && !strings.Contains(ge.Stderr, "reftable") {
+			return false, nil
+		}
+		return false, err
+	}
+	return out == "reftable", nil
+}
+
 // register makes the registration of a new worktree at path, on branch, in
 // gitDir (a repo's own git dir): worktrees/<id>, id the first free of
 // path's base name, and that name with 1, 2, ... after it, as git names
-// it. It is locked ("initializing") until the worktree is checked out.
-func register(gitDir *nofollow.Dir, path, branch string) (id string, err error) {
+// it. It is locked ("initializing") until the worktree is checked out. In
+// a reftable repo the worktree gets its own empty ref store, laid out as
+// git lays it out (HEAD and refs/heads stubs), HEAD set afterwards.
+func register(gitDir *nofollow.Dir, path, branch string, reftable bool) (id string, err error) {
 	if err := gitDir.MkdirAll("worktrees", 0o755); err != nil {
 		return "", fmt.Errorf("add worktree %s: %w", path, err)
 	}
@@ -596,13 +770,25 @@ func register(gitDir *nofollow.Dir, path, branch string) (id string, err error) 
 	if err != nil {
 		return id, fmt.Errorf("add worktree %s: %w", path, err)
 	}
-	for _, f := range []struct{ name, content string }{
+	dir := "worktrees/" + id + "/"
+	files := []struct{ name, content string }{
 		{"locked", "initializing"},
 		{"gitdir", real + "/.git\n"},
 		{"commondir", "../..\n"},
 		{"HEAD", "ref: refs/heads/" + branch + "\n"},
-	} {
-		if err := gitDir.WriteFile("worktrees/"+id+"/"+f.name, []byte(f.content), 0o644); err != nil {
+	}
+	if reftable {
+		for _, d := range []string{"refs", "reftable"} {
+			if err := gitDir.Mkdir(dir+d, 0o755); err != nil {
+				return id, fmt.Errorf("add worktree %s: %w", path, err)
+			}
+		}
+		files[3].content = "ref: refs/heads/.invalid\n"
+		files = append(files, struct{ name, content string }{"refs/heads", "this repository uses the reftable format\n"},
+			struct{ name, content string }{"reftable/tables.list", ""})
+	}
+	for _, f := range files {
+		if err := gitDir.WriteFile(dir+f.name, []byte(f.content), 0o644); err != nil {
 			return id, fmt.Errorf("add worktree %s: %w", path, err)
 		}
 	}
@@ -1028,7 +1214,7 @@ func LastCommit(ctx context.Context, worktree string) (sha, subject string, when
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
-	head, err := headCommit(gitDir, common)
+	head, err := headCommit(ctx, worktree, gitDir, common)
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
@@ -1078,4 +1264,27 @@ func RefExists(ctx context.Context, repo, ref string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+// alternatesLine is path as a line of objects/info/alternates: C-quoted
+// when it has a character a plain line cannot hold.
+func alternatesLine(path string) string {
+	if !strings.ContainsAny(path, "\"\\\n\r\t") && !strings.HasPrefix(path, "#") {
+		return path
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(path); i++ {
+		switch c := path[i]; {
+		case c == '"' || c == '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case c < 0x20 || c == 0x7f:
+			fmt.Fprintf(&b, "\\%03o", c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }

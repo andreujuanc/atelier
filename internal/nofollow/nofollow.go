@@ -288,6 +288,50 @@ func (d *Dir) Mkdir(rel string, perm os.FileMode) error {
 	return nil
 }
 
+// CreateExcl creates rel, a new regular file (fs.ErrExist if anything is
+// there, a symlink included), holding data, mode perm, synced: a lock file.
+func (d *Dir) CreateExcl(rel string, data []byte, perm os.FileMode) error {
+	fd, base, err := d.parent("create", rel)
+	if err != nil {
+		return err
+	}
+	defer d.closeParent(fd)
+	f, err := unix.Openat(fd, base, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(perm.Perm()))
+	if err != nil {
+		return pathErr("create", d.join(rel), err)
+	}
+	file := os.NewFile(uintptr(f), d.join(rel))
+	_, werr := file.Write(data)
+	if werr == nil {
+		werr = file.Sync()
+	}
+	if cerr := file.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		unix.Unlinkat(fd, base, 0)
+		return pathErr("create", d.join(rel), werr)
+	}
+	return nil
+}
+
+// Rename renames rel to the name to in the same directory, replacing
+// what is there (a symlink itself, never what it points to).
+func (d *Dir) Rename(rel, to string) error {
+	if strings.Contains(to, "/") || to == "" || to == "." || to == ".." {
+		return &fs.PathError{Op: "rename", Path: d.join(rel), Err: errors.New("not a name in the same directory")}
+	}
+	fd, base, err := d.parent("rename", rel)
+	if err != nil {
+		return err
+	}
+	defer d.closeParent(fd)
+	if err := unix.Renameat(fd, base, fd, to); err != nil {
+		return pathErr("rename", d.join(rel), err)
+	}
+	return nil
+}
+
 // Remove removes the file, symlink or empty directory rel, without
 // following a symlink.
 func (d *Dir) Remove(rel string) error {
@@ -308,12 +352,15 @@ func (d *Dir) Remove(rel string) error {
 	return nil
 }
 
-// ReadDirNames returns the names of the entries of the directory rel, in
-// no particular order.
+// ReadDirNames returns the names of the entries of the directory rel (".":
+// d itself), in no particular order.
 func (d *Dir) ReadDirNames(rel string) ([]string, error) {
-	fd, base, err := d.parent("readdir", rel)
-	if err != nil {
-		return nil, err
+	fd, base := d.fd, "."
+	if rel != "." {
+		var err error
+		if fd, base, err = d.parent("readdir", rel); err != nil {
+			return nil, err
+		}
 	}
 	defer d.closeParent(fd)
 	dir, err := unix.Openat(fd, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)

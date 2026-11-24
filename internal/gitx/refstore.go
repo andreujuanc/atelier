@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/andreujuanc/atelier/internal/nofollow"
 )
@@ -37,14 +38,16 @@ import (
 // remote with -c, see newTransport). The user's (system and global) is,
 // as it reads for the repo: its conditional includes (includeIf gitdir:,
 // onbranch:) are taken in the repo and the result handed to git
-// ($GIT_CONFIG_SYSTEM, $GIT_CONFIG_GLOBAL; see flatConfig). Refs are files:
-// a repo with another ref storage is refused.
+// ($GIT_CONFIG_SYSTEM, $GIT_CONFIG_GLOBAL; see flatConfig). A reftable repo's
+// store has a copy of its stack, and changes go back as new tables
+// (syncReftable).
 type refStore struct {
-	dir     string            // the temporary git dir
-	common  string            // the repo's common git dir
-	refs    map[string]string // the repo's refs, as copied in
-	shallow []byte            // the repo's shallow file; nil if none
-	env     []string          // what git runs with on the store
+	dir      string            // the temporary git dir
+	common   string            // the repo's common git dir
+	reftable bool              // the repo's refs are in reftable, not files
+	refs     map[string]string // the repo's refs, as copied in
+	shallow  []byte            // the repo's shallow file; nil if none
+	env      []string          // what git runs with on the store
 }
 
 func newRefStore(ctx context.Context, dir string) (*refStore, error) {
@@ -52,8 +55,9 @@ func newRefStore(ctx context.Context, dir string) (*refStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s := ConfigValue(ctx, dir, "extensions.refstorage"); s != "" && !strings.EqualFold(s, "files") {
-		return nil, fmt.Errorf("the refs of %s are stored as %s: atl only reads and writes files", printable(dir), printable(s))
+	reftable, err := usesReftable(ctx, dir)
+	if err != nil {
+		return nil, err
 	}
 	format, err := run(ctx, dir, "rev-parse", "--show-object-format")
 	if err != nil {
@@ -68,27 +72,59 @@ func newRefStore(ctx context.Context, dir string) (*refStore, error) {
 		return nil, err
 	}
 	defer d.Close()
-	s := &refStore{common: common}
-	if s.refs, err = readRefs(d); err != nil {
-		return nil, fmt.Errorf("read the refs of %s: %w", printable(dir), err)
-	}
+	s := &refStore{common: common, reftable: reftable}
 	if s.shallow, err = d.ReadFile("shallow", 64<<20); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	if s.dir, err = os.MkdirTemp("", "atl-refs-"); err != nil {
 		return nil, err
 	}
-	s.env = []string{"GIT_DIR=" + s.dir, "GIT_OBJECT_DIRECTORY=" + filepath.Join(common, "objects")}
-	config := "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
-	if format != "sha1" {
-		config = "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = " + format + "\n"
+	if err := s.fill(ctx, dir, d, format, head); err != nil {
+		s.close()
+		return nil, err
 	}
-	var packed strings.Builder
-	packed.WriteString("# pack-refs with: sorted \n")
-	for _, name := range slices.Sorted(maps.Keys(s.refs)) {
-		packed.WriteString(s.refs[name] + " " + name + "\n")
+	return s, nil
+}
+
+// fill lays out the store: its config, HEAD (on head) and a copy of the
+// refs of the repo at dir (d its common git dir), as packed-refs or, for a
+// reftable repo, a copy of its stack (copyReftable); its shallow file; the
+// user's config (flatConfig).
+func (s *refStore) fill(ctx context.Context, dir string, d *nofollow.Dir, format, head string) error {
+	s.env = []string{"GIT_DIR=" + s.dir, "GIT_OBJECT_DIRECTORY=" + filepath.Join(s.common, "objects")}
+	files := map[string]string{}
+	if s.reftable {
+		if _, err := copyReftable(ctx, dir, d, s.dir); err != nil {
+			return fmt.Errorf("read the refs of %s: %w", printable(dir), err)
+		}
+		var err error
+		if s.refs, err = listRefs(ctx, s.dir); err != nil {
+			return err
+		}
+		for _, args := range [][]string{{"config", "core.logAllRefUpdates", "false"}, {"symbolic-ref", "HEAD", "refs/heads/" + head}} {
+			if _, err := run(ctx, s.dir, args...); err != nil {
+				return err
+			}
+		}
+	} else {
+		var err error
+		if s.refs, err = readRefs(d); err != nil {
+			return fmt.Errorf("read the refs of %s: %w", printable(dir), err)
+		}
+		config := "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
+		if format != "sha1" {
+			config = "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = " + format + "\n"
+		}
+		var packed strings.Builder
+		packed.WriteString("# pack-refs with: sorted \n")
+		for _, name := range slices.Sorted(maps.Keys(s.refs)) {
+			packed.WriteString(s.refs[name] + " " + name + "\n")
+		}
+		files["config"], files["HEAD"], files["packed-refs"] = config, "ref: refs/heads/"+head+"\n", packed.String()
+		if err := os.Mkdir(filepath.Join(s.dir, "refs"), 0o755); err != nil {
+			return err
+		}
 	}
-	files := map[string]string{"config": config, "HEAD": "ref: refs/heads/" + head + "\n", "packed-refs": packed.String()}
 	if s.shallow != nil {
 		files["shallow"] = string(s.shallow)
 	}
@@ -100,17 +136,12 @@ func newRefStore(ctx context.Context, dir string) (*refStore, error) {
 		files["user-"+scope] = flatConfig(ctx, dir, scope)
 		s.env = append(s.env, env+"="+filepath.Join(s.dir, "user-"+scope))
 	}
-	err = os.Mkdir(filepath.Join(s.dir, "refs"), 0o755)
 	for name, content := range files {
-		if err == nil {
-			err = os.WriteFile(filepath.Join(s.dir, name), []byte(content), 0o644)
+		if err := os.WriteFile(filepath.Join(s.dir, name), []byte(content), 0o644); err != nil {
+			return err
 		}
 	}
-	if err != nil {
-		s.close()
-		return nil, err
-	}
-	return s, nil
+	return nil
 }
 
 // flatConfig is the user's config file of scope (system or global) as git
@@ -145,17 +176,23 @@ func flatConfig(ctx context.Context, dir, scope string) string {
 
 func (s *refStore) close() { os.RemoveAll(s.dir) }
 
-// sync copies into the repo the refs git changed in the store, and its
-// shallow file if git changed it, without following a symlink: one in the
-// way fails that ref. A ref git deleted (a prune) is deleted only if it is
-// a loose ref in the repo; a packed one stays.
-func (s *refStore) sync() error {
+// sync copies into the repo at dir the refs git changed in the store, and
+// its shallow file if git changed it, without following a symlink: one in
+// the way fails that ref. In a files repo, a ref git deleted (a prune) is
+// deleted only if it is a loose ref in the repo; a packed one stays. In a
+// reftable repo the changes go in as new tables (syncReftable).
+func (s *refStore) sync(ctx context.Context, dir string) error {
 	sd, err := nofollow.Open(s.dir)
 	if err != nil {
 		return err
 	}
 	defer sd.Close()
-	after, err := readRefs(sd)
+	var after map[string]string
+	if s.reftable {
+		after, err = listRefs(ctx, s.dir)
+	} else {
+		after, err = readRefs(sd)
+	}
 	if err != nil {
 		return err
 	}
@@ -169,18 +206,30 @@ func (s *refStore) sync() error {
 	}
 	defer d.Close()
 	var errs []error
-	for _, name := range slices.Sorted(maps.Keys(after)) {
-		if id := after[name]; s.refs[name] != id {
-			if err := d.MkdirAll(path.Dir(name), 0o755); err != nil {
-				errs = append(errs, fmt.Errorf("update %s: %w", name, err))
-			} else if err := d.WriteFile(name, []byte(id+"\n"), 0o644); err != nil {
-				errs = append(errs, fmt.Errorf("update %s: %w", name, err))
-			}
+	changed := map[string]string{} // "" for a deleted ref
+	for name, id := range after {
+		if s.refs[name] != id {
+			changed[name] = id
 		}
 	}
 	for name := range s.refs {
 		if _, ok := after[name]; !ok {
-			if fi, err := d.Lstat(name); err == nil && fi.Mode().IsRegular() {
+			changed[name] = ""
+		}
+	}
+	if s.reftable {
+		if len(changed) > 0 {
+			errs = append(errs, syncReftable(ctx, dir, d, changed))
+		}
+	} else {
+		for _, name := range slices.Sorted(maps.Keys(changed)) {
+			if id := changed[name]; id != "" {
+				if err := d.MkdirAll(path.Dir(name), 0o755); err != nil {
+					errs = append(errs, fmt.Errorf("update %s: %w", name, err))
+				} else if err := d.WriteFile(name, []byte(id+"\n"), 0o644); err != nil {
+					errs = append(errs, fmt.Errorf("update %s: %w", name, err))
+				}
+			} else if fi, err := d.Lstat(name); err == nil && fi.Mode().IsRegular() {
 				if err := d.Remove(name); err != nil {
 					errs = append(errs, fmt.Errorf("delete %s: %w", name, err))
 				}
@@ -199,6 +248,100 @@ func (s *refStore) sync() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// syncReftable writes changed (ref to id; "" deletes it) into the reftable
+// stack of the repo at dir, d its common git dir, as git adds to a stack,
+// without following a symlink. The stack as it is now is copied into a
+// git dir of atl's (copyReftable), git makes the changes there, and the
+// tables it wrote (fresh names; its own compaction may merge old ones)
+// are written next to the repo's and its tables.list replaced by the
+// copy's: under git's lock (tables.list.lock, made exclusively), and only
+// if the stack is still the one copied; else it starts over, a few times.
+func syncReftable(ctx context.Context, dir string, d *nofollow.Dir, changed map[string]string) error {
+	var stdin strings.Builder
+	for _, name := range slices.Sorted(maps.Keys(changed)) {
+		if id := changed[name]; id != "" {
+			stdin.WriteString("update " + name + " " + id + "\n")
+		} else {
+			stdin.WriteString("delete " + name + "\n")
+		}
+	}
+	const lock = "reftable/tables.list.lock"
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+		}
+		var retry bool
+		if retry, err = func() (bool, error) {
+			priv, err := os.MkdirTemp("", "atl-refs-")
+			if err != nil {
+				return false, err
+			}
+			defer os.RemoveAll(priv)
+			base, err := copyReftable(ctx, dir, d, priv)
+			if err != nil {
+				return false, err
+			}
+			args := []string{"-c", "core.logAllRefUpdates=false", "update-ref", "--stdin"}
+			cmd := command(ctx, priv, args...)
+			cmd.Env = append(cmd.Env, "GIT_OBJECT_DIRECTORY="+filepath.Join(d.Path(), "objects"))
+			cmd.Stdin = strings.NewReader(stdin.String())
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return false, wrap(ctx, args, string(out), err)
+			}
+			list, err := os.ReadFile(filepath.Join(priv, "reftable", "tables.list"))
+			if err != nil {
+				return false, err
+			}
+			tables := strings.Fields(string(list))
+			if err := d.CreateExcl(lock, list, 0o644); errors.Is(err, fs.ErrExist) {
+				return true, errors.New("its reftable stack is locked (tables.list.lock)")
+			} else if err != nil {
+				return false, err
+			}
+			done := false
+			defer func() {
+				if !done {
+					d.Remove(lock)
+				}
+			}()
+			now, err := d.ReadFile("reftable/tables.list", 1<<20)
+			if err != nil {
+				return false, err
+			}
+			if !slices.Equal(strings.Fields(string(now)), base) {
+				return true, errors.New("its reftable stack changed meanwhile")
+			}
+			for _, name := range tables {
+				if slices.Contains(base, name) {
+					continue
+				}
+				if !reftableName.MatchString(name) {
+					return false, fmt.Errorf("unexpected table %q", firstChars(name, 80))
+				}
+				data, err := os.ReadFile(filepath.Join(priv, "reftable", name))
+				if err == nil {
+					err = d.WriteFile("reftable/"+name, data, 0o644)
+				}
+				if err != nil {
+					return false, err
+				}
+			}
+			if err := d.Rename(lock, "tables.list"); err != nil {
+				return false, err
+			}
+			done = true
+			return false, nil
+		}(); !retry {
+			break
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("update the refs of %s: %w", printable(dir), err)
+	}
+	return nil
 }
 
 // readRefs returns the refs in the git dir d (packed-refs, then loose refs
