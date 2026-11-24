@@ -735,6 +735,21 @@ func TestRemoveWorktree(t *testing.T) {
 		}
 	})
 
+	t.Run("locked", func(t *testing.T) {
+		wt, _ := f.addWorktree(t, ctx, "locked")
+		git(t, f.repo, "worktree", "lock", wt)
+		if err := RemoveWorktree(ctx, f.repo, wt, true); err == nil || !strings.Contains(err.Error(), "locked") {
+			t.Fatalf("locked worktree: %v, want refused", err)
+		}
+		if _, err := os.Stat(wt); err != nil || !listed(wt) {
+			t.Fatalf("locked worktree removed: %v", err)
+		}
+		git(t, f.repo, "worktree", "unlock", wt)
+		if err := RemoveWorktree(ctx, f.repo, wt, true); err != nil || listed(wt) {
+			t.Fatalf("unlocked worktree: %v, listed %v", err, listed(wt))
+		}
+	})
+
 	t.Run("already deleted", func(t *testing.T) {
 		wt, _ := f.addWorktree(t, ctx, "gone")
 		if err := os.RemoveAll(wt); err != nil {

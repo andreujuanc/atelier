@@ -31,10 +31,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // localEnvVars is the output of `git rev-parse --local-env-vars`: repo-local
@@ -487,33 +490,115 @@ func addWorktree(ctx context.Context, repo, path string, origin Origin, args fun
 	return err
 }
 
-// RemoveWorktree removes the worktree at path (with --force if force) and
-// prunes stale worktree metadata. A path that no longer exists is just pruned.
-// A relative path is resolved against the current directory, not repo.
+// RemoveWorktree removes the worktree at path (with force even if it has
+// changes) and its registration in repo, <repo>/.git/worktrees/<id>. A path
+// that no longer exists only loses its registration. A relative path is
+// resolved against the current directory, not repo.
 //
 // Without force it refuses, as git does, a worktree with changes (IsDirty)
 // or with checked-out submodules; git's own check is `git status`, which
-// reads files through the repo's filters, so it is IsDirty's instead and git
-// is always told --force. A locked worktree is still refused by git.
+// reads files through the repo's filters, so it is IsDirty's instead. Like
+// git, it refuses a locked worktree, and leaves a missing one's
+// registration while it is locked.
+//
+// git deletes nothing here: `git worktree remove` and `git worktree prune`
+// delete a directory by path, an lstat and then an opendir per entry, and
+// every task with the repo rw can write its git dir (worktrees/ too). Such
+// a task swaps a directory there for a symlink once the deletion starts,
+// and git deletes on the host what the symlink points to. So the two
+// directories are removed here through file descriptors (os.RemoveAll,
+// package nofollow), which follow no symlink, and only this worktree's
+// registrations go: a stale one a task planted is left alone.
 func RemoveWorktree(ctx context.Context, repo, path string, force bool) error {
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("remove worktree: %w", err)
 	}
-	if _, err := os.Stat(path); err == nil {
+	gitDir, err := nofollow.Open(filepath.Join(repo, ".git"))
+	if err != nil {
+		return fmt.Errorf("remove worktree %s: %w", path, err)
+	}
+	defer gitDir.Close()
+	ids, err := worktreeIDs(gitDir, path)
+	if err != nil {
+		return fmt.Errorf("remove worktree %s: %w", path, err)
+	}
+	_, err = os.Lstat(path)
+	exists := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove worktree %s: %w", path, err)
+	}
+	locked := func(id string) bool {
+		_, err := gitDir.Lstat("worktrees/" + id + "/locked")
+		return err == nil
+	}
+	if exists {
+		fail := func(msg string) error {
+			return &Error{Args: []string{"worktree", "remove", path}, ExitCode: 128, Stderr: "fatal: " + msg}
+		}
+		if len(ids) == 0 {
+			return fail(fmt.Sprintf("'%s' is not a working tree", path))
+		}
+		if slices.ContainsFunc(ids, locked) {
+			return fail("cannot remove a locked working tree")
+		}
 		if !force {
 			if err := removable(ctx, path); err != nil {
 				return err
 			}
 		}
-		if _, err := run(ctx, repo, "worktree", "remove", "--force", path); err != nil {
-			return err
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove worktree %s: %w", path, err)
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove worktree %s: %w", path, err)
 	}
-	_, err = run(ctx, repo, "worktree", "prune")
-	return err
+	for _, id := range ids {
+		if !exists && locked(id) {
+			continue // as git worktree prune leaves it
+		}
+		if err := gitDir.RemoveAll("worktrees/" + id); err != nil {
+			return fmt.Errorf("remove worktree %s: %w", path, err)
+		}
+	}
+	gitDir.Remove("worktrees") // only once empty, as git does
+	return nil
+}
+
+// worktreeIDs returns the names of the entries of gitDir's worktrees/ that
+// register a worktree at path: their gitdir file names path/.git (or the
+// same with path's parent's symlinks resolved, as git writes it), absolute
+// or relative to the entry.
+func worktreeIDs(gitDir *nofollow.Dir, path string) ([]string, error) {
+	want := []string{path}
+	if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		want = append(want, filepath.Join(dir, filepath.Base(path)))
+	}
+	base := gitDir.Path()
+	if real, err := filepath.EvalSymlinks(base); err == nil {
+		base = real
+	}
+	names, err := gitDir.ReadDirNames("worktrees")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, id := range names {
+		data, err := gitDir.ReadFile("worktrees/"+id+"/gitdir", 64<<10)
+		if err != nil {
+			continue
+		}
+		// As git reads it: trailing whitespace and /.git off.
+		p := strings.TrimSuffix(strings.TrimRight(string(data), " \t\n\v\f\r"), "/.git")
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(base, "worktrees", id, p)
+		}
+		if slices.Contains(want, filepath.Clean(p)) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
 }
 
 // removable is git's check before `worktree remove` without --force, made

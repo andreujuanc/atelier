@@ -155,3 +155,32 @@ func TestOpenFileRefusesASocket(t *testing.T) {
 		t.Errorf("ReadFile(sock) = %v, want ErrNotRegular", err)
 	}
 }
+
+// RemoveAll removes a tree with symlinks in it, not their targets; a
+// symlink on the way is an error; what is missing is no error.
+// ReadDirNames lists a directory, not one through a symlink.
+func TestRemoveAllDoesNotFollowSymlinks(t *testing.T) {
+	d, root, victim, victimDir := setup(t)
+	must(t, os.MkdirAll(filepath.Join(root, "tree", "a", "b"), 0o755))
+	must(t, os.WriteFile(filepath.Join(root, "tree", "a", "b", "f"), []byte("x"), 0o644))
+	must(t, os.Symlink(victimDir, filepath.Join(root, "tree", "a", "dirlink")))
+	must(t, os.Symlink(victim, filepath.Join(root, "tree", "link")))
+	names, err := d.ReadDirNames("tree")
+	if err != nil || len(names) != 2 {
+		t.Errorf("ReadDirNames(tree) = %q, %v; want a and link", names, err)
+	}
+	if _, err := d.ReadDirNames("dirlink"); !errors.Is(err, ErrSymlink) {
+		t.Errorf("ReadDirNames(dirlink) = %v, want ErrSymlink", err)
+	}
+	if err := d.RemoveAll("dirlink/f"); !errors.Is(err, ErrSymlink) {
+		t.Errorf("RemoveAll(dirlink/f) = %v, want ErrSymlink", err)
+	}
+	must(t, d.RemoveAll("tree"))
+	must(t, d.RemoveAll("tree"))
+	must(t, d.RemoveAll("link"))
+	if _, err := os.Lstat(filepath.Join(root, "tree")); !os.IsNotExist(err) {
+		t.Errorf("tree after RemoveAll: %v", err)
+	}
+	unchanged(t, victim, "the user's file\n")
+	unchanged(t, filepath.Join(victimDir, "f"), "the user's other file\n")
+}

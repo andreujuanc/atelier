@@ -294,6 +294,77 @@ func (d *Dir) Remove(rel string) error {
 	return nil
 }
 
+// ReadDirNames returns the names of the entries of the directory rel, in
+// no particular order.
+func (d *Dir) ReadDirNames(rel string) ([]string, error) {
+	fd, base, err := d.parent("readdir", rel)
+	if err != nil {
+		return nil, err
+	}
+	defer d.closeParent(fd)
+	dir, err := unix.Openat(fd, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, pathErr("readdir", d.join(rel), err)
+	}
+	f := os.NewFile(uintptr(dir), d.join(rel))
+	defer f.Close()
+	return f.Readdirnames(-1)
+}
+
+// RemoveAll removes rel and, if it is a directory, everything in it. It
+// follows no symlink: one met is removed itself, and a directory swapped
+// for one while it is emptied is left (an error), never walked through,
+// since each directory is walked by the descriptor it was opened at.
+func (d *Dir) RemoveAll(rel string) error {
+	fd, base, err := d.parent("removeall", rel)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer d.closeParent(fd)
+	if err := removeAllAt(fd, base); err != nil {
+		return pathErr("removeall", d.join(rel), err)
+	}
+	return nil
+}
+
+// removeAllAt removes name, in the directory open at parent, and what is
+// in it.
+func removeAllAt(parent int, name string) error {
+	err := unix.Unlinkat(parent, name, 0)
+	if err == nil || errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if !errors.Is(err, unix.EISDIR) && !errors.Is(err, unix.EPERM) {
+		return err
+	}
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	dir := os.NewFile(uintptr(fd), name)
+	defer dir.Close()
+	// All names first: deleting while reading could skip some.
+	names, err := dir.Readdirnames(-1)
+	for _, n := range names {
+		if rerr := removeAllAt(fd, n); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(parent, name, unix.AT_REMOVEDIR); err != nil && !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	return nil
+}
+
 // fileInfo is an fs.FileInfo from a unix.Stat_t.
 type fileInfo struct {
 	name string

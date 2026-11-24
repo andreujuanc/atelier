@@ -3,10 +3,13 @@ package gitx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestCheckWorktree: only a real directory that is a worktree of the given
@@ -83,4 +86,102 @@ func TestWorktreeOddPaths(t *testing.T) {
 			t.Errorf("%q: %v", name, err)
 		}
 	}
+}
+
+// TestRemoveWorktreeFollowsNoSwappedDir: every task with a repo rw can write
+// the clone's git dir, worktrees/ included. git deletes a directory by path,
+// one lstat and then one opendir per entry, so a task that swaps a directory
+// there for a symlink as soon as the deletion starts has git delete, on the
+// host, what the symlink points to (by names it chose: a home directory's).
+// RemoveWorktree must delete nothing outside the worktree and its own
+// registration: not through a registration of its own the task rigged, and
+// not through a stale one it planted (which `git worktree prune` would
+// delete).
+func TestRemoveWorktreeFollowsNoSwappedDir(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	victim := t.TempDir() // the user's files, which no task can reach
+	var names []string
+	for i := range 40 {
+		name := fmt.Sprintf("t%02d", i)
+		names = append(names, name)
+		writeFile(t, filepath.Join(victim, name, "keep"), "mine\n")
+	}
+	intact := func(what string) {
+		t.Helper()
+		for _, name := range names {
+			if _, err := os.Stat(filepath.Join(victim, name, "keep")); err != nil {
+				t.Fatalf("%s: a file outside the repo was deleted: %v", what, err)
+			}
+		}
+	}
+	admin := filepath.Join(f.repo, ".git", "worktrees")
+
+	// A stale registration (its worktree is gone), rigged.
+	wt, _ := f.addWorktree(t, ctx, "x")
+	planted := filepath.Join(admin, "planted")
+	writeFile(t, filepath.Join(planted, "gitdir"), filepath.Join(f.root, "gone", ".git")+"\n")
+	stop := swapOnDelete(t, filepath.Join(planted, "a"), victim, names)
+	err := RemoveWorktree(ctx, f.repo, wt, false)
+	stop()
+	intact("a stale registration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatalf("worktree still there: %v", err)
+	}
+
+	// The worktree's own registration, rigged.
+	wt, _ = f.addWorktree(t, ctx, "y")
+	id := filepath.Base(wt)
+	stop = swapOnDelete(t, filepath.Join(admin, id, "a"), victim, names)
+	RemoveWorktree(ctx, f.repo, wt, true) // may fail on the swapped dir; nothing else may go
+	stop()
+	intact("the worktree's own registration")
+}
+
+// swapOnDelete fills dir with many files and with directories named names,
+// then, at the first deletion in it, moves it aside and puts a symlink to
+// target in its place, as a task would from its container. stop ends the
+// watch.
+func swapOnDelete(t *testing.T, dir, target string, names []string) (stop func()) {
+	t.Helper()
+	must(t, os.MkdirAll(dir, 0o755))
+	for i := range 3000 {
+		writeFile(t, filepath.Join(dir, fmt.Sprintf("f%04d", i)), "")
+	}
+	for _, name := range names {
+		writeFile(t, filepath.Join(dir, name, "keep"), "")
+	}
+	fd, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unix.InotifyAddWatch(fd, dir, unix.IN_DELETE); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		defer unix.Close(fd)
+		buf := make([]byte, 4096)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if n, _ := unix.Poll([]unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}, 10); n <= 0 {
+				continue
+			}
+			if n, _ := unix.Read(fd, buf); n > 0 {
+				os.Rename(dir, dir+".aside")
+				os.Symlink(target, dir)
+				return
+			}
+		}
+	}()
+	return func() { close(done); <-ended }
 }
