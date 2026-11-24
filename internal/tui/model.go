@@ -1447,20 +1447,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		}
 		return nil
 	case "n":
-		if m.creating {
-			m.setStatus("busy: a task is being created")
-			return nil
-		}
-		if m.lastForm != nil {
-			m.form = m.lastForm
-		} else {
-			m.form = newTaskForm(m.projects)
-		}
-		m.form.projects = m.projects
-		m.form.projErr, m.form.projErrFor = "", "" // retry a failed project load
-		m.form.setWidth(m.formInputWidth())
-		m.mode = modeForm
-		return tea.Batch(m.projectsCmd(), m.syncProject())
+		return m.openForm()
 	case "?":
 		m.mode = modeHelp
 		return nil
@@ -1536,14 +1523,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 	case "m":
 		return m.openNotes(t)
 	case "t":
-		m.renameID, m.renameSlug, m.renameOrig = t.Task.ID, slug, clean(t.Task.Title)
-		m.renameInput.SetValue(m.renameOrig)
-		m.renameFill = m.renameInput.Value()
-		m.renameInput.CursorEnd()
-		m.renameInput.SetWidth(m.renameInputWidth())
-		m.renameInput.Focus()
-		m.setStatus("")
-		m.mode = modeRename
+		m.startRename(t)
 		return nil
 	case "D":
 		return m.exec("diff", slug, m.diffCmd(slug))
@@ -1561,6 +1541,38 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		})
 	}
 	return nil
+}
+
+// openForm opens the new-task form (`n`): the one kept to retry (see
+// lastForm), else a blank one.
+func (m *Model) openForm() tea.Cmd {
+	if m.creating {
+		m.setStatus("busy: a task is being created")
+		return nil
+	}
+	if m.lastForm != nil {
+		m.form = m.lastForm
+	} else {
+		m.form = newTaskForm(m.projects)
+	}
+	m.form.projects = m.projects
+	m.form.projErr, m.form.projErrFor = "", "" // retry a failed project load
+	m.form.setWidth(m.formInputWidth())
+	m.mode = modeForm
+	return tea.Batch(m.projectsCmd(), m.syncProject())
+}
+
+// startRename opens the title input for task t (`t`), prefilled with its
+// title.
+func (m *Model) startRename(t *app.TaskView) {
+	m.renameID, m.renameSlug, m.renameOrig = t.Task.ID, t.Task.Slug, clean(t.Task.Title)
+	m.renameInput.SetValue(m.renameOrig)
+	m.renameFill = m.renameInput.Value()
+	m.renameInput.CursorEnd()
+	m.renameInput.SetWidth(m.renameInputWidth())
+	m.renameInput.Focus()
+	m.setStatus("")
+	m.mode = modeRename
 }
 
 // assistant opens the atelier assistant, pointed at the selected task if
