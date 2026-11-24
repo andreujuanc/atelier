@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
@@ -196,5 +198,51 @@ func TestRunScriptCancelKillsGroup(t *testing.T) {
 			t.Fatalf("background sleep %d survived cancellation", pid)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A script that wants the terminal (ssh asking about a host key or for a
+// passphrase on /dev/tty) fails at once instead of being stopped
+// (SIGTTIN) for good in a background process group of atl's terminal,
+// which hung atl new until Ctrl-C. The test runs RunScript in a copy of
+// itself whose controlling terminal is a pty, as atl's is.
+func TestRunScriptNoTerminal(t *testing.T) {
+	if os.Getenv("ATL_TEST_TTY_HELPER") == "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		var out bytes.Buffer
+		err := RunScript(ctx, "read x < /dev/tty || exit 3; echo read $x", t.TempDir(), nil, &out)
+		fmt.Printf("result: %v | %s\n", err, strings.TrimSpace(out.String()))
+		return
+	}
+	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		t.Skipf("no pty: %v", err)
+	}
+	defer ptmx.Close()
+	if err := unix.IoctlSetPointerInt(int(ptmx.Fd()), unix.TIOCSPTLCK, 0); err != nil {
+		t.Skipf("unlockpt: %v", err)
+	}
+	n, err := unix.IoctlGetInt(int(ptmx.Fd()), unix.TIOCGPTN)
+	if err != nil {
+		t.Skipf("ptsname: %v", err)
+	}
+	pts, err := os.OpenFile("/dev/pts/"+strconv.Itoa(n), os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Skipf("open pts: %v", err)
+	}
+	defer pts.Close()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRunScriptNoTerminal$")
+	cmd.Env = append(os.Environ(), "ATL_TEST_TTY_HELPER=1")
+	cmd.Stdin = pts
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0} // the pts, as its stdin
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("helper: %v\n%s", err, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "result: script failed") || strings.Contains(got, "interrupted") {
+		t.Fatalf("a script reading /dev/tty: %s", got)
 	}
 }

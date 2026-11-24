@@ -84,9 +84,11 @@ const scriptKillDelay = 5 * time.Second
 // background process left holding the output open does not block it for
 // more than scriptKillDelay after the shell exits.
 //
-// The script runs in its own process group. Cancelling ctx sends SIGTERM to
-// the whole group (so children such as `make` → `docker compose` are not
-// orphaned); whatever is still alive scriptKillDelay later gets SIGKILL.
+// The script runs in its own session, so in its own process group and
+// with no controlling terminal (a read of /dev/tty fails). Cancelling ctx
+// sends SIGTERM to the whole group (so children such as `make` → `docker
+// compose` are not orphaned); whatever is still alive scriptKillDelay
+// later gets SIGKILL.
 func RunScript(ctx context.Context, script, dir string, env []string, out io.Writer) error {
 	if strings.TrimSpace(script) == "" {
 		return nil
@@ -99,7 +101,11 @@ func RunScript(ctx context.Context, script, dir string, env []string, out io.Wri
 	cmd.Env = env
 	cmd.Stdout = out
 	cmd.Stderr = out
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// A session of its own: its own process group, and no controlling
+	// terminal. In a process group of atl's terminal that is not the
+	// foreground one, a read of /dev/tty (ssh asking about a host key)
+	// would stop it (SIGTTIN) until Ctrl-C; without one it fails at once.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	var cancelledAt time.Time // set by Cancel; read after Run (Wait syncs with it)
 	cmd.Cancel = func() error {
 		cancelledAt = time.Now()
