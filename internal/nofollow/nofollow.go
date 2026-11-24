@@ -167,6 +167,10 @@ func (d *Dir) OpenFile(rel string) (*os.File, error) {
 	}
 	defer d.closeParent(fd)
 	f, err := unix.Openat(fd, base, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENXIO) {
+		// What open(2) says of a unix socket (or a device with no driver).
+		err = ErrNotRegular
+	}
 	if err != nil {
 		return nil, pathErr("open", d.join(rel), err)
 	}
