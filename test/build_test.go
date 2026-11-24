@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -42,20 +43,55 @@ func TestBuildImagesUnderCDPATH(t *testing.T) {
 // into a shell. RUN's sh has no pipefail, so a failed download would run an
 // empty script and the build would go on without what it installs.
 func TestDockerfileNoPipeToShell(t *testing.T) {
+	for _, c := range []struct {
+		dockerfile string
+		bad        bool
+	}{
+		{"RUN curl -fsSL https://x/install.sh | bash\n", true},
+		{"RUN curl -fsSL https://x/install.sh \\\n    | sh -s -- -y\n", true},
+		{"RUN apt-get update \\\n    && wget -qO- https://x/i.sh |\\\n    sudo bash\n", true},
+		{"RUN curl -fsSL https://x/i.sh -o /tmp/i.sh \\\n    && bash /tmp/i.sh\n", false},
+		{"RUN grep x f | sha256sum -c -\n# curl x | sh\n", false},
+	} {
+		if got := pipesDownloadToShell(c.dockerfile); (len(got) > 0) != c.bad {
+			t.Errorf("pipesDownloadToShell(%q) = %q, want bad %v", c.dockerfile, got, c.bad)
+		}
+	}
 	data, err := os.ReadFile(filepath.Join("..", "Dockerfile"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, line := range strings.Split(string(data), "\n") {
-		if !strings.Contains(line, "curl ") {
-			continue
-		}
-		_, after, ok := strings.Cut(line, "|")
-		if !ok {
-			continue
-		}
-		if f := strings.Fields(after); len(f) > 0 && (f[0] == "sh" || f[0] == "bash") {
-			t.Errorf("Dockerfile:%d pipes curl into a shell: %s", i+1, strings.TrimSpace(line))
+	for _, run := range pipesDownloadToShell(string(data)) {
+		t.Errorf("the Dockerfile pipes a download into a shell: %s", run)
+	}
+}
+
+// downloadToShell matches curl or wget piped into sh, bash or dash.
+var downloadToShell = regexp.MustCompile(`\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|da)?sh\b`)
+
+// pipesDownloadToShell returns the RUN instructions of dockerfile, with
+// their continuation lines joined, that pipe a download into a shell.
+func pipesDownloadToShell(dockerfile string) []string {
+	var bad []string
+	var inst strings.Builder
+	flush := func() {
+		s := strings.TrimSpace(inst.String())
+		inst.Reset()
+		if f := strings.Fields(s); len(f) > 0 && strings.EqualFold(f[0], "RUN") && downloadToShell.MatchString(s) {
+			bad = append(bad, s)
 		}
 	}
+	for _, line := range strings.Split(dockerfile, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue // a comment, also between continuation lines
+		}
+		if body, ok := strings.CutSuffix(strings.TrimRight(line, " \t"), `\`); ok {
+			inst.WriteString(body + " ")
+			continue
+		}
+		inst.WriteString(line)
+		flush()
+	}
+	flush()
+	return bad
 }
