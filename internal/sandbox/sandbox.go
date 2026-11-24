@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // DefaultImage is the task image when neither the project nor
@@ -524,14 +525,18 @@ func InstallBin(src, runDir string) error {
 	return nil
 }
 
+// linkSeq numbers linkAtl's temp links.
+var linkSeq atomic.Int64
+
 // linkAtl makes path a symlink to atl in its own directory, replacing
-// whatever is there atomically, unless it is one already.
+// whatever is there atomically, unless it is one already. Its temp link
+// is its own (by process and call): launches in one task may run at once.
 func linkAtl(path string) error {
 	if target, err := os.Readlink(path); err == nil && target == "atl" {
 		return nil
 	}
-	tmp := path + ".tmp"
-	os.Remove(tmp)
+	tmp := fmt.Sprintf("%s.%d.%d.tmp", path, os.Getpid(), linkSeq.Add(1))
+	os.Remove(tmp) // left by a crashed process that had this pid
 	if err := os.Symlink("atl", tmp); err != nil {
 		return err
 	}

@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"text/template"
@@ -804,6 +806,39 @@ func TestInstallBin(t *testing.T) {
 	links()
 	if entries, _ := os.ReadDir(filepath.Join(run, "bin")); len(entries) != 3 {
 		t.Errorf("bin has %d entries, want atl and its two links", len(entries))
+	}
+}
+
+// Launches in one task, from several atl processes, install the binary at
+// once: each gets the copy and its links, and no temp file is left.
+func TestInstallBinConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "atl")
+	if err := os.WriteFile(src, []byte("v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 50; round++ {
+		run := filepath.Join(dir, fmt.Sprintf("run-%d", round))
+		var wg sync.WaitGroup
+		errs := make(chan error, 8)
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := InstallBin(src, run); err != nil {
+					errs <- err
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		entries, _ := os.ReadDir(filepath.Join(run, "bin"))
+		if len(entries) != 3 {
+			t.Fatalf("round %d: bin has %v, want atl and its two links", round, entries)
+		}
 	}
 }
 
