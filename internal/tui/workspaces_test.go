@@ -7,10 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/muesli/termenv"
 
 	"github.com/andreujuanc/atelier/internal/workspace"
 )
@@ -110,7 +108,7 @@ func wsKey(m *WorkspacePicker, k string) bool {
 	return drainWS(m, cmd)
 }
 
-func wsView(m *WorkspacePicker) string { return ansi.Strip(m.View()) }
+func wsView(m *WorkspacePicker) string { return ansi.Strip(m.View().Content) }
 
 func sampleWorkspaces() []workspace.Entry {
 	return []workspace.Entry{wsRow("alpha", true), wsRow("beta", true), wsRow("old", false)}
@@ -119,17 +117,14 @@ func sampleWorkspaces() []workspace.Entry {
 // TestWorkspacePickerView: a plain list, the name and the path; a
 // directory without atelier.toml dimmed and marked not adopted.
 func TestWorkspacePickerView(t *testing.T) {
-	old := lipgloss.ColorProfile()
-	lipgloss.SetColorProfile(termenv.ANSI256)
-	t.Cleanup(func() { lipgloss.SetColorProfile(old) })
 	f := &fakeWorkspaces{rows: sampleWorkspaces()}
 	m := newWSTest(t, f, "")
 	v := wsView(m)
 	for _, want := range []string{
-		"atelier workspaces  ~/atelier/workspaces",
+		"atelier  workspaces  ~/atelier/workspaces",
 		" alpha  ~/atelier/workspaces/alpha ",
-		" beta   ~/atelier/workspaces/beta\n",
-		" old    ~/atelier/workspaces/old  not adopted\n",
+		" beta   ~/atelier/workspaces/beta ",
+		" old    ~/atelier/workspaces/old  not adopted ",
 		"enter open  n new workspace  / filter",
 	} {
 		if !strings.Contains(v, want) {
@@ -140,9 +135,9 @@ func TestWorkspacePickerView(t *testing.T) {
 		t.Errorf("counts shown:\n%s", v)
 	}
 	// The path dimmed; the directory without atelier.toml dimmed.
-	raw := m.View()
-	if !strings.Contains(raw, dimStyle.Render("~/atelier/workspaces/beta")) || !strings.Contains(raw, dimStyle.Render("old")) ||
-		!strings.Contains(raw, dimStyle.Render("  not adopted")) {
+	raw := m.View().Content
+	if !strings.Contains(raw, dimStyle.Render("  ~/atelier/workspaces/beta")) || !strings.Contains(raw, dimStyle.Render("old  ")) ||
+		!strings.Contains(raw, warnStyle.Bold(false).Render("  not adopted")) {
 		t.Errorf("not dimmed:\n%q", raw)
 	}
 	// No preselection: the first row.
@@ -165,7 +160,7 @@ func TestWorkspacePickerView(t *testing.T) {
 		for w := 0; w <= 60; w += 3 {
 			for _, h := range []int{0, 1, 2, 4, 7} {
 				m.Update(tea.WindowSizeMsg{Width: w, Height: h})
-				v := m.View()
+				v := m.View().Content
 				if h > 0 && w > 0 && strings.Count(v, "\n")+1 > h {
 					t.Fatalf("%dx%d: %d lines", w, h, strings.Count(v, "\n")+1)
 				}
@@ -235,10 +230,10 @@ func TestWorkspacePickerAdopt(t *testing.T) {
 		for _, want := range []string{
 			"Adopt ~/atelier/workspaces/old as workspace old?",
 			"It writes atelier.toml (keeping what is there) with:",
-			"  repos = ~/src/work (from .devcontainer/devcontainer.json)",
-			"  sandbox.mounts = ~/.work.npmrc (from .devcontainer/devcontainer.json)",
-			"  skipped ANTHROPIC_API_KEY: a secret",
-			"  note: tmux_socket",
+			"• repos = ~/src/work (from .devcontainer/devcontainer.json)",
+			"• sandbox.mounts = ~/.work.npmrc (from .devcontainer/devcontainer.json)",
+			"• skipped ANTHROPIC_API_KEY: a secret",
+			"• note: tmux_socket",
 			"Adopt it? y/n",
 			"y adopt (as `atl workspace new old` does)  n/esc cancel",
 		} {
@@ -340,7 +335,7 @@ func TestWorkspacePickerNew(t *testing.T) {
 	}
 	m.nameInput.SetValue("")
 	typeWS(m, "old")
-	if v := wsView(m); !strings.Contains(v, "~/atelier/workspaces/old exists without atelier.toml: enter shows what adopting it writes") {
+	if v := wsView(m); !strings.Contains(v, "~/atelier/workspaces/old exists without atelier.toml:  enter shows what adopting it writes") {
 		t.Errorf("typing old:\n%s", v)
 	}
 	// enter: the adopt confirmation, as from the list.
@@ -472,9 +467,9 @@ func TestSwitchWorkspaceKey(t *testing.T) {
 	m, _ = newTest(t, fb)
 	m.workspace = "alpha"
 	lines := strings.Split(plainView(m), "\n")
-	// The status line, above the help (two lines at 120 columns).
-	if st := lines[len(lines)-3]; !strings.HasSuffix(st, "workspace alpha") || ansi.StringWidth(st) != 120 {
-		t.Errorf("status line %q", st)
+	// The top bar names the workspace.
+	if hd := lines[0]; !strings.HasPrefix(hd, " atelier  alpha") || ansi.StringWidth(hd) > 120 {
+		t.Errorf("top bar %q", hd)
 	}
 	op := press(m, "s")
 	if isQuit(press(m, "w")) || !m.quitRequested || !m.switching {

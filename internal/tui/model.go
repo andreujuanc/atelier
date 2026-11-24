@@ -10,9 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/cursor"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
@@ -26,6 +25,7 @@ const (
 	dirtyEvery   = 5 * time.Second // after the previous check finished
 	dirtyTimeout = 30 * time.Second
 	selDebounce  = 150 * time.Millisecond
+	spinEvery    = 100 * time.Millisecond
 )
 
 type mode int
@@ -42,6 +42,8 @@ const (
 	// modeNotesLoading: m was pressed and the notes text is loading; keys
 	// are swallowed (esc cancels) until it arrives or fails.
 	modeNotesLoading
+	// modeHelp: the key reference (?) is open; any key closes it.
+	modeHelp
 )
 
 // confirmState is the done/cancel dialog: confirming (space ticks the box,
@@ -65,6 +67,7 @@ type (
 	recoverTickMsg struct{}
 	dirtyTickMsg   struct{}
 	selTickMsg     struct{ seq int }
+	spinTickMsg    struct{}
 
 	listMsg struct {
 		tasks []app.TaskView
@@ -265,6 +268,8 @@ type Model struct {
 	// statusFromOut: the status is an App.Out line (warnMsg), which a later
 	// line may replace; other error statuses are kept until the next action.
 	statusFromOut bool
+	// statusOK: the status reports an operation that worked (drawn with ✓).
+	statusOK bool
 
 	// quitRequested: quit once no operation is in flight. forceQuit: the
 	// user forced the quit with operations still running.
@@ -277,6 +282,10 @@ type Model struct {
 	// workspace is the name of the workspace the TUI runs in ("" unknown),
 	// shown on the status line.
 	workspace string
+
+	// spinFrame is the busy spinner's frame; spinning: its tick is armed.
+	spinFrame int
+	spinning  bool
 }
 
 // Forced reports whether the user forced the quit (second ctrl+c) while
@@ -292,11 +301,11 @@ func New(ctx context.Context, be Backend) *Model {
 	fi := textinput.New()
 	fi.Prompt = "/"
 	fi.Placeholder = "filter"
-	fi.Cursor.SetMode(cursor.CursorStatic)
+	styleInput(&fi)
 	ri := textinput.New()
 	ri.Prompt = "title> "
 	ri.Placeholder = "the task's new title (enter saves, esc cancels)"
-	ri.Cursor.SetMode(cursor.CursorStatic)
+	styleInput(&ri)
 	ri.CharLimit = model.MaxTitleLen
 	return &Model{
 		be:  be,
@@ -320,7 +329,8 @@ func New(ctx context.Context, be Backend) *Model {
 func (m *Model) Init() tea.Cmd {
 	m.listing, m.recovering, m.dirtying = true, true, true
 	return tea.Batch(m.listCmd(), m.recoverCmd(), m.projectsCmd(), m.dirtyCmd(),
-		m.after(listEvery, listTickMsg{}), m.after(recoverEvery, recoverTickMsg{}))
+		m.after(listEvery, listTickMsg{}), m.after(recoverEvery, recoverTickMsg{}),
+		tea.RequestBackgroundColor)
 }
 
 // --- commands ---
@@ -615,14 +625,10 @@ func (m *Model) selectionChanged() tea.Cmd {
 	return m.after(selDebounce, selTickMsg{m.selSeq})
 }
 
-// listHeight is the number of list rows visible: the screen less the
-// status line and the help (see helpLines).
+// listHeight is the number of list rows visible: the list pane's inside
+// (see layout).
 func (m *Model) listHeight() int {
-	h := m.height - 1 - len(m.helpLines(m.width))
-	if h < 1 {
-		h = 1
-	}
-	return h
+	return max(m.layout().listInH, 1)
 }
 
 func (m *Model) clampOffset() {
@@ -654,7 +660,13 @@ func (m *Model) setStatus(s string) { m.setStatusErr(s, false) }
 func (m *Model) setErr(err error) { m.setStatusErr(firstLine(err.Error()), true) }
 
 func (m *Model) setStatusErr(s string, isErr bool) {
-	m.status, m.statusErr, m.statusFromOut = s, isErr, false
+	m.status, m.statusErr, m.statusFromOut, m.statusOK = s, isErr, false, false
+}
+
+// setOK shows s as the outcome of an operation that worked.
+func (m *Model) setOK(s string) {
+	m.setStatus(s)
+	m.statusOK = s != ""
 }
 
 func firstLine(s string) string {
@@ -685,8 +697,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.setStatus(m.quitText(n))
 	}
+	// The busy spinner turns while an operation runs.
+	if !m.spinning && len(m.busyOps()) > 0 {
+		m.spinning = true
+		cmd = tea.Batch(cmd, m.after(spinEvery, spinTickMsg{}))
+	}
 	return m, cmd
 }
+
+// spinner is the busy spinner's current frame (one cell).
+func (m *Model) spinner() string { return spinFrames[m.spinFrame%len(spinFrames)] }
+
+var spinFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func (m *Model) quitText(n int) string {
 	if m.switching {
@@ -717,10 +739,25 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		if m.form != nil {
 			m.form.setWidth(m.formInputWidth())
 		}
-		m.renameInput.Width = m.renameInputWidth()
+		m.renameInput.SetWidth(m.renameInputWidth())
 		return nil
-	case tea.KeyMsg:
+	case tea.PasteMsg:
+		return m.handlePaste(msg)
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
+	case tea.BackgroundColorMsg:
+		if msg.IsDark() != isDark {
+			applyTheme(msg.IsDark())
+			m.restyleInputs()
+		}
+		return nil
+	case spinTickMsg:
+		m.spinFrame++
+		if len(m.busyOps()) == 0 {
+			m.spinning = false
+			return nil
+		}
+		return m.after(spinEvery, spinTickMsg{})
 
 	case listTickMsg:
 		cmds := []tea.Cmd{m.after(listEvery, listTickMsg{})}
@@ -863,7 +900,11 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			return m.addStep(msg.id, msg.slug, msg.repos, next, added, failed)
 		}
 		delete(m.busy, msg.id)
-		m.setStatusErr(firstLine(addSummary(msg.slug, added, failed)), len(failed) > 0)
+		if len(failed) > 0 {
+			m.setStatusErr(firstLine(addSummary(msg.slug, added, failed)), true)
+		} else {
+			m.setOK(firstLine(addSummary(msg.slug, added, failed)))
+		}
 		return m.reload()
 	case warnMsg:
 		if m.statusErr && !m.statusFromOut {
@@ -887,7 +928,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 				m.setErr(fmt.Errorf("%s: %w", msg.op, msg.err))
 			}
 		} else {
-			m.setStatus(msg.text)
+			m.setOK(msg.text)
 		}
 		return m.reload()
 	case closeCheckMsg:
@@ -907,7 +948,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.setErr(fmt.Errorf("%s: %w", msg.verb, msg.err))
 			return m.reload()
 		}
-		m.setStatus(fmt.Sprintf("%s %s", msg.slug, map[string]string{"done": "done", "cancel": "cancelled"}[msg.verb]))
+		m.setOK(fmt.Sprintf("%s %s", msg.slug, map[string]string{"done": "done", "cancel": "cancelled"}[msg.verb]))
 		return m.reload()
 	case newTaskMsg:
 		m.creating = false
@@ -918,7 +959,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		m.lastForm = nil
 		m.selID, m.stickyID = msg.task.ID, 0
 		m.selIdx = len(m.rows) // fallback if it is filtered out
-		m.setStatus(fmt.Sprintf("created %s (%s)", msg.task.Slug, m.be.TaskDir(msg.task.Slug)))
+		m.setOK(fmt.Sprintf("created %s (%s)", msg.task.Slug, m.be.TaskDir(msg.task.Slug)))
 		return tea.Batch(m.reload(), m.selectionChanged())
 	case openMsg:
 		delete(m.busy, msg.id)
@@ -976,7 +1017,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			}
 			m.setStatusErr(text, true)
 		} else if msg.op == "open" {
-			m.setStatus("attached " + msg.slug)
+			m.setOK("attached " + msg.slug)
 		}
 		return m.reload()
 	}
@@ -1061,7 +1102,7 @@ func (m *Model) exec(op, slug string, c *exec.Cmd) tea.Cmd {
 	})
 }
 
-func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	key := msg.String()
 	if key == "ctrl+c" {
 		m.switching = false
@@ -1075,14 +1116,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 	// Bubble Tea may deliver fast-typed letters as one multi-rune event
 	// ("jjj"): in normal mode replay them one key at a time (the mode may
-	// change on the way, e.g. "/abc"). Pastes are ignored there.
-	if m.mode == modeNormal && msg.Type == tea.KeyRunes && len(msg.Runes) > 1 && !msg.Alt {
-		if msg.Paste {
-			return nil
-		}
+	// change on the way, e.g. "/abc"). Pastes arrive as tea.PasteMsg and
+	// are ignored there.
+	if rs := []rune(msg.Text); m.mode == modeNormal && len(rs) > 1 && msg.Mod&(tea.ModAlt|tea.ModCtrl) == 0 {
 		var cmds []tea.Cmd
-		for _, r := range msg.Runes {
-			cmds = append(cmds, m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}))
+		for _, r := range rs {
+			cmds = append(cmds, m.handleKey(runeKey(r)))
 		}
 		return tea.Batch(cmds...)
 	}
@@ -1103,12 +1142,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.renameKey(msg)
 	case modeSessions:
 		return m.sessionsKey(msg)
+	case modeHelp:
+		// Any key closes the key reference; it never acts on a task.
+		m.mode = modeNormal
+		return nil
 	}
 	return m.normalKey(key)
 }
 
 // renameKey handles a key while a task's title is being edited (`t`).
-func (m *Model) renameKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) renameKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		m.mode = modeNormal
@@ -1162,7 +1205,7 @@ func (m *Model) renameKey(msg tea.KeyMsg) tea.Cmd {
 	return cmd
 }
 
-func (m *Model) filterKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) filterKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		m.mode = modeNormal
@@ -1193,7 +1236,7 @@ func (m *Model) applyFilter(f string) tea.Cmd {
 
 // sessionsKey handles a key in the session picker: enter attaches to a live
 // session, resumes a past one or starts a new one; esc launches nothing.
-func (m *Model) sessionsKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) sessionsKey(msg tea.KeyPressMsg) tea.Cmd {
 	p := m.sessPick
 	if p == nil {
 		m.mode = modeNormal
@@ -1228,7 +1271,7 @@ func (m *Model) sessionsKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 // pickerKey handles a key in the repo picker.
-func (m *Model) pickerKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) pickerKey(msg tea.KeyPressMsg) tea.Cmd {
 	p, t := m.picker, m.pickTask
 	res := p.update(msg)
 	if res == pickContinue {
@@ -1266,7 +1309,7 @@ func (m *Model) pickerKey(msg tea.KeyMsg) tea.Cmd {
 	return m.addStep(t.Task.ID, t.Task.Slug, sel, 0, nil, nil)
 }
 
-func (m *Model) formKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) formKey(msg tea.KeyPressMsg) tea.Cmd {
 	res, cmd := m.form.update(msg)
 	switch res {
 	case formPick:
@@ -1310,7 +1353,7 @@ func (m *Model) confirmKey(key string) tea.Cmd {
 		m.confirm, m.mode = nil, modeNormal
 		m.setStatus(c.verb + " " + c.slug + " aborted")
 		return nil
-	case " ":
+	case "space":
 		c.ticked, c.unticked = !c.ticked, false
 		return nil
 	case "enter":
@@ -1395,6 +1438,9 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		m.form.setWidth(m.formInputWidth())
 		m.mode = modeForm
 		return tea.Batch(m.projectsCmd(), m.syncProject())
+	case "?":
+		m.mode = modeHelp
+		return nil
 	case "A":
 		return m.assistant()
 	}
@@ -1472,7 +1518,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		m.renameInput.SetValue(m.renameOrig)
 		m.renameFill = m.renameInput.Value()
 		m.renameInput.CursorEnd()
-		m.renameInput.Width = m.renameInputWidth()
+		m.renameInput.SetWidth(m.renameInputWidth())
 		m.renameInput.Focus()
 		m.setStatus("")
 		m.mode = modeRename
@@ -1549,5 +1595,6 @@ func (m *Model) busyOps() []string {
 // renameInputWidth is the visible width of the `t` title input: the full
 // terminal width minus its prompt (0 or less means unlimited).
 func (m *Model) renameInputWidth() int {
-	return m.width - len(m.renameInput.Prompt) - 1
+	// At least 1: a narrower input panics drawing its placeholder.
+	return max(m.width-len(m.renameInput.Prompt)-1, 1)
 }

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/model"
@@ -15,7 +15,7 @@ import (
 // more than h lines.
 func checkView(t *testing.T, m *Model, w, h int) string {
 	t.Helper()
-	v := m.View()
+	v := m.View().Content
 	lines := strings.Split(v, "\n")
 	if len(lines) != h {
 		t.Errorf("view has %d lines, want %d", len(lines), h)
@@ -49,7 +49,7 @@ func TestNotesArea(t *testing.T) {
 			t.Errorf("notes area lacks %q:\n%s", want, v)
 		}
 	}
-	if strings.Contains(m.View(), "\x1b[31m red") {
+	if strings.Contains(m.View().Content, "\x1b[31m red") {
 		t.Fatal("unsanitized notes rendered")
 	}
 	// wrapped: the long line takes several rows, all within the pane
@@ -74,7 +74,7 @@ func TestNotesArea(t *testing.T) {
 
 	// no notes
 	selectTask(t, m, "beta")
-	if v := plainView(m); !strings.Contains(v, "(no notes — press m to write)") {
+	if v := plainView(m); !strings.Contains(v, "no notes — m to write") {
 		t.Fatalf("empty notes:\n%s", v)
 	}
 
@@ -100,7 +100,7 @@ func TestNotesEditSave(t *testing.T) {
 		t.Fatalf("busy after opening: %v", m.busy)
 	}
 	v := checkView(t, m, 120, 40)
-	for _, want := range []string{"Notes editing · ctrl+s save · esc leave", "│ old text", "ctrl+s save  esc leave (asks if unsaved)  ctrl+r reload"} {
+	for _, want := range []string{"Notes editing · ctrl+s save · esc leave", "▎old text", "ctrl+s save  esc leave (asks if unsaved)  ctrl+r reload"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("edit view lacks %q:\n%s", want, v)
 		}
@@ -116,7 +116,7 @@ func TestNotesEditSave(t *testing.T) {
 	if got := m.notes.ta.Value(); got != "old text\nd s q" {
 		t.Fatalf("value = %q", got)
 	}
-	if v := plainView(m); !strings.Contains(v, "Notes editing*") || !strings.Contains(v, "│ d s q") {
+	if v := plainView(m); !strings.Contains(v, "Notes editing*") || !strings.Contains(v, "▎d s q") {
 		t.Fatalf("edited text / unsaved mark not shown:\n%s", v)
 	}
 
@@ -273,7 +273,7 @@ func TestNotesBoundToTask(t *testing.T) {
 	// the task vanishes from the list: still bound, still saves
 	fb.tasks = fb.tasks[:2]
 	drain(m, m.reload())
-	if v := plainView(m); !strings.Contains(v, "│ Title of gamma") || !strings.Contains(v, "│ edit g") {
+	if v := plainView(m); !strings.Contains(v, "│ Title of gamma") || !strings.Contains(v, "▎edit g") {
 		t.Fatalf("edited task not shown:\n%s", v)
 	}
 	key(m, "ctrl+s")
@@ -374,7 +374,8 @@ func TestNotesResize(t *testing.T) {
 	m, _ := newTest(t, fb)
 	selectTask(t, m, "gamma")
 	key(m, "m")
-	rw := 120 - listWidth(120) - 3
+	pw0, _ := m.detailPaneSize()
+	rw := pw0 - 1 // less the bar down the editor's left side
 	if m.notes.ta.Width() != rw {
 		t.Fatalf("editor width %d, want %d", m.notes.ta.Width(), rw)
 	}
@@ -384,7 +385,7 @@ func TestNotesResize(t *testing.T) {
 		m.Update(tea.WindowSizeMsg{Width: sz.w, Height: sz.h})
 		pw, ph := m.detailPaneSize()
 		keep, notesH := notesLayout(len(m.infoLines(m.notesTask(), pw)), ph)
-		if m.notes.ta.Width() != pw || m.notes.ta.Height() != notesH || keep+2+notesH != ph {
+		if m.notes.ta.Width() != pw-1 || m.notes.ta.Height() != notesH || keep+1+notesH != ph {
 			t.Errorf("%dx%d: editor %dx%d, want %dx%d (keep %d)", sz.w, sz.h, m.notes.ta.Width(), m.notes.ta.Height(), pw, notesH, keep)
 		}
 		v := checkView(t, m, sz.w, sz.h)
@@ -401,10 +402,10 @@ func TestNotesResize(t *testing.T) {
 // TestNotesLayout checks the split between details and the notes area.
 func TestNotesLayout(t *testing.T) {
 	for _, c := range []struct{ nInfo, h, keep, notesH int }{
-		{10, 38, 10, 26},
-		{10, 15, 10, 3},
-		{10, 12, 7, 3},
-		{10, 4, 0, 2},
+		{10, 38, 10, 27},
+		{10, 15, 10, 4},
+		{10, 12, 8, 3},
+		{10, 4, 0, 3},
 		{0, 1, 0, 1},
 	} {
 		keep, notesH := notesLayout(c.nInfo, c.h)
@@ -429,7 +430,7 @@ func TestNotesQuestionsWhileSaving(t *testing.T) {
 	key(m, "m")
 	typeText(m, "1")
 	save := press(m, "ctrl+s")
-	if v := plainView(m); !strings.Contains(v, "Notes saving…") {
+	if v := plainView(m); !strings.Contains(v, "Notes "+spinFrames[0]+" saving…") {
 		t.Fatalf("no saving mark:\n%s", v)
 	}
 	key(m, "esc")
@@ -577,7 +578,7 @@ func TestNotesLoading(t *testing.T) {
 			t.Fatalf("%s while loading returned a command", k)
 		}
 	}
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("js")})
+	m.Update(textKey("js"))
 	if m.mode != modeNotesLoading || m.selected().Task.Slug != "gamma" || m.form != nil || m.confirm != nil ||
 		m.quitRequested || fb.count("NewSession") != 0 || fb.count("GetNotes") != 0 {
 		t.Fatalf("keys leaked while loading: mode %v sel %s", m.mode, m.selected().Task.Slug)
@@ -589,7 +590,7 @@ func TestNotesLoading(t *testing.T) {
 	key(m, "esc")
 
 	// "mjs" as one burst: m starts loading, j and s are swallowed
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("mjs")})
+	_, cmd := m.Update(textKey("mjs"))
 	if m.mode != modeNotesLoading || m.selected().Task.Slug != "gamma" || fb.count("NewSession") != 0 {
 		t.Fatalf("burst: mode %v sel %s sessions %d", m.mode, m.selected().Task.Slug, fb.count("NewSession"))
 	}

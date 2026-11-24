@@ -97,6 +97,9 @@ Details: [docs/tasks.md](docs/tasks.md), [docs/sandbox.md](docs/sandbox.md).
 Run `atl` in a plain terminal or inside your own tmux. Opening a task attaches to the
 task's tmux session; **Ctrl-q** returns to the TUI (Claude keeps running).
 
+The top bar shows the workspace and what the sessions are doing (waiting for you,
+running, idle, stopped). Colours follow the terminal's light or dark background.
+
 | key | action |
 |---|---|
 | `n` | new task (title, project, repos, base branch) |
@@ -113,6 +116,7 @@ task's tmux session; **Ctrl-q** returns to the TUI (Claude keeps running).
 | `1`-`5` | set status: backlog, active, review, done, cancelled |
 | `/` | filter by slug or title |
 | `w` | switch workspace |
+| `?` | every key, with what it does (any key closes it) |
 | `q` | quit (waits for running operations; `ctrl+c` again forces) |
 
 Repo picker: type to filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter`

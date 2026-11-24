@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
@@ -53,7 +53,7 @@ func RunContext(ctx context.Context, a *app.App) error {
 		}
 		return c
 	}
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
+	p := tea.NewProgram(m, tea.WithContext(ctx))
 
 	// Progress and warnings from the app would corrupt the screen: route
 	// them, in order, to the status line instead. Once the program has

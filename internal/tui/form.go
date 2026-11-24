@@ -4,9 +4,8 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/cursor"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
@@ -60,7 +59,7 @@ func newTaskForm(projects []string) *newForm {
 		ti := textinput.New()
 		ti.Prompt = ""
 		ti.Placeholder = placeholders[i]
-		ti.Cursor.SetMode(cursor.CursorStatic)
+		styleInput(&ti)
 		ti.CharLimit = 500
 		if i == fieldTitle {
 			ti.CharLimit = model.MaxTitleLen // as atl new and rename
@@ -93,7 +92,7 @@ func (f *newForm) setWidth(w int) {
 		w = 1
 	}
 	for i := range f.inputs {
-		f.inputs[i].Width = w
+		f.inputs[i].SetWidth(w)
 	}
 }
 
@@ -209,7 +208,7 @@ const (
 )
 
 // update handles a key in the form. On formSubmit the caller reads opts().
-func (f *newForm) update(msg tea.KeyMsg) (formResult, tea.Cmd) {
+func (f *newForm) update(msg tea.KeyPressMsg) (formResult, tea.Cmd) {
 	key := msg.String()
 	if key != "tab" && key != "shift+tab" {
 		f.cycling = false
@@ -252,20 +251,20 @@ func (f *newForm) update(msg tea.KeyMsg) (formResult, tea.Cmd) {
 		return formContinue, nil
 	}
 	if f.focus == fieldRepos {
-		if key == " " {
+		if key == "space" {
 			return formPick, nil
 		}
 		return formContinue, nil
 	}
 	if f.focus == fieldBase {
 		switch key {
-		case " ", "left", "right":
+		case "space", "left", "right":
 			f.prodBase = !f.prodBase
 		}
 		return formContinue, nil
 	}
 	if f.focus == fieldBacklog {
-		if key == " " || key == "x" {
+		if key == "space" || key == "x" {
 			f.backlog = !f.backlog
 		}
 		return formContinue, nil

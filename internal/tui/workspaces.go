@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/cursor"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/workspace"
@@ -35,7 +34,7 @@ type WorkspaceSelector struct {
 // the name of the workspace chosen, "" when the user quit.
 func RunWorkspaces(ctx context.Context, s WorkspaceSelector) (string, error) {
 	m := NewWorkspacePicker(ctx, s)
-	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx)).Run()
+	_, err := tea.NewProgram(m, tea.WithContext(ctx)).Run()
 	if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {
 		return "", nil
 	}
@@ -100,11 +99,11 @@ func NewWorkspacePicker(ctx context.Context, s WorkspaceSelector) *WorkspacePick
 	fi := textinput.New()
 	fi.Prompt = "/"
 	fi.Placeholder = "filter"
-	fi.Cursor.SetMode(cursor.CursorStatic)
+	styleInput(&fi)
 	ni := textinput.New()
 	ni.Prompt = "new workspace> "
 	ni.Placeholder = "name (lowercase letters, digits, - and _)"
-	ni.Cursor.SetMode(cursor.CursorStatic)
+	styleInput(&ni)
 	ni.CharLimit = 32
 	return &WorkspacePicker{ctx: ctx, s: s, selName: s.Preselect, filterInput: fi, nameInput: ni, width: 80, height: 24}
 }
@@ -158,7 +157,9 @@ func (m *WorkspacePicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.clampOffset()
 		return m, nil
-	case tea.KeyMsg:
+	case tea.PasteMsg:
+		return m, m.paste(msg)
+	case tea.KeyPressMsg:
 		return m, m.handleKey(msg)
 	case wsLoadedMsg:
 		m.loading, m.loaded = false, true
@@ -201,7 +202,7 @@ func (m *WorkspacePicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *WorkspacePicker) setStatus(s string, isErr bool) { m.status, m.statusErr = s, isErr }
 
-func (m *WorkspacePicker) handleKey(msg tea.KeyMsg) tea.Cmd {
+func (m *WorkspacePicker) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	key := msg.String()
 	if key == "ctrl+c" {
 		return tea.Quit
@@ -226,13 +227,10 @@ func (m *WorkspacePicker) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 	// Fast-typed letters may arrive as one event ("jj"): one at a time.
-	if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 && !msg.Alt {
-		if msg.Paste {
-			return nil
-		}
+	if rs := []rune(msg.Text); len(rs) > 1 && msg.Mod&(tea.ModAlt|tea.ModCtrl) == 0 {
 		var cmds []tea.Cmd
-		for _, r := range msg.Runes {
-			cmds = append(cmds, m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}))
+		for _, r := range rs {
+			cmds = append(cmds, m.handleKey(runeKey(r)))
 		}
 		return tea.Batch(cmds...)
 	}
@@ -285,7 +283,7 @@ func (m *WorkspacePicker) handleKey(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m *WorkspacePicker) filterKey(msg tea.KeyMsg) tea.Cmd {
+func (m *WorkspacePicker) filterKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		m.mode = wsNormal
@@ -311,7 +309,7 @@ func (m *WorkspacePicker) filterKey(msg tea.KeyMsg) tea.Cmd {
 	return cmd
 }
 
-func (m *WorkspacePicker) newKey(msg tea.KeyMsg) tea.Cmd {
+func (m *WorkspacePicker) newKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		m.mode = wsNormal
@@ -405,15 +403,6 @@ func (m *WorkspacePicker) move(delta int) {
 	m.clampOffset()
 }
 
-// listHeight is the number of rows the list shows: the screen less the
-// title, a blank line, the status and the help lines.
-func (m *WorkspacePicker) listHeight() int {
-	if h := m.height - 4; h > 0 {
-		return h
-	}
-	return 0
-}
-
 func (m *WorkspacePicker) clampOffset() {
 	h := m.listHeight()
 	if m.sel < m.offset {
@@ -447,20 +436,52 @@ func (m *WorkspacePicker) abbrev(p string) string {
 	return p
 }
 
-// View implements tea.Model.
-func (m *WorkspacePicker) View() string {
+// boxed reports whether the list is drawn in a box (room enough).
+func (m *WorkspacePicker) boxed() bool { return m.width >= 24 && m.height >= 8 }
+
+// listHeight is the number of rows the list shows: the screen less the
+// top bar, the box (or a blank line), the status and the help lines.
+func (m *WorkspacePicker) listHeight() int {
+	used := 4
+	if m.boxed() {
+		used = 5
+	}
+	if h := m.height - used; h > 0 {
+		return h
+	}
+	return 0
+}
+
+// render draws the screen.
+func (m *WorkspacePicker) render() string {
 	w, h := m.width, m.height
 	if w <= 0 || h <= 0 {
 		return ""
 	}
-	lines := []string{
-		trunc(titleStyle.Render("atelier workspaces")+dimStyle.Render("  "+clean(m.abbrev(m.s.Root))), w),
-		"",
-	}
+	head := brandStyle.Render(" atelier ") + " " + titleStyle.Render("workspaces") + dimStyle.Render("  "+clean(m.abbrev(m.s.Root)))
+	lines := []string{trunc(head, w)}
+	var body []string
+	title := "Workspaces"
 	if m.mode == wsAdopt && m.adopt != nil {
-		lines = append(lines, m.adoptLines(w, m.listHeight())...)
+		title = "Adopt"
+		body = m.adoptLines(w-4, m.listHeight())
 	} else {
-		lines = append(lines, m.listLines(w, m.listHeight())...)
+		body = m.listLines(w-4, m.listHeight())
+	}
+	if m.boxed() {
+		right := ""
+		if m.loaded && m.loadErr == "" {
+			right = labelStyle.Render(fmt.Sprintf("%d", len(m.vis)))
+			if m.filter != "" {
+				right = dimStyle.Render("/"+clean(m.filter)) + " " + labelStyle.Render(fmt.Sprintf("%d/%d", len(m.vis), len(m.rows)))
+			}
+		}
+		lines = append(lines, panel(title, right, body, w, m.listHeight()+2, true)...)
+	} else {
+		lines = append(lines, "")
+		for _, l := range body {
+			lines = append(lines, trunc(l, w))
+		}
 	}
 	for len(lines) < h-2 {
 		lines = append(lines, "")
@@ -479,11 +500,12 @@ func (m *WorkspacePicker) listLines(w, h int) []string {
 	var msg string
 	switch {
 	case m.loadErr != "":
-		return []string{errStyle.Render(trunc("cannot list the workspaces in "+clean(m.s.Root)+": "+m.loadErr, w))}
+		return []string{errStyle.Render(trunc("✗ cannot list the workspaces in "+clean(m.s.Root)+": "+m.loadErr, w))}
 	case !m.loaded:
 		msg = "loading…"
 	case len(m.rows) == 0:
-		msg = "no workspaces in " + clean(m.abbrev(m.s.Root)) + " yet — press n to create one (as `atl workspace new <name>` does)"
+		return []string{dimStyle.Render(trunc("no workspaces in "+clean(m.abbrev(m.s.Root))+" yet — press n to create one (as `atl workspace new <name>` does)", w)), "",
+			trunc(keyStyle.Render("n")+descStyle.Render(" new workspace"), w)}
 	case len(m.vis) == 0:
 		msg = "no workspaces match /" + clean(m.filter)
 	}
@@ -502,52 +524,19 @@ func (m *WorkspacePicker) listLines(w, h int) []string {
 	return out
 }
 
-// wsCell is part of a row, drawn with a style.
-type wsCell struct {
-	text  string
-	style lipgloss.Style
-	width int // padded to this width (0: as is)
-}
-
 // rowLine renders a row: the name and the path, dimmed; a directory
 // without atelier.toml dimmed altogether and marked not adopted; the
-// selected one reversed across the width.
+// selected one highlighted across the width.
 func (m *WorkspacePicker) rowLine(r workspace.Entry, sel bool, w, nameW int) string {
-	base := lipgloss.NewStyle()
+	name := lipgloss.NewStyle().Bold(true)
 	if !r.Workspace {
-		base = dimStyle
+		name = dimStyle
 	}
-	cells := []wsCell{{text: " "}, {text: clean(r.Name), style: base, width: nameW}, {text: "  "},
-		{text: clean(m.abbrev(r.Dir)), style: dimStyle}}
+	segs := []seg{{padRight(clean(r.Name), nameW), name}, {"  " + clean(m.abbrev(r.Dir)), dimStyle}}
 	if !r.Workspace {
-		cells = append(cells, wsCell{text: "  not adopted", style: dimStyle})
+		segs = append(segs, seg{"  not adopted", warnStyle.Bold(false)})
 	}
-	var b strings.Builder
-	used := 0
-	padStyle := lipgloss.NewStyle()
-	if sel {
-		padStyle = selStyle
-	}
-	for _, c := range cells {
-		t := trunc(c.text, w-used)
-		if t == "" {
-			continue
-		}
-		used += ansi.StringWidth(t)
-		st := c.style
-		if sel {
-			st = st.Reverse(true)
-		}
-		b.WriteString(st.Render(t))
-		if pad := min(c.width-ansi.StringWidth(t), w-used); pad > 0 {
-			b.WriteString(padStyle.Render(strings.Repeat(" ", pad)))
-			used += pad
-		}
-	}
-	if sel && used < w {
-		b.WriteString(selStyle.Render(strings.Repeat(" ", w-used)))
-	}
-	return b.String()
+	return rowText(sel, w, segs...)
 }
 
 // adoptLines is the adopt confirmation: what adopting the directory
@@ -561,13 +550,14 @@ func (m *WorkspacePicker) adoptLines(w, h int) []string {
 	out := []string{
 		trunc(markStyle.Render("Adopt "+clean(m.abbrev(p.Dir))+" as workspace "+clean(p.Name)+"?"), w),
 		dimStyle.Render(trunc("It writes "+workspace.File+" (keeping what is there) with:", w)),
+		"",
 	}
 	item := func(s string, st lipgloss.Style) {
 		wrapped := strings.Split(ansi.Wrap(clean(s), max(w-4, 1), ""), "\n")
 		for i, l := range wrapped {
 			ind := "    "
 			if i == 0 {
-				ind = "  "
+				ind = "  • "
 			}
 			out = append(out, st.Render(trunc(ind+l, w)))
 		}
@@ -601,16 +591,16 @@ func (m *WorkspacePicker) statusLine(w int) string {
 		return trunc(m.nameInput.View(), w)
 	case wsAdopt:
 		if !m.creating {
-			return trunc(markStyle.Render("Adopt it? y/n"), w)
+			return trunc(markStyle.Render("? Adopt it? y/n"), w)
 		}
 	}
 	switch {
 	case m.creating:
-		return trunc(markStyle.Render("working… ")+"creating the workspace", w)
+		return trunc(keyStyle.Render("working… ")+"creating the workspace", w)
 	case m.status != "" && m.statusErr:
-		return trunc(errStyle.Render(clean(m.status)), w)
+		return trunc(errStyle.Render("✗ "+clean(m.status)), w)
 	case m.status != "":
-		return trunc(clean(m.status), w)
+		return trunc(okStyle.Render("✓ ")+clean(m.status), w)
 	case m.loading && m.loaded:
 		return trunc(dimStyle.Render("refreshing…"), w)
 	case m.filter != "":
@@ -620,28 +610,29 @@ func (m *WorkspacePicker) statusLine(w int) string {
 }
 
 func (m *WorkspacePicker) helpLine(w int) string {
-	var s string
+	var items []helpItem
 	switch m.mode {
 	case wsFilter:
-		s = "type to filter  enter apply  esc clear  ↑/↓ move"
+		items = []helpItem{{"", "type to filter"}, {"enter", "apply"}, {"esc", "clear"}, {"↑/↓", "move"}}
 	case wsNew:
 		if m.statusErr && m.status != "" {
-			return errStyle.Render(trunc(clean(m.status), w))
+			return errStyle.Render(trunc("✗ "+clean(m.status), w))
 		}
 		name := strings.TrimSpace(m.nameInput.Value())
-		s = "enter create (as `atl workspace new <name>` does)  esc cancel"
+		items = []helpItem{{"enter", "create (as `atl workspace new <name>` does)"}, {"esc", "cancel"}}
 		if name != "" {
 			if err := m.checkNew(name); err != nil {
-				return errStyle.Render(trunc(clean(err.Error()), w))
+				return errStyle.Render(trunc("✗ "+clean(err.Error()), w))
 			}
 			if r := m.row(name); r != nil && !r.Workspace {
-				s = clean(m.abbrev(r.Dir)) + " exists without " + workspace.File + ": enter shows what adopting it writes  esc cancel"
+				items = []helpItem{{"", clean(m.abbrev(r.Dir)) + " exists without " + workspace.File + ":"},
+					{"enter", "shows what adopting it writes"}, {"esc", "cancel"}}
 			}
 		}
 	case wsAdopt:
-		s = "y adopt (as `atl workspace new " + clean(m.adopt.Name) + "` does)  n/esc cancel"
+		items = []helpItem{{"y", "adopt (as `atl workspace new " + clean(m.adopt.Name) + "` does)"}, {"n/esc", "cancel"}}
 	default:
-		s = "↑/↓ move  enter open  n new workspace  / filter  r refresh  q quit"
+		items = []helpItem{{"↑/↓", "move"}, {"enter", "open"}, {"n", "new workspace"}, {"/", "filter"}, {"r", "refresh"}, {"q", "quit"}}
 	}
-	return dimStyle.Render(trunc(s, w))
+	return helpStyled(items, w)
 }

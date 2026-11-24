@@ -25,7 +25,7 @@
 
 # The atl binary, static (README "Install on the host" copies it out of this
 # stage: docker build --target build -t atl-build .).
-FROM golang:1.24-bookworm AS build
+FROM golang:1.25-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
