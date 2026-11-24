@@ -235,7 +235,7 @@ func (a *App) ensureAssistantSandbox(ctx context.Context, busy bool) (string, er
 		return "", err
 	}
 	runDir := a.Paths.AssistantRunDir()
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	if err := sandbox.MakeRunDir(runDir); err != nil {
 		return "", err
 	}
 	if err := sandbox.InstallBin(a.AtlBin, runDir); err != nil {

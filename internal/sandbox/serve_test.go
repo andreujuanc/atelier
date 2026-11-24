@@ -149,3 +149,40 @@ func TestStartReplacesStaleGate(t *testing.T) {
 		t.Error("Ident does not tell the lists apart")
 	}
 }
+
+// TestServeRunDirIsPrivate: the run dir is the owner's only (an older atl
+// made it 0755), so no other user of the host reaches the gate's sockets
+// in it; the Docker socket itself stays open to any UID, as the containers
+// a task bind-mounts it into (testcontainers, localstack) may run as
+// another one, and the dir is not on their path to it.
+func TestServeRunDirIsPrivate(t *testing.T) {
+	_, upstream := newDaemon(t)
+	runDir := filepath.Join(t.TempDir(), "run")
+	if err := os.Mkdir(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ctx, &Gate{ID: testID, Root: t.TempDir(), Upstream: upstream}, &Control{Slug: "t1", TaskID: 1, Atl: "/bin/false"}, runDir)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !Alive(runDir) {
+		if time.Now().After(deadline) {
+			t.Fatal("gate never came up")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for path, want := range map[string]os.FileMode{runDir: os.ModeDir | 0o700, SocketPath(runDir): os.ModeSocket | 0o666} {
+		if fi, err := os.Stat(path); err != nil {
+			t.Error(err)
+		} else if fi.Mode() != want {
+			t.Errorf("%s: mode %v, want %v", path, fi.Mode(), want)
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

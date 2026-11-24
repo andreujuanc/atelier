@@ -248,7 +248,7 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) 
 		return "", err
 	}
 	runDir := a.Paths.RunDir(t.Slug)
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	if err := sandbox.MakeRunDir(runDir); err != nil {
 		return "", err
 	}
 	// The run dir is named by a hash: say whose it is.

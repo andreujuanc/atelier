@@ -56,12 +56,24 @@ func UpstreamSocket() string {
 // holds 108 bytes including the final NUL).
 const MaxSocketPath = 107
 
+// MakeRunDir creates runDir, or makes an existing one (an older atl made
+// them 0755), the owner's only: the gate's sockets in it answer whoever
+// connects. The task container runs as the owner, and the containers a
+// task mounts the Docker socket into get the socket file itself, not
+// through the dir.
+func MakeRunDir(runDir string) error {
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(runDir, 0o700)
+}
+
 // Serve runs g on the socket in runDir, and ctl (if not nil) on the control
 // socket there, until ctx ends, the task directory (g.Root) disappears or the
 // gate's socket is removed or replaced. It returns nil at once if another
 // gate already serves runDir.
 func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	if err := MakeRunDir(runDir); err != nil {
 		return err
 	}
 	sock := socketPath(runDir)
