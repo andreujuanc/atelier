@@ -381,17 +381,23 @@ func globalEnvScript(env map[string]string) (string, error) {
 	return script.String(), nil
 }
 
-// redact removes env's values from a tmux error.
+// redact removes env's values from a tmux error, the longest first: a value
+// that is part of another must not leave the rest of that one behind.
 func redact(err error, env map[string]string) error {
 	var te *Error
 	if !errors.As(err, &te) {
 		return err
 	}
-	msg := te.Stderr
+	vals := make([]string, 0, len(env))
 	for _, v := range env {
 		if v != "" {
-			msg = strings.ReplaceAll(msg, v, "…")
+			vals = append(vals, v)
 		}
+	}
+	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
+	msg := te.Stderr
+	for _, v := range vals {
+		msg = strings.ReplaceAll(msg, v, "…")
 	}
 	return &Error{Args: te.Args, Stderr: msg, Err: te.Err}
 }
