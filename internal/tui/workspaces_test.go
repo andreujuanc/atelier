@@ -505,3 +505,28 @@ func TestSwitchWorkspaceKey(t *testing.T) {
 		t.Fatalf("w in the filter: switching %v filter %q", m.switching, m.filter)
 	}
 }
+
+// TestWorkspacePickerNarrow: too narrow for the box, the list takes the
+// whole width (the selected row highlighted across it).
+func TestWorkspacePickerNarrow(t *testing.T) {
+	f := &fakeWorkspaces{rows: sampleWorkspaces()}
+	m := newWSTest(t, f, "")
+	for _, size := range [][2]int{{22, 20}, {100, 6}} {
+		m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		if m.boxed() {
+			t.Fatalf("%v: boxed", size)
+		}
+		found := false
+		for _, l := range strings.Split(m.View().Content, "\n") {
+			if strings.Contains(ansi.Strip(l), "alpha") {
+				found = true
+				if w := ansi.StringWidth(l); w != size[0] {
+					t.Errorf("%v: selected row %d cells wide: %q", size, w, ansi.Strip(l))
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%v: no alpha row:\n%s", size, wsView(m))
+		}
+	}
+}

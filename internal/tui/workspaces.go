@@ -462,11 +462,15 @@ func (m *WorkspacePicker) render() string {
 	lines := []string{trunc(head, w)}
 	var body []string
 	title := "Workspaces"
+	iw := w // the list's width: inside the box, or the whole screen
+	if m.boxed() {
+		iw = w - 4
+	}
 	if m.mode == wsAdopt && m.adopt != nil {
 		title = "Adopt"
-		body = m.adoptLines(w-4, m.listHeight())
+		body = m.adoptLines(iw, m.listHeight())
 	} else {
-		body = m.listLines(w-4, m.listHeight())
+		body = m.listLines(iw, m.listHeight())
 	}
 	if m.boxed() {
 		right := ""
