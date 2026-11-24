@@ -404,7 +404,7 @@ expect_state fix-login stopped "after tmux server crash (startup recover)"
 step resume
 out="$(atl resume fix-login)" || fail "atl resume failed: $out"
 expect_eq "atl resume count" "$out" "1"
-resumed() { grep -qF "sid=$CID argv=[--resume][$CID][--add-dir][$ATL_REPOS/docs]" "$E2E_LOG"; }
+resumed() { grep -qF "sid=$CID argv=[--resume=$CID][--add-dir][$ATL_REPOS/docs]" "$E2E_LOG"; }
 wait_for "stub claude relaunched with --resume $CID" resumed
 expect_state fix-login idle "after resume"
 expect_eq "claude session id after resume" "$(sess_field fix-login claude_session_id)" "$CID"
@@ -423,7 +423,7 @@ tm kill-window -t "$(sess_field fix-login tmux_target)"
 # Attaching needs a terminal, so only the resume before it can succeed here.
 out="$(atl open fix-login --session "$SID" </dev/null 2>&1)" && fail "atl open attached without a terminal: $out"
 [[ "$out" == *"attach:"* ]] || fail "atl open --session failed before attaching: $out"
-resumed_twice() { [[ "$(grep -cF "sid=$CID argv=[--resume][$CID][--add-dir][$ATL_REPOS/docs]" "$E2E_LOG")" == 2 ]]; }
+resumed_twice() { [[ "$(grep -cF "sid=$CID argv=[--resume=$CID][--add-dir][$ATL_REPOS/docs]" "$E2E_LOG")" == 2 ]]; }
 wait_for "stub claude relaunched again with --resume $CID" resumed_twice
 expect_state fix-login idle "after open --session"
 expect_eq "session count after open --session" "$(sess_count fix-login)" "1"

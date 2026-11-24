@@ -14,11 +14,13 @@ import (
 )
 
 // ClaudeArgv returns the command line for a Claude window:
-// ["claude", ("--resume", id)?, "--add-dir", p...].
+// ["claude", ("--resume=" + id)?, "--add-dir", p...]. The id is joined to
+// --resume, whose value is optional: a separate one that starts with "-"
+// (the id comes from a hook, so from the task) would be a claude option.
 func ClaudeArgv(roPaths []string, resumeID string) []string {
 	argv := []string{"claude"}
 	if resumeID != "" {
-		argv = append(argv, "--resume", resumeID)
+		argv = append(argv, "--resume="+resumeID)
 	}
 	for _, p := range roPaths {
 		argv = append(argv, "--add-dir", p)

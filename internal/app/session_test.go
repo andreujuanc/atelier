@@ -212,8 +212,11 @@ func TestClaudeArgv(t *testing.T) {
 	}{
 		{nil, "", []string{"claude"}},
 		{[]string{"/r/a", "/r/b"}, "", []string{"claude", "--add-dir", "/r/a", "--add-dir", "/r/b"}},
-		{[]string{"/r/a"}, "cid", []string{"claude", "--resume", "cid", "--add-dir", "/r/a"}},
-		{nil, "cid", []string{"claude", "--resume", "cid"}},
+		{[]string{"/r/a"}, "cid", []string{"claude", "--resume=cid", "--add-dir", "/r/a"}},
+		{nil, "cid", []string{"claude", "--resume=cid"}},
+		// A stored id that looks like an option stays the value of --resume.
+		{nil, "--settings=x", []string{"claude", "--resume=--settings=x"}},
+		{[]string{"/r/a"}, "--dangerously-skip-permissions", []string{"claude", "--resume=--dangerously-skip-permissions", "--add-dir", "/r/a"}},
 	} {
 		if got := ClaudeArgv(c.ro, c.resume); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("ClaudeArgv(%v, %q) = %v, want %v", c.ro, c.resume, got, c.want)
@@ -485,7 +488,7 @@ func TestResume(t *testing.T) {
 	if tags[strconv.FormatInt(s1.ID, 10)] != got.TmuxTarget || len(tags) != 1 {
 		t.Errorf("tags = %v", tags)
 	}
-	want := []string{"--resume", "cid-1", "--add-dir", e.app.Paths.RepoPath("docs")}
+	want := []string{"--resume=cid-1", "--add-dir", e.app.Paths.RepoPath("docs")}
 	if argv := e.argv(t, s1.ID); !reflect.DeepEqual(argv, want) {
 		t.Errorf("resumed argv = %q, want %q", argv, want)
 	}
@@ -555,7 +558,7 @@ func TestOpen(t *testing.T) {
 	if len(all) != 1 || all[0].State != model.StateIdle {
 		t.Fatalf("sessions after resuming Open = %+v", all)
 	}
-	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume", "cid-9"}) {
+	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume=cid-9"}) {
 		t.Errorf("argv = %q", argv)
 	}
 
@@ -643,7 +646,7 @@ func TestUserTmuxOptions(t *testing.T) {
 	if got.State != model.StateIdle || got.TmuxTarget == "" || got.TmuxTarget == s1.TmuxTarget || got.ClaudeSessionID != "cid-1" {
 		t.Fatalf("resumed session = %+v (old target %s)", got, s1.TmuxTarget)
 	}
-	if argv := e.argv(t, s1.ID); !reflect.DeepEqual(argv, []string{"--resume", "cid-1"}) {
+	if argv := e.argv(t, s1.ID); !reflect.DeepEqual(argv, []string{"--resume=cid-1"}) {
 		t.Errorf("resumed argv = %q", argv)
 	}
 	tags, err := e.app.Tmux.TaggedWindows(ctx)
@@ -691,7 +694,7 @@ func TestResumeOnlyWindowDead(t *testing.T) {
 	if n, err := e.app.Resume(ctx, "t"); err != nil || n != 1 {
 		t.Fatalf("Resume = %d, %v; want 1", n, err)
 	}
-	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume", "cid-1"}) {
+	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume=cid-1"}) {
 		t.Errorf("resumed argv = %q", argv)
 	}
 	got := e.session(t, s.ID)
@@ -733,7 +736,7 @@ func TestOpenDeadWindow(t *testing.T) {
 	if _, err := e.app.Open(ctx, "t"); err != nil {
 		t.Fatal(err)
 	}
-	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume", "cid-1"}) {
+	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume=cid-1"}) {
 		t.Errorf("argv after Open = %q, want a resume", argv)
 	}
 	got := e.session(t, s.ID)
