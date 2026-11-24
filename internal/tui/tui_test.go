@@ -1677,6 +1677,43 @@ func TestShutdown(t *testing.T) {
 	}
 }
 
+// Every backend call that may run when the TUI stops (and write to App.Out)
+// goes through the tracker: once it is closed, none reaches the backend
+// (nil here, so an untracked call panics). TaskDir only builds a path.
+func TestTrackedBackendTracksEveryCall(t *testing.T) {
+	tr := &tracker{}
+	tr.close()
+	tb := reflect.ValueOf(&trackedBackend{tr: tr})
+	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	bt := reflect.TypeOf((*Backend)(nil)).Elem()
+	for i := 0; i < bt.NumMethod(); i++ {
+		name := bt.Method(i).Name
+		if name == "TaskDir" {
+			continue
+		}
+		fn := tb.MethodByName(name)
+		args := make([]reflect.Value, fn.Type().NumIn())
+		for j := range args {
+			if in := fn.Type().In(j); in == ctxType {
+				args[j] = reflect.ValueOf(context.Background())
+			} else {
+				args[j] = reflect.Zero(in)
+			}
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("%s is not tracked (reached the backend)", name)
+				}
+			}()
+			out := fn.Call(args)
+			if err, _ := out[len(out)-1].Interface().(error); !errors.Is(err, errStopped) {
+				t.Errorf("%s after close: %v", name, err)
+			}
+		}()
+	}
+}
+
 func TestOrderedSend(t *testing.T) {
 	var mu sync.Mutex
 	var got []string

@@ -394,3 +394,19 @@ func (b *trackedBackend) AddCheck(ctx context.Context, ref string, repos []app.R
 	defer b.tr.end()
 	return b.Backend.AddCheck(ctx, ref, repos)
 }
+
+func (b *trackedBackend) Rename(ctx context.Context, ref, title string) (*model.Task, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.Rename(ctx, ref, title)
+}
+
+func (b *trackedBackend) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.DirtyTasks(ctx)
+}
