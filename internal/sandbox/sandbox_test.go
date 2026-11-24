@@ -57,7 +57,6 @@ func TestKillSessionArgs(t *testing.T) {
 		return cmd
 	}
 	mine, other := start(str(s7)), start(str(s17))
-	time.Sleep(200 * time.Millisecond)
 	count := func(session string) int {
 		n := 0
 		dirs, _ := filepath.Glob("/proc/[0-9]*")
@@ -70,6 +69,8 @@ func TestKillSessionArgs(t *testing.T) {
 		}
 		return n
 	}
+	// Each session's sh starts its two sleeps in its own time.
+	until(func() bool { return count(str(s7)) >= 3 && count(str(s17)) >= 3 })
 	if n := count(str(s7)); n < 3 {
 		t.Fatalf("session 7 has %d processes, want its sh and two sleeps", n)
 	}
@@ -80,12 +81,20 @@ func TestKillSessionArgs(t *testing.T) {
 	if err := mine.Wait(); err == nil {
 		t.Error("session 7's process exited normally, want killed")
 	}
-	time.Sleep(100 * time.Millisecond)
+	until(func() bool { return count(str(s7)) == 0 }) // the kill reaches them in their own time
 	if n := count(str(s7)); n != 0 {
 		t.Errorf("%d processes of session 7 left", n)
 	}
 	if n := count(str(s17)); n < 3 || other.ProcessState != nil {
 		t.Errorf("session 17 lost processes: %d left", n)
+	}
+}
+
+// until waits, up to 10 seconds, for cond: what other processes do (start
+// children, die of a signal) takes its own time on a loaded machine.
+func until(cond func() bool) {
+	for deadline := time.Now().Add(10 * time.Second); !cond() && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -164,7 +173,7 @@ func TestEndSessionCmd(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the end script did not finish after Claude exited")
 	}
-	time.Sleep(100 * time.Millisecond)
+	until(func() bool { return !aliveProc(left7) }) // the kill reaches it in its own time
 	if aliveProc(left7) {
 		t.Error("session 7's background process outlived its Claude")
 	}
