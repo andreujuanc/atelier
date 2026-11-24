@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/andreujuanc/atelier/internal/model"
 )
@@ -342,5 +343,24 @@ func TestPrefixWriterLongLine(t *testing.T) {
 		if !strings.HasPrefix(line, "setup api: x") || len(line) > len("setup api: ")+maxPartialLine {
 			t.Fatalf("line of %d bytes: %.40q", len(line), line)
 		}
+	}
+}
+
+// A piece of a long line ends on a whole UTF-8 character, not inside one.
+func TestPrefixWriterLongLineRunes(t *testing.T) {
+	var buf bytes.Buffer
+	p := &prefixWriter{w: &buf, prefix: "setup api: "}
+	long := strings.Repeat("x", maxPartialLine-1) + "é" + strings.Repeat("€", maxPartialLine/3)
+	p.Write([]byte(long))
+	p.Flush()
+	var joined strings.Builder
+	for _, line := range strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n") {
+		if !utf8.ValidString(line) {
+			t.Fatalf("piece of %d bytes is not valid UTF-8, ending %q", len(line), line[len(line)-4:])
+		}
+		joined.WriteString(strings.TrimPrefix(line, "setup api: "))
+	}
+	if joined.String() != long {
+		t.Fatal("the pieces do not add up to the line")
 	}
 }
