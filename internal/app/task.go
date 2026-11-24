@@ -204,8 +204,10 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 	if title == "" {
 		return nil, errors.New("title is required")
 	}
-	// The same cap as a rename, so `atl rename`/TUI `t` can always resave it.
-	if err := model.CheckTitleLen(title); err != nil {
+	// Then the checks of a rename (other control characters, UTF-8, the
+	// length cap), so `atl rename`/TUI `t` can always resave it.
+	title, err := model.NormalizeTitle(title)
+	if err != nil {
 		return nil, err
 	}
 	o.Project = strings.TrimSpace(o.Project)

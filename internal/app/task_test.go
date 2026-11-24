@@ -262,6 +262,8 @@ func TestNewTaskValidation(t *testing.T) {
 	}{
 		{"no title", NewTaskOpts{Title: "  ", Repos: []RepoArg{{"api", model.ModeRW}}}, "title"},
 		{"no repos", NewTaskOpts{Title: "x"}, "no repos"},
+		{"escape", NewTaskOpts{Title: "a\x1bb", Repos: []RepoArg{{"api", model.ModeRW}}}, "control characters"},
+		{"bad utf-8", NewTaskOpts{Title: "a\xffb", Repos: []RepoArg{{"api", model.ModeRW}}}, "not valid UTF-8"},
 		{"missing", NewTaskOpts{Title: "x", Repos: []RepoArg{{"nope", model.ModeRW}}}, "does not exist"},
 		{"plain dir", NewTaskOpts{Title: "x", Repos: []RepoArg{{"plain", model.ModeRO}}}, "not a git repository"},
 		{"bad name", NewTaskOpts{Title: "x", Repos: []RepoArg{{"../api", model.ModeRW}}}, "invalid repo name"},
