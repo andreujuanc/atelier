@@ -366,12 +366,20 @@ func (p *Plan) Write() error {
 		}
 		return err
 	}
-	if _, err := f.Write(buf.Bytes()); err != nil {
-		f.Close()
-		return err
+	_, err = writeFile(f, buf.Bytes())
+	if cerr := f.Close(); err == nil {
+		err = cerr
 	}
-	return f.Close()
+	if err != nil {
+		// The file is ours (O_EXCL): a partial one would make a retry
+		// fail as an existing workspace that does not load.
+		os.Remove(f.Name())
+	}
+	return err
 }
+
+// writeFile writes atelier.toml's content; a var so tests can fail it.
+var writeFile = (*os.File).Write
 
 // HasDB reports whether dir has a database (data/atelier.db), as the
 // workspace of a devcontainer box does.
