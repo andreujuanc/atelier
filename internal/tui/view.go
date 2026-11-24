@@ -1168,9 +1168,10 @@ func (m *Model) formLines(w, h int) []string {
 
 // listWindow is the range of rows the list shows in h lines.
 func (m *Model) listWindow(h int) (off, end int) {
-	off = m.offset
+	// The help may have taken or given back a line since the offset was
+	// set (see helpLines).
+	off = max(min(m.offset, len(m.rows)-h), 0)
 	if m.selIdx >= off+h {
-		// the help took a line since the offset was set (see helpLines)
 		off = m.selIdx - h + 1
 	}
 	end = min(off+h, len(m.rows))
