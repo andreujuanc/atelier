@@ -240,6 +240,34 @@ func TestWriteSettingsInvalidJSON(t *testing.T) {
 	}
 }
 
+// TestWriteSettingsNullHooks: "hooks": null, or null for an event's list,
+// is no hooks, not an invalid file: the user's other keys and hooks are
+// kept and nothing is backed up.
+func TestWriteSettingsNullHooks(t *testing.T) {
+	for _, settings := range []string{
+		`{"model": "x", "hooks": null}`,
+		`{"model": "x", "hooks": {"Stop": null, "PreCompact": [{"hooks": [{"type": "command", "command": "mine"}]}]}}`,
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".claude", "settings.json")
+		os.MkdirAll(filepath.Dir(path), 0o755)
+		if err := os.WriteFile(path, []byte(settings), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteSettings(dir, "/bin/atl"); err != nil {
+			t.Fatal(err)
+		}
+		sf, raw, text := readSettings(t, dir)
+		checkAtelierHooks(t, sf, "/bin/atl")
+		if raw["model"] != "x" || strings.Contains(settings, "mine") && !strings.Contains(text, `"mine"`) {
+			t.Errorf("%s: user settings lost:\n%s", settings, text)
+		}
+		if _, err := os.Stat(path + ".bak"); err == nil {
+			t.Errorf("%s: backed up as invalid", settings)
+		}
+	}
+}
+
 func TestWriteSettingsQuotedBin(t *testing.T) {
 	dir := t.TempDir()
 	bin := "/home/my user/it's bin/atl"
