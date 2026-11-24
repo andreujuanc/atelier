@@ -174,3 +174,62 @@ func TestAssistantDir(t *testing.T) {
 		t.Fatalf("AssistantDir = %q", got)
 	}
 }
+
+// TestRunLayout: everything next to the run dirs (task Claude dirs, the
+// token, the assistant's dirs) lies under RunRoot, outside StateDir and the
+// task dirs that containers see; each task's run dir and Claude dir are its
+// own (named by a hash of its task dir), and no task's can be the
+// assistant's.
+func TestRunLayout(t *testing.T) {
+	for _, p := range []Paths{
+		{Tasks: "/t", StateDir: "/s", DB: "/d/atelier.db"},
+		{Workspace: "/w", Tasks: "/w/tasks", StateDir: "/w/state", DB: "/w/data/atelier.db"},
+	} {
+		root := p.RunRoot()
+		under := func(path string) bool {
+			rel, err := filepath.Rel(root, path)
+			return err == nil && rel != "." && filepath.IsLocal(rel)
+		}
+		for _, d := range []string{p.RunDir("a"), p.ClaudeDir("a"), p.ClaudeToken(), p.AssistantRunDir(), p.AssistantClaudeDir(), p.OriginPin("api")} {
+			if !under(d) {
+				t.Errorf("%s is not under the run root %s", d, root)
+			}
+			for _, seen := range []string{p.StateDir, p.Tasks, filepath.Dir(p.DB)} {
+				if rel, err := filepath.Rel(seen, d); err == nil && filepath.IsLocal(rel) {
+					t.Errorf("%s is inside %s", d, seen)
+				}
+			}
+		}
+		if p.RunDir("a") == p.RunDir("b") || p.ClaudeDir("a") == p.ClaudeDir("b") {
+			t.Error("two tasks share a run dir or Claude dir")
+		}
+		other := p
+		other.Tasks += "2"
+		if other.ClaudeDir("a") == p.ClaudeDir("a") {
+			t.Error("the same slug in another tasks dir shares the Claude dir")
+		}
+		if filepath.Dir(p.ClaudeDir("a")) != filepath.Dir(p.AssistantClaudeDir()) || p.ClaudeDir("assistant") == p.AssistantClaudeDir() ||
+			p.RunDir("assistant") == p.AssistantRunDir() {
+			t.Error("a task's dirs can be the assistant's")
+		}
+	}
+	if got := (Paths{StateDir: "/s"}).UserTmuxConf(); got != "" {
+		t.Errorf("UserTmuxConf without a workspace = %q", got)
+	}
+	if got := (Paths{Workspace: "/w"}).UserTmuxConf(); got != "/w/tmux.conf" {
+		t.Errorf("UserTmuxConf = %q", got)
+	}
+}
+
+func TestClaudeConfigDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	if got := ClaudeConfigDir(); got != filepath.Join(home, ".claude") {
+		t.Errorf("ClaudeConfigDir = %q", got)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "/cc")
+	if got := ClaudeUserSettings(); got != "/cc/settings.json" {
+		t.Errorf("ClaudeUserSettings = %q", got)
+	}
+}

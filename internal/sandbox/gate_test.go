@@ -369,6 +369,15 @@ func TestGateRefusesHostReachingContainers(t *testing.T) {
 	}
 	for name, body := range map[string]string{
 		"host root bind":       `{"HostConfig":{"Binds":["/:/host"]}}`,
+		"bind of four parts":   `{"HostConfig":{"Binds":["` + c.root + `:/x:ro:extra"]}}`,
+		"bind not a string":    `{"HostConfig":{"Binds":[{"Source":"/"}]}}`,
+		"bind option":          `{"HostConfig":{"Binds":["` + c.root + `:/x:ro,rbind"]}}`,
+		"mount not an object":  `{"HostConfig":{"Mounts":["/:/host"]}}`,
+		"mount type npipe":     `{"HostConfig":{"Mounts":[{"Type":"npipe","Source":"/","Target":"/h"}]}}`,
+		"mount without type":   `{"HostConfig":{"Mounts":[{"Source":"/","Target":"/h"}]}}`,
+		"relative mount":       `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"rootlink","Target":"/h"}]}}`,
+		"volume of a host dir": `{"HostConfig":{"Mounts":[{"Type":"volume","Source":"/etc","Target":"/h"}]}}`,
+		"volumes from nothing": `{"HostConfig":{"VolumesFrom":[7]}}`,
 		"bind outside":         `{"HostConfig":{"Binds":["` + outside + `:/x:ro"]}}`,
 		"bind via dotdot":      `{"HostConfig":{"Binds":["` + c.root + `/../x:/x"]}}`,
 		"bind via symlink":     `{"HostConfig":{"Binds":["` + c.root + `/rootlink/etc:/x"]}}`,
@@ -959,6 +968,7 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/session", ""},
 		{"POST", "/build?version=2", ""},
 		{"POST", "/build?networkmode=host", ""},
+		{"POST", "/build?cgroupparent=" + url.QueryEscape("/system.slice"), ""},
 		{"POST", "/build?remote=" + url.QueryEscape("git@github.com:org/private.git"), ""},
 		{"POST", "/build?remote=" + url.QueryEscape("https://example.com/context.tar"), ""},
 		{"POST", "/containers/mine/update", "{}"},

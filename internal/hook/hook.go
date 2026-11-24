@@ -311,7 +311,7 @@ func partialInput(data []byte) (in Input, ok bool) {
 			return str(&in.HookEventName)
 		case "tool_input":
 			targets = map[string]string{} // a later tool_input replaces an earlier one
-			return walkObject(dec, func(key string) error {
+			err := walkObject(dec, func(key string) error {
 				if key != "file_path" && key != "notebook_path" {
 					return skipValue(dec)
 				}
@@ -326,6 +326,10 @@ func partialInput(data []byte) (in Input, ok bool) {
 				}
 				return nil
 			})
+			if errors.Is(err, errNotObject) {
+				return nil // a value of the wrong type: no targets, as json.Unmarshal leaves it
+			}
+			return err
 		}
 		return skipValue(dec)
 	})
@@ -336,15 +340,23 @@ func partialInput(data []byte) (in Input, ok bool) {
 	return in, true
 }
 
+// errNotObject is walkObject's error for a value that is not an object,
+// which it has consumed.
+var errNotObject = errors.New("not a JSON object")
+
 // walkObject reads a JSON object from dec, calling field for each key with
-// the decoder positioned at its value (field must consume the value).
+// the decoder positioned at its value (field must consume the value). Any
+// other value is consumed and errNotObject returned.
 func walkObject(dec *json.Decoder, field func(key string) error) error {
 	tok, err := dec.Token()
 	if err != nil {
 		return err
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return errors.New("not a JSON object")
+		if err := skipRest(dec, tok); err != nil {
+			return err
+		}
+		return errNotObject
 	}
 	for dec.More() {
 		tok, err := dec.Token()
@@ -365,12 +377,18 @@ func walkObject(dec *json.Decoder, field func(key string) error) error {
 
 // skipValue consumes one JSON value from dec.
 func skipValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	return skipRest(dec, tok)
+}
+
+// skipRest consumes the rest of the JSON value whose first token, tok, was
+// read from dec.
+func skipRest(dec *json.Decoder, tok json.Token) error {
 	depth := 0
 	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return err
-		}
 		if d, ok := tok.(json.Delim); ok {
 			switch d {
 			case '{', '[':
@@ -381,6 +399,10 @@ func skipValue(dec *json.Decoder) error {
 		}
 		if depth == 0 {
 			return nil
+		}
+		var err error
+		if tok, err = dec.Token(); err != nil {
+			return err
 		}
 	}
 }

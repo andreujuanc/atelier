@@ -3458,3 +3458,62 @@ func TestAddRestartCheckInFlight(t *testing.T) {
 		t.Fatal("esc did not close the dialog after the refused add")
 	}
 }
+
+// TestExecDoneAndRecovered: the status line after a command run on the
+// terminal (its last stderr line on failure, "attached" after an open),
+// and after a recovery pass (an error shown once; stopped sessions
+// counted and the list reloaded). D runs atl diff on the selected task; a
+// status key for the status the task has does nothing.
+func TestExecDoneAndRecovered(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	var diffed []string
+	m.diffCmd = func(slug string) *exec.Cmd { diffed = append(diffed, slug); return exec.Command("true") }
+	if press(m, "D") == nil || !slices.Equal(diffed, []string{"beta"}) {
+		t.Fatalf("D: diffed %q", diffed)
+	}
+	key(m, "1") // beta is backlog already
+	if fb.count("SetStatus") != 0 {
+		t.Fatal("status key for the same status called SetStatus")
+	}
+
+	lists := fb.count("List")
+	drain(m, func() tea.Msg {
+		return execDoneMsg{op: "diff", slug: "beta", stderr: bytes.NewBufferString("warning: x\nfatal: boom\n\n"), err: errors.New("exit status 128")}
+	})
+	if m.status != "diff beta: fatal: boom" || !m.statusErr {
+		t.Fatalf("failed exec: %q %v", m.status, m.statusErr)
+	}
+	if fb.count("List") == lists {
+		t.Fatal("no reload after an exec")
+	}
+	drain(m, func() tea.Msg {
+		return execDoneMsg{op: "assistant", stderr: &bytes.Buffer{}, err: errors.New("exit status 1")}
+	})
+	if m.status != "assistant: exit status 1" || !m.statusErr {
+		t.Fatalf("failed exec without stderr: %q", m.status)
+	}
+	drain(m, func() tea.Msg { return execDoneMsg{op: "open", slug: "beta", stderr: &bytes.Buffer{}} })
+	if m.status != "attached beta" || m.statusErr {
+		t.Fatalf("open: %q %v", m.status, m.statusErr)
+	}
+
+	drain(m, func() tea.Msg { return recoverMsg{err: errors.New("tmux: no server")} })
+	if !strings.Contains(m.status, "tmux: no server") || !m.statusErr {
+		t.Fatalf("recover error: %q", m.status)
+	}
+	m.setStatus("")
+	drain(m, func() tea.Msg { return recoverMsg{err: errors.New("tmux: no server")} })
+	if m.status != "" {
+		t.Fatalf("the same recover error shown again: %q", m.status)
+	}
+	lists = fb.count("List")
+	drain(m, func() tea.Msg { return recoverMsg{n: 2} })
+	if !strings.Contains(m.status, "2 session(s) marked stopped") || fb.count("List") == lists {
+		t.Fatalf("recovered 2: %q, reloaded %v", m.status, fb.count("List") != lists)
+	}
+	drain(m, func() tea.Msg { return recoverMsg{err: errors.New("tmux: no server")} })
+	if !strings.Contains(m.status, "tmux: no server") {
+		t.Fatalf("a recover error after a success not shown: %q", m.status)
+	}
+}

@@ -364,3 +364,46 @@ func TestPrefixWriterLongLineRunes(t *testing.T) {
 		t.Fatal("the pieces do not add up to the line")
 	}
 }
+
+// A teardown that puts something else at the worktree's path (here a
+// symlink to a copy of the worktree) makes the close refuse, before git
+// removes anything; with --force the close goes on and leaves it alone.
+func TestTeardownSwapsWorktree(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.writeProject(t, "shop", "teardown = 'cd .. && mv api api.moved && ln -s api.moved api'\n[[repos]]\nname = \"api\"\n")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "td swap", Project: "shop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	moved := wt + ".moved"
+	_, err = e.app.Done(ctx, task.Slug, false)
+	if err == nil || !strings.Contains(err.Error(), "repo api:") || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("err = %v", err)
+	}
+	if got, _ := e.app.Store.GetTask(ctx, task.ID); got.Status != model.StatusActive {
+		t.Fatalf("refused close: status %s", got.Status)
+	}
+	if !exists(filepath.Join(moved, "README")) {
+		t.Fatal("the worktree behind the symlink was removed")
+	}
+	// Put it back as it was, and let the teardown swap it again.
+	if err := os.Remove(wt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moved, wt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.app.Done(ctx, task.Slug, true)
+	if err != nil || got.Status != model.StatusDone {
+		t.Fatalf("forced close: %v", err)
+	}
+	if !strings.Contains(e.outString(), "warning: repo api:") || !strings.Contains(e.outString(), "left alone") {
+		t.Fatalf("output:\n%s", e.outString())
+	}
+	if !exists(filepath.Join(moved, "README")) {
+		t.Fatal("forced close removed the worktree behind the symlink")
+	}
+}

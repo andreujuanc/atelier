@@ -768,3 +768,24 @@ func TestNewWindowPathAndShell(t *testing.T) {
 		}
 	}
 }
+
+// TestRedact: no part of a value is left in a tmux error, also when one
+// value is part of another (whatever order the values are replaced in);
+// an error that is not tmux's is left as it is.
+func TestRedact(t *testing.T) {
+	env := map[string]string{"A": "sk-ant", "B": "sk-ant-oat01-SECRET", "C": "", "D": "SECRET-2"}
+	for i := 0; i < 50; i++ {
+		err := redact(&Error{Args: []string{"source-file"}, Stderr: "bad: sk-ant-oat01-SECRET and SECRET-2", Err: errors.New("exit status 1")}, env)
+		var te *Error
+		if !errors.As(err, &te) || te.Args[0] != "source-file" || te.Err == nil {
+			t.Fatalf("redact lost the error: %#v", err)
+		}
+		if strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "oat01") || !strings.Contains(err.Error(), "bad: ") {
+			t.Fatalf("redacted: %q", err.Error())
+		}
+	}
+	plain := errors.New("sk-ant")
+	if got := redact(plain, env); got != plain {
+		t.Fatalf("a non-tmux error changed: %v", got)
+	}
+}

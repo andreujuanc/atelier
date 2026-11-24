@@ -677,6 +677,13 @@ func TestUnreadableInput(t *testing.T) {
 			"inside read-only repo docs", 2},
 		{"truncated after wrongly typed fields", EventPreToolUse,
 			`{"session_id":5,"cwd":"/","tool_input":{"file_path":"` + docs + `","content":"x`, "inside read-only repo docs", 2},
+		{"truncated after nested values", EventPreToolUse,
+			`{"x":{"a":[1,{"b":[]}],"c":{}},"cwd":"/","tool_input":{"edits":[{"old_string":"a","new_string":{"n":[2]}}],"file_path":"` + docs + `","content":"x`,
+			"inside read-only repo docs", 2},
+		{"truncated after a wrongly typed tool_input", EventPreToolUse,
+			`{"cwd":"/","tool_input":"x","tool_input":{"file_path":"` + docs + `","content":"x`, "inside read-only repo docs", 2},
+		{"truncated after a tool_input array", EventPreToolUse,
+			`{"cwd":"/","tool_input":[{"file_path":"` + rw + `"}],"tool_input":{"file_path":"` + docs + `","content":"x`, "inside read-only repo docs", 2},
 		{"oversized Stop ignored", EventStop, `{"session_id":"s","x":"` + big + `"}`, "", 0},
 	} {
 		t.Run(c.name, func(t *testing.T) {

@@ -676,3 +676,82 @@ func TestGateLatency(t *testing.T) {
 		}
 	}
 }
+
+// TestTaskServerEdges: a task server opens only for a task that still has
+// its id and slug, and notices when the task goes; a note needs text and
+// is the user's unless it says otherwise; an unknown op is refused.
+func TestTaskServerEdges(t *testing.T) {
+	ctx := context.Background()
+	f := setup(t)
+	if _, err := OpenTaskServer(f.p, f.task.ID, "other"); err == nil || !strings.Contains(err.Error(), "is not other") {
+		t.Fatalf("open with another task's slug: %v", err)
+	}
+	if _, err := OpenTaskServer(f.p, 9999, "fix"); err == nil {
+		t.Fatal("open for a missing task: no error")
+	}
+	ts, err := OpenTaskServer(f.p, f.task.ID, "fix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+	do := func(req sandbox.ControlRequest, body string) (int, string, string) {
+		var out, errb bytes.Buffer
+		code := ts.Do(req, []byte(body), &out, &errb)
+		return code, out.String(), errb.String()
+	}
+	if code, _, errs := do(sandbox.ControlRequest{Op: "frobnicate"}, ""); code != 1 || !strings.Contains(errs, `unknown operation "frobnicate"`) {
+		t.Errorf("unknown op: %d %q", code, errs)
+	}
+	if code, _, errs := do(sandbox.ControlRequest{Op: sandbox.OpNote}, " \n\x01\t"); code != 1 || !strings.Contains(errs, "note is empty") {
+		t.Errorf("empty note: %d %q", code, errs)
+	}
+	if code, out, _ := do(sandbox.ControlRequest{Op: sandbox.OpNote}, "plain"); code != 0 || out != "note added\n" {
+		t.Errorf("note without author: %d %q", code, out)
+	}
+	if notes, err := f.st.GetNotes(ctx, f.task.ID); err != nil || !strings.HasSuffix(notes, "[user] plain") {
+		t.Errorf("notes %q, %v", notes, err)
+	}
+	if code, _, errs := do(sandbox.ControlRequest{Op: sandbox.OpHook, Event: EventAssistantGuard}, "{}"); code != 2 || errs == "" {
+		t.Errorf("assistant guard for a task container: %d %q", code, errs)
+	}
+	if gone, err := ts.Gone(ctx); err != nil || gone {
+		t.Fatalf("Gone = %v, %v", gone, err)
+	}
+	if err := f.st.DeleteTask(ctx, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := ts.Gone(ctx); err != nil || !gone {
+		t.Fatalf("Gone after delete = %v, %v", gone, err)
+	}
+}
+
+// TestViaGateLongRequestLine: when JSON escaping makes the request line too
+// long, PreToolUse goes to the gate without the container's landings and
+// ATL_CONTEXT, and the gate still guards the targets itself; the
+// assistant's guard, which may not go without them, refuses.
+func TestViaGateLongRequestLine(t *testing.T) {
+	f := setup(t)
+	sock := gated(t, f)
+	odd := strings.Repeat("\x01", 16000) // \u0001 on the line: six bytes each
+	target := filepath.Join(f.p.RepoPath("docs"), odd)
+	in := hookInput(Input{SessionID: "s", Cwd: f.p.TaskDir("fix"), ToolName: "Write", ToolInput: json.RawMessage(`{"file_path":` + strconvQuote(target) + `}`)})
+	if l := containerLandings([]byte(in)); len(l) == 0 {
+		t.Fatal("no landings: the test does not make a long line")
+	}
+	r := hookVia(t, f, sock, EventPreToolUse, in, map[string]string{envContextVar: strings.Repeat("\x01", 8000), "ATL_LAUNCH": strings.Repeat("\x01", 8000)})
+	if r.code != 2 || !strings.Contains(r.stderr, "inside read-only repo docs") {
+		t.Fatalf("long PreToolUse into ro: %+v", r)
+	}
+	rw := hookInput(Input{SessionID: "s", Cwd: f.p.TaskDir("fix"), ToolName: "Write",
+		ToolInput: json.RawMessage(`{"file_path":` + strconvQuote(filepath.Join(f.p.WorktreePath("fix", "api"), odd)) + `}`)})
+	if r := hookVia(t, f, sock, EventPreToolUse, rw, nil); r.code != 0 || r.stderr != "" {
+		t.Fatalf("long PreToolUse into rw: %+v", r)
+	}
+	var out, errb bytes.Buffer
+	code := run([]string{EventAssistantGuard}, strings.NewReader(in), &out, &errb, inContainer(sock, nil))
+	if code != 2 || !strings.Contains(errb.String(), "too long to check") {
+		t.Fatalf("long assistant guard: %d %q", code, errb.String())
+	}
+}
+
+func strconvQuote(s string) string { b, _ := json.Marshal(s); return string(b) }
