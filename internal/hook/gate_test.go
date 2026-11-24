@@ -578,6 +578,28 @@ func TestGateTranscriptPath(t *testing.T) {
 	if err := os.Symlink(filepath.Join(f.root, ".claude", ".credentials.json"), filepath.Join(project, "creds.jsonl")); err != nil {
 		t.Fatal(err)
 	}
+	// A path whose ".." stay in the dir as the gate resolves it (after a
+	// symlink to a deep dir) but leave it as written: atl, reading it
+	// later, cleans it to the user's dir.
+	up, err := filepath.Rel(filepath.Join(own, "projects"), f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ups := strings.Count(up, "..") + 1
+	deep := project
+	for i := range ups {
+		deep = filepath.Join(deep, "d"+itoa(int64(i)))
+	}
+	if err := os.MkdirAll(deep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(deep, filepath.Join(own, "projects", "up")); err != nil {
+		t.Fatal(err)
+	}
+	dotdot := filepath.Join(own, "projects", "up") + strings.Repeat("/..", ups) + "/.claude/projects/k/b.jsonl"
+	if filepath.Clean(dotdot) != filepath.Join(userDir, "b.jsonl") {
+		t.Fatalf("test setup: %s cleans to %s", dotdot, filepath.Clean(dotdot))
+	}
 	for _, c := range []struct {
 		name, path string
 		ok         bool
@@ -590,6 +612,8 @@ func TestGateTranscriptPath(t *testing.T) {
 		{"a symlinked dir out of it", filepath.Join(own, "projects", "out", "d.jsonl"), false},
 		{"a symlink out of it", filepath.Join(project, "creds.jsonl"), false},
 		{"relative", "projects/k/e.jsonl", false},
+		{"dot-dot after a symlink, out of it as written", dotdot, false},
+		{"own, not clean", project + "/./f.jsonl", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s := f.session(t, model.StateIdle, "")

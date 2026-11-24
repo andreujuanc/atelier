@@ -93,6 +93,21 @@ func TestTranscriptReadIsConfined(t *testing.T) {
 	if _, err := e.app.Transcript(ctx, "boxed", s.ID, 0); err == nil || !strings.Contains(err.Error(), "not read") {
 		t.Errorf("a path outside the Claude dirs: %v", err)
 	}
+
+	// Its ".." may have stayed in the task's dir as the gate resolved
+	// them (after a symlink): as written, they lead to the user's.
+	rel, err := filepath.Rel(e.app.Paths.ClaudeDir("boxed"), secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dotdot := filepath.Join(e.app.Paths.ClaudeDir("boxed"), "projects") + "/../" + rel
+	if filepath.Clean(dotdot) != secret {
+		t.Fatalf("test setup: %s cleans to %s", dotdot, filepath.Clean(dotdot))
+	}
+	if err := e.app.Store.SetTranscriptPath(ctx, s.ID, dotdot); err != nil {
+		t.Fatal(err)
+	}
+	read("a recorded path that is not clean")
 }
 
 func writeTestFile(t *testing.T, path, content string) {

@@ -80,7 +80,11 @@ func (a *App) openTranscript(t *model.Task, path string) (*os.File, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("%q is not an absolute path; not read", path)
 	}
-	path = filepath.Clean(path)
+	if path != filepath.Clean(path) {
+		// Its ".." were checked after the symlinks before them: cleaned,
+		// they could lead out of the dir it was checked in.
+		return nil, fmt.Errorf("%q is not a clean path; not read", path)
+	}
 	for _, root := range []string{a.Paths.ClaudeDir(t.Slug), config.ClaudeConfigDir()} {
 		if root == "" {
 			continue

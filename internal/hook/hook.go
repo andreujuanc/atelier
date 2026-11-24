@@ -554,6 +554,11 @@ func transcriptIn(dir, path string) error {
 	if dir == "" {
 		return errors.New("the task has no Claude config dir")
 	}
+	if path != filepath.Clean(path) {
+		// Its ".." are resolved below after the symlinks before them, and
+		// lexically where atl reads it: they may land in different places.
+		return fmt.Errorf("%q is not a clean path", path)
+	}
 	root, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return fmt.Errorf("the task's Claude config dir: %w", err)
