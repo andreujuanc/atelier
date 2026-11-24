@@ -328,6 +328,17 @@ func TestClaudeMDTitleWhitespace(t *testing.T) {
 	}
 }
 
+// TestClaudeMDDescriptionControl: a description stored with control
+// characters (before atl new sanitized it) is written as notes are stored:
+// newlines and tabs kept, \r\n made \n, the rest dropped.
+func TestClaudeMDDescriptionControl(t *testing.T) {
+	task := model.Task{Slug: "x", Title: "x", Description: "\x1b[2Jline\a one\r\n\tdetail\x00\r\n"}
+	got := ClaudeMD(task, nil)
+	if strings.ContainsAny(got, "\x1b\a\r\x00") || !strings.Contains(got, "\n[2Jline one\n\tdetail\n\n") {
+		t.Errorf("description not sanitized:\n%q", got)
+	}
+}
+
 // checkStatusLine fails unless raw's statusLine is exactly atelier's entry
 // for atlBin (type command, "<atl> statusline").
 func checkStatusLine(t *testing.T, raw map[string]any, atlBin string) {
