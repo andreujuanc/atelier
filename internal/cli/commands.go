@@ -117,33 +117,51 @@ func parseRepoArg(label, s string) (app.RepoArg, error) {
 }
 
 func (c *cli) addCmd() *cobra.Command {
-	var noFetch bool
+	var noFetch, forceRestart bool
 	cmd := &cobra.Command{
-		Use:   "add <task> <repo>[:rw|ro] [--no-fetch]",
-		Short: "Add a repo to an open task (rw: worktree on atl/<slug>); prints slug, repo, mode and path",
-		Args:  args(cobra.ExactArgs(2)),
+		Use:   "add <task> <repo>[:rw|ro]... [--no-fetch] [--force-restart]",
+		Short: "Add repos to an open task (rw: worktree on atl/<slug>), restarting its sessions; prints slug, repo, mode and path",
+		Long: "Add repos to an open task (rw: worktree on atl/<slug>); prints slug, repo, mode and path per repo added.\n\n" +
+			"Running sessions cannot see a repo added under them (sandboxed: their container cannot get a new mount;\n" +
+			"ro: Claude gets it at launch), so when the task has any, atl closes them, adds the repos and resumes the\n" +
+			"same conversations in a new container. While things run in the task (Claude working or waiting for a\n" +
+			"permission answer, commands, background processes, shells) it refuses and changes nothing, unless\n" +
+			"--force-restart, which ends them.",
+		Args: args(cobra.MinimumNArgs(2)),
 		RunE: func(cmd *cobra.Command, a []string) error {
-			ra, err := parseRepoArg("repo", a[1])
-			if err != nil {
-				return err
+			var repos []app.RepoArg
+			for _, s := range a[1:] {
+				ra, err := parseRepoArg("repo", s)
+				if err != nil {
+					return err
+				}
+				repos = append(repos, ra)
 			}
 			ap, err := c.App()
 			if err != nil {
 				return err
 			}
-			t, err := ap.AddRepo(cmd.Context(), a[0], ra, noFetch)
-			if err != nil {
-				return err
+			res, err := ap.AddRepos(cmd.Context(), a[0], repos, app.AddOpts{NoFetch: noFetch, Force: forceRestart})
+			var busy *app.BusyError
+			if errors.As(err, &busy) {
+				return fmt.Errorf("%w\nwait for them to finish, or pass --force-restart to end them", err)
 			}
-			for _, r := range t.Repos {
-				if r.Name == strings.TrimSpace(ra.Name) {
-					fmt.Fprintf(c.stdout, "%s\t%s\t%s\t%s\n", t.Slug, r.Name, r.Mode, ap.RepoPathFor(t, r))
+			var errs []error
+			if res != nil {
+				for _, ra := range res.Added {
+					for _, r := range res.Task.Repos {
+						if r.Name == strings.TrimSpace(ra.Name) {
+							fmt.Fprintf(c.stdout, "%s\t%s\t%s\t%s\n", res.Task.Slug, r.Name, r.Mode, ap.RepoPathFor(res.Task, r))
+						}
+					}
 				}
+				errs = res.Failed
 			}
-			return nil
+			return errors.Join(append(errs, err)...) // the repos that failed, then the resume's error
 		},
 	}
 	cmd.Flags().BoolVar(&noFetch, "no-fetch", false, "do not fetch origin before branching (rw)")
+	cmd.Flags().BoolVar(&forceRestart, "force-restart", false, "restart the task's sessions even while things run in it (ends them)")
 	return cmd
 }
 

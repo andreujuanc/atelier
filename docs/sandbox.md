@@ -51,8 +51,22 @@ config dir, atelier's database, state dir (logs) or config dir (projects).
 - Created on the task's first session; reused by later ones (installed tools persist);
   restarted after a reboot; removed by `atl done`/`atl cancel`.
 - Replaced when the task's repos, image or mounts change, at the next session start while no
-  other session runs in it. A running container cannot get a new mount: after `atl add`,
-  close running sessions, then start or resume one.
+  other session runs in it. A running container cannot get a new mount, so adding a repo
+  (`atl add`, TUI `a`) to a task with live sessions restarts them: their windows close, the
+  container is removed and the same conversations are resumed (`claude --resume`) in a new
+  one that has the repo. While things run in the task (Claude mid-turn, background work an
+  idle Claude still has in flight: subagents, shells, monitors, as its Stop hook reports
+  them; Bash tool commands in the foreground or background, processes they left running,
+  `docker exec` shells) nothing is added: the TUI shows what runs, checks again every 2s (read-only) and adds once it is
+  idle (or on a ticked "Force restart"); `atl add` refuses unless `--force-restart`. A
+  session that has not reported its Claude id, or whose Claude is not found in the
+  container, also counts as busy. Repos are checked and fetched before anything is
+  closed (a bad repo restarts nothing), and once the sessions are closed an interrupt no
+  longer stops the add and resume. A repo is never added under sessions that would not see
+  it. Not seen as busy: with the sandbox off, processes an idle session left running on the
+  host; and the background work of a Claude Code too old to report it to its Stop hook.
+  Background work Claude ends without starting a turn (one you stop from its task list)
+  may still show until its next turn: force it then.
 - When a session ends, what it left running in the container (a background dev server) is
   killed. What should outlive a session belongs in a `docker compose` service.
 - atl only touches a container named like the task's if it carries atl's `atelier.agent`

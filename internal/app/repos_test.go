@@ -146,7 +146,7 @@ MARKER = "`+filepath.Join(e.root, "marker")+`"
 		t.Fatalf("marker after add: %q", got)
 	}
 	out := e.outString()
-	if strings.Contains(out, "fetching") || !strings.Contains(out, "worktree at "+wt+"; running sessions can already see it") {
+	if strings.Contains(out, "fetching") || !strings.Contains(out, "added lib (rw) to "+task.Slug+": worktree at "+wt) {
 		t.Fatalf("output:\n%s", out)
 	}
 
@@ -199,7 +199,7 @@ func TestAddRepoRO(t *testing.T) {
 		t.Fatalf("CLAUDE.md lacks read-only docs:\n%s", md)
 	}
 	if strings.Contains(e.outString(), "fetching docs") ||
-		!strings.Contains(e.outString(), "running Claude sessions need a new session (s) to see docs") {
+		!strings.Contains(e.outString(), "added docs (ro) to "+task.Slug) {
 		t.Fatalf("output:\n%s", e.outString())
 	}
 	// The guard reads the DB live: writes into docs are blocked right away.
@@ -574,14 +574,15 @@ func TestDoneWaitsForAddRepo(t *testing.T) {
 	}
 }
 
-// TestAddRepoWarnsSandboxedSessions: with the sandbox on, a repo added (or
-// upgraded to rw) while the task's container runs sessions is not in that
-// container, and atl add says so; it does not when no session runs, nor
-// when there is no container.
-func TestAddRepoWarnsSandboxedSessions(t *testing.T) {
+// TestAddRepoRefusesUnderLiveSessions: with the sandbox on, a repo added
+// (or upgraded to rw) while the task has live sessions would not be in
+// their container: AddRepo refuses, before anything changes (AddRepos is
+// the call that restarts them). Without live sessions it adds; with the
+// sandbox off it adds rw repos under live sessions too.
+func TestAddRepoRefusesUnderLiveSessions(t *testing.T) {
 	e := newTaskEnv(t)
 	ctx := context.Background()
-	for _, r := range []string{"api", "docs", "lib", "web", "more"} {
+	for _, r := range []string{"api", "docs", "lib", "web"} {
 		e.addRepo(t, r, "main")
 	}
 	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Boxed", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
@@ -591,19 +592,10 @@ func TestAddRepoWarnsSandboxedSessions(t *testing.T) {
 	fd := &fakeDocker{label: "spec", agent: e.app.sandboxID(task)} // the task's container exists
 	e.app.Sandbox = &sandbox.Config{Image: "task-image"}
 	e.app.Docker = fd.run
-	const warning = "do not see"
-	add := func(r RepoArg) string {
-		t.Helper()
-		e.app.Out.(*bytes.Buffer).Reset()
-		if _, err := e.app.AddRepo(ctx, task.Slug, r, true); err != nil {
-			t.Fatal(err)
-		}
-		return e.outString()
-	}
 
 	// No live session: the next session gets a new container anyway.
-	if out := add(RepoArg{"docs", model.ModeRO}); strings.Contains(out, warning) {
-		t.Errorf("warned without live sessions:\n%s", out)
+	if _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"docs", model.ModeRO}, true); err != nil {
+		t.Fatal(err)
 	}
 
 	// A live session in the container.
@@ -615,35 +607,31 @@ func TestAddRepoWarnsSandboxedSessions(t *testing.T) {
 		Dir: e.app.Paths.TaskDir(task.Slug), Argv: []string{"sleep", "300"}, Tag: strconv.FormatInt(s.ID, 10)}); err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range []struct {
-		r    RepoArg
-		name string
-	}{
-		{RepoArg{"lib", model.ModeRO}, "lib"},
-		{RepoArg{"web", model.ModeRW}, "web"},
-		{RepoArg{"docs", model.ModeRW}, "docs"}, // ro → rw
-	} {
-		out := add(c.r)
-		if !strings.Contains(out, "the sessions running now in "+task.Slug+" do not see "+c.name) ||
-			!strings.Contains(out, "start or resume a session") || strings.Contains(out, "can already see it") {
-			t.Errorf("add %+v:\n%s", c.r, out)
+	for _, r := range []RepoArg{{"lib", model.ModeRO}, {"web", model.ModeRW}, {"docs", model.ModeRW}} {
+		if _, err := e.app.AddRepo(ctx, task.Slug, r, true); !errors.Is(err, ErrRestartNeeded) {
+			t.Errorf("add %+v under a live session: %v", r, err)
 		}
 	}
+	got, _ := e.app.Store.GetTask(ctx, task.ID)
+	want := []model.TaskRepo{{Name: "api", Mode: model.ModeRW}, {Name: "docs", Mode: model.ModeRO}}
+	if len(got.Repos) != 2 || got.Repos[0].Name != want[0].Name || got.Repos[1] != want[1] ||
+		exists(e.app.Paths.WorktreePath(task.Slug, "web")) || exists(e.app.Paths.WorktreePath(task.Slug, "docs")) {
+		t.Fatalf("a refused add changed the task: %+v", got.Repos)
+	}
 
-	// Live sessions, but no container (they predate the sandbox): no warning.
-	fd.label = ""
-	if out := add(RepoArg{"more", model.ModeRO}); strings.Contains(out, warning) {
-		t.Errorf("warned without a container:\n%s", out)
-	}
-	// And never with the sandbox off.
+	// The sandbox switched off while the sessions run in its container:
+	// they still would not see it.
 	e.app.Sandbox = nil
-	fd.label = "spec"
-	task2, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Plain", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
-	if err != nil {
-		t.Fatal(err)
+	if _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"web", model.ModeRW}, true); !errors.Is(err, ErrRestartNeeded) {
+		t.Fatalf("rw, sandbox off, container there: %v", err)
 	}
-	task = task2
-	if out := add(RepoArg{"docs", model.ModeRO}); strings.Contains(out, warning) {
-		t.Errorf("warned with the sandbox off:\n%s", out)
+	// The sandbox off, no container: a rw worktree is seen at once, a ro
+	// repo is not.
+	fd.label = ""
+	if _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"web", model.ModeRW}, true); err != nil {
+		t.Fatalf("rw with the sandbox off: %v", err)
+	}
+	if _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"lib", model.ModeRO}, true); !errors.Is(err, ErrRestartNeeded) {
+		t.Fatalf("ro with the sandbox off: %v", err)
 	}
 }

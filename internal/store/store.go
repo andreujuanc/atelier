@@ -97,6 +97,10 @@ UPDATE tasks SET notes = (
     ' [' || n.author || '] ' || n.body, char(10) ORDER BY n.created_at, n.id)
   FROM task_notes n WHERE n.task_id = tasks.id)
 WHERE notes = '' AND EXISTS (SELECT 1 FROM task_notes n WHERE n.task_id = tasks.id);`,
+	// v6: the background work (subagents, background shells, monitors, ...) a
+	// session's Claude still had in flight when it last went idle, one line
+	// each, as its Stop hook reported it ('': none, or not reported).
+	`ALTER TABLE sessions ADD COLUMN background TEXT NOT NULL DEFAULT '';`,
 }
 
 // DefaultBusyTimeout is how long Open waits on a locked database.

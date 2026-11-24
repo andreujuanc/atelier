@@ -259,6 +259,8 @@ type fakeDocker struct {
 	task    string          // its atelier.task: a task's container that has the name; "" → atl's own
 	missing map[string]bool // images not on the daemon, which docker run cannot pull either
 	down    bool            // the daemon cannot be reached
+	ps      string          // what the activity probe prints (sandbox.ActivityArgs)
+	onRm    func()          // called on docker rm
 }
 
 // fakeContainerID is the full ID of fakeDocker's container.
@@ -310,6 +312,13 @@ func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 		return fakeContainerID, nil
 	case "rm":
 		f.label = ""
+		if f.onRm != nil {
+			f.onRm()
+		}
+	case "exec":
+		if args[len(args)-1] == "atl-activity" {
+			return f.ps, nil
+		}
 	}
 	return "", nil
 }

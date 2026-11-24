@@ -44,6 +44,9 @@ const (
 	modeNotesLoading
 	// modeHelp: the key reference (?) is open; any key closes it.
 	modeHelp
+	// modeRestart: an `a` run waits for what runs in the task before it
+	// restarts its sessions (restartState).
+	modeRestart
 )
 
 // confirmState is the done/cancel dialog: confirming (space ticks the box,
@@ -163,16 +166,6 @@ type (
 		sent, saved string
 		err         error
 	}
-	// addStepMsg ends AddRepo for repos[i] of an `a` run on a task.
-	addStepMsg struct {
-		id     int64
-		slug   string
-		repos  []app.RepoArg
-		i      int
-		err    error
-		added  []app.RepoArg // before this step
-		failed []string      // before this step
-	}
 )
 
 // Model is the TUI state. All backend calls run as tea.Cmds.
@@ -232,7 +225,11 @@ type Model struct {
 	form        *newForm
 	lastForm    *newForm // kept after a failed create, to retry
 	confirm     *confirmState
-	picker      *picker
+	// restart is the dialog of an `a` run that waits to restart the task's
+	// sessions (modeRestart); restartSeq numbers its ticks.
+	restart    *restartState
+	restartSeq int
+	picker     *picker
 	// pickTask is the task the open picker adds repos to (`a`); nil: the
 	// picker belongs to the new-task form.
 	pickTask *app.TaskView
@@ -434,41 +431,6 @@ func (m *Model) openPicker(t *app.TaskView, title string, sel []app.RepoArg, loc
 	m.pickTask = t
 	m.mode = modePicker
 	return m.reposCmd()
-}
-
-// addStep runs AddRepo for repos[i] of task id.
-func (m *Model) addStep(id int64, slug string, repos []app.RepoArg, i int, added []app.RepoArg, failed []string) tea.Cmd {
-	m.busy[id] = fmt.Sprintf("add %s (%d/%d) to %s", repos[i].Name, i+1, len(repos), slug)
-	be, ctx, flush := m.be, m.ctx, m.flushOut
-	return func() tea.Msg {
-		_, err := be.AddRepo(ctx, slug, repos[i], false)
-		if flush != nil {
-			flush() // AddRepo's output lines land before this result
-		}
-		return addStepMsg{id: id, slug: slug, repos: repos, i: i, err: err, added: added, failed: failed}
-	}
-}
-
-// addSummary is the status text after an `a` run.
-func addSummary(slug string, added []app.RepoArg, failed []string) string {
-	var parts []string
-	if len(added) > 0 {
-		s := "added " + summary(added) + " to " + slug
-		var ro []string
-		for _, r := range added {
-			if r.Mode == model.ModeRO {
-				ro = append(ro, r.Name)
-			}
-		}
-		if len(ro) > 0 {
-			s += "; start a new session (s) to see " + strings.Join(ro, ", ")
-		}
-		parts = append(parts, s)
-	}
-	if len(failed) > 0 {
-		parts = append(parts, "failed: "+strings.Join(failed, "; "))
-	}
-	return strings.Join(parts, "; ")
 }
 
 func (m *Model) detailCmd(id int64, slug string) tea.Cmd {
@@ -698,7 +660,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setStatus(m.quitText(n))
 	}
 	// The busy spinner turns while an operation runs.
-	if !m.spinning && len(m.busyOps()) > 0 {
+	if !m.spinning && (len(m.busyOps()) > 0 || m.restart != nil) {
 		m.spinning = true
 		cmd = tea.Batch(cmd, m.after(spinEvery, spinTickMsg{}))
 	}
@@ -753,7 +715,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return nil
 	case spinTickMsg:
 		m.spinFrame++
-		if len(m.busyOps()) == 0 {
+		if len(m.busyOps()) == 0 && m.restart == nil {
 			m.spinning = false
 			return nil
 		}
@@ -888,24 +850,12 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.picker.setAvailable(msg.names, msg.err)
 		}
 		return nil
-	case addStepMsg:
-		added, failed := msg.added, msg.failed
-		r := msg.repos[msg.i]
-		if msg.err != nil {
-			failed = append(append([]string(nil), failed...), r.Name+": "+firstLine(msg.err.Error()))
-		} else {
-			added = append(append([]app.RepoArg(nil), added...), r)
-		}
-		if next := msg.i + 1; next < len(msg.repos) {
-			return m.addStep(msg.id, msg.slug, msg.repos, next, added, failed)
-		}
-		delete(m.busy, msg.id)
-		if len(failed) > 0 {
-			m.setStatusErr(firstLine(addSummary(msg.slug, added, failed)), true)
-		} else {
-			m.setOK(firstLine(addSummary(msg.slug, added, failed)))
-		}
-		return m.reload()
+	case addDoneMsg:
+		return m.addDone(msg)
+	case restartTickMsg:
+		return m.restartTicked(msg)
+	case restartCheckMsg:
+		return m.restartChecked(msg)
 	case warnMsg:
 		if m.statusErr && !m.statusFromOut {
 			return nil // never hide an error summary behind progress
@@ -1112,6 +1062,9 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		if m.mode == modeNotesLoading {
 			m.cancelNotesLoad()
 		}
+		if m.mode == modeRestart {
+			m.closeRestart() // nothing changed; an add in flight goes on (quit waits for it)
+		}
 		return m.requestQuit(key)
 	}
 	// Bubble Tea may deliver fast-typed letters as one multi-rune event
@@ -1132,6 +1085,8 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.formKey(msg)
 	case modeConfirm:
 		return m.confirmKey(key)
+	case modeRestart:
+		return m.restartKey(key)
 	case modeFilter:
 		return m.filterKey(msg)
 	case modeNotes:
@@ -1306,7 +1261,7 @@ func (m *Model) pickerKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.setStatus("busy: " + op + "…")
 		return nil
 	}
-	return m.addStep(t.Task.ID, t.Task.Slug, sel, 0, nil, nil)
+	return m.addRun(t.Task.ID, t.Task.Slug, sel, false)
 }
 
 func (m *Model) formKey(msg tea.KeyPressMsg) tea.Cmd {

@@ -328,7 +328,7 @@ func TestMigrationV5FromV4(t *testing.T) {
 		t.Fatal(err)
 	}
 	var v int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 5 || len(migrations) != 5 {
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != len(migrations) || len(migrations) < 5 {
 		t.Fatalf("user_version = %d (%v), migrations %d", v, err, len(migrations))
 	}
 	want := map[int64]string{
