@@ -107,11 +107,7 @@ func (s *Store) CreateTaskAutoPort(ctx context.Context, t *model.Task, avoid Avo
 // DeleteTask deletes a task; its repos and sessions go with it (ON DELETE
 // CASCADE).
 func (s *Store) DeleteTask(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "task", id)
+	return s.execOne(ctx, "task", id, `DELETE FROM tasks WHERE id = ?`, id)
 }
 
 func validateTask(t *model.Task) error {
@@ -361,12 +357,8 @@ func (s *Store) SetTaskStatus(ctx context.Context, id int64, st model.Status) er
 	if !st.Valid() {
 		return fmt.Errorf("store: invalid task status %q", st)
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?`,
+	return s.execOne(ctx, "task", id, `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?`,
 		string(st), toMS(now()), id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "task", id)
 }
 
 // ErrTaskOpen is returned (wrapped) by ReopenTask when the task is not
@@ -429,21 +421,13 @@ func (s *Store) UpdateTaskTitle(ctx context.Context, id int64, title string) err
 	} else if t != title {
 		return fmt.Errorf("store: title %q is not normalized", title)
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?`,
+	return s.execOne(ctx, "task", id, `UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?`,
 		title, toMS(now()), id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "task", id)
 }
 
 // TouchTask sets a task's updated_at to now.
 func (s *Store) TouchTask(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET updated_at = ? WHERE id = ?`, toMS(now()), id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "task", id)
+	return s.execOne(ctx, "task", id, `UPDATE tasks SET updated_at = ? WHERE id = ?`, toMS(now()), id)
 }
 
 // maxSlugLen mirrors the ≤40-char slug limit enforced by model.Slugify.
