@@ -187,6 +187,13 @@ func (t *tracker) begin() bool {
 
 func (t *tracker) end() { t.wg.Done() }
 
+// stopped reports whether the tracker was closed.
+func (t *tracker) stopped() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
+}
+
 func (t *tracker) close() {
 	t.mu.Lock()
 	t.closed = true
@@ -403,10 +410,12 @@ func (b *trackedBackend) Rename(ctx context.Context, ref, title string) (*model.
 	return b.Backend.Rename(ctx, ref, title)
 }
 
+// DirtyTasks only reads (it never writes to App.Out) and may take up to
+// dirtyTimeout: it is refused once the TUI stopped but not waited for, so
+// a quit never hangs on it (shutdown cancels its context).
 func (b *trackedBackend) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
-	if !b.tr.begin() {
+	if b.tr.stopped() {
 		return nil, errStopped
 	}
-	defer b.tr.end()
 	return b.Backend.DirtyTasks(ctx)
 }

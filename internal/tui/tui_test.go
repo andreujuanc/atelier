@@ -1677,6 +1677,52 @@ func TestShutdown(t *testing.T) {
 	}
 }
 
+// slowDirty is a backend whose DirtyTasks runs until its context ends.
+type slowDirty struct {
+	Backend
+	started chan struct{}
+}
+
+func (s slowDirty) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
+	close(s.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A plain quit never waits for a dirty check in flight (it only reads; up
+// to dirtyTimeout): shutdown cancels it.
+func TestShutdownDoesNotWaitForDirtyCheck(t *testing.T) {
+	tr := &tracker{}
+	ctx, cancel := context.WithCancel(context.Background())
+	sd := slowDirty{Backend: &fakeBackend{}, started: make(chan struct{})}
+	tb := &trackedBackend{Backend: sd, tr: tr}
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		tb.DirtyTasks(ctx)
+	}()
+	<-sd.started
+	returned := make(chan bool, 1)
+	go func() { returned <- shutdown(context.Background(), cancel, tr, false, time.Second) }()
+	select {
+	case ok := <-returned:
+		if !ok {
+			t.Fatal("shutdown reported unfinished calls")
+		}
+	case <-time.After(2 * time.Second):
+		cancel() // unblock the check
+		t.Fatal("quit waited for the dirty check")
+	}
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dirty check not cancelled")
+	}
+	if _, err := tb.DirtyTasks(context.Background()); !errors.Is(err, errStopped) {
+		t.Fatalf("dirty check after stop: %v", err)
+	}
+}
+
 // Every backend call that may run when the TUI stops (and write to App.Out)
 // goes through the tracker: once it is closed, none reaches the backend
 // (nil here, so an untracked call panics). TaskDir only builds a path.
