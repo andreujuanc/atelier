@@ -421,7 +421,8 @@ func IsNoSuch(err error) bool { return noSuch(err) }
 // fresh, if not nil, runs right before a container is created, when no
 // container of the task exists (any old one was removed): what it prepares
 // for the container cannot be touched by the task meanwhile. Its error stops
-// the creation.
+// the creation. A new container gets a usable $HOME (makeHome) before it is
+// returned.
 func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh func() error) (container string, stale bool, err error) {
 	create := func() (string, error) {
 		if fresh != nil {
@@ -441,11 +442,24 @@ func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh 
 			}
 			return c.ID, err
 		}
+		var id string
 		if lines := strings.Fields(out); len(lines) > 0 && fullID(lines[len(lines)-1]) {
-			return lines[len(lines)-1], nil // docker run -d prints the ID last
+			id = lines[len(lines)-1] // docker run -d prints the ID last
+		} else {
+			c, err := Agent(ctx, run, spec.ID)
+			if err != nil {
+				return "", err
+			}
+			id = c.ID
 		}
-		c, err := Agent(ctx, run, spec.ID)
-		return c.ID, err
+		if err := spec.makeHome(ctx, run, id); err != nil {
+			// Removed, so that the next try makes it again.
+			if _, rerr := run(ctx, "rm", "-f", id); rerr != nil && !noSuch(rerr) {
+				err = errors.Join(err, rerr)
+			}
+			return "", err
+		}
+		return id, nil
 	}
 	c, err := Agent(ctx, run, spec.ID)
 	switch {
@@ -471,6 +485,28 @@ func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh 
 		}
 	}
 	return c.ID, false, nil
+}
+
+// makeHome makes the spec's $HOME, in the new container id, a directory the
+// spec's user can write to, unless it is one already. $HOME is the home dir
+// of the user running atl, which the image has only when built for that
+// path: atelier's images put the user's home in /home/<user>, so on a host
+// where it is elsewhere (/var/home/<user>, /Users/<user>) it would be
+// missing, or a root-owned directory docker made to mount something below
+// it, and what writes to ~/.cache, ~/.npm or ~/.config would fail. Without
+// $HOME or a user in the spec it does nothing.
+func (s Spec) makeHome(ctx context.Context, run Runner, id string) error {
+	home := s.Env["HOME"]
+	if home == "" || s.User == "" {
+		return nil
+	}
+	if _, err := run(ctx, "exec", id, "sh", "-c", `[ -d "$HOME" ] && [ -w "$HOME" ]`); err == nil {
+		return nil
+	}
+	if _, err := run(ctx, "exec", "-u", "0", id, "sh", "-c", `mkdir -p -- "$HOME" && chown -- "$1" "$HOME"`, "sh", s.User); err != nil {
+		return fmt.Errorf("make the home dir %s in the container: %w", home, err)
+	}
+	return nil
 }
 
 // Cleanup removes the task container of sandbox id (only atl's own, see
