@@ -29,7 +29,7 @@ const AssistantGuardEvent = "AssistantGuard"
 var (
 	assistantAllow = []string{
 		"Bash(atl ls *)", "Bash(atl show *)", "Bash(atl transcript *)",
-		"Bash(atl repos *)", "Bash(atl help *)", "Read", "Grep", "Glob",
+		"Bash(atl repos)", "Bash(atl help *)", "Read", "Grep", "Glob",
 	}
 	assistantAsk = []string{
 		"Bash(atl new *)", "Bash(atl add *)", "Bash(atl status *)", "Bash(atl session *)",
@@ -46,11 +46,15 @@ var (
 	// retiredAssistantRules lists allow/ask rules earlier atelier versions
 	// wrote that are no longer wanted; they are removed on rewrite. Earlier
 	// versions spelled Bash rules "Bash(atl ls:*)".
-	retiredAssistantRules = append(colonForms(assistantAllow, assistantAsk), retiredAtlHelp...)
+	retiredAssistantRules = append(append(colonForms(assistantAllow, assistantAsk), retiredAtlHelp...), retiredRepos...)
 	// retiredAtlHelp allowed "atl --help <anything>" without asking: cobra
 	// takes the argument after a leading flag as its value and runs what
 	// follows (`atl --help --help=false done X`). Help is `atl help`.
 	retiredAtlHelp = []string{"Bash(atl --help *)", "Bash(atl --help:*)"}
+	// retiredRepos allowed `atl repos <anything>` without asking, `atl repos pin`
+	// too, which accepts a changed origin URL: only the bare `atl repos` (the
+	// list) is allowed now.
+	retiredRepos = []string{"Bash(atl repos *)", "Bash(atl repos:*)"}
 )
 
 // colonForms returns the legacy "Bash(cmd:*)" spelling of every
