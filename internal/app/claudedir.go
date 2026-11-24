@@ -193,7 +193,7 @@ func (c *seedCopy) copy(src, dst string, depth int) error {
 		return err
 	}
 	for _, f := range c.forbidden {
-		if rel, err := filepath.Rel(f, real); err == nil && (rel == "." || !strings.HasPrefix(rel, "..")) {
+		if rel, err := filepath.Rel(f, real); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return nil // never carried over
 		}
 	}
