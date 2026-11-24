@@ -693,6 +693,22 @@ func TestEnsureMakesHome(t *testing.T) {
 		t.Errorf("home not made: %q, %v; want an error that names it, and the container removed", d.verbs(), err)
 	}
 
+	// Lost the name race to another atl that has not made the home yet (or
+	// died before it did): the loser makes it, in the winner's container,
+	// and leaves that container alone when it cannot.
+	conflict := errors.New(`docker run: Conflict. The container name "/atl-t-abc123" is already in use`)
+	d = &agentDaemon{t: t, runErr: conflict, winner: atlsContainer(spec, true, spec.Hash()), noHome: true}
+	if id, _, err := Ensure(ctx, d.run, spec, idle, nil); err != nil || d.verbs() != "inspect run inspect exec exec" || id != oldID || d.noHome {
+		t.Errorf("name race, home missing: %q, %.4s…, %v, still missing %v", d.verbs(), id, err, d.noHome)
+	} else if root := d.execs[1]; !slices.Equal(root[:4], []string{"exec", "-u", "0", oldID}) {
+		t.Errorf("name race: home made with %q, want as root in the winner's container", root)
+	}
+	d = &agentDaemon{t: t, runErr: conflict, winner: atlsContainer(spec, false, spec.Hash()), noHome: true,
+		rootErr: errors.New("docker exec: chown: not permitted")}
+	if _, _, err := Ensure(ctx, d.run, spec, idle, nil); err == nil || d.verbs() != "inspect run inspect start exec exec" || d.c == nil {
+		t.Errorf("name race, home not made: %q, %v; want an error, and the winner's container kept", d.verbs(), err)
+	}
+
 	// Without $HOME in the spec, nothing to check.
 	d = &agentDaemon{t: t, noHome: true}
 	if _, _, err := Ensure(ctx, d.run, testSpec(), idle, nil); err != nil || d.verbs() != "inspect run" {

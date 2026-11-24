@@ -435,12 +435,22 @@ func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh 
 			if !strings.Contains(err.Error(), "already in use") {
 				return "", err
 			}
-			// Lost a race with another atl creating it: take theirs, if it is atl's.
+			// Lost a race with another atl creating it: take theirs, if it
+			// is atl's, with its home made, in case that atl has not made it
+			// yet or died first; left alone if that fails (it is theirs).
 			c, err := Agent(ctx, run, spec.ID)
-			if err == nil && !c.Running {
-				_, err = run(ctx, "start", c.ID)
+			if err != nil {
+				return "", err
 			}
-			return c.ID, err
+			if !c.Running {
+				if _, err := run(ctx, "start", c.ID); err != nil {
+					return "", err
+				}
+			}
+			if err := spec.makeHome(ctx, run, c.ID); err != nil {
+				return "", err
+			}
+			return c.ID, nil
 		}
 		var id string
 		if lines := strings.Fields(out); len(lines) > 0 && fullID(lines[len(lines)-1]) {
