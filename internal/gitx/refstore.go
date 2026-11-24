@@ -218,8 +218,16 @@ func (s *refStore) sync(ctx context.Context, dir string) error {
 		}
 	}
 	if s.reftable {
-		if len(changed) > 0 {
-			errs = append(errs, syncReftable(ctx, dir, d, changed))
+		var stdin strings.Builder
+		for _, name := range slices.Sorted(maps.Keys(changed)) {
+			if id := changed[name]; id != "" {
+				stdin.WriteString("update " + name + " " + id + "\n")
+			} else {
+				stdin.WriteString("delete " + name + "\n")
+			}
+		}
+		if stdin.Len() > 0 {
+			errs = append(errs, syncReftable(ctx, dir, d, stdin.String()))
 		}
 	} else {
 		for _, name := range slices.Sorted(maps.Keys(changed)) {
@@ -250,23 +258,15 @@ func (s *refStore) sync(ctx context.Context, dir string) error {
 	return errors.Join(errs...)
 }
 
-// syncReftable writes changed (ref to id; "" deletes it) into the reftable
-// stack of the repo at dir, d its common git dir, as git adds to a stack,
+// syncReftable makes the changes stdin lists (git update-ref --stdin) in the
+// reftable stack of the repo at dir, d its common git dir, as git adds to a stack,
 // without following a symlink. The stack as it is now is copied into a
 // git dir of atl's (copyReftable), git makes the changes there, and the
 // tables it wrote (fresh names; its own compaction may merge old ones)
 // are written next to the repo's and its tables.list replaced by the
 // copy's: under git's lock (tables.list.lock, made exclusively), and only
 // if the stack is still the one copied; else it starts over, a few times.
-func syncReftable(ctx context.Context, dir string, d *nofollow.Dir, changed map[string]string) error {
-	var stdin strings.Builder
-	for _, name := range slices.Sorted(maps.Keys(changed)) {
-		if id := changed[name]; id != "" {
-			stdin.WriteString("update " + name + " " + id + "\n")
-		} else {
-			stdin.WriteString("delete " + name + "\n")
-		}
-	}
+func syncReftable(ctx context.Context, dir string, d *nofollow.Dir, stdin string) error {
 	const lock = "reftable/tables.list.lock"
 	var err error
 	for attempt := 0; attempt < 5; attempt++ {
@@ -287,7 +287,7 @@ func syncReftable(ctx context.Context, dir string, d *nofollow.Dir, changed map[
 			args := []string{"-c", "core.logAllRefUpdates=false", "update-ref", "--stdin"}
 			cmd := command(ctx, priv, args...)
 			cmd.Env = append(cmd.Env, "GIT_OBJECT_DIRECTORY="+filepath.Join(d.Path(), "objects"))
-			cmd.Stdin = strings.NewReader(stdin.String())
+			cmd.Stdin = strings.NewReader(stdin)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return false, wrap(ctx, args, string(out), err)
 			}
@@ -437,4 +437,120 @@ func writeSymref(ctx context.Context, dir, ref, target string) error {
 		return err
 	}
 	return d.WriteFile(ref, []byte("ref: "+target+"\n"), 0o644)
+}
+
+// deleteBranch deletes the local branch in repo, if oid is not "" only
+// while its tip is oid, and refuses one a worktree has checked out (as git
+// branch -D does). git deletes a loose ref by path, and rewrites
+// packed-refs through a symlink: a task that made refs/heads/atl a symlink
+// to a directory of the user's (or packed-refs one to a file of theirs)
+// had git delete or rewrite the user's file. So the ref is deleted here,
+// without following a symlink, under git's locks (<ref>.lock,
+// packed-refs.lock, made exclusively); in a reftable repo through
+// syncReftable.
+func deleteBranch(ctx context.Context, repo, branch, oid string) error {
+	ref := "refs/heads/" + branch
+	if !plainRefName(ref) {
+		return fmt.Errorf("not a branch name %q", printable(branch))
+	}
+	out, err := run(ctx, repo, "worktree", "list", "--porcelain")
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if line == "branch "+ref {
+			return fmt.Errorf("branch %s is checked out in a worktree", branch)
+		}
+	}
+	_, common, err := checkGitDirs(ctx, repo)
+	if err != nil {
+		return err
+	}
+	cur, err := refCommit(ctx, repo, common, ref)
+	if err != nil {
+		return err
+	}
+	if oid != "" && cur != oid {
+		return fmt.Errorf("branch %s is at %s, not %s", branch, cur, oid)
+	}
+	d, err := nofollow.Open(common)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if reftable, err := usesReftable(ctx, repo); err != nil {
+		return err
+	} else if reftable {
+		return syncReftable(ctx, repo, d, "delete "+ref+" "+cur+"\n")
+	}
+	if err := deletePacked(d, ref, cur); err != nil {
+		return err
+	}
+	if fi, err := d.Lstat(ref); err == nil && fi.Mode().IsRegular() {
+		if err := d.CreateExcl(ref+".lock", nil, 0o644); err != nil {
+			return err
+		}
+		defer d.Remove(ref + ".lock")
+		if data, err := d.ReadFile(ref, 1024); err != nil || strings.TrimSuffix(string(data), "\n") != cur {
+			return fmt.Errorf("branch %s changed meanwhile", branch)
+		}
+		if err := d.Remove(ref); err != nil {
+			return err
+		}
+	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	d.Remove("logs/" + ref) // its reflog, as git deletes it
+	for dir := path.Dir(ref); dir != "refs/heads"; dir = path.Dir(dir) {
+		if d.Remove(dir) != nil { // only an empty one
+			break
+		}
+	}
+	return nil
+}
+
+// deletePacked removes ref (at oid) from packed-refs in d, if it is there,
+// as git does: the new packed-refs written as packed-refs.lock (made
+// exclusively, so git's own writers wait) and renamed over it, without
+// following a symlink.
+func deletePacked(d *nofollow.Dir, ref, oid string) error {
+	data, err := d.ReadFile("packed-refs", 256<<20)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var kept strings.Builder
+	found, skipPeeled := false, false
+	for _, line := range strings.SplitAfter(string(data), "\n") {
+		if skipPeeled && strings.HasPrefix(line, "^") {
+			continue
+		}
+		skipPeeled = false
+		if id, name, ok := strings.Cut(strings.TrimSuffix(line, "\n"), " "); ok && name == ref {
+			if id != oid {
+				return fmt.Errorf("packed %s is at %s, not %s", ref, id, oid)
+			}
+			found, skipPeeled = true, true
+			continue
+		}
+		kept.WriteString(line)
+	}
+	if !found {
+		return nil
+	}
+	const lock = "packed-refs.lock"
+	if err := d.CreateExcl(lock, []byte(kept.String()), 0o644); err != nil {
+		return err
+	}
+	if now, err := d.ReadFile("packed-refs", 256<<20); err != nil || !bytes.Equal(now, data) {
+		d.Remove(lock)
+		return errors.New("packed-refs changed meanwhile")
+	}
+	if err := d.Rename(lock, "packed-refs"); err != nil {
+		d.Remove(lock)
+		return err
+	}
+	return nil
 }

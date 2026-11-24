@@ -328,4 +328,85 @@ func TestReftableTransport(t *testing.T) {
 	if got := git(t, repo, "rev-parse", "refs/remotes/origin/main"); got != tip {
 		t.Errorf("origin/main = %s after the last fetch, want %s", got, tip)
 	}
+
+	// A branch deleted in the stack.
+	git(t, repo, "branch", "atl/gone", base)
+	if err := DeleteBranchIfAt(ctx, repo, "atl/gone", head); err == nil {
+		t.Error("deleted with a stale oid")
+	}
+	if err := DeleteBranchIfAt(ctx, repo, "atl/gone", base); err != nil {
+		t.Fatal(err)
+	}
+	if out := git(t, repo, "for-each-ref", "refs/heads/atl/gone"); out != "" {
+		t.Errorf("branch left: %s", out)
+	}
+	git(t, repo, "fsck", "--no-progress")
+}
+
+// TestDeleteBranchWritesOnlyTheRepo: deleting a task's branch (done,
+// cancel, a rollback) in a clone whose refs/heads/atl, or packed-refs, a
+// task made a symlink into a directory of the user's must not delete or
+// rewrite the user's file there.
+func TestDeleteBranchWritesOnlyTheRepo(t *testing.T) {
+	ctx := context.Background()
+	for _, del := range []struct {
+		name string
+		fn   func(repo, oid string) error
+	}{
+		{"DeleteBranch", func(repo, _ string) error { return DeleteBranch(ctx, repo, "atl/x") }},
+		{"DeleteBranchIfAt", func(repo, oid string) error { return DeleteBranchIfAt(ctx, repo, "atl/x", oid) }},
+	} {
+		f := newFixture(t)
+		tip := git(t, f.repo, "rev-parse", "HEAD")
+		git(t, f.repo, "branch", "atl/x")
+		victim := t.TempDir()
+		writeFile(t, filepath.Join(victim, "x"), tip+"\n")
+		atl := filepath.Join(f.repo, ".git", "refs", "heads", "atl")
+		must(t, os.Rename(atl, atl+".saved"))
+		must(t, os.Symlink(victim, atl))
+		del.fn(f.repo, tip)
+		if data, err := os.ReadFile(filepath.Join(victim, "x")); err != nil || string(data) != tip+"\n" {
+			t.Errorf("%s, refs/heads/atl a symlink: the user's file is now %q, %v", del.name, data, err)
+		}
+		must(t, os.Remove(atl))
+		must(t, os.Rename(atl+".saved", atl))
+
+		// Packed, and packed-refs a symlink to the user's file.
+		git(t, f.repo, "pack-refs", "--all")
+		packed := filepath.Join(f.repo, ".git", "packed-refs")
+		data, err := os.ReadFile(packed)
+		must(t, err)
+		users := filepath.Join(victim, "packed")
+		writeFile(t, users, string(data))
+		must(t, os.Remove(packed))
+		must(t, os.Symlink(users, packed))
+		del.fn(f.repo, tip)
+		if got, _ := os.ReadFile(users); string(got) != string(data) {
+			t.Errorf("%s, packed-refs a symlink: the user's file is now %q", del.name, got)
+		}
+		if fi, err := os.Lstat(packed); err == nil && fi.Mode()&os.ModeSymlink == 0 {
+			// Replaced by a file of its own: the branch must be gone from it.
+			if out := git(t, f.repo, "for-each-ref", "refs/heads/atl"); out != "" {
+				t.Errorf("%s: branch left: %s", del.name, out)
+			}
+		}
+	}
+}
+
+// TestDeleteBranchPacked: a packed branch (its peeled line too) leaves
+// packed-refs, the other refs stay.
+func TestDeleteBranchPacked(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	tip := git(t, f.repo, "rev-parse", "HEAD")
+	git(t, f.repo, "branch", "atl/p")
+	git(t, f.repo, "tag", "-a", "-m", "t", "v1")
+	git(t, f.repo, "pack-refs", "--all")
+	if err := DeleteBranchIfAt(ctx, f.repo, "atl/p", tip); err != nil {
+		t.Fatal(err)
+	}
+	if out := git(t, f.repo, "for-each-ref", "--format=%(refname)"); strings.Contains(out, "atl/p") || !strings.Contains(out, "refs/tags/v1") || !strings.Contains(out, "refs/heads/main") {
+		t.Errorf("refs after the delete:\n%s", out)
+	}
+	git(t, f.repo, "fsck", "--no-progress")
 }

@@ -205,3 +205,37 @@ func TestMkdir(t *testing.T) {
 		t.Error("a directory was made through the symlink")
 	}
 }
+
+// TestCreateExclAndRename: a lock file is made only where nothing is, a
+// symlink included, never through one; a rename replaces a symlink itself.
+func TestCreateExclAndRename(t *testing.T) {
+	d, root, victim, victimDir := setup(t)
+	if err := d.CreateExcl("sub/f.lock", []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CreateExcl("sub/f.lock", nil, 0o644); !errors.Is(err, fs.ErrExist) {
+		t.Errorf("second CreateExcl: %v, want ErrExist", err)
+	}
+	if err := d.CreateExcl("link", nil, 0o644); !errors.Is(err, fs.ErrExist) {
+		t.Errorf("CreateExcl on a symlink: %v, want ErrExist", err)
+	}
+	if err := d.CreateExcl("dirlink/new", nil, 0o644); !errors.Is(err, ErrSymlink) {
+		t.Errorf("CreateExcl under a symlink: %v, want ErrSymlink", err)
+	}
+	if _, err := os.Stat(filepath.Join(victimDir, "new")); !os.IsNotExist(err) {
+		t.Errorf("a file was made in the symlinked dir: %v", err)
+	}
+	must(t, os.Symlink(victim, filepath.Join(root, "sub", "g")))
+	if err := d.Rename("sub/f.lock", "g"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(root, "sub", "g")); string(data) != "new\n" {
+		t.Errorf("sub/g = %q", data)
+	}
+	if data, _ := os.ReadFile(victim); string(data) != "the user's file\n" {
+		t.Errorf("victim = %q", data)
+	}
+	if err := d.Rename("sub/g", "../x"); err == nil {
+		t.Error("rename out of the directory: no error")
+	}
+}

@@ -958,34 +958,28 @@ func Worktrees(ctx context.Context, repo string) ([]string, error) {
 	return paths, nil
 }
 
-// DeleteBranch force-deletes the local branch in repo (`git branch -D`).
+// DeleteBranch force-deletes the local branch in repo, as `git branch -D`
+// does, without following a symlink (see deleteBranch).
 func DeleteBranch(ctx context.Context, repo, branch string) error {
-	_, err := run(ctx, repo, "branch", "-D", branch)
-	return err
+	if err := deleteBranch(ctx, repo, branch, ""); err != nil {
+		return &Error{Args: []string{"branch", "-D", branch}, ExitCode: 1, Stderr: "error: " + err.Error(), Err: err}
+	}
+	return nil
 }
 
 // DeleteBranchIfAt deletes the local branch in repo only if its tip is
-// still oid (a compare-and-delete via `git update-ref -d`). If the branch
+// still oid (a compare-and-delete, as `git update-ref -d`; see
+// deleteBranch). If the branch
 // moved, is missing, or is checked out in a worktree, it fails and the
 // branch is left untouched.
 func DeleteBranchIfAt(ctx context.Context, repo, branch, oid string) error {
 	if oid == "" {
 		return fmt.Errorf("delete branch %s: empty expected oid", branch)
 	}
-	ref := "refs/heads/" + branch
-	// update-ref does not refuse a branch checked out in a worktree (unlike
-	// `git branch -D`), so check that first.
-	out, err := run(ctx, repo, "worktree", "list", "--porcelain")
-	if err != nil {
-		return err
+	if err := deleteBranch(ctx, repo, branch, oid); err != nil {
+		return &Error{Args: []string{"update-ref", "-d", "refs/heads/" + branch, oid}, ExitCode: 1, Stderr: "error: " + err.Error(), Err: err}
 	}
-	for _, line := range strings.Split(out, "\n") {
-		if line == "branch "+ref {
-			return fmt.Errorf("delete branch %s: checked out in a worktree", branch)
-		}
-	}
-	_, err = run(ctx, repo, "update-ref", "-d", ref, oid)
-	return err
+	return nil
 }
 
 // UniqueCommits returns the number of commits reachable from the local
