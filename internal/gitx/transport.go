@@ -221,7 +221,10 @@ func newTransport(ctx context.Context, dir string, origin Origin, push bool) (*t
 			kv = append(kv, "pushurl="+u)
 		}
 	}
-	refspecs, _ := configList(ctx, dir, "remote.origin.fetch")
+	refspecs, err := configList(ctx, dir, "remote.origin.fetch")
+	if err != nil {
+		return nil, err
+	}
 	if len(refspecs) == 0 {
 		refspecs = []string{"+refs/heads/*:refs/remotes/origin/*"}
 	}
