@@ -376,20 +376,27 @@ func (m *Model) listLines(w, h int) []string {
 	return out
 }
 
+// groupLine renders status group header r at width w: the status, its
+// task count (shown/total when the closed limit leaves some out) and a rule.
+func (r row) groupLine(w int) string {
+	c := lipgloss.NewStyle().Foreground(statusColor(r.status)).Bold(true)
+	label := strings.ToUpper(string(r.status))
+	count := strconv.Itoa(r.count)
+	if r.total > r.count {
+		count += "/" + strconv.Itoa(r.total)
+	}
+	text := " " + c.Render(label) + " " + labelStyle.Render(count)
+	used := ansi.StringWidth(" "+label+" "+count) + 1
+	if n := w - used; n > 0 {
+		text += " " + ruleStyle.Render(strings.Repeat("─", n))
+	}
+	return trunc(text, w)
+}
+
+// rowLine renders list row r at width w, highlighted if sel.
 func (m *Model) rowLine(r row, sel bool, w int) string {
 	if r.header {
-		c := lipgloss.NewStyle().Foreground(statusColor(r.status)).Bold(true)
-		label := strings.ToUpper(string(r.status))
-		count := strconv.Itoa(r.count)
-		if r.total > r.count {
-			count += "/" + strconv.Itoa(r.total)
-		}
-		text := " " + c.Render(label) + " " + labelStyle.Render(count)
-		used := ansi.StringWidth(" "+label+" "+count) + 1
-		if n := w - used; n > 0 {
-			text += " " + ruleStyle.Render(strings.Repeat("─", n))
-		}
-		return trunc(text, w)
+		return r.groupLine(w)
 	}
 	t := r.task
 	agg := aggregate(t.Sessions)
