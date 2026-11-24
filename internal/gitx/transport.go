@@ -1,15 +1,12 @@
 package gitx
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
-	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
@@ -17,8 +14,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-
-	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // Origin is where a repo's origin points, as its config says it: the values
@@ -156,49 +151,13 @@ func PushBranch(ctx context.Context, dir string, origin Origin, branch string, f
 }
 
 // branchCommit returns the commit id ref (a branch, refs/heads/...) names
-// in the repo at dir: its loose ref file in the repo's common git dir, else
-// its line in packed-refs, both read without following a symlink (see
-// package nofollow). A symbolic ref is refused.
+// in the repo at dir, read without following a symlink (see readRef).
 func branchCommit(ctx context.Context, dir, ref string) (string, error) {
 	common, err := revParsePath(ctx, dir, "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return "", err
 	}
-	d, err := nofollow.Open(common)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", ref, err)
-	}
-	defer d.Close()
-	data, err := d.ReadFile(ref, 1024)
-	if err == nil {
-		id := strings.TrimSuffix(string(data), "\n")
-		if !objectID.MatchString(id) {
-			return "", fmt.Errorf("read %s: not a commit id: %q", ref, firstChars(id, 80))
-		}
-		return id, nil
-	}
-	if !errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("read %s: %w", ref, err)
-	}
-	f, err := d.OpenFile("packed-refs")
-	if errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("no branch %s", ref)
-	}
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", ref, err)
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(nil, 64<<10)
-	for sc.Scan() {
-		if id, name, ok := strings.Cut(sc.Text(), " "); ok && name == ref && objectID.MatchString(id) {
-			return id, nil
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return "", fmt.Errorf("read %s: packed-refs: %w", ref, err)
-	}
-	return "", fmt.Errorf("no branch %s", ref)
+	return readRef(common, ref)
 }
 
 // objectID matches a full object id, SHA-1 or SHA-256.

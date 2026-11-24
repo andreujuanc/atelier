@@ -830,8 +830,8 @@ func TestFailureLine(t *testing.T) {
 
 // TestPushBranchPushesOnlyWhatTheRepoHas: a task can write the clone's git
 // dir: make its branch's ref file a symlink to another repo's ref on the
-// host (git follows it where atl runs; the task cannot) and list that
-// repo's objects as alternates. A push of the branch must not send that
+// host (git follows it where atl runs; the task cannot) and have that
+// repo's objects. A push of the branch must not send that
 // repo's history to origin, from where the task would fetch it.
 func TestPushBranchPushesOnlyWhatTheRepoHas(t *testing.T) {
 	ctx := context.Background()
@@ -839,7 +839,8 @@ func TestPushBranchPushesOnlyWhatTheRepoHas(t *testing.T) {
 	secret := filepath.Join(t.TempDir(), "secret")
 	git(t, f.root, "init", "-q", "-b", "main", secret)
 	commitFile(t, secret, "creds", "hunter2\n", "the user's private work")
-	writeFile(t, filepath.Join(f.repo, ".git", "objects", "info", "alternates"), filepath.Join(secret, ".git", "objects")+"\n")
+	// Its objects in the clone (alternates are refused: TestHostGitReadsOnlyTheRepo).
+	git(t, f.repo, "fetch", "-q", secret, "main")
 	pushed := func() string {
 		out, _ := exec.Command("git", "-C", f.origin, "log", "--format=%s", "atl/x").CombinedOutput()
 		return string(out)

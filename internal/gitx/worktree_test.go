@@ -191,9 +191,9 @@ func swapOnDelete(t *testing.T, dir, target string, names []string) (stop func()
 
 // TestReplaceRefsAreNotRead: a task writes the clone's git dir, refs/replace
 // too. A replace ref for the task's base commit that is a symlink to a
-// branch of another repo on the host (whose objects it lists as
-// alternates) would have atl's git on the host show that repo's history
-// and files as the task's (atl diff, atl show: what the assistant reads).
+// branch of another repo on the host (whose objects it has) would have
+// atl's git on the host show that repo's history and files as the task's
+// (atl diff, atl show: what the assistant reads).
 func TestReplaceRefsAreNotRead(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
@@ -201,7 +201,8 @@ func TestReplaceRefsAreNotRead(t *testing.T) {
 	secret := filepath.Join(t.TempDir(), "secret")
 	git(t, f.root, "init", "-q", "-b", "main", secret)
 	commitFile(t, secret, "creds", "hunter2\n", "the user's private work")
-	writeFile(t, filepath.Join(f.repo, ".git", "objects", "info", "alternates"), filepath.Join(secret, ".git", "objects")+"\n")
+	// Its objects in the clone (alternates are refused: TestHostGitReadsOnlyTheRepo).
+	git(t, f.repo, "fetch", "-q", secret, "main")
 	commitFile(t, wt, "work.txt", "work\n", "the task's work")
 	head := git(t, wt, "rev-parse", "HEAD")
 	for _, id := range []string{base, head} {

@@ -178,8 +178,12 @@ func hazards(ctx context.Context, dir string, origin *Origin, cfgArgs []string) 
 
 // checkHazards refuses (*RefusedError) when the repo at dir has a Hazard for
 // a command of kind o, which runs with the -c options cfgArgs (on top of
-// safetyArgs).
+// safetyArgs), and, first, when git there would read another repository
+// (checkGitDirs).
 func checkHazards(ctx context.Context, dir string, o op, origin *Origin, cfgArgs []string) error {
+	if _, _, err := checkGitDirs(ctx, dir); err != nil {
+		return err
+	}
 	hs, err := hazards(ctx, dir, origin, cfgArgs)
 	if err != nil {
 		return err

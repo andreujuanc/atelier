@@ -91,6 +91,11 @@ branch cleanup, push, fetch) defends in three ways:
 A refusal names the repo, setting and value, and is logged to `<workspace>/state/refused.log`.
 `atl doctor` lists, per repo, what it would refuse now. Fix: remove the setting and rerun.
 
+The same commands, and `atl show`'s last commit, are also refused while git would read another
+repository: `.git/objects/info/alternates` (a clone made with `--reference`: run
+`git repack -a -d` in it, then remove the file), a symlink in `.git/objects/`, or a `commondir`
+file in the clone's `.git`. `atl show` reads HEAD and its branch without following a symlink.
+
 Worktree checks: before running git or a project script in a worktree, atl checks that it is
 a real directory (not a symlink) and a worktree of that repo's canonical clone. If not, the
 command fails for that repo; `atl done`/`cancel` refuse (with `--force`, close the task and
@@ -98,6 +103,6 @@ leave the path alone). Push, fetch and the PR remote check run in the canonical 
 
 Limits:
 
-- A task rewriting its config in a tight loop could slip a setting in between the check and
-  git's read.
+- A task rewriting its config (or git dir) in a tight loop could slip a setting in between the
+  check and git's read.
 - A partial clone (`clone --filter`) cannot be an rw repo: the checkout fails.

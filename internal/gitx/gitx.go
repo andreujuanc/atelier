@@ -1019,9 +1019,20 @@ func Untracked(ctx context.Context, worktree string) ([]string, error) {
 }
 
 // LastCommit returns the sha, subject and committer date of HEAD in
-// worktree.
+// worktree. HEAD, and the branch it names, are read here without following
+// a symlink (headCommit), in a git dir that reads no other repository
+// (checkGitDirs): git would follow a HEAD or ref that is a symlink to
+// another repo's branch.
 func LastCommit(ctx context.Context, worktree string) (sha, subject string, when time.Time, err error) {
-	out, err := run(ctx, worktree, "log", "-1", "--format=%H%x00%ct%x00%s", "HEAD", "--")
+	gitDir, common, err := checkGitDirs(ctx, worktree)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	head, err := headCommit(gitDir, common)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	out, err := run(ctx, worktree, "log", "-1", "--format=%H%x00%ct%x00%s", head, "--")
 	if err != nil {
 		return "", "", time.Time{}, err
 	}

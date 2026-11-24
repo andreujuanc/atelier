@@ -217,8 +217,6 @@ func (p *poisoned) plant(t *testing.T) {
 	for _, name := range []string{"atl", "atl-0000000000000000"} {
 		set(p.repo, "remote."+name+".url", p.decoy, "remote."+name+".uploadpack", prog("upload-pack-"+name))
 	}
-	// The alternate-refs command runs for repos with alternates.
-	writeFile(t, filepath.Join(p.repo, ".git", "objects", "info", "alternates"), filepath.Join(p.fixture.origin, "objects")+"\n")
 	// The worktree's own config, and attributes from $GIT_DIR/info.
 	git(t, p.wt, "config", "--worktree", "core.fsmonitor", prog("fsmonitor-worktree"))
 	writeFile(t, filepath.Join(p.repo, ".git", "info", "attributes"), "* filter=evil2 diff=evil2\n")
