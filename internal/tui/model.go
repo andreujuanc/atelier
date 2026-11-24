@@ -1079,10 +1079,11 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.requestQuit(key)
 	}
 	// Bubble Tea may deliver fast-typed letters as one multi-rune event
-	// ("jjj"): in normal mode replay them one key at a time (the mode may
-	// change on the way, e.g. "/abc"). Pastes arrive as tea.PasteMsg and
-	// are ignored there.
-	if rs := []rune(msg.Text); m.mode == modeNormal && len(rs) > 1 && msg.Mod&(tea.ModAlt|tea.ModCtrl) == 0 {
+	// ("jjj"): in normal mode and the session picker (j/k move there too)
+	// replay them one key at a time (the mode may change on the way, e.g.
+	// "/abc"). Pastes arrive as tea.PasteMsg and are ignored there.
+	replay := m.mode == modeNormal || m.mode == modeSessions
+	if rs := []rune(msg.Text); replay && len(rs) > 1 && msg.Mod&(tea.ModAlt|tea.ModCtrl) == 0 {
 		var cmds []tea.Cmd
 		for _, r := range rs {
 			cmds = append(cmds, m.handleKey(runeKey(r)))

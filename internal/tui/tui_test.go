@@ -2804,6 +2804,30 @@ func TestSessionPickerStartsOnMostRecent(t *testing.T) {
 	}
 }
 
+// Fast j/k in the session picker may arrive as one event ("jj"): each
+// letter moves, as in the task list.
+func TestSessionPickerMultiRuneKeys(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), choices: map[string][]app.SessionChoice{"gamma": {
+		choice(7, model.StateIdle, true, "a", "", time.Minute),
+		choice(5, model.StateEnded, false, "b", "", time.Hour),
+		choice(4, model.StateEnded, false, "c", "", 2*time.Hour),
+	}}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+	runOpen(t, m, press(m, "enter"))
+	if m.mode != modeSessions || m.sessPick.cursor != 1 {
+		t.Fatalf("mode %v, picker %+v", m.mode, m.sessPick)
+	}
+	key(m, "jj")
+	if m.sessPick.cursor != 3 {
+		t.Fatalf("jj: cursor %d, want 3", m.sessPick.cursor)
+	}
+	key(m, "kkk")
+	if m.sessPick.cursor != 0 {
+		t.Fatalf("kkk: cursor %d, want 0", m.sessPick.cursor)
+	}
+}
+
 func TestOpenChoicesWhileBusyElsewhere(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks(), choices: map[string][]app.SessionChoice{
 		"gamma": {choice(7, model.StateIdle, true, "t", "", time.Minute)}}}
