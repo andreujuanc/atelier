@@ -980,6 +980,13 @@ func TestLaunchWaitsForClose(t *testing.T) {
 	}
 }
 
+// waitedForLaunch reports whether err is the timeout of a wait for the
+// task's launch lock.
+func waitedForLaunch(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) &&
+		strings.Contains(err.Error(), "a session is being started in it") && strings.Contains(err.Error(), ".launch.lock")
+}
+
 // A launch held up in its sandbox (a slow docker run or image pull) does
 // not hold up the task's other operations: rename and a status change go
 // through at once. Only closing the task waits for it.
@@ -1020,13 +1027,13 @@ func TestSlowLaunchBlocksOnlyClose(t *testing.T) {
 	}
 	short, cancel2 := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancel2()
-	if _, err := e.app.Done(short, task.Slug, true); err == nil {
-		t.Fatal("done went ahead during a launch")
+	if _, err := e.app.Done(short, task.Slug, true); !waitedForLaunch(err) {
+		t.Fatalf("done during a launch: %v", err)
 	}
 	short2, cancel3 := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancel3()
-	if err := e.app.SetStatus(short2, task.Slug, model.StatusDone); err == nil {
-		t.Fatal("status done went ahead during a launch")
+	if err := e.app.SetStatus(short2, task.Slug, model.StatusDone); !waitedForLaunch(err) {
+		t.Fatalf("status done during a launch: %v", err)
 	}
 
 	close(release)
