@@ -168,7 +168,8 @@ assistant's container forwards an allowlist ([docs/assistant.md](docs/assistant.
 ### `<workspace>/atelier.toml`
 
 Strict TOML: every key optional, unknown keys are an error. `~/` expands in `repos`,
-`git_config` and `mounts`; relative paths are relative to the workspace. No secrets here.
+`git_config` and `mounts`; relative `repos` and `git_config` paths are relative to the workspace
+(`mounts` must be absolute). No secrets here.
 
 | key | default | meaning |
 |---|---|---|
