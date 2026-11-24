@@ -151,7 +151,17 @@ func TestEndSessionCmd(t *testing.T) {
 	claude7, left7 := root(str(s7)), leftover(str(s7))
 	claude17, left17 := root(str(s17)), leftover(str(s17))
 	claude8, left8 := root(str(s8)), leftover(str(s8))
-	time.Sleep(200 * time.Millisecond)
+	// Each of them runs, with its session in its environment, for the scripts to find.
+	until(func() bool {
+		for pid, session := range map[int]int64{claude7.Process.Pid: s7, left7: s7, claude17.Process.Pid: s17, left17: s17,
+			claude8.Process.Pid: s8, left8: s8} {
+			env, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "environ"))
+			if err != nil || !aliveProc(pid) || !slices.Contains(strings.Split(string(env), "\x00"), "ATL_SESSION="+str(session)) {
+				return false
+			}
+		}
+		return true
+	})
 
 	// Session 8 had a /clear: its Claude outlives the wait.
 	clear8 := end(str(s8), 2)
