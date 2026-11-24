@@ -55,11 +55,42 @@ func (s *Store) getSession(ctx context.Context, desc, where string, args ...any)
 // CreateSession inserts sess, setting sess.ID and filling zero
 // CreatedAt/LastEventAt with now.
 func (s *Store) CreateSession(ctx context.Context, sess *model.Session) error {
+	return insertSession(ctx, s.db, sess)
+}
+
+// CreateNamedSession is CreateSession for a session atl is about to launch
+// a window for: in the same transaction the row is named name(id) (and
+// sess.Name set), so that it is known as atl's launch from the start (see
+// ListUnrecordedLaunches).
+func (s *Store) CreateNamedSession(ctx context.Context, sess *model.Session, name func(id int64) string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	cp := *sess
+	if err := insertSession(ctx, tx, &cp); err != nil {
+		return err
+	}
+	cp.Name = name(cp.ID)
+	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET name = ? WHERE id = ?`, cp.Name, cp.ID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	*sess = cp
+	return nil
+}
+
+func insertSession(ctx context.Context, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, sess *model.Session) error {
 	if !sess.State.Valid() {
 		return fmt.Errorf("store: invalid session state %q", sess.State)
 	}
 	created, last := normTime(sess.CreatedAt), normTime(sess.LastEventAt)
-	res, err := s.db.ExecContext(ctx, `INSERT INTO sessions
+	res, err := db.ExecContext(ctx, `INSERT INTO sessions
 		(task_id, claude_session_id, tmux_target, name, state, created_at, last_event_at, transcript_path)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.TaskID, sess.ClaudeSessionID, sess.TmuxTarget, sess.Name, string(sess.State),
@@ -234,6 +265,51 @@ func (s *Store) MarkStoppedIfLaunch(ctx context.Context, l Launch, at time.Time)
 	return s.changed(ctx, `UPDATE sessions SET state = 'stopped', last_event_at = ?, background = ''
 		WHERE id = ? AND state IN ('running', 'waiting', 'idle') AND tmux_target != ''
 		AND tmux_target = ? AND launch_seq = ?`, toMS(normTime(at)), l.ID, l.Target, l.Seq)
+}
+
+// Unrecorded is a live session whose window atl launched, or was about to,
+// without recording it (see ListUnrecordedLaunches).
+type Unrecorded struct {
+	ID, TaskID int64
+	Slug       string // its task's
+	Name       string // its window name ("" before a resume of a row the hooks made)
+	Seq        int64  // its launch sequence number
+}
+
+// ListUnrecordedLaunches returns the live sessions (running, waiting, idle)
+// that atl made or claimed for a launch (they have a window name, or a
+// launch sequence number past 0) and whose window it has not recorded (an
+// empty tmux target): a launch under way, or one whose atl died before it
+// recorded the window. A row the hooks made for a Claude atl did not launch
+// has neither.
+func (s *Store) ListUnrecordedLaunches(ctx context.Context) ([]Unrecorded, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT s.id, s.task_id, t.slug, s.name, s.launch_seq
+		FROM sessions s JOIN tasks t ON t.id = s.task_id
+		WHERE s.state IN ('running', 'waiting', 'idle') AND s.tmux_target = ''
+		AND (s.name != '' OR s.launch_seq > 0) ORDER BY s.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Unrecorded
+	for rows.Next() {
+		var u Unrecorded
+		if err := rows.Scan(&u.ID, &u.TaskID, &u.Slug, &u.Name, &u.Seq); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// MarkStoppedIfUnrecorded sets the session to stopped (last_event_at = at,
+// now if zero) only if it is still live, still has no tmux target and is
+// still at launch sequence u.Seq: a launch recorded since u was observed is
+// left alone. It reports whether the row changed.
+func (s *Store) MarkStoppedIfUnrecorded(ctx context.Context, u Unrecorded, at time.Time) (bool, error) {
+	return s.changed(ctx, `UPDATE sessions SET state = 'stopped', last_event_at = ?, background = ''
+		WHERE id = ? AND state IN ('running', 'waiting', 'idle') AND tmux_target = '' AND launch_seq = ?`,
+		toMS(normTime(at)), u.ID, u.Seq)
 }
 
 // ClaimStopped atomically moves a stopped session to idle (last_event_at =
