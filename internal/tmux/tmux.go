@@ -633,15 +633,12 @@ func (c *Client) CapturePane(ctx context.Context, window string) (text string, w
 	if err != nil {
 		return "", 0, fmt.Errorf("tmux: capture pane of window %s: %w", window, err)
 	}
-	width, _ = strconv.Atoi(strings.TrimSpace(w))
-	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "tmux", c.args("capture-pane", "-p", "-J", "-S", "-", "-E", "-", "-t", window)...)
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	cmd.WaitDelay = 2 * time.Second
-	if err := cmd.Run(); err != nil {
-		return "", 0, fmt.Errorf("tmux: capture pane of window %s: %s", window, strings.TrimSpace(stderr.String()))
+	width, _ = strconv.Atoi(w)
+	text, err = c.runCmds(ctx, "", []string{"capture-pane", "-p", "-J", "-S", "-", "-E", "-", "-t", window})
+	if err != nil {
+		return "", 0, fmt.Errorf("tmux: capture pane of window %s: %w", window, err)
 	}
-	return stdout.String(), width, nil
+	return text, width, nil
 }
 
 // SetBuffer puts text in a new automatic paste buffer, the one tmux's
