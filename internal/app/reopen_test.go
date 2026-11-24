@@ -430,3 +430,56 @@ func TestSetStatusWaitsForLock(t *testing.T) {
 	}
 	reopened(t, e, task.Slug, model.StatusReview, head)
 }
+
+// A reopen is refused, and the task stays closed with nothing changed,
+// when what is at a worktree's path is not a worktree of the repo's clone,
+// or when a repo's canonical clone is gone.
+func TestReopenRefusals(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "docs", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "refused",
+		Repos: []RepoArg{{"api", model.ModeRW}, {"docs", model.ModeRO}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.app.SetStatus(ctx, task.Slug, model.StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	if err := os.RemoveAll(wt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(wt, "mine"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stays := func(what string) {
+		t.Helper()
+		got, err := e.app.Store.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != model.StatusDone {
+			t.Fatalf("%s: status %s", what, got.Status)
+		}
+		if !exists(filepath.Join(wt, "mine")) {
+			t.Fatalf("%s: the directory at the worktree path was touched", what)
+		}
+	}
+	err = e.app.SetStatus(ctx, task.Slug, model.StatusActive)
+	if err == nil || !strings.Contains(err.Error(), "repo api:") || !strings.Contains(err.Error(), "remove it first") ||
+		!strings.Contains(err.Error(), "it stays done") {
+		t.Fatalf("reopen over a plain directory: %v", err)
+	}
+	stays("plain directory")
+
+	if err := os.Rename(e.canonical("docs"), e.canonical("docs")+".away"); err != nil {
+		t.Fatal(err)
+	}
+	err = e.app.SetStatus(ctx, task.Slug, model.StatusActive)
+	if err == nil || !strings.Contains(err.Error(), "repo docs") || !strings.Contains(err.Error(), "it stays done") {
+		t.Fatalf("reopen without the docs clone: %v", err)
+	}
+	stays("missing clone")
+}
