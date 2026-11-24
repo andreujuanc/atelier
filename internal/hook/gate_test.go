@@ -611,6 +611,41 @@ func TestGateTranscriptPath(t *testing.T) {
 	}
 }
 
+// TestGateClaudeID: a Claude session id that cannot be one (control
+// characters, or a leading "-": resuming runs `claude --resume <id>`,
+// where it would be an option) is not recorded; the event still counts,
+// and the id is logged as ignored.
+func TestGateClaudeID(t *testing.T) {
+	f := setup(t)
+	sock := gated(t, f)
+	start := func(cid string) *model.Session {
+		t.Helper()
+		s := f.session(t, model.StateEnded, "old")
+		in := hookInput(Input{SessionID: cid, Cwd: f.p.TaskDir("fix"), Source: "clear"})
+		if r := hookVia(t, f, sock, EventSessionStart, in, map[string]string{"ATL_SESSION": itoa(s.ID)}); r.code != 0 {
+			t.Fatalf("result %+v", r)
+		}
+		got := f.get(t, s.ID)
+		if got.State != model.StateIdle {
+			t.Fatalf("event not applied: row %+v", got)
+		}
+		return got
+	}
+	for _, cid := range []string{"--dangerously-skip-permissions", "-x", "a\x1b]0;pwned\x07b", "a\nb", "a\u009bb"} {
+		t.Run(strconv.Quote(cid), func(t *testing.T) {
+			if got := start(cid); got.ClaudeSessionID != "old" {
+				t.Errorf("claude id recorded: %q", got.ClaudeSessionID)
+			}
+			if !strings.Contains(readLog(t, f.p), "claude session id ignored") {
+				t.Errorf("not logged:\n%s", readLog(t, f.p))
+			}
+		})
+	}
+	if got := start("1f0c3a52-7d4e-4b8a-9c1e-2f3a4b5c6d7e"); got.ClaudeSessionID != "1f0c3a52-7d4e-4b8a-9c1e-2f3a4b5c6d7e" {
+		t.Errorf("a valid claude id not recorded: %q", got.ClaudeSessionID)
+	}
+}
+
 func TestGateLatency(t *testing.T) {
 	if raceEnabled {
 		t.Skip("race-instrumented code is too slow to measure")

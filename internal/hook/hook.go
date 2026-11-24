@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
@@ -450,6 +451,11 @@ func (d db) handle(ctx context.Context, event string, in Input, env func(string)
 // task id (0 if the event matched no session or task).
 func (d db) transition(ctx context.Context, event string, in Input, env func(string) string, now time.Time) (int64, error) {
 	st := d.st
+	if !claudeIDOK(in.SessionID) {
+		logError(d.p, io.Discard, event, in.SessionID,
+			fmt.Errorf("claude session id ignored: %q has a control character or starts with \"-\"", in.SessionID))
+		in.SessionID = ""
+	}
 	if event == EventSessionStart && d.scope != 0 {
 		// A Claude session id is how the hooks and the status line of every
 		// task find a session row (GetSessionByClaudeID): a sandboxed task
@@ -490,6 +496,13 @@ func (d db) transition(ctx context.Context, event string, in Input, env func(str
 		d.ended(sess.ID)
 	}
 	return sess.TaskID, recordTranscript(ctx, event, in, sess, st)
+}
+
+// claudeIDOK reports whether id can be stored as a Claude session id: it
+// has no control character (atl shows it) and does not start with "-"
+// (resuming runs `claude --resume <id>`, where it would be an option).
+func claudeIDOK(id string) bool {
+	return !strings.HasPrefix(id, "-") && strings.IndexFunc(id, unicode.IsControl) < 0
 }
 
 // recordTranscript stores the event's transcript path: SessionStart (any
