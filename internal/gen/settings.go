@@ -225,8 +225,8 @@ func saveSettings(d *nofollow.Dir, root map[string]any) error {
 }
 
 // parseSettings decodes a settings file, requiring a JSON object whose
-// "hooks" (if present and not null) is an object of arrays (or nulls).
-// Numbers are kept verbatim.
+// "hooks" (if present and not null) is an object of arrays; a null event
+// list is dropped. Numbers are kept verbatim.
 func parseSettings(data []byte) (map[string]any, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -246,7 +246,11 @@ func parseSettings(data []byte) (map[string]any, error) {
 			return nil, errors.New(`"hooks" is not an object`)
 		}
 		for ev, v := range hm {
-			if _, ok := v.([]any); !ok && v != nil {
+			switch v.(type) {
+			case nil:
+				delete(hm, ev) // null: no hooks for the event
+			case []any:
+			default:
 				return nil, fmt.Errorf("hooks.%s is not an array", ev)
 			}
 		}
