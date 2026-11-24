@@ -790,7 +790,7 @@ func gateVolumeCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []strin
 		return
 	}
 	// The local driver's options can bind any host path (type=none,o=bind,device=/).
-	if d, _ := body["Driver"].(string); !oneOf(d, "", "local") || !isZero(body["DriverOpts"]) || !isZero(body["ClusterVolumeSpec"]) {
+	if d, err := as[string]("Driver", body["Driver"]); err != nil || !oneOf(d, "", "local") || !isZero(body["DriverOpts"]) || !isZero(body["ClusterVolumeSpec"]) {
 		g.deny(w, r, http.StatusForbidden, "volume drivers and driver options are not allowed")
 		return
 	}
@@ -819,9 +819,9 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 			return
 		}
 	}
-	driver, _ := body["Driver"].(string)
-	scope, _ := body["Scope"].(string)
-	if !oneOf(driver, "", "bridge") || !oneOf(scope, "", "local") {
+	driver, derr := as[string]("Driver", body["Driver"])
+	scope, serr := as[string]("Scope", body["Scope"])
+	if derr != nil || serr != nil || !oneOf(driver, "", "bridge") || !oneOf(scope, "", "local") {
 		g.deny(w, r, http.StatusForbidden, "only local bridge networks are allowed")
 		return
 	}
@@ -997,11 +997,17 @@ func (g *Gate) checkCreate(body map[string]any) error {
 			return fmt.Errorf("container setting %s is not allowed here (host settings go in HostConfig)", k)
 		}
 	}
-	hc, _ := body["HostConfig"].(map[string]any)
+	hc, err := as[map[string]any]("HostConfig", body["HostConfig"])
+	if err != nil {
+		return err
+	}
 	if err := g.checkHostConfig(hc); err != nil {
 		return err
 	}
-	nc, _ := body["NetworkingConfig"].(map[string]any)
+	nc, err := as[map[string]any]("NetworkingConfig", body["NetworkingConfig"])
+	if err != nil {
+		return err
+	}
 	return g.checkNetworking(nc)
 }
 
@@ -1021,12 +1027,19 @@ func (g *Gate) checkHostConfig(hc map[string]any) error {
 		case "Mounts":
 			err = g.mounts(v)
 		case "NetworkMode":
-			s, _ := v.(string)
-			hc[k], err = g.network(s)
+			var s string
+			if s, err = as[string](k, v); err == nil {
+				hc[k], err = g.network(s)
+			}
 		case "VolumesFrom":
-			list, _ := v.([]any)
+			var list []any
+			list, err = as[[]any](k, v)
 			for i, c := range list {
-				name, _ := c.(string)
+				name, ok := c.(string)
+				if !ok {
+					err = fmt.Errorf("setting %s has the wrong type", k)
+					break
+				}
 				ref, mode, hasMode := strings.Cut(name, ":")
 				id, e := g.owned("containers", ref)
 				if e != nil {
@@ -1039,19 +1052,25 @@ func (g *Gate) checkHostConfig(hc map[string]any) error {
 				list[i] = id
 			}
 		case "LogConfig":
-			lc, _ := v.(map[string]any)
+			var lc map[string]any
+			if lc, err = as[map[string]any](k, v); err != nil {
+				break
+			}
 			if err = fieldKeys(lc, "Type"); err != nil {
 				break
 			}
-			if t, _ := lc["Type"].(string); !oneOf(t, "", "json-file", "local", "none") {
+			var t string
+			if t, err = as[string]("LogConfig.Type", lc["Type"]); err == nil && !oneOf(t, "", "json-file", "local", "none") {
 				err = fmt.Errorf("log driver %s is not allowed (json-file, local and none are)", t)
 			}
 		case "IpcMode":
-			if s, _ := v.(string); !oneOf(s, "", "private", "shareable", "none") {
+			var s string
+			if s, err = as[string](k, v); err == nil && !oneOf(s, "", "private", "shareable", "none") {
 				err = fmt.Errorf("IPC mode %s is not allowed", s)
 			}
 		case "CgroupnsMode":
-			if s, _ := v.(string); !oneOf(s, "", "private") {
+			var s string
+			if s, err = as[string](k, v); err == nil && !oneOf(s, "", "private") {
 				err = fmt.Errorf("cgroup namespace mode %s is not allowed", s)
 			}
 		case "MaskedPaths", "ReadonlyPaths":
@@ -1142,7 +1161,10 @@ func (g *Gate) network(mode string) (string, error) {
 }
 
 func (g *Gate) binds(v any) error {
-	list, _ := v.([]any)
+	list, err := as[[]any]("Binds", v)
+	if err != nil {
+		return err
+	}
 	for i, item := range list {
 		spec, _ := item.(string)
 		parts := strings.Split(spec, ":")
@@ -1195,24 +1217,43 @@ func (g *Gate) readOnlyBind(src string, opts []string) []string {
 }
 
 func (g *Gate) mounts(v any) error {
-	list, _ := v.([]any)
+	list, err := as[[]any]("Mounts", v)
+	if err != nil {
+		return err
+	}
 	for _, item := range list {
-		m, _ := item.(map[string]any)
+		m, ok := item.(map[string]any)
+		if !ok {
+			return errors.New("setting Mounts has the wrong type")
+		}
 		if err := fieldKeys(m, "Type", "Source", "ReadOnly", "BindOptions", "VolumeOptions"); err != nil {
 			return err
 		}
-		bindOpts, _ := m["BindOptions"].(map[string]any)
+		bindOpts, err := as[map[string]any]("Mounts.BindOptions", m["BindOptions"])
+		if err != nil {
+			return err
+		}
 		if err := fieldKeys(bindOpts, "Propagation", "ReadOnlyNonRecursive"); err != nil {
 			return err
 		}
-		volumeOpts, _ := m["VolumeOptions"].(map[string]any)
+		volumeOpts, err := as[map[string]any]("Mounts.VolumeOptions", m["VolumeOptions"])
+		if err != nil {
+			return err
+		}
 		if err := fieldKeys(volumeOpts, "DriverConfig"); err != nil {
 			return err
 		}
-		src, _ := m["Source"].(string)
+		src, err := as[string]("Mounts.Source", m["Source"])
+		if err != nil {
+			return err
+		}
 		switch m["Type"] {
 		case "bind":
-			if p, _ := bindOpts["Propagation"].(string); !oneOf(p, "", "private", "rprivate") {
+			p, err := as[string]("Mounts.BindOptions.Propagation", bindOpts["Propagation"])
+			if err != nil {
+				return err
+			}
+			if !oneOf(p, "", "private", "rprivate") {
 				return fmt.Errorf("mount propagation %s is not allowed", p)
 			}
 			if !strings.HasPrefix(src, "/") {
@@ -1328,6 +1369,22 @@ func oneOf(s string, options ...string) bool {
 		}
 	}
 	return false
+}
+
+// as returns v, the value of the setting name the gate checks, as the type
+// the gate reads it as; the zero value if it is unset (null or absent). A
+// value of another type would pass the check unread: dockerd would refuse
+// it, but the gate does not count on that.
+func as[T any](name string, v any) (T, error) {
+	var t T
+	if v == nil {
+		return t, nil
+	}
+	t, ok := v.(T)
+	if !ok {
+		return t, fmt.Errorf("setting %s has the wrong type", name)
+	}
+	return t, nil
 }
 
 // isZero reports whether a decoded JSON value is unset: null, false, 0, "",

@@ -420,6 +420,23 @@ func TestGateRefusesHostReachingContainers(t *testing.T) {
 		"top-level bind":       `{"Image":"x","Binds":["/:/host"]}`,
 		"top-level unmasked":   `{"Image":"x","maskedpaths":[]}`,
 		"top-level driver":     `{"Image":"x","HostConfig":{},"VolumeDriver":"evil"}`,
+		// A checked setting of another type than the gate reads is refused,
+		// not passed on unread.
+		"host config list":  `{"Image":"x","HostConfig":[{"Privileged":true}]}`,
+		"networking string": `{"Image":"x","NetworkingConfig":"hostnet"}`,
+		"binds string":      `{"HostConfig":{"Binds":"/:/host"}}`,
+		"mounts object":     `{"HostConfig":{"Mounts":{"Type":"bind","Source":"/","Target":"/h"}}}`,
+		"mount source list": `{"HostConfig":{"Mounts":[{"Type":"volume","Source":["hostvol"],"Target":"/h"}]}}`,
+		"bind opts string":  `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + c.root + `","Target":"/h","BindOptions":"rshared"}]}}`,
+		"propagation list":  `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + c.root + `","Target":"/h","BindOptions":{"Propagation":["shared"]}}]}}`,
+		"volume opts list":  `{"HostConfig":{"Mounts":[{"Type":"volume","Source":"myvol","Target":"/h","VolumeOptions":[{"DriverConfig":{"Name":"x"}}]}]}}`,
+		"volumes from str":  `{"HostConfig":{"VolumesFrom":"other"}}`,
+		"volumes from num":  `{"HostConfig":{"VolumesFrom":[5]}}`,
+		"log config string": `{"HostConfig":{"LogConfig":"syslog"}}`,
+		"log type list":     `{"HostConfig":{"LogConfig":{"Type":["syslog"]}}}`,
+		"ipc mode list":     `{"HostConfig":{"IpcMode":["host"]}}`,
+		"cgroupns list":     `{"HostConfig":{"CgroupnsMode":["host"]}}`,
+		"network mode list": `{"HostConfig":{"NetworkMode":["host"]}}`,
 	} {
 		status, out := c.do("POST", "/v1.45/containers/create", body)
 		if status != http.StatusForbidden || !strings.Contains(out, "atelier gate:") {
@@ -981,6 +998,9 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/networks/create", `{"Name":"n","ConfigFrom":{"Network":"hostnet"}}`},
 		{"POST", "/networks/create", `{"Name":"n","Options":{"com.docker.network.bridge.name":""}}`},
 		{"POST", "/volumes/create", `{"Name":"evil","DriverOpts":{"type":""}}`},
+		{"POST", "/volumes/create", `{"Name":"evil","Driver":["nfs"]}`},
+		{"POST", "/networks/create", `{"Name":"n","Driver":["host"]}`},
+		{"POST", "/networks/create", `{"Name":"n","Scope":["swarm"]}`},
 		// API versions before 1.24 (Docker 24 and older) apply a
 		// HostConfig sent with a start.
 		{"POST", "/v1.23/containers/mine/start", `{"Privileged":true,"Binds":["/:/host"]}`},
@@ -1007,7 +1027,11 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/build?networkmode=default", ""},
 		{"POST", "/volumes/create", `{"Name":"data"}`},
 		{"POST", "/volumes/create", `{"Name":"data","DriverOpts":{}}`},
-		{"POST", "/networks/create", `{"Name":"n","Options":{},"ConfigFrom":null}`},
+		{"POST", "/networks/create", `{"Name":"n","Options":{},"ConfigFrom":null,"Driver":null,"Scope":null}`},
+		{"POST", "/volumes/create", `{"Name":"data","Driver":null}`},
+		{"POST", "/containers/create", `{"Image":"x","HostConfig":null,"NetworkingConfig":null}`},
+		{"POST", "/containers/create", `{"Image":"x","HostConfig":{"Binds":null,"Mounts":[{"Type":"tmpfs","Target":"/t","Source":null,"BindOptions":null,"VolumeOptions":null}],` +
+			`"VolumesFrom":null,"LogConfig":{"Type":null,"Config":null},"IpcMode":null,"CgroupnsMode":null,"NetworkMode":null}}`},
 		{"POST", "/containers/mine/start", ""},
 		{"POST", "/containers/mine/start", "{}"},
 		{"POST", "/containers/create", `{"Hostname":"h","Domainname":"d","User":"1000","AttachStdin":false,"AttachStdout":true,` +
