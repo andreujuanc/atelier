@@ -21,6 +21,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Labels the gate puts on Docker objects. Their value is the sandbox ID.
@@ -66,7 +69,11 @@ type Gate struct {
 	once   sync.Once
 	client *http.Client
 	proxy  *httputil.ReverseProxy
-	execs  sync.Map // exec IDs created through this gate
+
+	execMu  sync.Mutex
+	execs   map[string]bool // exec IDs created through this gate (see addExec)
+	execsAt int             // size of execs at which addExec prunes it next
+	pruning bool            // a pruneExecs runs
 
 	// volumes orders the task's requests that name volumes. A volume is
 	// the one object the gate forwards by name (its name is its ID), and
@@ -331,13 +338,61 @@ func (g *Gate) stream(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(conn, "HTTP/1.1 %s\r\n", resp.Status)
 	resp.Header.Write(conn)
 	io.WriteString(conn, "\r\n")
+	done := make(chan struct{})
+	defer close(done)
 	go func() { // client to daemon; when the client is done sending, say so and keep reading
 		io.Copy(back, client)
 		if c, ok := back.(*net.UnixConn); ok {
 			c.CloseWrite()
 		}
+		// ...until it hangs up: a quiet container would otherwise hold
+		// the stream until it next prints or exits.
+		if awaitHangup(conn, done) {
+			back.Close()
+		}
 	}()
 	io.Copy(conn, fromBack)
+}
+
+// hangupCheck is how often awaitHangup looks.
+const hangupCheck = 500 * time.Millisecond
+
+// awaitHangup waits until conn, a client that has stopped sending, hangs
+// up altogether, and reports whether it did; false once done is closed. A
+// unix socket tells that apart from a client that only shut its sending
+// side and still reads (docker run without -i): POLLHUP. Other conns are
+// not watched.
+func awaitHangup(conn net.Conn, done <-chan struct{}) bool {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return false
+	}
+	rc, err := uc.SyscallConn()
+	if err != nil {
+		return false
+	}
+	tick := time.NewTicker(hangupCheck)
+	defer tick.Stop()
+	for {
+		hup := false
+		err := rc.Control(func(fd uintptr) {
+			fds := []unix.PollFd{{Fd: int32(fd)}}
+			if n, _ := unix.Poll(fds, 0); n > 0 {
+				hup = fds[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0
+			}
+		})
+		switch {
+		case err != nil:
+			return false
+		case hup:
+			return true
+		}
+		select {
+		case <-done:
+			return false
+		case <-tick.C:
+		}
+	}
 }
 
 func decodeBody(r *http.Request) (map[string]any, error) {
@@ -523,6 +578,12 @@ func gateContainer(g *Gate, w http.ResponseWriter, r *http.Request, m []string) 
 		g.deny(w, r, http.StatusForbidden, "a container start takes no settings; they go in the create")
 		return
 	}
+	if action == "start" && slices.ContainsFunc(r.URL.Query()["checkpoint-dir"], func(s string) bool { return s != "" }) {
+		// Docker 17.09 and older (experimental) restore the container
+		// from a checkpoint in this host directory; later ones refuse it.
+		g.deny(w, r, http.StatusForbidden, "a checkpoint directory is not allowed")
+		return
+	}
 	if action == "rename" {
 		if err := checkName(r); err != nil {
 			g.deny(w, r, http.StatusForbidden, err.Error())
@@ -585,7 +646,7 @@ func gateVolume(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
 }
 
 func gateExec(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
-	if _, ok := g.execs.Load(m[1]); !ok {
+	if !g.ownExec(m[1]) {
 		g.deny(w, r, http.StatusForbidden, "this exec was not started by this task")
 		return
 	}
@@ -623,9 +684,59 @@ func gateExecCreate(g *Gate, w http.ResponseWriter, r *http.Request, m []string)
 	if status, out := g.relay(w, r, body); status == http.StatusCreated {
 		var created struct{ Id string }
 		if json.Unmarshal(out, &created) == nil && created.Id != "" {
-			g.execs.Store(created.Id, true)
+			g.addExec(created.Id)
 		}
 	}
+}
+
+// execsPruneMin is the least number of exec IDs the gate holds before it
+// looks for the ones the daemon has forgotten.
+const execsPruneMin = 256
+
+// ownExec reports whether exec id was created through this gate.
+func (g *Gate) ownExec(id string) bool {
+	g.execMu.Lock()
+	defer g.execMu.Unlock()
+	return g.execs[id]
+}
+
+// addExec records an exec created through this gate. The daemon forgets an
+// exec some minutes after it ended, or with its container; so that a long
+// task's execs do not pile up here, each time execs has doubled since it
+// was last pruned (and holds execsPruneMin), pruneExecs drops in the
+// background those the daemon no longer knows.
+func (g *Gate) addExec(id string) {
+	g.execMu.Lock()
+	defer g.execMu.Unlock()
+	if g.execs == nil {
+		g.execs = map[string]bool{}
+	}
+	g.execs[id] = true
+	if g.pruning || len(g.execs) < max(g.execsAt, execsPruneMin) {
+		return
+	}
+	g.pruning = true
+	go g.pruneExecs(slices.Collect(maps.Keys(g.execs)))
+}
+
+// pruneExecs drops those of ids whose inspect the daemon answers with a
+// 404: an exec it has forgotten, or one whose container is gone. Neither
+// comes back (IDs are not reused), so the gate refuses only what the
+// daemon would refuse anyway.
+func (g *Gate) pruneExecs(ids []string) {
+	var gone []string
+	for _, id := range ids {
+		if status, _, err := g.call("GET", "/exec/"+url.PathEscape(id)+"/json", nil); err == nil && status == http.StatusNotFound {
+			gone = append(gone, id)
+		}
+	}
+	g.execMu.Lock()
+	defer g.execMu.Unlock()
+	for _, id := range gone {
+		delete(g.execs, id)
+	}
+	g.execsAt = 2 * len(g.execs)
+	g.pruning = false
 }
 
 func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
@@ -1200,7 +1311,11 @@ func oneOf(s string, options ...string) bool {
 }
 
 // isZero reports whether a decoded JSON value is unset: null, false, 0, "",
-// or a list or object holding nothing but such values.
+// or an empty list or object. An object with a key is set, whatever its
+// value: the settings that are maps (sysctls, annotations, driver options)
+// act on a key with an empty value too (it overrides the daemon's default
+// sysctl; containerd's shim groups containers by an annotation whatever its
+// value).
 func isZero(v any) bool {
 	switch v := v.(type) {
 	case nil:
@@ -1215,12 +1330,7 @@ func isZero(v any) bool {
 	case []any:
 		return len(v) == 0
 	case map[string]any:
-		for _, item := range v {
-			if !isZero(item) {
-				return false
-			}
-		}
-		return true
+		return len(v) == 0
 	}
 	return false
 }

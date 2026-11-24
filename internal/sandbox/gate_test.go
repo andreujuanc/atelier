@@ -29,13 +29,18 @@ type daemon struct {
 	requests []string          // "METHOD path?query"
 	bodies   map[string]string // last body per "METHOD path"
 	objects  []*object
-	execIn   []string // IDs of the containers execs were created in
+	execIn   []string        // IDs of the containers execs were created in
+	execs    int             // execs created: the next one is new<execs+1>
+	execGone map[string]bool // execs the daemon has forgotten: their inspect is a 404
 	// onInspect, if set, runs before an inspect of an object is answered.
 	onInspect func(kind, ref string)
 	// volumesMissing are the volumes a container create named by name that
 	// did not exist when the create reached the daemon (which would create
 	// them itself, without the task's label).
 	volumesMissing []string
+	// attached are the daemon's ends of attach streams, in the order they
+	// came: a quiet container, until the test writes to one or closes it.
+	attached []net.Conn
 }
 
 type object struct {
@@ -57,7 +62,7 @@ const (
 
 func newDaemon(t *testing.T) (*daemon, string) {
 	t.Helper()
-	d := &daemon{bodies: map[string]string{}, objects: []*object{
+	d := &daemon{bodies: map[string]string{}, execGone: map[string]bool{}, objects: []*object{
 		{"containers", mineID, "mine", map[string]string{LabelTask: testID}},
 		{"containers", agentID, "agent", map[string]string{LabelAgent: testID}},
 		{"containers", otherID, "other", map[string]string{LabelTask: "someone-else"}},
@@ -80,7 +85,14 @@ func newDaemon(t *testing.T) (*daemon, string) {
 	}
 	srv := &http.Server{Handler: d}
 	go srv.Serve(l)
-	t.Cleanup(func() { srv.Close() })
+	t.Cleanup(func() {
+		srv.Close()
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for _, conn := range d.attached {
+			conn.Close()
+		}
+	})
 	return d, sock
 }
 
@@ -157,9 +169,31 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "POST" && len(parts) == 3 && parts[2] == "exec" && obj != nil:
 		d.mu.Lock()
 		d.execIn = append(d.execIn, obj.id)
+		d.execs++
+		id := fmt.Sprintf("new%d", d.execs)
 		d.mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
-		io.WriteString(w, `{"Id":"new1"}`)
+		fmt.Fprintf(w, `{"Id":%q}`, id)
+	case r.Method == "GET" && len(parts) == 3 && parts[0] == "exec" && parts[2] == "json":
+		d.mu.Lock()
+		gone := d.execGone[parts[1]]
+		d.mu.Unlock()
+		if gone {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"message":"no such exec"}`)
+			return
+		}
+		io.WriteString(w, `{}`)
+	case r.Method == "POST" && len(parts) == 3 && parts[2] == "attach" && obj != nil:
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		d.mu.Lock()
+		d.attached = append(d.attached, conn)
+		d.mu.Unlock()
+		io.WriteString(conn, "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\n"+
+			"Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
 	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/create"):
 		w.WriteHeader(http.StatusCreated)
 		io.WriteString(w, `{"Id":"new1"}`)
@@ -354,6 +388,11 @@ func TestGateRefusesHostReachingContainers(t *testing.T) {
 		"unmasked paths":       `{"HostConfig":{"MaskedPaths":[]}}`,
 		"runtime":              `{"HostConfig":{"Runtime":"other"}}`,
 		"sysctls":              `{"HostConfig":{"Sysctls":{"kernel.x":"1"}}}`,
+		"empty sysctl":         `{"HostConfig":{"Sysctls":{"net.ipv4.ip_unprivileged_port_start":""}}}`,
+		"shim group":           `{"HostConfig":{"Annotations":{"io.containerd.runc.v2.group":""}}}`,
+		"empty storage opt":    `{"HostConfig":{"StorageOpt":{"size":""}}}`,
+		"empty volume opt":     `{"HostConfig":{"Mounts":[{"Type":"volume","Source":"myvol","Target":"/e","VolumeOptions":{"DriverConfig":{"Options":{"type":""}}}}]}}`,
+		"top-level sysctl":     `{"Image":"x","Sysctls":{"net.ipv4.ip_unprivileged_port_start":""}}`,
 		"unknown setting":      `{"HostConfig":{"FutureHostThing":"x"}}`,
 		"another's network":    `{"HostConfig":{"NetworkMode":"hostnet"}}`,
 		"another's endpoint":   `{"NetworkingConfig":{"EndpointsConfig":{"hostnet":{}}}}`,
@@ -536,6 +575,105 @@ func TestGateOwnership(t *testing.T) {
 	if b := c.d.body("POST /v1.45/networks/" + mynetID + "/connect"); !strings.Contains(b, `"NetworkID":"`+mynetID+`"`) ||
 		!strings.Contains(b, `"Container":"`+agentID+`"`) {
 		t.Errorf("connect body = %s", b)
+	}
+}
+
+// TestGateForgetsGoneExecs: the daemon forgets an exec some minutes after
+// it ended (or with its container), and so does the gate, once it has seen
+// enough new ones: a task that runs docker exec in a loop does not grow it
+// without bound. The execs the daemon still knows stay the task's.
+func TestGateForgetsGoneExecs(t *testing.T) {
+	c := newGate(t)
+	create := func() string {
+		t.Helper()
+		status, out := c.do("POST", "/containers/mine/exec", `{"Cmd":["true"]}`)
+		var created struct{ Id string }
+		if status != http.StatusCreated || json.Unmarshal([]byte(out), &created) != nil {
+			t.Fatalf("exec create: %d %s", status, out)
+		}
+		return created.Id
+	}
+	gone, kept := create(), create()
+	c.d.mu.Lock()
+	c.d.execGone[gone] = true
+	c.d.mu.Unlock()
+	for range execsPruneMin {
+		create()
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if status, _ := c.do("GET", "/exec/"+gone+"/json", ""); status == http.StatusForbidden {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the gate still holds an exec the daemon has forgotten")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status, out := c.do("GET", "/exec/"+kept+"/json", ""); status != http.StatusOK {
+		t.Errorf("an exec the daemon still knows: %d %s", status, out)
+	}
+}
+
+// TestGateAttachEndsWithTheClient: an attach stream lasts as long as its
+// client. One that only stops sending (docker run without -i) still gets
+// what the container prints; one that hangs up ends the stream, even of a
+// container that prints nothing, instead of holding the gate's handler and
+// the daemon's attach until the container writes or exits.
+func TestGateAttachEndsWithTheClient(t *testing.T) {
+	d, upstream := newDaemon(t)
+	g := &Gate{ID: testID, Root: t.TempDir(), Upstream: upstream}
+	ended := make(chan struct{}, 2)
+	sock := filepath.Join(t.TempDir(), "gate.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.ServeHTTP(w, r)
+		ended <- struct{}{}
+	})}
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+	attach := func() (client *net.UnixConn, in *bufio.Reader, container net.Conn) {
+		t.Helper()
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		io.WriteString(conn, "POST /v1.45/containers/mine/attach?stream=1&stdout=1 HTTP/1.1\r\nHost: d\r\n"+
+			"Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+		in = bufio.NewReader(conn)
+		resp, err := http.ReadResponse(in, nil)
+		if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("attach: %v %v", resp, err)
+		}
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return conn.(*net.UnixConn), in, d.attached[len(d.attached)-1]
+	}
+
+	client, in, container := attach()
+	client.CloseWrite()
+	time.Sleep(3 * hangupCheck)
+	io.WriteString(container, "late\n")
+	if line, err := in.ReadString('\n'); line != "late\n" {
+		t.Errorf("after the client stopped sending, it got %q, %v; want the container's output", line, err)
+	}
+	container.Close()
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream did not end with the container's")
+	}
+
+	client, _, _ = attach()
+	client.Close()
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream of a quiet container outlived its client")
 	}
 }
 
@@ -830,9 +968,14 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/networks/create", `{"Name":"n","Driver":"host"}`},
 		{"POST", "/networks/create", `{"Name":"n","Options":{"com.docker.network.bridge.name":"docker0"}}`},
 		{"POST", "/networks/create", `{"Name":"n","ConfigFrom":{"Network":"hostnet"}}`},
+		{"POST", "/networks/create", `{"Name":"n","Options":{"com.docker.network.bridge.name":""}}`},
+		{"POST", "/volumes/create", `{"Name":"evil","DriverOpts":{"type":""}}`},
 		// API versions before 1.24 (Docker 24 and older) apply a
 		// HostConfig sent with a start.
 		{"POST", "/v1.23/containers/mine/start", `{"Privileged":true,"Binds":["/:/host"]}`},
+		// Docker 17.09 and older (experimental) restore a checkpoint from
+		// any host directory.
+		{"POST", "/containers/mine/start?checkpoint=c1&checkpoint-dir=" + url.QueryEscape(c.root+"/cp"), ""},
 	} {
 		before := len(c.d.requests)
 		if status, out := c.do(tc.method, tc.uri, tc.body); status != http.StatusForbidden {
@@ -852,13 +995,15 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/images/create?fromImage=postgres&tag=17", ""},
 		{"POST", "/build?networkmode=default", ""},
 		{"POST", "/volumes/create", `{"Name":"data"}`},
+		{"POST", "/volumes/create", `{"Name":"data","DriverOpts":{}}`},
+		{"POST", "/networks/create", `{"Name":"n","Options":{},"ConfigFrom":null}`},
 		{"POST", "/containers/mine/start", ""},
 		{"POST", "/containers/mine/start", "{}"},
 		{"POST", "/containers/create", `{"Hostname":"h","Domainname":"d","User":"1000","AttachStdin":false,"AttachStdout":true,` +
 			`"AttachStderr":true,"ExposedPorts":{"5432/tcp":{}},"Tty":true,"OpenStdin":true,"StdinOnce":false,"Env":["A=1"],` +
 			`"Cmd":["x"],"Healthcheck":{"Test":["NONE"]},"ArgsEscaped":false,"Image":"postgres","Volumes":{"/d":{}},` +
 			`"WorkingDir":"/","Entrypoint":["sh"],"NetworkDisabled":false,"MacAddress":"","OnBuild":null,"Labels":{},` +
-			`"StopSignal":"SIGINT","StopTimeout":5,"Shell":["sh"],"HostConfig":{},"NetworkingConfig":{}}`},
+			`"StopSignal":"SIGINT","StopTimeout":5,"Shell":["sh"],"HostConfig":{"Sysctls":{},"Annotations":null},"NetworkingConfig":{}}`},
 		{"POST", "/networks/create", `{"Name":"n","Driver":"bridge","IPAM":{"Config":[{"Subnet":"10.1.0.0/24"}]}}`},
 	} {
 		if status, out := c.do(tc.method, tc.uri, tc.body); status >= 400 {

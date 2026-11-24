@@ -140,14 +140,15 @@ const maxAtlOutput = 16 << 20
 // a request beyond it is refused at once.
 const maxAtlRunning = 3
 
-// atlWriteTimeout bounds each reply write of an atl request.
-const atlWriteTimeout = 30 * time.Second
+// replyWriteTimeout bounds each reply write of an atl request or a task
+// operation.
+const replyWriteTimeout = 30 * time.Second
 
 func (c *Control) writeTimeout() time.Duration {
 	if c.WriteTimeout > 0 {
 		return c.WriteTimeout
 	}
-	return atlWriteTimeout
+	return replyWriteTimeout
 }
 
 // MaxCopy bounds what a task can put in the user's clipboard at once: 1 MiB,
@@ -187,8 +188,8 @@ type Control struct {
 	// CommandPath of the command it runs ("atl notes") and whether that
 	// reads stdin (notes --set); an error refuses the request.
 	Resolve func(argv []string) (path string, readsStdin bool, err error)
-	// WriteTimeout bounds each reply write of an atl request (a client that
-	// stops reading); 0 → atlWriteTimeout.
+	// WriteTimeout bounds each reply write of an atl request or a task
+	// operation (a client that stops reading); 0 → replyWriteTimeout.
 	WriteTimeout time.Duration
 
 	atlOnce  sync.Once
@@ -322,12 +323,20 @@ func (c *Control) argv(req ControlRequest) []string {
 type replyWriter struct {
 	mu  sync.Mutex
 	enc *json.Encoder
-	// conn and perWrite, when set (the assistant's atl op), bound each
-	// write: a client that stops reading cannot hold the gate. After a write
-	// fails, the rest is dropped.
+	// conn and perWrite, when set (see bound), bound each write: a client
+	// that stops reading cannot hold the gate. After a write fails, the
+	// rest is dropped.
 	conn     net.Conn
 	perWrite time.Duration
 	broken   bool
+}
+
+// bound has each write from now on (an atl request's, a task operation's
+// replies) give up after perWrite on conn.
+func (w *replyWriter) bound(conn net.Conn, perWrite time.Duration) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.conn, w.perWrite = conn, perWrite
 }
 
 func (w *replyWriter) send(r controlReply) {
@@ -514,9 +523,7 @@ func (c *Control) atl(conn net.Conn, in *bufio.Reader, out *replyWriter, req Con
 	lim := &outputLimit{left: maxAtlOutput}
 	stdout, stderr := lim.writer(out), lim.writer(stderrWriter{out})
 	c.logf("run   atl %s (for the assistant)", sub)
-	out.mu.Lock()
-	out.conn, out.perWrite = conn, c.writeTimeout()
-	out.mu.Unlock()
+	out.bound(conn, c.writeTimeout())
 	code := c.run(in, argv, bytes.NewReader(stdin), stdout, stderr)
 	release() // the process is done: its slot is free, whatever the client does now
 	if lim.cut() {
@@ -584,6 +591,7 @@ func (c *Control) task(conn net.Conn, in *bufio.Reader, out *replyWriter, req Co
 		return
 	}
 	conn.SetReadDeadline(time.Time{})
+	out.bound(conn, c.writeTimeout()) // a client that stops reading holds no slot
 	code := c.Task.Do(req, body, out, stderrWriter{out})
 	out.exit(code, req.Op)
 }
