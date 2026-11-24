@@ -411,30 +411,11 @@ func (a *App) buildTaskDir(ctx context.Context, t *model.Task, plan []rwCheckout
 		}
 		name := c.Repo.Name
 		wt := a.Paths.WorktreePath(t.Slug, name)
-		repo := a.Paths.RepoPath(name)
-		_, berr := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
-		branchExisted := berr == nil
-		var err error
-		if c.Existing {
-			err = a.addBranchWorktree(ctx, name, repo, wt, t.Branch)
-		} else {
-			err = a.addWorktree(ctx, name, repo, wt, t.Branch, c.Start)
-		}
+		createdBranch, err := a.addTaskWorktree(ctx, name, wt, t.Branch, c.Start, c.Existing)
 		if err != nil {
-			// git may have created the branch (and worktree) before failing,
-			// e.g. when the checkout fails: undo only what this call
-			// verifiably created. "already exists" means git refused up
-			// front and whatever is there belongs to someone else.
-			if !strings.Contains(err.Error(), "already exists") {
-				_, werr := os.Lstat(wt)
-				_, nberr := gitx.RevParse(context.WithoutCancel(ctx), repo, "refs/heads/"+t.Branch)
-				createdWT, createdBr := werr == nil, !branchExisted && nberr == nil
-				// A missing worktree is only pruned.
-				a.undoWorktree(ctx, name, wt, t.Branch, createdWT || !branchExisted, createdBr)
-			}
 			return nil, fmt.Errorf("repo %s: %w", name, err)
 		}
-		created = append(created, made{name, wt, !branchExisted})
+		created = append(created, made{name, wt, createdBranch})
 	}
 	if err := gen.WriteClaudeMD(dir, *t, a.repoInfos(t)); err != nil {
 		return nil, err

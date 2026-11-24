@@ -201,24 +201,9 @@ func (a *App) addRepoLocked(ctx context.Context, id int64, name string, mode mod
 		if err := os.MkdirAll(a.Paths.TaskDir(t.Slug), 0o755); err != nil {
 			return nil, fmt.Errorf("create task dir: %w", err)
 		}
-		_, berr := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
-		branchExisted := berr == nil
-		if err := a.addWorktree(ctx, name, repo, wt, t.Branch, tr.BaseCommit); err != nil {
-			// git may have created the branch (and worktree) before
-			// failing, e.g. when the checkout fails: undo only what this
-			// call verifiably created. "already exists" means git refused
-			// up front and whatever is there belongs to someone else.
-			if !strings.Contains(err.Error(), "already exists") {
-				_, werr := os.Lstat(wt)
-				_, nberr := gitx.RevParse(context.WithoutCancel(ctx), repo, "refs/heads/"+t.Branch)
-				createdWT, createdBr := werr == nil, !branchExisted && nberr == nil
-				if createdWT || createdBr {
-					a.undoWorktree(ctx, name, wt, t.Branch, createdWT, createdBr)
-				}
-			}
+		if createdBranch, err = a.addTaskWorktree(ctx, name, wt, t.Branch, tr.BaseCommit, false); err != nil {
 			return nil, fmt.Errorf("repo %s: %w", name, err)
 		}
-		createdBranch = !branchExisted
 		if afterWorktreeAdd != nil {
 			afterWorktreeAdd(wt)
 		}
@@ -282,6 +267,40 @@ func (a *App) addRepoLocked(ctx context.Context, id int64, name string, mode mod
 // afterWorktreeAdd, if set (tests only), runs in AddRepo between the
 // worktree's creation and the repo's insert.
 var afterWorktreeAdd func(wt string)
+
+// addTaskWorktree adds worktree wt of rw repo name on the task branch:
+// the existing local branch (existing) or a new one at start. It reports
+// whether it created the branch. On failure it undoes only what it
+// verifiably created: git may create the branch (and worktree) before
+// failing, e.g. when the checkout fails; "already exists" means git
+// refused up front and whatever is there belongs to someone else. If it
+// cannot tell whether the branch exists beforehand, it adds nothing: a
+// branch that is there would otherwise be deleted as its own.
+func (a *App) addTaskWorktree(ctx context.Context, name, wt, branch, start string, existing bool) (createdBranch bool, err error) {
+	repo := a.Paths.RepoPath(name)
+	branchExisted, err := gitx.RefExists(ctx, repo, "refs/heads/"+branch)
+	if err != nil {
+		return false, err
+	}
+	if existing {
+		err = a.addBranchWorktree(ctx, name, repo, wt, branch)
+	} else {
+		err = a.addWorktree(ctx, name, repo, wt, branch, start)
+	}
+	if err == nil {
+		return !branchExisted, nil
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		_, werr := os.Lstat(wt)
+		createdBr := false
+		if !branchExisted {
+			createdBr, _ = gitx.RefExists(context.WithoutCancel(ctx), repo, "refs/heads/"+branch)
+		}
+		// A missing worktree is only pruned.
+		a.undoWorktree(ctx, name, wt, branch, werr == nil || !branchExisted, createdBr)
+	}
+	return false, err
+}
 
 // undoWorktree removes (if removeWT) worktree wt of repo name and, if
 // deleteBranch and the branch exists, deletes it; failures are warnings.

@@ -1049,3 +1049,33 @@ func TestFinishRefusesOrphanCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A failed check whether the task branch exists (here: ctx cancelled) is
+// not "it did not exist": the worktree is not attempted, and the kept
+// branch, with its unpushed commit, is not deleted as if this call had
+// made it.
+func TestBuildTaskDirKeepsBranchOnFailedProbe(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "kept", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := e.commitIn(t, task.Slug, "api", "work")
+	if _, err := e.app.Done(ctx, task.Slug, false); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	plan := []rwCheckout{{Repo: task.Repos[0], Existing: true}}
+	if _, err := e.app.buildTaskDir(cancelled, task, plan, true); err == nil {
+		t.Fatal("buildTaskDir worked with a cancelled ctx")
+	}
+	if got := git(t, e.canonical("api"), "rev-parse", "refs/heads/atl/kept"); got != kept {
+		t.Fatalf("kept branch at %s, want %s", got, kept)
+	}
+	if exists(e.app.Paths.TaskDir(task.Slug)) {
+		t.Fatal("task dir left behind")
+	}
+}
