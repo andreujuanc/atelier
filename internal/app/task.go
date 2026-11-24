@@ -126,12 +126,11 @@ func (a *App) mergeRepos(o NewTaskOpts) ([]model.TaskRepo, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, r := range pr.Repos {
-			if o.ExactRepos {
-				break
-			}
-			if err := add(r.Name, r.Mode); err != nil {
-				return nil, err
+		if !o.ExactRepos {
+			for _, r := range pr.Repos {
+				if err := add(r.Name, r.Mode); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -205,8 +204,10 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 	if title == "" {
 		return nil, errors.New("title is required")
 	}
-	// The same cap as a rename, so `atl rename`/TUI `t` can always resave it.
-	if err := model.CheckTitleLen(title); err != nil {
+	// Then the checks of a rename (other control characters, UTF-8, the
+	// length cap), so `atl rename`/TUI `t` can always resave it.
+	title, err := model.NormalizeTitle(title)
+	if err != nil {
 		return nil, err
 	}
 	o.Project = strings.TrimSpace(o.Project)
@@ -261,8 +262,8 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 		a.warnf("%s", w)
 	}
 	avoid := store.Avoid{SlugTaken: a.slugTaken(ctx, repos)}
-	for _, o := range others.Tasks {
-		avoid.PortOffsets = append(avoid.PortOffsets, o.PortOffset)
+	for _, ot := range others.Tasks {
+		avoid.PortOffsets = append(avoid.PortOffsets, ot.PortOffset)
 	}
 	if err := a.Store.CreateTaskAutoPort(ctx, t, avoid); err != nil {
 		return nil, err
@@ -411,30 +412,11 @@ func (a *App) buildTaskDir(ctx context.Context, t *model.Task, plan []rwCheckout
 		}
 		name := c.Repo.Name
 		wt := a.Paths.WorktreePath(t.Slug, name)
-		repo := a.Paths.RepoPath(name)
-		_, berr := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
-		branchExisted := berr == nil
-		var err error
-		if c.Existing {
-			err = a.addBranchWorktree(ctx, name, repo, wt, t.Branch)
-		} else {
-			err = a.addWorktree(ctx, name, repo, wt, t.Branch, c.Start)
-		}
+		createdBranch, err := a.addTaskWorktree(ctx, name, wt, t.Branch, c.Start, c.Existing)
 		if err != nil {
-			// git may have created the branch (and worktree) before failing,
-			// e.g. when the checkout fails: undo only what this call
-			// verifiably created. "already exists" means git refused up
-			// front and whatever is there belongs to someone else.
-			if !strings.Contains(err.Error(), "already exists") {
-				_, werr := os.Lstat(wt)
-				_, nberr := gitx.RevParse(context.WithoutCancel(ctx), repo, "refs/heads/"+t.Branch)
-				createdWT, createdBr := werr == nil, !branchExisted && nberr == nil
-				// A missing worktree is only pruned.
-				a.undoWorktree(ctx, name, wt, t.Branch, createdWT || !branchExisted, createdBr)
-			}
 			return nil, fmt.Errorf("repo %s: %w", name, err)
 		}
-		created = append(created, made{name, wt, !branchExisted})
+		created = append(created, made{name, wt, createdBranch})
 	}
 	if err := gen.WriteClaudeMD(dir, *t, a.repoInfos(t)); err != nil {
 		return nil, err
@@ -614,7 +596,9 @@ func (a *App) Get(ctx context.Context, ref string) (*TaskView, error) {
 // SetStatus changes a task's status. Between open statuses, between closed
 // ones (done ↔ cancelled) and from open to closed it changes nothing else
 // (closing with cleanup is Done/Cancel). From closed to open it reopens the
-// task (see reopen).
+// task (see reopen). It decides under the per-task lock, as done, cancel
+// and reopen hold it: an open status set while done runs would otherwise
+// mark the task it just closed open, without its worktrees.
 func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error {
 	if !st.Valid() {
 		return fmt.Errorf("invalid status %q", st)
@@ -623,15 +607,23 @@ func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error 
 	if err != nil {
 		return err
 	}
+	unlock, err := a.lockTask(ctx, t.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
+		return err
+	}
 	if t.Status.Open() || !st.Open() {
 		return a.Store.SetTaskStatus(ctx, t.ID, st)
 	}
-	return a.reopen(ctx, t.ID, st)
+	return a.reopen(ctx, t, st)
 }
 
-// reopen brings closed task id back to the state a new task has, and then
-// sets its status to the open status to; under the per-task lock, like
-// finish. For each rw repo it makes the worktree on the task branch
+// reopen brings closed task t back to the state a new task has, and then
+// sets its status to the open status to; the caller holds the per-task
+// lock (SetStatus). For each rw repo it makes the worktree on the task branch
 // (buildTaskDir): on the local branch if the canonical clone still has it
 // (done/cancel keep a branch with unpushed commits); else, after a fetch,
 // on a new one from origin/<branch> if origin has it; else on a new one
@@ -643,21 +635,9 @@ func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error 
 // project's setup in each new worktree (a failure is a warning). If a step
 // fails, what this call made is undone, the task stays closed and the error
 // says what failed.
-func (a *App) reopen(ctx context.Context, id int64, to model.Status) error {
+func (a *App) reopen(ctx context.Context, t *model.Task, to model.Status) error {
 	if err := outsideSandbox("reopen a task"); err != nil {
 		return err
-	}
-	unlock, err := a.lockTask(ctx, id)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	t, err := a.Store.GetTask(ctx, id)
-	if err != nil {
-		return err
-	}
-	if t.Status.Open() { // reopened meanwhile
-		return a.Store.SetTaskStatus(ctx, t.ID, to)
 	}
 	fail := func(err error) error {
 		return fmt.Errorf("reopen task %s: %w (it stays %s)", t.Slug, err, t.Status)
@@ -678,6 +658,22 @@ func (a *App) reopen(ctx context.Context, id int64, to model.Status) error {
 	// a container left from before would have the old task dir mounted.
 	if a.Sandbox != nil || fileExists(a.Paths.RunDir(t.Slug)) {
 		a.removeSandbox(ctx, t)
+	}
+	// A worktree removed by hand (the task closed with `atl status`, say)
+	// is still registered in git, which refuses to add it again until it
+	// is pruned. Only a path still missing is pruned, and only now that
+	// nothing of the task runs to put something there.
+	for _, c := range plan {
+		if c.Keep {
+			continue
+		}
+		wt := a.Paths.WorktreePath(t.Slug, c.Repo.Name)
+		if _, err := os.Lstat(wt); !errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err := gitx.RemoveWorktree(ctx, a.Paths.RepoPath(c.Repo.Name), wt, false); err != nil {
+			return fail(fmt.Errorf("repo %s: prune worktrees: %w", c.Repo.Name, err))
+		}
 	}
 	undo, err := a.buildTaskDir(ctx, t, plan, true)
 	if err != nil {
