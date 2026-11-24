@@ -3,6 +3,7 @@ package nofollow
 import (
 	"errors"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -141,5 +142,16 @@ func TestOpenRefusesASymlink(t *testing.T) {
 	_, root, _, _ := setup(t)
 	if _, err := Open(filepath.Join(root, "dirlink")); !errors.Is(err, ErrSymlink) {
 		t.Errorf("Open(dirlink) = %v, want ErrSymlink", err)
+	}
+}
+
+// A unix socket, which open(2) refuses with ENXIO, is ErrNotRegular too.
+func TestOpenFileRefusesASocket(t *testing.T) {
+	d, root, _, _ := setup(t)
+	l, err := net.Listen("unix", filepath.Join(root, "sock"))
+	must(t, err)
+	defer l.Close()
+	if _, err := d.ReadFile("sock", 100); !errors.Is(err, ErrNotRegular) {
+		t.Errorf("ReadFile(sock) = %v, want ErrNotRegular", err)
 	}
 }

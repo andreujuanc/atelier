@@ -59,7 +59,9 @@ RUN (getent group "$GID" || groupadd -g "$GID" "$USERNAME") \
     && useradd -m -u "$UID" -g "$GID" -s /bin/bash "$USERNAME"
 
 USER $USERNAME
-RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
+    && bash /tmp/claude-install.sh \
+    && rm /tmp/claude-install.sh
 ENV PATH=/home/$USERNAME/.local/bin:$PATH
 WORKDIR /home/$USERNAME
 

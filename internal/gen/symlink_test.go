@@ -1,6 +1,7 @@
 package gen
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,5 +125,27 @@ func TestWriteClaudeMDSymlink(t *testing.T) {
 	checkUntouched(t, victim, orig)
 	if fi, err := os.Lstat(filepath.Join(taskDir, "CLAUDE.md")); err != nil || !fi.Mode().IsRegular() {
 		t.Errorf("CLAUDE.md: %v, %v; want a regular file", fi, err)
+	}
+}
+
+// settings.json a unix socket (the task can make one): like any file that
+// is not a regular one, it is replaced as if it were missing.
+func TestWriteSettingsSettingsSocket(t *testing.T) {
+	taskDir := t.TempDir()
+	cdir := filepath.Join(taskDir, ".claude")
+	if err := os.MkdirAll(cdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(cdir, "settings.json")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := WriteSettings(taskDir, "/run/atl/bin/atl"); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Lstat(path); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("settings.json: %v, %v; want a regular file", fi, err)
 	}
 }

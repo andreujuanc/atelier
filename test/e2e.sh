@@ -6,7 +6,7 @@
 # python3. Run from anywhere: test/e2e.sh. Prints "E2E OK" on success.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 STUBS="$ROOT/test/stubs"
 
 fail() {
