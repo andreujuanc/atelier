@@ -917,7 +917,10 @@ func TestListTasksConsistentRepos(t *testing.T) {
 // of failing at once with SQLITE_BUSY when it switches the file to WAL.
 func TestOpenWaitsForWALSwitch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fresh.db")
-	db, err := sql.Open("sqlite", path) // rollback journal, like a fresh file
+	// Rollback journal, like a fresh file; and a busy timeout, like every
+	// connection of atl: its COMMIT waits for the read lock that each of
+	// Open's tries of the switch takes.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
 	}

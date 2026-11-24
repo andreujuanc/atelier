@@ -138,9 +138,10 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 // NewSession creates a session row (state idle) for the task, launches a
 // Claude window for it in the task's tmux session and records the window.
 //
-// The row exists before its window and has an empty tmux target until the
-// launch is recorded; Recover never touches live rows without a target, so a
-// concurrent Recover cannot mark the session stopped mid-launch. The window is
+// The row exists (named after its window) before its window and has an
+// empty tmux target until the launch is recorded; Recover leaves such a row
+// alone while the task's launch lock is held, so a concurrent Recover cannot
+// mark the session stopped mid-launch. The window is
 // recorded with a targeted update (SetSessionLaunch) so that a claude session
 // id or state written meanwhile by a hook is never clobbered.
 func (a *App) NewSession(ctx context.Context, ref string) (*model.Session, error) {
@@ -155,10 +156,9 @@ func (a *App) NewSession(ctx context.Context, ref string) (*model.Session, error
 	defer unlock()
 	now := a.now()
 	s := &model.Session{TaskID: t.ID, State: model.StateIdle, CreatedAt: now, LastEventAt: now}
-	if err := a.Store.CreateSession(ctx, s); err != nil {
+	if err := a.Store.CreateNamedSession(ctx, s, windowName); err != nil {
 		return nil, err
 	}
-	s.Name = windowName(s.ID)
 	win, err := a.launch(ctx, t, s, dir, "")
 	if err != nil {
 		if serr := a.Store.SetSessionState(context.WithoutCancel(ctx), s.ID, model.StateEnded, a.now()); serr != nil {
