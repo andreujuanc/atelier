@@ -145,13 +145,9 @@ func (s *Store) UpdateSession(ctx context.Context, sess *model.Session) error {
 		return fmt.Errorf("store: invalid session state %q", sess.State)
 	}
 	last := normTime(sess.LastEventAt)
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET claude_session_id = ?, tmux_target = ?,
+	if err := s.execOne(ctx, "session", sess.ID, `UPDATE sessions SET claude_session_id = ?, tmux_target = ?,
 		name = ?, state = ?, last_event_at = ?, background = '' WHERE id = ?`,
-		sess.ClaudeSessionID, sess.TmuxTarget, sess.Name, string(sess.State), toMS(last), sess.ID)
-	if err != nil {
-		return err
-	}
-	if err := checkAffected(res, "session", sess.ID); err != nil {
+		sess.ClaudeSessionID, sess.TmuxTarget, sess.Name, string(sess.State), toMS(last), sess.ID); err != nil {
 		return err
 	}
 	sess.LastEventAt = last
@@ -166,23 +162,15 @@ func (s *Store) SetSessionState(ctx context.Context, id int64, st model.SessionS
 	if !st.Valid() {
 		return fmt.Errorf("store: invalid session state %q", st)
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET state = ?, last_event_at = ?, background = '' WHERE id = ?`,
+	return s.execOne(ctx, "session", id, `UPDATE sessions SET state = ?, last_event_at = ?, background = '' WHERE id = ?`,
 		string(st), toMS(normTime(at)), id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "session", id)
 }
 
 // SetIdle sets a session idle (last_event_at = at, now if zero) with the
 // background work its Claude still has in flight, one per line ("": none).
 func (s *Store) SetIdle(ctx context.Context, id int64, background string, at time.Time) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET state = 'idle', last_event_at = ?, background = ? WHERE id = ?`,
+	return s.execOne(ctx, "session", id, `UPDATE sessions SET state = 'idle', last_event_at = ?, background = ? WHERE id = ?`,
 		toMS(normTime(at)), background, id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "session", id)
 }
 
 // Launch identifies one launch of a live session's window, as observed by
@@ -256,12 +244,8 @@ func (s *Store) ClaimFrom(ctx context.Context, id int64, from model.SessionState
 // bumps its launch sequence, leaving every other column (state,
 // claude_session_id, ...) untouched.
 func (s *Store) SetSessionLaunch(ctx context.Context, id int64, tmuxTarget, name string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET tmux_target = ?, name = ?,
+	return s.execOne(ctx, "session", id, `UPDATE sessions SET tmux_target = ?, name = ?,
 		launch_seq = launch_seq + 1 WHERE id = ?`, tmuxTarget, name, id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "session", id)
 }
 
 // changed runs a conditional UPDATE and reports whether it changed a row.
@@ -279,24 +263,16 @@ func (s *Store) changed(ctx context.Context, query string, args ...any) (bool, e
 // every other column untouched. It works from any state (resume of a stopped
 // or ended session).
 func (s *Store) SetClaudeSession(ctx context.Context, id int64, claudeSessionID string, at time.Time) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET claude_session_id = ?, state = 'idle',
+	return s.execOne(ctx, "session", id, `UPDATE sessions SET claude_session_id = ?, state = 'idle',
 		last_event_at = ?, background = '' WHERE id = ?`, claudeSessionID, toMS(normTime(at)), id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "session", id)
 }
 
 // SetClaudeSessionID records a new Claude session id (e.g. after
 // auto-compaction) and sets last_event_at (now if at is zero), leaving state
 // and every other column untouched.
 func (s *Store) SetClaudeSessionID(ctx context.Context, id int64, claudeSessionID string, at time.Time) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET claude_session_id = ?, last_event_at = ? WHERE id = ?`,
+	return s.execOne(ctx, "session", id, `UPDATE sessions SET claude_session_id = ?, last_event_at = ? WHERE id = ?`,
 		claudeSessionID, toMS(normTime(at)), id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "session", id)
 }
 
 // SetStateIf moves a session from state from to state to (last_event_at =
@@ -312,23 +288,15 @@ func (s *Store) SetStateIf(ctx context.Context, id int64, from, to model.Session
 
 // TouchSession sets a session's last_event_at (now if at is zero) only.
 func (s *Store) TouchSession(ctx context.Context, id int64, at time.Time) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET last_event_at = ? WHERE id = ?`,
+	return s.execOne(ctx, "session", id, `UPDATE sessions SET last_event_at = ? WHERE id = ?`,
 		toMS(normTime(at)), id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "session", id)
 }
 
 // SetTranscriptPath records the Claude Code transcript file of a session
 // (reported by every SessionStart hook), leaving every other column
 // untouched.
 func (s *Store) SetTranscriptPath(ctx context.Context, id int64, path string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET transcript_path = ? WHERE id = ?`, path, id)
-	if err != nil {
-		return err
-	}
-	return checkAffected(res, "session", id)
+	return s.execOne(ctx, "session", id, `UPDATE sessions SET transcript_path = ? WHERE id = ?`, path, id)
 }
 
 // SetTranscriptPathIfEmpty records a session's transcript file only if none

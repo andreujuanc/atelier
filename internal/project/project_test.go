@@ -72,6 +72,9 @@ func TestLoadInvalid(t *testing.T) {
 		"mode":      "[[repos]]\nname = \"a\"\nmode = \"rx\"\n",
 		"dup":       "[[repos]]\nname = \"a\"\n[[repos]]\nname = \"a\"\nmode = \"ro\"\n",
 		"unknown":   "setpu = \"x\"\n",
+		"envempty":  "[env]\n\"\" = \"x\"\n",
+		"envequals": "[env]\n\"ATL_SESSION=1\" = \"\"\n",
+		"envnul":    "[env]\nA = \"x\\u0000y\"\n",
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -639,21 +638,13 @@ func TestSessionStartContextLatency(t *testing.T) {
 	ctxTask(t, f, 20)
 	f.st.Close()
 	in := `{"session_id":"c-lat","cwd":"` + f.p.TaskDir("ctx") + `","hook_event_name":"SessionStart","source":"startup"}`
-	runMain(t, "SessionStart", in) // warm the page cache
-	var walls []time.Duration
-	for i := 0; i < 7; i++ {
+	checkLatency(t, "SessionStart+context hook", func() time.Duration {
 		exit, out, errOut, wall := runMain(t, "SessionStart", in)
 		if exit != 0 || errOut != "" || !strings.Contains(sessionStartContext(t, out), "note 20") {
 			t.Fatalf("exit=%d stdout=%q stderr=%q", exit, out, errOut)
 		}
-		walls = append(walls, wall)
-	}
-	sort.Slice(walls, func(i, j int) bool { return walls[i] < walls[j] })
-	median := walls[len(walls)/2]
-	t.Logf("SessionStart+context hook wall time (re-exec of test binary): min %v, median %v, max %v", walls[0], median, walls[len(walls)-1])
-	if median > 200*time.Millisecond {
-		t.Errorf("median hook latency %v exceeds 200ms", median)
-	}
+		return wall
+	})
 	if log := readLog(t, f.p); log != "" {
 		t.Errorf("unexpected errors logged: %s", log)
 	}

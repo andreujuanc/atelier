@@ -186,13 +186,35 @@ func (d db) serve(event string, data []byte, readErr error, landings []candidate
 		if event == EventPreToolUse {
 			return d.guardPartial(stderr, env, event, data, false, landings)
 		}
-		return 0
+		if !typeErrorOnly(err, data) {
+			return 0
+		}
+		// The rest of the input decoded: a field of an unexpected type
+		// (left empty) must not cost the session its state change.
 	}
 	if !knownEvent(event) {
 		return 0
 	}
 	in.landings = landings
 	return d.handleMain(stdout, stderr, env, event, in)
+}
+
+// typeErrorOnly reports whether err, from json.Unmarshal of data into an
+// Input, only says that some field had an unexpected type (json.Unmarshal
+// then decodes the others), data is a JSON object, and its session_id, if
+// any, is a string: the session can still be told apart.
+func typeErrorOnly(err error, data []byte) bool {
+	var te *json.UnmarshalTypeError
+	if !errors.As(err, &te) {
+		return false
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) != nil || obj == nil {
+		return false
+	}
+	var sid string
+	raw, ok := obj["session_id"]
+	return !ok || json.Unmarshal(raw, &sid) == nil
 }
 
 // handleMain opens the store (unless d has one) and runs Handle, mapping its
@@ -260,23 +282,32 @@ func refuseOversized(stderr io.Writer, tool string) int {
 
 // partialInput recovers session_id, cwd, tool_name and tool_input's
 // file_path/notebook_path from a possibly truncated or malformed hook JSON
-// object by decoding it token by token and stopping at the first error.
+// object by decoding it token by token and stopping at the first syntax
+// error (a value of the wrong type is ignored, as json.Unmarshal does).
 // Other values (e.g. a huge "content" string) are skipped without being
 // kept. As with json.Unmarshal, a duplicate key's last value wins (as far
 // as the input could be read). ok reports whether a target path was found.
 func partialInput(data []byte) (in Input, ok bool) {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	str := func(dst *string) error {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return err
+		}
+		_ = json.Unmarshal(raw, dst) // not a string: left as it was
+		return nil
+	}
 	var targets map[string]string
 	_ = walkObject(dec, func(key string) error {
 		switch key {
 		case "session_id":
-			return dec.Decode(&in.SessionID)
+			return str(&in.SessionID)
 		case "cwd":
-			return dec.Decode(&in.Cwd)
+			return str(&in.Cwd)
 		case "tool_name":
-			return dec.Decode(&in.ToolName)
+			return str(&in.ToolName)
 		case "hook_event_name":
-			return dec.Decode(&in.HookEventName)
+			return str(&in.HookEventName)
 		case "tool_input":
 			targets = map[string]string{} // a later tool_input replaces an earlier one
 			return walkObject(dec, func(key string) error {

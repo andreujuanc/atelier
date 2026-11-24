@@ -19,42 +19,6 @@ import (
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
 
-// TestMain isolates git from the user's global/system config and supplies
-// an identity so commits work without any global setup.
-func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "app-test-git")
-	if err != nil {
-		panic(err)
-	}
-	cfg := filepath.Join(dir, "gitconfig")
-	if err := os.WriteFile(cfg, nil, 0o644); err != nil {
-		panic(err)
-	}
-	for k, v := range map[string]string{
-		"GIT_CONFIG_GLOBAL":   cfg,
-		"GIT_CONFIG_NOSYSTEM": "1",
-		"GIT_AUTHOR_NAME":     "Test",
-		"GIT_AUTHOR_EMAIL":    "test@example.com",
-		"GIT_COMMITTER_NAME":  "Test",
-		"GIT_COMMITTER_EMAIL": "test@example.com",
-		// No global Claude Code settings (a global statusLine would keep
-		// atelier's out of task settings, see gen.WriteSettings).
-		"CLAUDE_CONFIG_DIR": filepath.Join(dir, "claude"),
-		// The sandbox is on by default. These tests build Apps without it
-		// (sessions run next to atl) and doctor must say the same, as with
-		// ATL_SANDBOX=off; the sandbox tests set what they need.
-		"ATL_SANDBOX": "off",
-		// No other workspaces (the developer's real ones would shift the
-		// port offsets); the cross-workspace tests set their own root.
-		"ATL_WORKSPACES": filepath.Join(dir, "workspaces"),
-	} {
-		os.Setenv(k, v)
-	}
-	code := m.Run()
-	os.RemoveAll(dir)
-	os.Exit(code)
-}
-
 type taskEnv struct {
 	app  *App
 	root string
@@ -262,6 +226,8 @@ func TestNewTaskValidation(t *testing.T) {
 	}{
 		{"no title", NewTaskOpts{Title: "  ", Repos: []RepoArg{{"api", model.ModeRW}}}, "title"},
 		{"no repos", NewTaskOpts{Title: "x"}, "no repos"},
+		{"escape", NewTaskOpts{Title: "a\x1bb", Repos: []RepoArg{{"api", model.ModeRW}}}, "control characters"},
+		{"bad utf-8", NewTaskOpts{Title: "a\xffb", Repos: []RepoArg{{"api", model.ModeRW}}}, "not valid UTF-8"},
 		{"missing", NewTaskOpts{Title: "x", Repos: []RepoArg{{"nope", model.ModeRW}}}, "does not exist"},
 		{"plain dir", NewTaskOpts{Title: "x", Repos: []RepoArg{{"plain", model.ModeRO}}}, "not a git repository"},
 		{"bad name", NewTaskOpts{Title: "x", Repos: []RepoArg{{"../api", model.ModeRW}}}, "invalid repo name"},
@@ -1047,5 +1013,35 @@ func TestFinishRefusesOrphanCommits(t *testing.T) {
 	git(t, wt, "branch", "keep")
 	if _, err := e.app.Cancel(ctx, task.Slug, false); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A failed check whether the task branch exists (here: ctx cancelled) is
+// not "it did not exist": the worktree is not attempted, and the kept
+// branch, with its unpushed commit, is not deleted as if this call had
+// made it.
+func TestBuildTaskDirKeepsBranchOnFailedProbe(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "kept", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := e.commitIn(t, task.Slug, "api", "work")
+	if _, err := e.app.Done(ctx, task.Slug, false); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	plan := []rwCheckout{{Repo: task.Repos[0], Existing: true}}
+	if _, err := e.app.buildTaskDir(cancelled, task, plan, true); err == nil {
+		t.Fatal("buildTaskDir worked with a cancelled ctx")
+	}
+	if got := git(t, e.canonical("api"), "rev-parse", "refs/heads/atl/kept"); got != kept {
+		t.Fatalf("kept branch at %s, want %s", got, kept)
+	}
+	if exists(e.app.Paths.TaskDir(task.Slug)) {
+		t.Fatal("task dir left behind")
 	}
 }

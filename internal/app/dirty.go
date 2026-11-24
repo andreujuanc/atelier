@@ -21,16 +21,15 @@ func (a *App) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
 		return nil, err
 	}
 	type job struct {
-		id int64
-		t  *model.Task
-		r  model.TaskRepo
+		t *model.Task
+		r model.TaskRepo
 	}
 	var jobs []job
 	for i := range tasks {
 		t := &tasks[i]
 		for _, r := range t.Repos {
 			if r.Mode == model.ModeRW {
-				jobs = append(jobs, job{t.ID, t, r})
+				jobs = append(jobs, job{t, r})
 			}
 		}
 	}
@@ -48,7 +47,7 @@ func (a *App) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
 			defer wg.Done()
 			for j := range ch {
 				mu.Lock()
-				done := out[j.id]
+				done := out[j.t.ID]
 				mu.Unlock()
 				if done || ctx.Err() != nil {
 					continue
@@ -59,7 +58,7 @@ func (a *App) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
 				}
 				if dirty, err := gitx.IsDirty(ctx, path); err == nil && dirty {
 					mu.Lock()
-					out[j.id] = true
+					out[j.t.ID] = true
 					mu.Unlock()
 				}
 			}

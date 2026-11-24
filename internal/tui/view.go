@@ -93,13 +93,15 @@ type layout struct {
 	listW, detailW int
 	// what the panes hold inside their borders
 	listInW, listInH, detailInW, detailInH int
+	help                                   []string // the help lines under the status line
 }
 
 func (m *Model) layout() layout {
 	w, h := m.width, m.height
 	var l layout
 	l.header = h >= 10
-	l.bodyH = h - 1 - len(m.helpLines(w))
+	l.help = m.helpLines(w)
+	l.bodyH = h - 1 - len(l.help)
 	if l.header {
 		l.bodyH--
 	}
@@ -211,7 +213,6 @@ func (m *Model) render() string {
 		return ""
 	}
 	l := m.layout()
-	help := m.helpLines(w)
 	var lines []string
 	if l.header {
 		lines = append(lines, m.headerLine(w))
@@ -220,7 +221,7 @@ func (m *Model) render() string {
 	if over := m.overlay(w, len(lines)); over != nil {
 		lines = composite(lines, over, w)
 	}
-	lines = append(append(lines, m.statusLine(w)), help...)
+	lines = append(append(lines, m.statusLine(w)), l.help...)
 	if len(lines) > h {
 		lines = lines[len(lines)-h:]
 	}
@@ -298,12 +299,9 @@ func (m *Model) detailPane(l layout, w, h int, focused bool) []string {
 		return m.detailLines(w, h)
 	}
 	inner := m.detailLines(w-4, h-2)
-	title := ""
+	title, right := "", ""
 	if t := m.notesTask(); t != nil {
 		title = t.Task.Slug
-	}
-	right := ""
-	if t := m.notesTask(); t != nil {
 		if op, ok := m.busy[t.Task.ID]; ok {
 			right = keyStyle.Render(m.spinner()) + " " + dimStyle.Render(trunc(clean(op), max(w/3, 8)))
 		}
@@ -394,7 +392,8 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 		return trunc(text, w)
 	}
 	t := r.task
-	glyph, dotStyle := dotFor(aggregate(t.Sessions))
+	agg := aggregate(t.Sessions)
+	glyph, dotStyle := dotFor(agg)
 	busy := ""
 	if _, ok := m.busy[t.Task.ID]; ok {
 		busy = " " + m.spinner()
@@ -403,12 +402,8 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 	if t.Task.Status.Open() && m.dirty[t.Task.ID] {
 		star = "*"
 	}
-	// The list shows the title only (the slug is in the details pane); a
-	// task with a blank title falls back to its slug.
-	title := clean(t.Task.Title)
-	if title == "" {
-		title = clean(t.Task.Slug)
-	}
+	// The list shows the title only (the slug is in the details pane).
+	title := taskTitle(t.Task)
 	// Width budget after the bar, the dot and busy suffix; the star is kept
 	// even when the title has to be truncated.
 	avail := w - 3 - ansi.StringWidth(busy)
@@ -420,7 +415,7 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 	switch {
 	case !t.Task.Status.Open():
 		base = dimStyle
-	case aggregate(t.Sessions) == dotWaiting:
+	case agg == dotWaiting:
 		base = base.Bold(true) // a session waits for you: stand out
 	}
 	lead := " "
@@ -504,10 +499,7 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 	add := func(s string) { out = append(out, trunc(s, w)) }
 	kv := func(k, v string) { add(labelStyle.Render(fmt.Sprintf("%-9s", k)) + " " + v) }
 
-	title := clean(task.Title)
-	if title == "" {
-		title = clean(task.Slug)
-	}
+	title := taskTitle(task)
 	// The title, the status at the right when there is room.
 	st := chip(string(task.Status), statusColor(task.Status))
 	if m.dirty[task.ID] && task.Status.Open() {
@@ -588,10 +580,7 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 		if !s.LastEventAt.IsZero() {
 			age = humanAge(now.Sub(s.LastEventAt))
 		}
-		glyph := palette.StateLook(s.State).Glyph
-		if glyph == " " {
-			glyph = "·"
-		}
+		glyph := sessionGlyph(s.State)
 		st := stateStyle(s.State)
 		name := padRight(sessionName(s), sessW)
 		state := fmt.Sprintf("%-7s", clean(string(s.State)))
@@ -615,6 +604,23 @@ func sessionName(s model.Session) string {
 		return n
 	}
 	return "claude-" + strconv.FormatInt(s.ID, 10)
+}
+
+// sessionGlyph is the dot of a session in the session lists ("·" for a
+// state the palette draws blank).
+func sessionGlyph(st model.SessionState) string {
+	if g := palette.StateLook(st).Glyph; g != " " {
+		return g
+	}
+	return "·"
+}
+
+// taskTitle is t's title to show, its slug when the title is blank.
+func taskTitle(t model.Task) string {
+	if s := clean(t.Title); s != "" {
+		return s
+	}
+	return clean(t.Slug)
 }
 
 func orDash(s string) string {
@@ -684,17 +690,7 @@ func (c *confirmState) lines(w, h int) []string {
 	if w <= 0 || h <= 0 {
 		return nil
 	}
-	ww := w
-	if ww > confirmWrap {
-		ww = confirmWrap
-	}
-	wrap := func(s string, st lipgloss.Style) []string {
-		var out []string
-		for _, l := range strings.Split(ansi.Wrap(s, ww, ""), "\n") {
-			out = append(out, st.Render(trunc(strings.TrimRight(l, " "), w)))
-		}
-		return out
-	}
+	wrap := func(s string, st lipgloss.Style) []string { return wrapText(s, min(w, confirmWrap), w, st) }
 	head := "Mark " + clean(c.slug) + " done?"
 	if c.verb == "cancel" {
 		head = "Cancel " + clean(c.slug) + "?"
@@ -707,11 +703,7 @@ func (c *confirmState) lines(w, h int) []string {
 	if c.dirty {
 		blocks = append(blocks, wrap("There are uncommitted changes. They will be deleted.", errStyle.Bold(true)))
 	}
-	box := dimStyle.Render("[ ]") + " Delete them"
-	if c.ticked {
-		box = errStyle.Bold(true).Render("[x]") + " Delete them"
-	}
-	last := []string{trunc(box, w)}
+	last := []string{trunc(checkbox(c.ticked, "Delete them"), w)}
 	if c.unticked {
 		last = append(last, wrap("Tick the box with space to confirm.", markStyle)...)
 	}
@@ -734,6 +726,25 @@ func (c *confirmState) lines(w, h int) []string {
 		out = out[len(out)-h:] // keep the box visible on very short terminals
 	}
 	return out
+}
+
+// wrapText wraps a dialog's text s at ww cells, each line cut to w cells
+// and drawn in st.
+func wrapText(s string, ww, w int, st lipgloss.Style) []string {
+	var out []string
+	for _, l := range strings.Split(ansi.Wrap(s, ww, ""), "\n") {
+		out = append(out, st.Render(trunc(strings.TrimRight(l, " "), w)))
+	}
+	return out
+}
+
+// checkbox is a dialog's tick box and its label; ticked, the box is drawn
+// as the warning it is.
+func checkbox(ticked bool, label string) string {
+	if ticked {
+		return errStyle.Bold(true).Render("[x]") + " " + label
+	}
+	return dimStyle.Render("[ ]") + " " + label
 }
 
 // baseSuffix shows the origin branch a rw repo's task branch started from
@@ -1168,9 +1179,10 @@ func (m *Model) formLines(w, h int) []string {
 
 // listWindow is the range of rows the list shows in h lines.
 func (m *Model) listWindow(h int) (off, end int) {
-	off = m.offset
+	// The help may have taken or given back a line since the offset was
+	// set (see helpLines).
+	off = max(min(m.offset, len(m.rows)-h), 0)
 	if m.selIdx >= off+h {
-		// the help took a line since the offset was set (see helpLines)
 		off = m.selIdx - h + 1
 	}
 	end = min(off+h, len(m.rows))
@@ -1210,4 +1222,16 @@ func welcomeLines(w int) []string {
 		item("A", "ask the atelier assistant"),
 		item("?", "every key"),
 	}
+}
+
+// scrollOffset is the first of n rows to show in h lines, moved from
+// offset (the current one) just enough to show row cursor.
+func scrollOffset(cursor, offset, n, h int) int {
+	if cursor < offset {
+		offset = cursor
+	}
+	if h > 0 && cursor >= offset+h {
+		offset = cursor - h + 1
+	}
+	return max(min(offset, n-h), 0)
 }

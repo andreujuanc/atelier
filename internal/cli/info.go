@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -149,9 +148,7 @@ func (c *cli) showCmd() *cobra.Command {
 				return err
 			}
 			if asJSON {
-				enc := json.NewEncoder(c.stdout)
-				enc.SetIndent("", "  ")
-				return enc.Encode(showJSON(d))
+				return c.printJSON(showJSON(d))
 			}
 			writeShow(c.stdout, d)
 			return nil
@@ -240,10 +237,10 @@ func writeShow(w io.Writer, d *app.TaskDetail) {
 			fmt.Fprintf(w, "    title       %s\n", sanitize(title))
 		}
 		if s.ClaudeSessionID != "" {
-			fmt.Fprintf(w, "    claude id   %s\n", s.ClaudeSessionID)
+			fmt.Fprintf(w, "    claude id   %s\n", sanitize(s.ClaudeSessionID))
 		}
 		if s.TranscriptPath != "" {
-			fmt.Fprintf(w, "    transcript  %s\n", s.TranscriptPath)
+			fmt.Fprintf(w, "    transcript  %s\n", sanitize(s.TranscriptPath))
 		}
 	}
 
@@ -385,16 +382,9 @@ func (c *cli) notesCmd() *cobra.Command {
 			}
 			text := "" // --clear alone
 			if set {
-				data, err := c.readNotesStdin(cmd)
-				if err != nil {
+				if text, err = c.readNotesStdin(cmd, clearNotes); err != nil {
 					return err
 				}
-				// Empty (once sanitised) only clears with --clear too, so
-				// an empty pipe by mistake never wipes the notes.
-				if !clearNotes && model.SanitizeNotes(data) == "" {
-					return errors.New("stdin is empty: nothing to set (use --clear to clear the notes)")
-				}
-				text = data
 			}
 			if c.forAssistant {
 				text, err = ap.ReplaceNotesKept(cmd.Context(), t.Slug, text)
@@ -428,12 +418,9 @@ func (c *cli) notesViaGate(cmd *cobra.Command, ref string, set, clearNotes bool)
 	req := sandbox.ControlRequest{Op: sandbox.OpNotes, Set: set, Clear: clearNotes}
 	var body []byte
 	if set {
-		data, err := c.readNotesStdin(cmd)
+		data, err := c.readNotesStdin(cmd, clearNotes)
 		if err != nil {
 			return err
-		}
-		if !clearNotes && model.SanitizeNotes(data) == "" {
-			return errors.New("stdin is empty: nothing to set (use --clear to clear the notes)")
 		}
 		body = []byte(data)
 	}
@@ -441,8 +428,10 @@ func (c *cli) notesViaGate(cmd *cobra.Command, ref string, set, clearNotes bool)
 }
 
 // readNotesStdin reads the new notes text for `atl notes --set`, with a
-// hint on stderr when stdin is a terminal.
-func (c *cli) readNotesStdin(cmd *cobra.Command) (string, error) {
+// hint on stderr when stdin is a terminal. A text that is empty once
+// sanitised is an error unless clearNotes (--clear too), so an empty pipe
+// by mistake never wipes the notes.
+func (c *cli) readNotesStdin(cmd *cobra.Command, clearNotes bool) (string, error) {
 	// The store checks the sanitised size (\r\n, control characters and
 	// trailing blanks don't count); reading stops well past the limit so
 	// a huge stdin is never fully read.
@@ -458,6 +447,9 @@ func (c *cli) readNotesStdin(cmd *cobra.Command) (string, error) {
 	if len(data) > readMax {
 		return "", fmt.Errorf("%w: stdin is over %d bytes, the limit is %d (64 KiB)",
 			model.ErrNotesTooLarge, readMax, model.MaxNotesLen)
+	}
+	if !clearNotes && model.SanitizeNotes(string(data)) == "" {
+		return "", errors.New("stdin is empty: nothing to set (use --clear to clear the notes)")
 	}
 	return string(data), nil
 }

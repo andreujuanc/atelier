@@ -120,6 +120,19 @@ func (e *env) startServer(t *testing.T, opts ...[2]string) {
 func (e *env) crash(t *testing.T) {
 	t.Helper()
 	e.tmux(t, "kill-server")
+	// kill-server returns before the old server is gone: a client that
+	// reaches it on its way out gets "server exited unexpectedly". Start the
+	// new one only once no server answers any more.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		out, err := exec.Command("tmux", "-L", e.sock, "-f", os.DevNull, "list-sessions").CombinedOutput()
+		if err != nil && !strings.Contains(string(out), "server exited unexpectedly") {
+			break // no server running (or no socket): gone
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tmux server still there after kill-server: %v: %s", err, out)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	e.startServer(t)
 }
 

@@ -54,12 +54,13 @@ mkdir -p "$W/bin"
 (cd "$ROOT" && CGO_ENABLED=0 go build -buildmode=exe -o "$W/bin/atl" ./cmd/atl) || fail "go build"
 
 # Isolated environment.
-unset TMUX TMUX_PANE ATL_WORKSPACE ATL_BIN ATL_SESSION ATL_TASK ATL_TASK_DIR ATL_PORT_OFFSET CLAUDE_CONFIG_DIR
+unset TMUX TMUX_PANE CLAUDE_CONFIG_DIR
 # git takes config from the environment too (GIT_CONFIG_PARAMETERS and
 # GIT_CONFIG_COUNT, e.g. when run under `git -c`), and GIT_DIR & co. point it
-# at the caller's repo: only the config files below may count.
+# at the caller's repo: only the config files below may count. Likewise for
+# atl's own ATL_* (e.g. ATL_SANDBOX_ID when run inside a task container).
 for v in $(compgen -e); do
-	if [[ $v == GIT_* ]]; then unset "$v"; fi
+	if [[ $v == GIT_* || $v == ATL_* ]]; then unset "$v"; fi
 done
 export PATH="$W/bin:$STUBS:$PATH"
 export HOME="$W/home"

@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -270,7 +269,7 @@ func TestStatusLineReadOnly(t *testing.T) {
 func TestStatusLineText(t *testing.T) {
 	for _, c := range []struct{ name, title, want string }{
 		{"plain", "Fix login", "● Fix login"},
-		{"control and format characters", "Fix\nthe\tlogin\x1b[31m page‮\r\x00", "● Fix the login [31m page"},
+		{"control and format characters", "Fix\nthe\tlogin\x1b[31m page\u202e\r\x00", "● Fix the login [31m page"},
 		{"invalid UTF-8", "a\xffb", "● a b"},
 		{"blank title shows the slug", " \n\t", "● slug"},
 		{"long title cut to 80 columns", strings.Repeat("x", 200), "● " + strings.Repeat("x", 77) + "…"},
@@ -318,21 +317,13 @@ func TestStatusLineLatency(t *testing.T) {
 		{"session id", `{"session_id":"c-lat","cwd":"/"}`},
 		{"cwd", `{"session_id":"c-other","cwd":"` + f.p.WorktreePath("fix", "api") + `"}`},
 	} {
-		run(c.stdin) // warm the page cache
-		var walls []time.Duration
-		for i := 0; i < 7; i++ {
+		checkLatency(t, "statusline by "+c.name, func() time.Duration {
 			out, wall := run(c.stdin)
 			if out != "● Fix\n" {
 				t.Fatalf("%s: stdout %q", c.name, out)
 			}
-			walls = append(walls, wall)
-		}
-		sort.Slice(walls, func(i, j int) bool { return walls[i] < walls[j] })
-		median := walls[len(walls)/2]
-		t.Logf("statusline by %s wall time (re-exec of test binary): min %v, median %v, max %v", c.name, walls[0], median, walls[len(walls)-1])
-		if median > 200*time.Millisecond {
-			t.Errorf("%s: median latency %v exceeds 200ms", c.name, median)
-		}
+			return wall
+		})
 	}
 	if log := readLog(t, f.p); log != "" {
 		t.Errorf("unexpected errors logged: %s", log)

@@ -281,7 +281,13 @@ func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
-func checkAffected(res sql.Result, what string, id int64) error {
+// execOne runs a statement on the row what id (an UPDATE or DELETE by id),
+// failing with ErrNotFound when it matches no row.
+func (s *Store) execOne(ctx context.Context, what string, id int64, query string, args ...any) error {
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
 	n, err := res.RowsAffected()
 	if err != nil {
 		return err

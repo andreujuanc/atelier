@@ -32,10 +32,10 @@ var isDark = true
 
 // Styles, set by applyTheme.
 var (
-	accent, subtle, errColor, okColor color.Color
-	primary, purple, warn, muted      color.Color
-	faint, border, surface, onBrand   color.Color
-	onSel                             color.Color
+	accent, errColor, okColor       color.Color
+	primary, purple, warn, muted    color.Color
+	faint, border, surface, onBrand color.Color
+	onSel                           color.Color
 
 	headerStyle lipgloss.Style // section and group headings
 	selStyle    lipgloss.Style // the selected row's background
@@ -61,7 +61,7 @@ func init() { applyTheme(true) }
 // applyTheme sets every style for a dark (or light) background.
 func applyTheme(dark bool) {
 	isDark = dark
-	accent, subtle = adaptive(palette.Accent), adaptive(palette.Subtle)
+	accent = adaptive(palette.Accent)
 	errColor, okColor = adaptive(palette.Err), adaptive(palette.OK)
 	primary, purple, warn, muted = adaptive(cPrimary), adaptive(cPurple), adaptive(cWarn), adaptive(cMuted)
 	faint, border, surface, onBrand = adaptive(cFaint), adaptive(cBorder), adaptive(cSurface), adaptive(cOnBrand)

@@ -1677,6 +1677,43 @@ func TestShutdown(t *testing.T) {
 	}
 }
 
+// Every backend call that may run when the TUI stops (and write to App.Out)
+// goes through the tracker: once it is closed, none reaches the backend
+// (nil here, so an untracked call panics). TaskDir only builds a path.
+func TestTrackedBackendTracksEveryCall(t *testing.T) {
+	tr := &tracker{}
+	tr.close()
+	tb := reflect.ValueOf(&trackedBackend{tr: tr})
+	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	bt := reflect.TypeOf((*Backend)(nil)).Elem()
+	for i := 0; i < bt.NumMethod(); i++ {
+		name := bt.Method(i).Name
+		if name == "TaskDir" {
+			continue
+		}
+		fn := tb.MethodByName(name)
+		args := make([]reflect.Value, fn.Type().NumIn())
+		for j := range args {
+			if in := fn.Type().In(j); in == ctxType {
+				args[j] = reflect.ValueOf(context.Background())
+			} else {
+				args[j] = reflect.Zero(in)
+			}
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("%s is not tracked (reached the backend)", name)
+				}
+			}()
+			out := fn.Call(args)
+			if err, _ := out[len(out)-1].Interface().(error); !errors.Is(err, errStopped) {
+				t.Errorf("%s after close: %v", name, err)
+			}
+		}()
+	}
+}
+
 func TestOrderedSend(t *testing.T) {
 	var mu sync.Mutex
 	var got []string
@@ -1853,6 +1890,27 @@ func TestDetailStaleDropped(t *testing.T) {
 	m.Update(r1) // a late duplicate of the older reply
 	if m.detailApplied != applied {
 		t.Fatal("older reply applied after a newer one")
+	}
+}
+
+// A list in flight when an operation ends may have been read before the
+// operation's change: it is not shown, a fresh one is asked for instead. A
+// created task ends up selected (the stale list does not have it).
+func TestStaleListAfterOp(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	stale := m.listCmd()() // read before the task exists…
+	m.listing = true       // …and still in flight
+	created := tv(9, "fresh", model.StatusActive)
+	fb.tasks = append(fb.tasks, created)
+	_, cmd := m.Update(newTaskMsg{task: &created.Task})
+	drain(m, cmd)
+	_, cmd = m.Update(stale)
+	drain(m, cmd)
+	_, cmd = m.Update(listTickMsg{})
+	drain(m, cmd)
+	if s := m.selected(); s == nil || s.Task.Slug != "fresh" {
+		t.Fatalf("selected %v, want the created task", s)
 	}
 }
 
@@ -2072,6 +2130,35 @@ func TestPickerEscClearsFilter(t *testing.T) {
 	key(m, "esc")
 	if m.mode != modeNormal || m.picker != nil {
 		t.Fatalf("esc without filter: mode %d", m.mode)
+	}
+}
+
+// The picker shows the last known repos at once and the refreshed list when
+// it arrives: a cursor the user moved stays on the same repo, so space never
+// toggles a repo the user did not highlight.
+func TestPickerRefreshKeepsCursor(t *testing.T) {
+	p := newPicker("Pick", nil, nil)
+	p.available = []string{"api", "lib", "web"} // shown until the refresh
+	p.initCursor()
+	p.update(keyMsg("down"))
+	if p.current() != "lib" {
+		t.Fatalf("cursor on %q", p.current())
+	}
+	p.setAvailable([]string{"api", "docs", "lib", "web"}, nil)
+	if p.current() != "lib" {
+		t.Fatalf("after the refresh the cursor is on %q, want lib", p.current())
+	}
+	p.update(keyMsg(" "))
+	if got := p.selection(); len(got) != 1 || got[0].Name != "lib" {
+		t.Fatalf("space selected %v", got)
+	}
+	// Its repo gone from disk: the cursor stays at its row, clamped.
+	p.update(keyMsg(" "))
+	p.update(keyMsg(" ")) // deselected again
+	p.update(keyMsg("end"))
+	p.setAvailable([]string{"api", "docs"}, nil)
+	if p.current() != "docs" {
+		t.Fatalf("after its repo went the cursor is on %q, want docs", p.current())
 	}
 }
 
@@ -2751,6 +2838,30 @@ func TestSessionPickerStartsOnMostRecent(t *testing.T) {
 		if got := newSessionPicker(1, "x", tc.choices).cursor; got != tc.want {
 			t.Errorf("%s: cursor %d, want %d", tc.name, got, tc.want)
 		}
+	}
+}
+
+// Fast j/k in the session picker may arrive as one event ("jj"): each
+// letter moves, as in the task list.
+func TestSessionPickerMultiRuneKeys(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), choices: map[string][]app.SessionChoice{"gamma": {
+		choice(7, model.StateIdle, true, "a", "", time.Minute),
+		choice(5, model.StateEnded, false, "b", "", time.Hour),
+		choice(4, model.StateEnded, false, "c", "", 2*time.Hour),
+	}}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+	runOpen(t, m, press(m, "enter"))
+	if m.mode != modeSessions || m.sessPick.cursor != 1 {
+		t.Fatalf("mode %v, picker %+v", m.mode, m.sessPick)
+	}
+	key(m, "jj")
+	if m.sessPick.cursor != 3 {
+		t.Fatalf("jj: cursor %d, want 3", m.sessPick.cursor)
+	}
+	key(m, "kkk")
+	if m.sessPick.cursor != 0 {
+		t.Fatalf("kkk: cursor %d, want 0", m.sessPick.cursor)
 	}
 }
 

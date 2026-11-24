@@ -221,7 +221,8 @@ func TestWriteSettingsMerge(t *testing.T) {
 }
 
 func TestWriteSettingsInvalidJSON(t *testing.T) {
-	for _, bad := range []string{`{"permissions": `, `[1,2]`, `{"hooks": []}`, `{"hooks": {"Stop": {}}}`, `null`} {
+	for _, bad := range []string{`{"permissions": `, `[1,2]`, `{"hooks": []}`, `{"hooks": {"Stop": {}}}`, `null`,
+		`{"model": "x"} {}`, `{"model": "x"} garbage`, `{"model": "x"}]`} {
 		dir := t.TempDir()
 		path := filepath.Join(dir, ".claude", "settings.json")
 		os.MkdirAll(filepath.Dir(path), 0o755)
@@ -247,12 +248,15 @@ func TestWriteSettingsQuotedBin(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	sf, _, text := readSettings(t, dir)
+	sf, raw, text := readSettings(t, dir)
 	want := `'/home/my user/it'\''s bin/atl' hook Stop`
 	if HookCommand(bin, "Stop") != want {
 		t.Fatalf("HookCommand = %q, want %q", HookCommand(bin, "Stop"), want)
 	}
 	checkAtelierHooks(t, sf, bin)
+	if sl, _ := raw["statusLine"].(map[string]any); sl == nil || sl["command"] != `'/home/my user/it'\''s bin/atl' statusline` {
+		t.Errorf("statusLine = %#v, want the quoted binary:\n%s", raw["statusLine"], text)
+	}
 	// Switching binaries replaces the entries rather than adding new ones.
 	if err := WriteSettings(dir, "/usr/bin/atl"); err != nil {
 		t.Fatal(err)

@@ -17,13 +17,23 @@ import (
 	"github.com/andreujuanc/atelier/internal/store"
 )
 
-// TestMain lets tests re-exec the test binary as `atl hook <args>`.
+// TestMain lets tests re-exec the test binary as `atl hook <args>`. The
+// tests themselves run without any ATL_* variable of the environment they
+// run in (e.g. inside an atelier task, whose ATL_SANDBOX_ID would send the
+// hooks to a gate), so neither they nor the processes they start see it.
 func TestMain(m *testing.M) {
 	switch os.Getenv("ATL_HOOK_TEST_MAIN") {
 	case "1":
 		os.Exit(Main(strings.Fields(os.Getenv("ATL_HOOK_TEST_ARGS"))))
 	case "statusline":
 		os.Exit(StatusLineMain())
+	case "noop": // the bare start of a re-exec (see checkLatency)
+		os.Exit(0)
+	}
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "ATL_") {
+			os.Unsetenv(k)
+		}
 	}
 	os.Exit(m.Run())
 }
@@ -612,6 +622,11 @@ func TestUnreadableInput(t *testing.T) {
 		{"truncated later tool_input wins", EventPreToolUse,
 			`{"cwd":"/","tool_input":{"file_path":"` + docs + `"},"tool_input":{"file_path":"` + rw + `","content":"x`, "", 0},
 		{"malformed without path fails open", EventPreToolUse, `{"tool_input":`, "", 0},
+		{"wrongly typed fields before the path", EventPreToolUse,
+			`{"session_id":5,"cwd":["/"],"tool_name":{},"hook_event_name":null,"tool_input":{"file_path":"` + docs + `","content":"x"}}`,
+			"inside read-only repo docs", 2},
+		{"truncated after wrongly typed fields", EventPreToolUse,
+			`{"session_id":5,"cwd":"/","tool_input":{"file_path":"` + docs + `","content":"x`, "inside read-only repo docs", 2},
 		{"oversized Stop ignored", EventStop, `{"session_id":"s","x":"` + big + `"}`, "", 0},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -647,6 +662,51 @@ func runMain(t *testing.T, args, stdin string) (exit int, stdout, stderr string,
 		t.Fatal(err)
 	}
 	return exit, out.String(), errb.String(), wall
+}
+
+// latencyLimit bounds the median wall time a re-exec'd hook or status line
+// adds to a bare start of the test binary.
+const latencyLimit = 200 * time.Millisecond
+
+// checkLatency fails t if one call of measure (a re-exec of the test
+// binary as the hook or status line; it returns the wall time) takes more
+// than latencyLimit over a bare re-exec, in median. Each round runs 7
+// calls, each next to a bare re-exec, after a warm-up. A loaded machine
+// (go test runs packages in parallel) slows process starts and the
+// database alike, so a round over the limit is run again, up to 3 rounds:
+// a real slowdown fails them all.
+func checkLatency(t *testing.T, name string, measure func() time.Duration) {
+	t.Helper()
+	bare := func() time.Duration {
+		cmd := exec.Command(os.Args[0])
+		cmd.Env = append(os.Environ(), "ATL_HOOK_TEST_MAIN=noop")
+		start := time.Now()
+		if err := cmd.Run(); err != nil {
+			t.Fatal(err)
+		}
+		return time.Since(start)
+	}
+	median := func(d []time.Duration) time.Duration {
+		sort.Slice(d, func(i, j int) bool { return d[i] < d[j] })
+		return d[len(d)/2]
+	}
+	measure() // warm the page cache
+	var excess time.Duration
+	for round := 1; round <= 3; round++ {
+		var walls, bases []time.Duration
+		for i := 0; i < 7; i++ {
+			bases = append(bases, bare())
+			walls = append(walls, measure())
+		}
+		m, b := median(walls), median(bases)
+		excess = m - b
+		t.Logf("%s wall time (re-exec of test binary), round %d: min %v, median %v, max %v; bare start median %v",
+			name, round, walls[0], m, walls[len(walls)-1], b)
+		if excess <= latencyLimit {
+			return
+		}
+	}
+	t.Errorf("%s: median latency over a bare start %v exceeds %v in 3 rounds", name, excess, latencyLimit)
 }
 
 func readLog(t *testing.T, p config.Paths) string {
@@ -733,21 +793,13 @@ func TestMainProcess(t *testing.T) {
 			t.Skip("race-instrumented binaries start too slowly to measure hook latency")
 		}
 		in := `{"session_id":"c-main","cwd":"` + f.p.TaskDir("fix") + `","hook_event_name":"SessionStart","source":"startup","transcript_path":"/tmp/t.jsonl"}`
-		runMain(t, "SessionStart", in) // warm the page cache
-		var walls []time.Duration
-		for i := 0; i < 7; i++ {
+		checkLatency(t, "SessionStart hook", func() time.Duration {
 			exit, out, errOut, wall := runMain(t, "SessionStart", in)
 			if exit != 0 || errOut != "" || !strings.Contains(sessionStartContext(t, out), "- Slug: fix") {
 				t.Fatalf("exit=%d stdout=%q stderr=%q", exit, out, errOut)
 			}
-			walls = append(walls, wall)
-		}
-		sort.Slice(walls, func(i, j int) bool { return walls[i] < walls[j] })
-		median := walls[len(walls)/2]
-		t.Logf("SessionStart hook wall time (re-exec of test binary): min %v, median %v, max %v", walls[0], median, walls[len(walls)-1])
-		if median > 200*time.Millisecond {
-			t.Errorf("median hook latency %v exceeds 200ms", median)
-		}
+			return wall
+		})
 		if strings.Contains(readLog(t, f.p), "SessionStart") {
 			t.Errorf("unexpected errors logged: %s", readLog(t, f.p))
 		}
@@ -874,5 +926,39 @@ func TestStopBackground(t *testing.T) {
 	got := backgroundLines(many)
 	if len(got) != maxBackground || got[len(got)-1] != "… and 31 more" || len([]rune(got[0])) != maxBackgroundLine {
 		t.Fatalf("capped: %d lines, last %q, first %d runes", len(got), got[len(got)-1], len([]rune(got[0])))
+	}
+}
+
+// TestWronglyTypedField: a field of an unexpected type (here a background
+// task's id) is logged but does not drop the event's state change; input
+// that is not an object, or whose session id is not a string, still
+// changes nothing.
+func TestWronglyTypedField(t *testing.T) {
+	f := setup(t)
+	s := f.session(t, model.StateRunning, "cid")
+	env := envOf(map[string]string{"ATL_SESSION": itoa(s.ID), "ATL_TASK": "fix"})
+	hook := func(event, stdin string) {
+		t.Helper()
+		var out, errb bytes.Buffer
+		if code := run([]string{event}, strings.NewReader(stdin), &out, &errb, env); code != 0 || out.Len() != 0 {
+			t.Fatalf("%s: exit %d stdout %q stderr %q", event, code, out.String(), errb.String())
+		}
+	}
+	hook(EventStop, `{"session_id":"cid","background_tasks":[{"id":1,"type":"shell","status":"running","command":"npm run dev"}]}`)
+	if g := f.get(t, s.ID); g.State != model.StateIdle || g.Background != "shell: npm run dev" {
+		t.Errorf("after Stop: %s %q, want idle with the shell", g.State, g.Background)
+	}
+	if log := readLog(t, f.p); !strings.Contains(log, "event=Stop") || !strings.Contains(log, "cannot unmarshal number") {
+		t.Errorf("type error not logged: %q", log)
+	}
+	hook(EventUserPromptSubmit, `{"session_id":"cid","message":5}`)
+	if g := f.get(t, s.ID); g.State != model.StateRunning {
+		t.Errorf("after a prompt: %s, want running", g.State)
+	}
+	for _, stdin := range []string{`["cid"]`, `{"session_id":7}`, `{"session_id":["cid"]}`} {
+		hook(EventStop, stdin)
+		if g := f.get(t, s.ID); g.State != model.StateRunning {
+			t.Errorf("Stop %s: %s, want still running", stdin, g.State)
+		}
 	}
 }

@@ -236,7 +236,7 @@ func parseSettings(data []byte) (map[string]any, error) {
 	if root == nil {
 		return nil, errors.New("settings is not a JSON object")
 	}
-	if _, err := dec.Token(); err == nil {
+	if _, err := dec.Token(); err != io.EOF {
 		return nil, errors.New("trailing data after settings object")
 	}
 	if h, ok := root["hooks"]; ok {
