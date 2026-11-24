@@ -1856,6 +1856,27 @@ func TestDetailStaleDropped(t *testing.T) {
 	}
 }
 
+// A list in flight when an operation ends may have been read before the
+// operation's change: it is not shown, a fresh one is asked for instead. A
+// created task ends up selected (the stale list does not have it).
+func TestStaleListAfterOp(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	stale := m.listCmd()() // read before the task exists…
+	m.listing = true       // …and still in flight
+	created := tv(9, "fresh", model.StatusActive)
+	fb.tasks = append(fb.tasks, created)
+	_, cmd := m.Update(newTaskMsg{task: &created.Task})
+	drain(m, cmd)
+	_, cmd = m.Update(stale)
+	drain(m, cmd)
+	_, cmd = m.Update(listTickMsg{})
+	drain(m, cmd)
+	if s := m.selected(); s == nil || s.Task.Slug != "fresh" {
+		t.Fatalf("selected %v, want the created task", s)
+	}
+}
+
 func TestRemovedRepoOfClosedTask(t *testing.T) {
 	done := tv(1, "old", model.StatusDone)
 	done.Task.Repos[0].Name = "gonerepo"

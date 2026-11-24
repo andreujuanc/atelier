@@ -208,7 +208,10 @@ type Model struct {
 	detailInflight int
 	detailApplied  int
 
-	listing    bool
+	listing bool
+	// relist: the list in flight was asked for before a change (reload);
+	// its result is dropped for a fresh one.
+	relist     bool
 	recovering bool
 	recoverErr string
 
@@ -444,11 +447,14 @@ func (m *Model) detailCmd(id int64, slug string) tea.Cmd {
 	}
 }
 
-// reload asks for a fresh list (unless one is in flight) and the selected
-// task's detail.
+// reload asks for a fresh list and the selected task's detail. A list in
+// flight may predate what changed: its result is dropped and the list
+// asked for again (see listMsg).
 func (m *Model) reload() tea.Cmd {
 	var cmds []tea.Cmd
-	if !m.listing {
+	if m.listing {
+		m.relist = true
+	} else {
 		m.listing = true
 		cmds = append(cmds, m.listCmd())
 	}
@@ -760,6 +766,12 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 
 	case listMsg:
 		m.listing = false
+		if m.relist {
+			// Read before a change reload was asked for: list again.
+			m.relist = false
+			m.listing = true
+			return m.listCmd()
+		}
 		if msg.err != nil {
 			m.setErr(fmt.Errorf("list: %w", msg.err))
 			return nil
