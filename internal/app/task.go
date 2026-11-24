@@ -508,7 +508,8 @@ func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error 
 
 // prefixWriter writes each line to w with prefix; Flush emits a trailing
 // partial line. '\r' ends a line too, so progress output (docker, npm)
-// streams; empty segments (e.g. from "\r\n") are skipped.
+// streams; empty segments (e.g. from "\r\n") are skipped. A line longer
+// than maxPartialLine goes out in pieces of that size.
 type prefixWriter struct {
 	w      io.Writer
 	prefix string
@@ -519,11 +520,15 @@ func (p *prefixWriter) Write(b []byte) (int, error) {
 	p.buf = append(p.buf, b...)
 	for {
 		i := bytes.IndexAny(p.buf, "\r\n")
-		if i < 0 {
-			break
+		var line []byte
+		switch {
+		case i >= 0:
+			line, p.buf = p.buf[:i], p.buf[i+1:]
+		case len(p.buf) > maxPartialLine:
+			line, p.buf = p.buf[:maxPartialLine], p.buf[maxPartialLine:]
+		default:
+			return len(b), nil
 		}
-		line := p.buf[:i]
-		p.buf = p.buf[i+1:]
 		if len(line) == 0 {
 			continue
 		}
@@ -532,8 +537,11 @@ func (p *prefixWriter) Write(b []byte) (int, error) {
 			return len(b), nil
 		}
 	}
-	return len(b), nil
 }
+
+// maxPartialLine bounds what prefixWriter keeps of a line not ended yet:
+// a longer one is written out in pieces of this size.
+const maxPartialLine = 64 << 10
 
 // Flush writes any buffered partial line.
 func (p *prefixWriter) Flush() {

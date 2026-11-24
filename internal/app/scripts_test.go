@@ -319,3 +319,28 @@ func TestPrefixWriter(t *testing.T) {
 		t.Fatalf("got %q\nwant %q", buf.String(), want)
 	}
 }
+
+// Output with no line break (binary junk, a progress bar drawn otherwise)
+// is not kept whole: past maxPartialLine bytes it goes out as a line.
+func TestPrefixWriterLongLine(t *testing.T) {
+	var buf bytes.Buffer
+	p := &prefixWriter{w: &buf, prefix: "setup api: "}
+	chunk := bytes.Repeat([]byte("x"), 4096)
+	total := 0
+	for total < 4*maxPartialLine {
+		p.Write(chunk)
+		total += len(chunk)
+		if len(p.buf) > maxPartialLine {
+			t.Fatalf("after %d bytes the writer holds %d", total, len(p.buf))
+		}
+	}
+	p.Flush()
+	if got := strings.Count(buf.String(), "x"); got != total {
+		t.Fatalf("wrote %d of %d bytes", got, total)
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n") {
+		if !strings.HasPrefix(line, "setup api: x") || len(line) > len("setup api: ")+maxPartialLine {
+			t.Fatalf("line of %d bytes: %.40q", len(line), line)
+		}
+	}
+}
