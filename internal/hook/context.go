@@ -239,19 +239,27 @@ func notesTail(text string, room int, slug string) string {
 // dropped or become spaces (as in envBlock), and surrounding blank lines
 // and trailing spaces are trimmed.
 func notesBlock(s string) string {
+	s = strings.TrimRight(keepLines(s), " \n")
+	return strings.TrimLeft(s, "\n")
+}
+
+// keepLines turns \r\n and \r into \n and every other control or format
+// character into a space (see unprintable).
+func keepLines(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
-	s = strings.Map(func(r rune) rune {
-		if r == '\n' {
-			return r
-		}
-		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+	return strings.Map(func(r rune) rune {
+		if r != '\n' && unprintable(r) {
 			return ' '
 		}
 		return r
 	}, s)
-	s = strings.TrimRight(s, " \n")
-	return strings.TrimLeft(s, "\n")
+}
+
+// unprintable reports whether r is a control or format character (newline,
+// tab, escape, bidi override, ...) or invalid UTF-8.
+func unprintable(r rune) bool {
+	return r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
 }
 
 // oneLine sanitises s for a single line: control and format characters
@@ -259,7 +267,7 @@ func notesBlock(s string) string {
 // whitespace collapse to one space.
 func oneLine(s string) string {
 	s = strings.Map(func(r rune) rune {
-		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+		if unprintable(r) {
 			return ' '
 		}
 		return r
@@ -307,18 +315,7 @@ func envBlock(s string) string {
 // and format characters into spaces (as in oneLine) and trims surrounding
 // whitespace.
 func sanitiseEnv(s string) string {
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	s = strings.ReplaceAll(s, "\r", "\n")
-	s = strings.Map(func(r rune) rune {
-		if r == '\n' {
-			return r
-		}
-		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			return ' '
-		}
-		return r
-	}, s)
-	return strings.TrimSpace(s)
+	return strings.TrimSpace(keepLines(s))
 }
 
 // truncateBytes cuts s to at most n bytes on a rune boundary.

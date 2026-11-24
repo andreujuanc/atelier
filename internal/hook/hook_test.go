@@ -17,13 +17,21 @@ import (
 	"github.com/andreujuanc/atelier/internal/store"
 )
 
-// TestMain lets tests re-exec the test binary as `atl hook <args>`.
+// TestMain lets tests re-exec the test binary as `atl hook <args>`. The
+// tests themselves run without any ATL_* variable of the environment they
+// run in (e.g. inside an atelier task, whose ATL_SANDBOX_ID would send the
+// hooks to a gate), so neither they nor the processes they start see it.
 func TestMain(m *testing.M) {
 	switch os.Getenv("ATL_HOOK_TEST_MAIN") {
 	case "1":
 		os.Exit(Main(strings.Fields(os.Getenv("ATL_HOOK_TEST_ARGS"))))
 	case "statusline":
 		os.Exit(StatusLineMain())
+	}
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "ATL_") {
+			os.Unsetenv(k)
+		}
 	}
 	os.Exit(m.Run())
 }
@@ -612,6 +620,11 @@ func TestUnreadableInput(t *testing.T) {
 		{"truncated later tool_input wins", EventPreToolUse,
 			`{"cwd":"/","tool_input":{"file_path":"` + docs + `"},"tool_input":{"file_path":"` + rw + `","content":"x`, "", 0},
 		{"malformed without path fails open", EventPreToolUse, `{"tool_input":`, "", 0},
+		{"wrongly typed fields before the path", EventPreToolUse,
+			`{"session_id":5,"cwd":["/"],"tool_name":{},"hook_event_name":null,"tool_input":{"file_path":"` + docs + `","content":"x"}}`,
+			"inside read-only repo docs", 2},
+		{"truncated after wrongly typed fields", EventPreToolUse,
+			`{"session_id":5,"cwd":"/","tool_input":{"file_path":"` + docs + `","content":"x`, "inside read-only repo docs", 2},
 		{"oversized Stop ignored", EventStop, `{"session_id":"s","x":"` + big + `"}`, "", 0},
 	} {
 		t.Run(c.name, func(t *testing.T) {

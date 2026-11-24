@@ -270,7 +270,7 @@ func TestStatusLineReadOnly(t *testing.T) {
 func TestStatusLineText(t *testing.T) {
 	for _, c := range []struct{ name, title, want string }{
 		{"plain", "Fix login", "● Fix login"},
-		{"control and format characters", "Fix\nthe\tlogin\x1b[31m page‮\r\x00", "● Fix the login [31m page"},
+		{"control and format characters", "Fix\nthe\tlogin\x1b[31m page\u202e\r\x00", "● Fix the login [31m page"},
 		{"invalid UTF-8", "a\xffb", "● a b"},
 		{"blank title shows the slug", " \n\t", "● slug"},
 		{"long title cut to 80 columns", strings.Repeat("x", 200), "● " + strings.Repeat("x", 77) + "…"},
