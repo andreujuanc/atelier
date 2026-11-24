@@ -733,3 +733,38 @@ func TestNewWindowFormatChars(t *testing.T) {
 		t.Errorf("window names = %q, %v", names, err)
 	}
 }
+
+// TestNewWindowPathAndShell: tmux gives a new pane its PATH (the client's,
+// or the session's) and SHELL (default-shell) after -e, so the window's
+// command gets those of WindowSpec.Env otherwise; the command is looked up
+// on that PATH, in a new session's first window and in a later one.
+func TestNewWindowPathAndShell(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "my bin's")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prog := "#!/bin/sh\nenv > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\nexec sleep 300\n"
+	if err := os.WriteFile(filepath.Join(bin, "atlt-prog"), []byte(prog), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := bin + ":" + os.Getenv("PATH")
+	for i, session := range []string{"atl-new", "atl-new"} {
+		out := filepath.Join(dir, fmt.Sprintf("env%d", i))
+		if _, err := c.NewWindow(ctx, WindowSpec{
+			Session: session, Name: "w",
+			Env:  map[string]string{"PATH": path, "SHELL": "/bin/proj-sh", "OTHER": "o"},
+			Argv: []string{"atlt-prog", out},
+		}); err != nil {
+			t.Fatalf("NewWindow %d: %v", i, err)
+		}
+		env := waitFile(t, out)
+		for _, want := range []string{"\nPATH=" + path + "\n", "\nSHELL=/bin/proj-sh\n", "\nOTHER=o\n"} {
+			if !strings.Contains("\n"+env, want) {
+				t.Errorf("window %d env missing %q:\n%s", i, want, env)
+			}
+		}
+	}
+}

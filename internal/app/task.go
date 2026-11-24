@@ -248,7 +248,7 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 	t := &model.Task{
 		Slug:        model.Slugify(title),
 		Title:       title,
-		Description: strings.TrimSpace(o.Description),
+		Description: strings.TrimSpace(model.SanitizeNotes(o.Description)), // as notes: keeps newlines and tabs
 		Status:      status,
 		Project:     o.Project,
 		Base:        base,
@@ -838,8 +838,10 @@ func (a *App) Cancel(ctx context.Context, ref string, force bool) (*model.Task, 
 
 // finish closes an open task: refuses if a rw worktree's HEAD has commits
 // no branch, remote-tracking ref or tag reaches (even with force) or has
-// uncommitted changes (unless force), kills its tmux session, ends its sessions, runs
-// teardown, removes its worktrees and generated files, deletes each task
+// uncommitted changes (unless force), kills its tmux session, ends its
+// sessions (if the close then fails, those it ended that have a Claude id are
+// left stopped, resumable), runs teardown, removes its worktrees and
+// generated files, deletes each task
 // branch that has no unpushed commits (see cleanupBranch), removes the task
 // dir if it is then empty and sets the status. Worktrees
 // whose dir was deleted by hand are skipped by the dirty check but still
@@ -951,7 +953,24 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 	if err != nil {
 		return err
 	}
-	var ended []int64
+	// The sessions this close ends. Should it fail, the task stays open:
+	// those with a conversation to resume are set back to stopped (their
+	// windows are gone), so atl resume / atl open relaunch them.
+	var ended []model.Session
+	closed := false
+	defer func() {
+		if closed {
+			return
+		}
+		for _, s := range ended {
+			if s.ClaudeSessionID == "" {
+				continue
+			}
+			if _, err := a.Store.SetStateIf(context.WithoutCancel(ctx), s.ID, model.StateEnded, model.StateStopped, a.now()); err != nil {
+				a.warnf("session %s: %v", sessionName(s), err)
+			}
+		}
+	}()
 	for _, s := range sessions {
 		if s.State == model.StateEnded {
 			continue
@@ -959,7 +978,7 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		if err := a.Store.SetSessionState(ctx, s.ID, model.StateEnded, a.now()); err != nil {
 			return err
 		}
-		ended = append(ended, s.ID)
+		ended = append(ended, s)
 	}
 	if err := a.runTeardown(ctx, t, force); err != nil {
 		if !force {
@@ -967,8 +986,8 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 			// sessions just ended (their windows are gone) left running in
 			// it goes now. Otherwise removeSandbox takes it with the
 			// container.
-			for _, id := range ended {
-				a.killSessionProcs(ctx, t, id)
+			for _, s := range ended {
+				a.killSessionProcs(ctx, t, s.ID)
 			}
 			return fmt.Errorf("task %s: teardown: %w (use --force to continue anyway)", t.Slug, err)
 		}
@@ -1018,7 +1037,11 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 			a.warnf("left %s: %v", dir, err)
 		}
 	}
-	return a.Store.SetTaskStatus(ctx, t.ID, to)
+	if err := a.Store.SetTaskStatus(ctx, t.ID, to); err != nil {
+		return err
+	}
+	closed = true
+	return nil
 }
 
 // beforeBranchDelete, if set (tests only), runs in cleanupBranch between the

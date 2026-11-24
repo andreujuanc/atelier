@@ -568,7 +568,7 @@ func TestCreate(t *testing.T) {
 		_, _, err := create(root, "box", Config{})
 		var ae *AdoptDBError
 		if !errors.As(err, &ae) || !strings.Contains(err.Error(), "`atl workspace new box --repos DIR [--mount PATH]...`") ||
-			!strings.Contains(err.Error(), "Moving from a devcontainer box") || strings.Contains(err.Error(), "\n") {
+			!strings.Contains(err.Error(), `"Moving from a devcontainer box" in atelier's docs/workspaces.md`) || strings.Contains(err.Error(), "\n") {
 			t.Errorf("$%s=%q %q: %v", Var, ws.val, ws.vars, err)
 		}
 		for _, p := range []string{File, "repos", "tasks"} {

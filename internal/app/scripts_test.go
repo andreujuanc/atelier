@@ -191,6 +191,49 @@ func TestTeardownFailureAbortsUnlessForce(t *testing.T) {
 	}
 }
 
+// TestFailedCloseLeavesSessionsResumable: a close that fails after it
+// closed the task's sessions (teardown fails, or leaves changes the
+// worktree removal then refuses) leaves the task open with the sessions
+// that have a Claude id stopped, so `atl resume` relaunches them; one
+// without a Claude id (nothing to resume) and one ended before stay ended.
+func TestFailedCloseLeavesSessionsResumable(t *testing.T) {
+	for _, teardown := range []string{"exit 4", "echo x > teardown.log"} {
+		t.Run(teardown, func(t *testing.T) {
+			e := newTaskEnv(t)
+			ctx := context.Background()
+			e.addRepo(t, "api", "main")
+			e.writeProject(t, "shop", "teardown = '"+teardown+"'\n[[repos]]\nname = \"api\"\n")
+			task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "td fail", Project: "shop"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sessions := []*model.Session{
+				{TaskID: task.ID, State: model.StateIdle, ClaudeSessionID: "cid-idle"},
+				{TaskID: task.ID, State: model.StateStopped, ClaudeSessionID: "cid-stopped"},
+				{TaskID: task.ID, State: model.StateRunning},
+				{TaskID: task.ID, State: model.StateEnded, ClaudeSessionID: "cid-ended"},
+			}
+			for _, s := range sessions {
+				if err := e.app.Store.CreateSession(ctx, s); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := e.app.Done(ctx, task.Slug, false); err == nil {
+				t.Fatal("Done succeeded; want it to fail")
+			}
+			if st, _ := e.app.Store.GetTask(ctx, task.ID); st.Status != model.StatusActive {
+				t.Fatalf("status %s", st.Status)
+			}
+			want := []model.SessionState{model.StateStopped, model.StateStopped, model.StateEnded, model.StateEnded}
+			for i, s := range sessions {
+				if got, _ := e.app.Store.GetSession(ctx, s.ID); got.State != want[i] {
+					t.Errorf("session %d (%s): %s, want %s", s.ID, s.ClaudeSessionID, got.State, want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestTeardownProjectGone(t *testing.T) {
 	e := newTaskEnv(t)
 	ctx := context.Background()

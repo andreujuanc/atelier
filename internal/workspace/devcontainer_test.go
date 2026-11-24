@@ -235,7 +235,8 @@ func TestAdoptDevcontainer(t *testing.T) {
 		t.Errorf("norepos: %v", err)
 	}
 	// Selecting it says to adopt it; with repos in devcontainer.json without --repos.
-	if _, err := Load(filepath.Join(root, "norepos")); err == nil || !strings.Contains(err.Error(), "--repos DIR") {
+	if _, err := Load(filepath.Join(root, "norepos")); err == nil || !strings.Contains(err.Error(), "--repos DIR") ||
+		!strings.Contains(err.Error(), `"Moving from a devcontainer box" in atelier's docs/workspaces.md`) {
 		t.Errorf("load norepos: %v", err)
 	}
 	box(t, root, "hasrepos", `{"containerEnv": {"ATL_REPOS": "/srv/r"}}`)

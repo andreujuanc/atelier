@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/spf13/cobra"
 
 	"github.com/andreujuanc/atelier/internal/app"
@@ -483,38 +484,41 @@ func writeWrapped(w io.Writer, indent, text string) {
 	}
 }
 
-// wrapLine word-wraps s to lines of at most width runes, breaking words
-// longer than width. An empty s yields one empty line.
+// wrapLine word-wraps s to lines of at most width display columns (wide
+// characters count two), breaking words longer than width. An empty s
+// yields one empty line.
 func wrapLine(s string, width int) []string {
 	if width < 20 {
 		width = 20
 	}
 	var out []string
-	var cur []rune
+	cur, curW := "", 0
 	flush := func() {
-		out = append(out, string(cur))
-		cur = cur[:0]
+		out = append(out, cur)
+		cur, curW = "", 0
 	}
 	for _, word := range strings.Fields(s) {
-		wr := []rune(word)
-		for len(wr) > width {
-			if len(cur) > 0 {
+		ww := ansi.StringWidth(word)
+		for ww > width {
+			if curW > 0 {
 				flush()
 			}
-			out = append(out, string(wr[:width]))
-			wr = wr[width:]
+			head := ansi.Truncate(word, width, "")
+			out = append(out, head)
+			word = word[len(head):]
+			ww = ansi.StringWidth(word)
 		}
 		switch {
-		case len(cur) == 0:
-			cur = append(cur, wr...)
-		case len(cur)+1+len(wr) <= width:
-			cur = append(append(cur, ' '), wr...)
+		case curW == 0:
+			cur, curW = word, ww
+		case curW+1+ww <= width:
+			cur, curW = cur+" "+word, curW+1+ww
 		default:
 			flush()
-			cur = append(cur, wr...)
+			cur, curW = word, ww
 		}
 	}
-	if len(cur) > 0 || len(out) == 0 {
+	if curW > 0 || len(out) == 0 {
 		flush()
 	}
 	return out

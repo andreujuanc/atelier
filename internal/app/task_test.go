@@ -476,6 +476,29 @@ func TestNewTaskTitleWhitespace(t *testing.T) {
 	}
 }
 
+// TestNewTaskDescriptionControl: control characters in a description are
+// dropped as in notes (newlines and tabs kept, \r\n made \n), in the
+// database and in CLAUDE.md.
+func TestNewTaskDescriptionControl(t *testing.T) {
+	e := newTaskEnv(t)
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(context.Background(), NewTaskOpts{Title: "Fix",
+		Description: " \x1b[2Jline\a one\r\n\tdetail\x00 \n", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRO}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "[2Jline one\n\tdetail"; task.Description != want {
+		t.Fatalf("description = %q, want %q", task.Description, want)
+	}
+	md, err := os.ReadFile(filepath.Join(e.app.Paths.TaskDir(task.Slug), "CLAUDE.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(string(md), "\x1b\a\r\x00") || !strings.Contains(string(md), "[2Jline one\n\tdetail") {
+		t.Fatalf("CLAUDE.md:\n%q", md)
+	}
+}
+
 func TestNewTaskProject(t *testing.T) {
 	e := newTaskEnv(t)
 	e.addRepo(t, "api", "main")

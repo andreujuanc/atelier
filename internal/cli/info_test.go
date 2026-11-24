@@ -389,6 +389,12 @@ func TestWrapLine(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("wrap = %q", got)
 	}
+	// Wide (CJK) characters take two columns: wrapped by display width.
+	got = wrapLine("漢字 "+strings.Repeat("字", 25)+" 漢", 20)
+	want = []string{"漢字", strings.Repeat("字", 10), strings.Repeat("字", 10), "字字字字字 漢"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("wide wrap = %q", got)
+	}
 }
 
 func TestPushedText(t *testing.T) {
