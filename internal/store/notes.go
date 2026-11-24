@@ -12,8 +12,12 @@ import (
 
 // GetNotes returns task id's notes text ("" if it has none).
 func (s *Store) GetNotes(ctx context.Context, id int64) (string, error) {
+	return readNotes(ctx, s.db, id)
+}
+
+func readNotes(ctx context.Context, q querier, id int64) (string, error) {
 	var text string
-	err := s.db.QueryRowContext(ctx, `SELECT notes FROM tasks WHERE id = ?`, id).Scan(&text)
+	err := q.QueryRowContext(ctx, `SELECT notes FROM tasks WHERE id = ?`, id).Scan(&text)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("task %d: %w", id, ErrNotFound)
 	}
@@ -46,10 +50,8 @@ func (s *Store) writeNotes(ctx context.Context, id int64, text string, base *str
 		return "", err
 	}
 	defer tx.Rollback()
-	var cur string
-	if err := tx.QueryRowContext(ctx, `SELECT notes FROM tasks WHERE id = ?`, id).Scan(&cur); errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("task %d: %w", id, ErrNotFound)
-	} else if err != nil {
+	cur, err := readNotes(ctx, tx, id)
+	if err != nil {
 		return "", err
 	}
 	if base != nil && cur != *base {
@@ -84,10 +86,8 @@ func (s *Store) AppendNote(ctx context.Context, id int64, author, body string) (
 		return "", err
 	}
 	defer tx.Rollback()
-	var cur string
-	if err := tx.QueryRowContext(ctx, `SELECT notes FROM tasks WHERE id = ?`, id).Scan(&cur); errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("task %d: %w", id, ErrNotFound)
-	} else if err != nil {
+	cur, err := readNotes(ctx, tx, id)
+	if err != nil {
 		return "", err
 	}
 	next := line
