@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -34,5 +35,27 @@ func TestBuildImagesUnderCDPATH(t *testing.T) {
 	// The last argument of each docker build call: the context.
 	if got, want := string(data), "["+root+"]["+root+"]"; got != want {
 		t.Errorf("build contexts %q, want %q", got, want)
+	}
+}
+
+// TestDockerfileNoPipeToShell: no RUN of the Dockerfile pipes a download
+// into a shell. RUN's sh has no pipefail, so a failed download would run an
+// empty script and the build would go on without what it installs.
+func TestDockerfileNoPipeToShell(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(string(data), "\n") {
+		if !strings.Contains(line, "curl ") {
+			continue
+		}
+		_, after, ok := strings.Cut(line, "|")
+		if !ok {
+			continue
+		}
+		if f := strings.Fields(after); len(f) > 0 && (f[0] == "sh" || f[0] == "bash") {
+			t.Errorf("Dockerfile:%d pipes curl into a shell: %s", i+1, strings.TrimSpace(line))
+		}
 	}
 }
