@@ -1086,3 +1086,44 @@ func TestBuildTaskDirKeepsBranchOnFailedProbe(t *testing.T) {
 		t.Fatal("task dir left behind")
 	}
 }
+
+// Doctor lists, per repo, the settings of its own config (its clone's and
+// its worktrees') that make atl refuse a git command, naming the worktree
+// a worktree-scoped one is in; repos without any pass.
+func TestDoctorRepoConfigs(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "docs", "main")
+	check := func() map[string]Check {
+		t.Helper()
+		found := map[string]Check{}
+		for _, c := range e.app.checkRepoConfigs(ctx) {
+			found[c.Name] = c
+		}
+		return found
+	}
+	if c := check()["repo configs"]; !c.OK || c.Warn || !strings.Contains(c.Detail, "2 repos") {
+		t.Fatalf("clean repos: %+v", c)
+	}
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "cfg", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	git(t, e.canonical("api"), "config", "filter.x.clean", "cat")
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	git(t, e.canonical("api"), "config", "extensions.worktreeConfig", "true")
+	git(t, wt, "config", "--worktree", "url.https://evil.example/.insteadOf", "https://github.com/")
+	found := check()
+	c, ok := found["repo api"]
+	if !ok || !c.Warn || !strings.Contains(c.Detail, "filter.x.clean = cat (local; blocks atl diff") ||
+		!strings.Contains(c.Detail, "(worktree "+wt+"; blocks atl push") {
+		t.Fatalf("repo api: %+v (all: %+v)", c, found)
+	}
+	if _, ok := found["repo docs"]; ok {
+		t.Fatalf("docs flagged: %+v", found)
+	}
+	if _, ok := found["repo configs"]; ok {
+		t.Fatalf("a pass besides the warnings: %+v", found)
+	}
+}
