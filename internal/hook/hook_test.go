@@ -889,3 +889,37 @@ func TestStopBackground(t *testing.T) {
 		t.Fatalf("capped: %d lines, last %q, first %d runes", len(got), got[len(got)-1], len([]rune(got[0])))
 	}
 }
+
+// TestWronglyTypedField: a field of an unexpected type (here a background
+// task's id) is logged but does not drop the event's state change; input
+// that is not an object, or whose session id is not a string, still
+// changes nothing.
+func TestWronglyTypedField(t *testing.T) {
+	f := setup(t)
+	s := f.session(t, model.StateRunning, "cid")
+	env := envOf(map[string]string{"ATL_SESSION": itoa(s.ID), "ATL_TASK": "fix"})
+	hook := func(event, stdin string) {
+		t.Helper()
+		var out, errb bytes.Buffer
+		if code := run([]string{event}, strings.NewReader(stdin), &out, &errb, env); code != 0 || out.Len() != 0 {
+			t.Fatalf("%s: exit %d stdout %q stderr %q", event, code, out.String(), errb.String())
+		}
+	}
+	hook(EventStop, `{"session_id":"cid","background_tasks":[{"id":1,"type":"shell","status":"running","command":"npm run dev"}]}`)
+	if g := f.get(t, s.ID); g.State != model.StateIdle || g.Background != "shell: npm run dev" {
+		t.Errorf("after Stop: %s %q, want idle with the shell", g.State, g.Background)
+	}
+	if log := readLog(t, f.p); !strings.Contains(log, "event=Stop") || !strings.Contains(log, "cannot unmarshal number") {
+		t.Errorf("type error not logged: %q", log)
+	}
+	hook(EventUserPromptSubmit, `{"session_id":"cid","message":5}`)
+	if g := f.get(t, s.ID); g.State != model.StateRunning {
+		t.Errorf("after a prompt: %s, want running", g.State)
+	}
+	for _, stdin := range []string{`["cid"]`, `{"session_id":7}`, `{"session_id":["cid"]}`} {
+		hook(EventStop, stdin)
+		if g := f.get(t, s.ID); g.State != model.StateRunning {
+			t.Errorf("Stop %s: %s, want still running", stdin, g.State)
+		}
+	}
+}
