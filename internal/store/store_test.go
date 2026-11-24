@@ -841,3 +841,56 @@ func TestOpenNewerSchema(t *testing.T) {
 		t.Errorf("Open newer schema: err = %v", err)
 	}
 }
+
+// TestListTasksConsistentRepos checks that ListTasks reads a task and its
+// repos from one snapshot: a task whose status changes while it is listed
+// still comes with its repos.
+func TestListTasksConsistentRepos(t *testing.T) {
+	s, path := openTest(t)
+	ctx := context.Background()
+	for i := 0; i < 20; i++ {
+		mkTask(t, s, fmt.Sprintf("t%d", i), model.StatusActive, 0, model.TaskRepo{Name: "r", Mode: model.ModeRW})
+	}
+	w, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			st := model.StatusActive
+			if i%2 == 0 {
+				st = model.StatusDone
+			}
+			if err := w.SetTaskStatus(ctx, int64(i%20+1), st); err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	for i := 0; i < 300; i++ {
+		ts, err := s.ListTasks(ctx, model.StatusActive)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range ts {
+			if len(task.Repos) != 1 {
+				t.Fatalf("iteration %d: %s listed with repos %+v, want its one repo", i, task.Slug, task.Repos)
+			}
+		}
+	}
+}

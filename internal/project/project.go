@@ -85,6 +85,13 @@ func Load(p config.Paths, name string) (*Project, error) {
 		}
 		seen[r.Name] = true
 	}
+	for k, v := range pr.Env {
+		// "A=B" = "v" would reach a process as A with value "B=v",
+		// overriding what EnvFor puts after the project's env.
+		if k == "" || strings.ContainsAny(k, "=\x00") || strings.ContainsRune(v, 0) {
+			return nil, fmt.Errorf("project %q: env %q: invalid variable (empty name, or '=' in the name, or a NUL byte)", name, k)
+		}
+	}
 	return &pr, nil
 }
 

@@ -2,7 +2,8 @@ package model
 
 import "strings"
 
-const maxSlugLen = 40
+// MaxSlugLen caps a task slug, in bytes (it is ASCII).
+const MaxSlugLen = 40
 
 // Slugify turns a title into a slug: lowercase, runs of characters outside
 // [a-z0-9] become a single "-", leading/trailing "-" trimmed, cut to 40
@@ -22,8 +23,8 @@ func Slugify(title string) string {
 		}
 	}
 	s := b.String()
-	if len(s) > maxSlugLen {
-		s = strings.TrimRight(s[:maxSlugLen], "-")
+	if len(s) > MaxSlugLen {
+		s = strings.TrimRight(s[:MaxSlugLen], "-")
 	}
 	if s == "" {
 		return "task"
