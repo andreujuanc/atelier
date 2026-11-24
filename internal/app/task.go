@@ -248,7 +248,7 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 	t := &model.Task{
 		Slug:        model.Slugify(title),
 		Title:       title,
-		Description: strings.TrimSpace(o.Description),
+		Description: strings.TrimSpace(model.SanitizeNotes(o.Description)), // as notes: keeps newlines and tabs
 		Status:      status,
 		Project:     o.Project,
 		Base:        base,
