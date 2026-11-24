@@ -180,6 +180,9 @@ func TestRecoverAfterKilledResume(t *testing.T) {
 			if got := e.session(t, s.ID); got.State != model.StateStopped || got.ClaudeSessionID != "cid-1" {
 				t.Fatalf("after Recover: %+v", got)
 			}
+			// The first launch's argv: e.argv would read it, or the resumed
+			// stub's file while it is being written.
+			os.Remove(filepath.Join(e.out, "argv-"+strconv.FormatInt(s.ID, 10)))
 			if n, err := e.app.Resume(ctx, "t"); err != nil || n != 1 {
 				t.Fatalf("Resume = %d, %v", n, err)
 			}
