@@ -26,6 +26,9 @@ var (
 // Store is a handle on the atelier database. It is safe for concurrent use.
 type Store struct {
 	db *sql.DB
+	// wal is the path of the database's -wal file, or "" for a
+	// read-only store (see Close).
+	wal string
 }
 
 // migrations are applied in order; the database's PRAGMA user_version
@@ -121,6 +124,10 @@ func Open(path string) (*Store, error) { return OpenWithTimeout(path, DefaultBus
 // set once (see setWAL). Transactions use BEGIN IMMEDIATE ("_txlock")
 // so concurrent writers wait on busy_timeout instead of failing with
 // SQLITE_BUSY on a read→write lock upgrade.
+//
+// Its connections do not checkpoint the WAL when they close; Close
+// checkpoints it once it has grown past walTruncateSize instead (see
+// noCheckpointOnClose).
 func OpenWithTimeout(path string, busy time.Duration) (*Store, error) {
 	if busy < 0 {
 		busy = 0
@@ -139,15 +146,12 @@ func OpenWithTimeout(path string, busy time.Duration) (*Store, error) {
 	q.Add("_pragma", "foreign_keys(ON)")
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Set("_txlock", "immediate")
-	db, err := sql.Open("sqlite", path+"?"+q.Encode())
-	if err != nil {
-		return nil, fmt.Errorf("store: open %s: %w", path, err)
-	}
+	db := sql.OpenDB(noCkptConnector{dsn: path + "?" + q.Encode(), drv: &sqlite.Driver{}})
 	if err := setWAL(context.Background(), db, busy); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: open %s: set WAL mode: %w", path, err)
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, wal: path + "-wal"}
 	if err := s.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate %s: %w", path, err)
@@ -192,10 +196,10 @@ var ErrSchemaVersion = errors.New("database schema version mismatch")
 // The database file itself is never written. A read-only connection to a
 // WAL database does create empty -wal and -shm files next to it when they
 // are missing (SQLite needs the shared-memory index to read a WAL
-// database), and cannot remove them on close; the next read-write
-// connection cleans them up as usual. That is unavoidable without
+// database), and cannot remove them on close. That is unavoidable without
 // immutable=1 (unsafe while hooks write) or readonly_shm=1 (fails when no
-// -shm exists).
+// -shm exists), and harmless: read-write connections leave them in place
+// too (see noCheckpointOnClose).
 func OpenReadOnly(path string, busy time.Duration) (*Store, error) {
 	if busy < 0 {
 		busy = 0
@@ -234,8 +238,49 @@ func OpenReadOnly(path string, busy time.Duration) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// Close closes the database.
-func (s *Store) Close() error { return s.db.Close() }
+// walTruncateSize is the -wal file size past which a read-write Store's
+// Close checkpoints the WAL and truncates it.
+const walTruncateSize = 1 << 20
+
+// walCheckpointBusy bounds how long that checkpoint waits on another
+// connection's lock or read transaction, well within a hook's latency
+// budget.
+const walCheckpointBusy = 20 * time.Millisecond
+
+// Close closes the database. A read-write store first checkpoints the WAL
+// into the database file and truncates it, if it has grown past
+// walTruncateSize: its connections do not checkpoint on close (see
+// noCheckpointOnClose), and when no other connection has the database
+// open the next one to open it recovers the WAL by reading all of it and
+// forgets what was already checkpointed, so SQLite's automatic checkpoint
+// could never restart it and it would grow without bound. The checkpoint
+// waits at most walCheckpointBusy for other connections; one that cannot
+// finish (busy) is left to a later Close.
+func (s *Store) Close() error {
+	if s.wal != "" {
+		s.truncateWAL(context.Background())
+	}
+	return s.db.Close()
+}
+
+// truncateWAL checkpoints the WAL and truncates it if the -wal file is
+// larger than walTruncateSize, waiting at most walCheckpointBusy on locks.
+// It is best effort: on any failure the WAL is left as it is.
+func (s *Store) truncateWAL(ctx context.Context) {
+	if fi, err := os.Stat(s.wal); err != nil || fi.Size() <= walTruncateSize {
+		return
+	}
+	c, err := s.db.Conn(ctx)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	// busy_timeout is per connection, and Close closes this one right after.
+	if _, err := c.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", walCheckpointBusy.Milliseconds())); err != nil {
+		return
+	}
+	_, _ = c.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+}
 
 // migrate applies pending migrations. The common case (schema current) is
 // a plain read of user_version with no write transaction, so concurrent
