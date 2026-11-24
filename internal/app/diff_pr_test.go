@@ -159,13 +159,6 @@ func (l ghLog) args(t *testing.T) []string {
 
 func (l ghLog) cwd(t *testing.T) string { return strings.TrimSpace(readFile(t, l.base+".cwd")) }
 
-func samePathT(t *testing.T, a, b string) bool {
-	t.Helper()
-	ra, err1 := filepath.EvalSymlinks(a)
-	rb, err2 := filepath.EvalSymlinks(b)
-	return err1 == nil && err2 == nil && ra == rb
-}
-
 // originHasBranch reports whether the bare origin of repo has branch.
 func (e *taskEnv) originHasBranch(t *testing.T, repo, branch string) bool {
 	t.Helper()

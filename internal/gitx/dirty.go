@@ -2,7 +2,6 @@ package gitx
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -185,15 +184,12 @@ type gitIndex struct {
 // readIndex lists the index of the worktree with each entry's stat data
 // (`git ls-files --stage --debug`), and the index file's mtime.
 func readIndex(ctx context.Context, worktree string) (*gitIndex, error) {
-	var stdout, stderr bytes.Buffer
-	args := []string{"ls-files", "-z", "--stage", "--debug"}
-	cmd := command(ctx, worktree, args...)
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, wrap(ctx, args, stderr.String(), err)
+	stdout, err := output(ctx, worktree, "", "ls-files", "-z", "--stage", "--debug")
+	if err != nil {
+		return nil, err
 	}
 	ix := &gitIndex{}
-	r := bufio.NewReader(&stdout)
+	r := bufio.NewReader(strings.NewReader(stdout))
 	for {
 		head, err := r.ReadString(0)
 		if err == io.EOF && head == "" {
@@ -208,7 +204,7 @@ func readIndex(ctx context.Context, worktree string) (*gitIndex, error) {
 		}
 		ix.entries = append(ix.entries, e)
 	}
-	path, err := run(ctx, worktree, "rev-parse", "--git-path", "index")
+	path, err := revParsePath(ctx, worktree, "--git-path", "index")
 	if err != nil {
 		return nil, err
 	}

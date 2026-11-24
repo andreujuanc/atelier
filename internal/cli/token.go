@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/charmbracelet/x/term"
@@ -53,10 +52,7 @@ func (c *cli) tokenCmd() *cobra.Command {
 					return err
 				}
 				var auto bool
-				auto, err = ap.SetupToken(cmd.Context(), func(attach *exec.Cmd) error {
-					attach.Stdin, attach.Stdout, attach.Stderr = os.Stdin, c.stdout, c.stderr
-					return attach.Run()
-				}, ask)
+				auto, err = ap.SetupToken(cmd.Context(), c.runOnTerminal, ask)
 				if err == nil && auto {
 					fmt.Fprintln(c.stdout, "Read the token from claude setup-token's screen.")
 				}

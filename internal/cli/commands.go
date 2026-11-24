@@ -273,6 +273,13 @@ type jsonTask struct {
 
 func rfc3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
+// printJSON prints v on stdout as indented JSON (the --json outputs).
+func (c *cli) printJSON(v any) error {
+	enc := json.NewEncoder(c.stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
 func toJSON(ap *app.App, v app.TaskView) jsonTask {
 	t := v.Task
 	jt := jsonTask{
@@ -354,16 +361,14 @@ func (c *cli) lsCmd() *cobra.Command {
 				for _, v := range views {
 					out = append(out, toJSON(ap, v))
 				}
-				enc := json.NewEncoder(c.stdout)
-				enc.SetIndent("", "  ")
-				return enc.Encode(out)
+				return c.printJSON(out)
 			}
 			tw := tabwriter.NewWriter(c.stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(tw, "ID\tSLUG\tSTATUS\tPROJECT\tSESSIONS\tTITLE")
 			for _, v := range views {
 				t := v.Task
 				fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", t.ID, t.Slug, t.Status, orDash(t.Project),
-					sessionsSummary(v.Sessions), t.Title)
+					sessionsSummary(v.Sessions), sanitize(t.Title))
 			}
 			return tw.Flush()
 		},
@@ -410,11 +415,7 @@ func (c *cli) openCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			attach.Stdin, attach.Stdout, attach.Stderr = os.Stdin, c.stdout, c.stderr
-			if err := attach.Run(); err != nil {
-				return fmt.Errorf("attach: %w", err)
-			}
-			return nil
+			return c.attach(attach)
 		},
 	}
 	cmd.Flags().Int64Var(&sessionID, "session", 0, "open this session (id from atl show): attach to it if live, else resume it")
@@ -445,13 +446,24 @@ func (c *cli) assistantCmd() *cobra.Command {
 			if hint != "" {
 				fmt.Fprintln(c.stderr, hint)
 			}
-			attach.Stdin, attach.Stdout, attach.Stderr = os.Stdin, c.stdout, c.stderr
-			if err := attach.Run(); err != nil {
-				return fmt.Errorf("attach: %w", err)
-			}
-			return nil
+			return c.attach(attach)
 		},
 	}
+}
+
+// attach runs a tmux attach command on the terminal.
+func (c *cli) attach(attach *exec.Cmd) error {
+	if err := c.runOnTerminal(attach); err != nil {
+		return fmt.Errorf("attach: %w", err)
+	}
+	return nil
+}
+
+// runOnTerminal runs cmd with the terminal's stdin and atl's stdout and
+// stderr.
+func (c *cli) runOnTerminal(cmd *exec.Cmd) error {
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, c.stdout, c.stderr
+	return cmd.Run()
 }
 
 func (c *cli) sessionCmd() *cobra.Command {
@@ -647,9 +659,9 @@ func (c *cli) prCmd() *cobra.Command {
 
 func (c *cli) finishCmd(verb string) *cobra.Command {
 	var force bool
-	short := "Finish a task: kill tmux, remove worktrees (branches kept), status done"
+	short := "Finish a task: kill tmux, remove worktrees and the branches with nothing unpushed, status done"
 	if verb == "cancel" {
-		short = "Cancel a task: kill tmux, remove worktrees (branches kept), status cancelled"
+		short = "Cancel a task: kill tmux, remove worktrees and the branches with nothing unpushed, status cancelled"
 	}
 	cmd := &cobra.Command{
 		Use:   verb + " <task> [--force]",
@@ -772,7 +784,7 @@ func (c *cli) gateCmd() *cobra.Command {
 			}
 			runDir := p.RunDir(slug)
 			id := sandbox.ID(slug, dir)
-			bin, err := gateBin()
+			bin, err := atlBin()
 			if err != nil {
 				return err
 			}
@@ -871,9 +883,9 @@ func reservedImages(p config.Paths, startImages ...string) func() ([]string, err
 	}
 }
 
-// gateBin is the atl binary a gate runs push, fetch and the assistant's
-// commands with: $ATL_BIN, else the running one.
-func gateBin() (string, error) {
+// atlBin is the atl binary a gate runs push, fetch and the assistant's
+// commands with, and the one atl re-executes: $ATL_BIN, else the running one.
+func atlBin() (string, error) {
 	if bin := os.Getenv("ATL_BIN"); bin != "" {
 		return bin, nil
 	}
@@ -901,7 +913,7 @@ func (c *cli) assistantGate(ctx context.Context, p config.Paths) error {
 	if err != nil {
 		return fmt.Errorf("assistant dir: %w", err)
 	}
-	bin, err := gateBin()
+	bin, err := atlBin()
 	if err != nil {
 		return err
 	}

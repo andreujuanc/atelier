@@ -17,6 +17,14 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	// The tests may run inside an atelier task (or its container), whose
+	// ATL_* variables change what atl does (e.g. it refuses most commands
+	// inside a task container): start from none; tests set what they need.
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "ATL_") {
+			os.Unsetenv(k)
+		}
+	}
 	dir, err := os.MkdirTemp("", "cli-test-git")
 	if err != nil {
 		panic(err)
@@ -225,6 +233,11 @@ func TestRootAndDoctor(t *testing.T) {
 	code, out, _ := atl(t)
 	if code != 0 || !strings.Contains(out, "Usage:") {
 		t.Fatalf("root: %d %s", code, out)
+	}
+	// done and cancel delete a task branch that has nothing unpushed
+	// (docs/tasks.md); the help must not say branches are kept.
+	if strings.Contains(out, "branches kept") || !strings.Contains(out, "remove worktrees and the branches with nothing unpushed") {
+		t.Errorf("root help on done/cancel branches:\n%s", out)
 	}
 	code, out, _ = atl(t, "doctor")
 	if !strings.Contains(out, "repos dir") || !strings.Contains(out, "database") {
@@ -488,5 +501,19 @@ func TestStartupRecover(t *testing.T) {
 	}
 	if got := tasks[0].Sessions[0].State; got != "stopped" {
 		t.Fatalf("session state after startup recover = %s, want stopped", got)
+	}
+}
+
+// TestLsSanitizesTitle: `atl new` keeps control characters other than
+// whitespace in a title (ESC included); `atl ls` must not print them to
+// the terminal, as `atl show` does not.
+func TestLsSanitizesTitle(t *testing.T) {
+	setup(t)
+	if code, _, errs := atl(t, "new", "Red \x1b[31malert\x07", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	code, out, errs := atl(t, "ls")
+	if code != 0 || strings.ContainsAny(out, "\x1b\x07") || !strings.Contains(out, "Red [31malert\n") {
+		t.Fatalf("ls: %d %q %s", code, out, errs)
 	}
 }
