@@ -301,7 +301,10 @@ type loudTask struct{ started chan struct{} }
 
 func (l loudTask) Do(req ControlRequest, body []byte, stdout, stderr io.Writer) int {
 	l.started <- struct{}{}
-	stdout.Write(bytes.Repeat([]byte("x"), 4<<20))
+	chunk := bytes.Repeat([]byte("x"), 4<<10)
+	for range 1024 { // 4 MiB, in writes short enough for the write timeout
+		stdout.Write(chunk)
+	}
 	return 0
 }
 
