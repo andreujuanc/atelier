@@ -256,6 +256,16 @@ func TestPushGoesToThePinnedOrigin(t *testing.T) {
 		!strings.Contains(res[0].Err.Error(), "atl repos pin api") {
 		t.Errorf("push with a damaged pin: %+v, %v", res, err)
 	}
+	// Doctor says so too.
+	found := false
+	for _, c := range e.app.Doctor(ctx) {
+		if c.Name == "repo api" && c.Warn && strings.Contains(c.Detail, "atl repos pin api") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("doctor does not report the damaged pin: %+v", e.app.Doctor(ctx))
+	}
 	if _, _, _, err := e.app.RepinOrigin(ctx, "api"); err != nil {
 		t.Fatal(err)
 	}

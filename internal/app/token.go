@@ -154,7 +154,7 @@ func (a *App) sandboxAuth() (map[string]string, error) {
 	}
 	if auth.stored && a.now().Sub(auth.storedAt) >= tokenLifetime {
 		a.warnf("the Claude Code token stored on %s is over a year old and has probably expired: run `atl token`",
-			auth.storedAt.Format(time.DateOnly))
+			auth.storedAt.Local().Format(time.DateOnly))
 	}
 	return auth.vars, nil
 }

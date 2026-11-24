@@ -2,10 +2,12 @@ package workspace
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -718,4 +720,30 @@ func create(root, name string, c Config) (string, []string, error) {
 		return "", nil, err
 	}
 	return p.Dir, p.Notes, nil
+}
+
+// A failed write of atelier.toml (a full disk) leaves no partial file
+// behind: a retry makes the workspace rather than calling it existing.
+func TestCreateWriteFails(t *testing.T) {
+	root := env(t)
+	write := writeFile
+	t.Cleanup(func() { writeFile = write })
+	writeFile = func(f *os.File, b []byte) (int, error) {
+		n, _ := f.Write(b[:len(b)/2])
+		return n, syscall.ENOSPC
+	}
+	if _, _, err := create(root, "full", Config{}); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("create on a full disk: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "full", File)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("partial %s left: %v", File, err)
+	}
+	writeFile = write
+	dir, _, err := create(root, "full", Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); err != nil {
+		t.Fatal(err)
+	}
 }

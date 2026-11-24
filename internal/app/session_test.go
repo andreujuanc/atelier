@@ -913,3 +913,65 @@ func TestResumeLaunchFailure(t *testing.T) {
 		t.Fatalf("Resume = %d, %v", n, err)
 	}
 }
+
+// No session is launched into a task done or cancel is closing: a launch
+// waits for the task's lock, which they hold until the task is closed, and
+// then finds the task closed. Otherwise its window (and, sandboxed, the
+// task's container) would outlive the task.
+func TestLaunchWaitsForClose(t *testing.T) {
+	launches := map[string]func(e *env, ctx context.Context, task *model.Task) error{
+		"NewSession": func(e *env, ctx context.Context, task *model.Task) error {
+			_, err := e.app.NewSession(ctx, task.Slug)
+			return err
+		},
+		"Resume": func(e *env, ctx context.Context, task *model.Task) error {
+			_, err := e.app.Resume(ctx, task.Slug)
+			return err
+		},
+		"OpenSession": func(e *env, ctx context.Context, task *model.Task) error {
+			ss, err := e.app.Store.ListSessions(ctx, task.ID)
+			if err != nil {
+				return err
+			}
+			_, err = e.app.OpenSession(ctx, task.Slug, ss[0].ID)
+			return err
+		},
+	}
+	for name, launch := range launches {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			ctx := context.Background()
+			task := e.task(t, "t", model.StatusActive, true)
+			past := &model.Session{TaskID: task.ID, ClaudeSessionID: "cid", Name: "claude-1", State: model.StateStopped}
+			if err := e.app.Store.CreateSession(ctx, past); err != nil {
+				t.Fatal(err)
+			}
+			unlock, err := e.app.lockTask(ctx, task.ID) // as done holds it
+			if err != nil {
+				t.Fatal(err)
+			}
+			errc := make(chan error, 1)
+			go func() { errc <- launch(e, ctx, task) }()
+			select {
+			case err := <-errc:
+				unlock()
+				t.Fatalf("%s did not wait for the task's lock: %v", name, err)
+			case <-time.After(300 * time.Millisecond):
+			}
+			if err := e.app.Store.SetTaskStatus(ctx, task.ID, model.StatusDone); err != nil {
+				t.Fatal(err)
+			}
+			unlock()
+			if err := <-errc; err == nil || !strings.Contains(err.Error(), "is done") {
+				t.Fatalf("%s into a closed task: %v", name, err)
+			}
+			if e.app.Tmux.HasSession(ctx, "atl-t") {
+				t.Error("tmux session made for a closed task")
+			}
+			live, err := e.app.Store.ListSessionsByState(ctx, model.StateRunning, model.StateWaiting, model.StateIdle)
+			if err != nil || len(live) != 0 {
+				t.Fatalf("live sessions of a closed task: %+v, %v", live, err)
+			}
+		})
+	}
+}

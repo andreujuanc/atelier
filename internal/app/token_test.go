@@ -319,6 +319,42 @@ func TestDoctorClaudeToken(t *testing.T) {
 	}
 }
 
+// TestTokenDates: doctor and a session's launch give the day a token was
+// stored as the same, local, date; a token stored "later" than now (the
+// clock was set back) is not given a negative age.
+func TestTokenDates(t *testing.T) {
+	e := newEnv(t)
+	a := e.app
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	local := time.Local
+	t.Cleanup(func() { time.Local = local })
+	time.Local = time.FixedZone("east", 5*3600)
+	t0 := time.Date(2026, 1, 10, 23, 30, 0, 0, time.UTC) // Jan 11 at 04:30 local
+	now := t0
+	a.Now = func() time.Time { return now }
+	if err := a.StoreToken(storedTestToken); err != nil {
+		t.Fatal(err)
+	}
+
+	now = t0.Add(-3 * 24 * time.Hour)
+	if c := a.checkClaudeToken(); c.Level() != "ok" || !strings.Contains(c.Detail, " 0 days old") {
+		t.Errorf("future-dated token: %s %q", c.Level(), c.Detail)
+	}
+
+	now = t0.Add(400 * 24 * time.Hour)
+	if c := a.checkClaudeToken(); !strings.Contains(c.Detail, "on 2026-01-11 ") {
+		t.Errorf("doctor: %q", c.Detail)
+	}
+	a.Out.(*bytes.Buffer).Reset()
+	if _, err := a.sandboxAuth(); err != nil {
+		t.Fatal(err)
+	}
+	if out := a.Out.(*bytes.Buffer).String(); !strings.Contains(out, "stored on 2026-01-11 ") {
+		t.Errorf("launch warning: %q", out)
+	}
+}
+
 // tokenEnv sets up newEnv's PATH with a `claude` whose setup-token prints
 // screen.
 func tokenEnv(t *testing.T, screen string) *env {
