@@ -281,7 +281,7 @@ type Model struct {
 	switching bool
 
 	// workspace is the name of the workspace the TUI runs in ("" unknown),
-	// shown on the status line.
+	// shown in the top bar (headerLine).
 	workspace string
 
 	// spinFrame is the busy spinner's frame; spinning: its tick is armed.
@@ -766,67 +766,13 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return nil
 
 	case listMsg:
-		m.listing = false
-		if m.relist {
-			// Read before a change reload was asked for: list again.
-			m.relist = false
-			m.listing = true
-			return m.listCmd()
-		}
-		if msg.err != nil {
-			m.setErr(fmt.Errorf("list: %w", msg.err))
-			return nil
-		}
-		m.tasks, m.loaded = msg.tasks, true
-		if m.rebuild() {
-			return m.selectionChanged()
-		}
-		return nil
+		return m.listed(msg)
 	case detailMsg:
-		if msg.seq == m.detailInflight {
-			m.detailInflight = 0
-		}
-		// Drop replies for another task or older than the one shown.
-		if t := m.selected(); t == nil || t.Task.ID != msg.id || msg.seq < m.detailApplied {
-			return nil
-		}
-		m.detailApplied = msg.seq
-		if msg.err != nil {
-			m.setErr(msg.err)
-			return nil
-		}
-		m.detail, m.detailAt = msg.view, m.now()
-		return nil
+		return m.detailLoaded(msg)
 	case recoverMsg:
-		m.recovering = false
-		if msg.err != nil {
-			// Shown once per distinct error: tmux may simply be missing.
-			if e := msg.err.Error(); e != m.recoverErr {
-				m.recoverErr = e
-				m.setErr(msg.err)
-			}
-			return nil
-		}
-		m.recoverErr = ""
-		if msg.n > 0 {
-			m.setStatus(fmt.Sprintf("%d session(s) marked stopped (tmux window gone); r resumes", msg.n))
-			return m.reload()
-		}
-		return nil
+		return m.recovered(msg)
 	case dirtyMsg:
-		m.dirtying = false
-		next := m.after(dirtyEvery, dirtyTickMsg{})
-		if msg.err != nil {
-			// Keep the last result; show each distinct error once.
-			if e := msg.err.Error(); e != m.dirtyErr {
-				m.dirtyErr = e
-				m.setErr(fmt.Errorf("dirty check: %w", msg.err))
-			}
-			return next
-		}
-		m.dirtyErr = ""
-		m.dirty = msg.dirty
-		return next
+		return m.dirtyChecked(msg)
 	case projectsMsg:
 		if msg.err == nil {
 			m.projects = msg.names
@@ -837,24 +783,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		}
 		return nil
 	case projectReposMsg:
-		f := m.form
-		if f == nil {
-			return nil
-		}
-		if f.loadingProject == msg.name {
-			f.loadingProject = ""
-		}
-		if f.project() != msg.name {
-			return m.syncProject() // stale: load the current one
-		}
-		if msg.err != nil {
-			// Not preselected: submitting sends the project as is and
-			// NewTask reports the problem.
-			f.projErr, f.projErrFor = firstLine(msg.err.Error()), msg.name
-			return nil
-		}
-		m.applyFormProject(msg.name, msg.repos)
-		return nil
+		return m.projectReposLoaded(msg)
 	case reposMsg:
 		if msg.err == nil {
 			m.repos = msg.names
@@ -883,105 +812,21 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 	case notesSavedMsg:
 		return m.notesSaved(msg)
 	case opMsg:
-		delete(m.busy, msg.id)
-		if msg.err != nil {
-			if msg.text != "" {
-				m.setStatusErr(firstLine(msg.text+"; "+msg.err.Error()), true)
-			} else {
-				m.setErr(fmt.Errorf("%s: %w", msg.op, msg.err))
-			}
-		} else {
-			m.setOK(msg.text)
-		}
-		return m.reload()
+		return m.opDone(msg)
 	case closeCheckMsg:
 		delete(m.busy, msg.id)
 		m.showConfirm(&confirmState{verb: msg.verb, id: msg.id, slug: msg.slug, dirty: msg.dirty})
 		return nil
 	case finishMsg:
-		delete(m.busy, msg.id)
-		if msg.err != nil {
-			m.setErr(fmt.Errorf("%s: %w", msg.verb, msg.err))
-			if !msg.force && isDirtyErr(msg.err) {
-				// Changes the dialog did not show: ask again, now saying
-				// they will be deleted. Never forced without that.
-				m.showConfirm(&confirmState{verb: msg.verb, id: msg.id, slug: msg.slug, dirty: true})
-				return nil
-			}
-			return m.reload()
-		}
-		m.setOK(fmt.Sprintf("%s %s", msg.slug, map[string]string{"done": "done", "cancel": "cancelled"}[msg.verb]))
-		return m.reload()
+		return m.finished(msg)
 	case newTaskMsg:
-		m.creating = false
-		if msg.err != nil {
-			m.setErr(fmt.Errorf("new task: %w", msg.err))
-			return nil
-		}
-		m.lastForm = nil
-		m.selID, m.stickyID = msg.task.ID, 0
-		m.selIdx = len(m.rows) // fallback if it is filtered out
-		m.setOK(fmt.Sprintf("created %s (%s)", msg.task.Slug, m.be.TaskDir(msg.task.Slug)))
-		return tea.Batch(m.reload(), m.selectionChanged())
+		return m.taskCreated(msg)
 	case openMsg:
-		delete(m.busy, msg.id)
-		if msg.err != nil {
-			m.setErr(fmt.Errorf("open: %w", msg.err))
-			return m.reload()
-		}
-		if msg.cmd != nil {
-			if !m.canTakeOver() {
-				// Don't attach over the form/filter/editor: the keys
-				// typed there would go to Claude. Its window is running.
-				m.setStatus("open " + msg.slug + ": ready — press enter again")
-				return m.reload()
-			}
-			return m.exec("open", msg.slug, msg.cmd)
-		}
-		if len(msg.choices) == 0 { // defensive: the backend returns one or the other
-			return m.reload()
-		}
-		if !m.canTakeOver() {
-			// Don't yank the user out of the form/filter/another prompt.
-			m.setStatus("open " + msg.slug + ": it has sessions to choose from — press enter again")
-			return nil
-		}
-		m.sessPick = newSessionPicker(msg.id, msg.slug, msg.choices)
-		m.mode = modeSessions
-		return nil
+		return m.opened(msg)
 	case assistantMsg:
-		m.assisting = false
-		if msg.err != nil {
-			m.setErr(fmt.Errorf("assistant: %w", msg.err))
-			return nil
-		}
-		if !m.canTakeOver() {
-			// As for open: don't attach over another mode.
-			text := "assistant ready — press A again"
-			if msg.hint != "" {
-				text += "; " + msg.hint
-			}
-			m.setStatus(text)
-			return nil
-		}
-		if msg.hint != "" {
-			m.setStatus(msg.hint)
-		}
-		return m.exec("assistant", "", msg.cmd)
+		return m.assistantOpened(msg)
 	case execDoneMsg:
-		if msg.err != nil {
-			prefix := strings.TrimSpace(msg.op + " " + msg.slug)
-			text := prefix + ": " + msg.err.Error()
-			if msg.stderr != nil {
-				if s := lastLine(msg.stderr.String()); s != "" {
-					text = prefix + ": " + s
-				}
-			}
-			m.setStatusErr(text, true)
-		} else if msg.op == "open" {
-			m.setOK("attached " + msg.slug)
-		}
-		return m.reload()
+		return m.execDone(msg)
 	}
 
 	switch m.mode {
@@ -997,6 +842,218 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return cmd
 	}
 	return nil
+}
+
+// listed applies the task list read by listCmd.
+func (m *Model) listed(msg listMsg) tea.Cmd {
+	m.listing = false
+	if m.relist {
+		// Read before a change reload was asked for: list again.
+		m.relist = false
+		m.listing = true
+		return m.listCmd()
+	}
+	if msg.err != nil {
+		m.setErr(fmt.Errorf("list: %w", msg.err))
+		return nil
+	}
+	m.tasks, m.loaded = msg.tasks, true
+	if m.rebuild() {
+		return m.selectionChanged()
+	}
+	return nil
+}
+
+// detailLoaded applies the selected task's details read by detailCmd.
+func (m *Model) detailLoaded(msg detailMsg) tea.Cmd {
+	if msg.seq == m.detailInflight {
+		m.detailInflight = 0
+	}
+	// Drop replies for another task or older than the one shown.
+	if t := m.selected(); t == nil || t.Task.ID != msg.id || msg.seq < m.detailApplied {
+		return nil
+	}
+	m.detailApplied = msg.seq
+	if msg.err != nil {
+		m.setErr(msg.err)
+		return nil
+	}
+	m.detail, m.detailAt = msg.view, m.now()
+	return nil
+}
+
+// recovered handles the result of recoverCmd.
+func (m *Model) recovered(msg recoverMsg) tea.Cmd {
+	m.recovering = false
+	if msg.err != nil {
+		// Shown once per distinct error: tmux may simply be missing.
+		if e := msg.err.Error(); e != m.recoverErr {
+			m.recoverErr = e
+			m.setErr(msg.err)
+		}
+		return nil
+	}
+	m.recoverErr = ""
+	if msg.n > 0 {
+		m.setStatus(fmt.Sprintf("%d session(s) marked stopped (tmux window gone); r resumes", msg.n))
+		return m.reload()
+	}
+	return nil
+}
+
+// dirtyChecked applies the result of dirtyCmd and arms the next check.
+func (m *Model) dirtyChecked(msg dirtyMsg) tea.Cmd {
+	m.dirtying = false
+	next := m.after(dirtyEvery, dirtyTickMsg{})
+	if msg.err != nil {
+		// Keep the last result; show each distinct error once.
+		if e := msg.err.Error(); e != m.dirtyErr {
+			m.dirtyErr = e
+			m.setErr(fmt.Errorf("dirty check: %w", msg.err))
+		}
+		return next
+	}
+	m.dirtyErr = ""
+	m.dirty = msg.dirty
+	return next
+}
+
+// projectReposLoaded applies the repos of the project named in the form.
+func (m *Model) projectReposLoaded(msg projectReposMsg) tea.Cmd {
+	f := m.form
+	if f == nil {
+		return nil
+	}
+	if f.loadingProject == msg.name {
+		f.loadingProject = ""
+	}
+	if f.project() != msg.name {
+		return m.syncProject() // stale: load the current one
+	}
+	if msg.err != nil {
+		// Not preselected: submitting sends the project as is and
+		// NewTask reports the problem.
+		f.projErr, f.projErrFor = firstLine(msg.err.Error()), msg.name
+		return nil
+	}
+	m.applyFormProject(msg.name, msg.repos)
+	return nil
+}
+
+// opDone reports a finished task operation (startOp, rename).
+func (m *Model) opDone(msg opMsg) tea.Cmd {
+	delete(m.busy, msg.id)
+	if msg.err != nil {
+		if msg.text != "" {
+			m.setStatusErr(firstLine(msg.text+"; "+msg.err.Error()), true)
+		} else {
+			m.setErr(fmt.Errorf("%s: %w", msg.op, msg.err))
+		}
+	} else {
+		m.setOK(msg.text)
+	}
+	return m.reload()
+}
+
+// finished reports a done/cancel, asking again if it was refused for
+// changes the dialog did not show.
+func (m *Model) finished(msg finishMsg) tea.Cmd {
+	delete(m.busy, msg.id)
+	if msg.err != nil {
+		m.setErr(fmt.Errorf("%s: %w", msg.verb, msg.err))
+		if !msg.force && isDirtyErr(msg.err) {
+			// Changes the dialog did not show: ask again, now saying
+			// they will be deleted. Never forced without that.
+			m.showConfirm(&confirmState{verb: msg.verb, id: msg.id, slug: msg.slug, dirty: true})
+			return nil
+		}
+		return m.reload()
+	}
+	m.setOK(fmt.Sprintf("%s %s", msg.slug, map[string]string{"done": "done", "cancel": "cancelled"}[msg.verb]))
+	return m.reload()
+}
+
+// taskCreated reports the new-task form's task and selects it.
+func (m *Model) taskCreated(msg newTaskMsg) tea.Cmd {
+	m.creating = false
+	if msg.err != nil {
+		m.setErr(fmt.Errorf("new task: %w", msg.err))
+		return nil
+	}
+	m.lastForm = nil
+	m.selID, m.stickyID = msg.task.ID, 0
+	m.selIdx = len(m.rows) // fallback if it is filtered out
+	m.setOK(fmt.Sprintf("created %s (%s)", msg.task.Slug, m.be.TaskDir(msg.task.Slug)))
+	return tea.Batch(m.reload(), m.selectionChanged())
+}
+
+// opened attaches to the session enter opened, or shows the picker of
+// the task's sessions.
+func (m *Model) opened(msg openMsg) tea.Cmd {
+	delete(m.busy, msg.id)
+	if msg.err != nil {
+		m.setErr(fmt.Errorf("open: %w", msg.err))
+		return m.reload()
+	}
+	if msg.cmd != nil {
+		if !m.canTakeOver() {
+			// Don't attach over the form/filter/editor: the keys
+			// typed there would go to Claude. Its window is running.
+			m.setStatus("open " + msg.slug + ": ready — press enter again")
+			return m.reload()
+		}
+		return m.exec("open", msg.slug, msg.cmd)
+	}
+	if len(msg.choices) == 0 { // defensive: the backend returns one or the other
+		return m.reload()
+	}
+	if !m.canTakeOver() {
+		// Don't yank the user out of the form/filter/another prompt.
+		m.setStatus("open " + msg.slug + ": it has sessions to choose from — press enter again")
+		return nil
+	}
+	m.sessPick = newSessionPicker(msg.id, msg.slug, msg.choices)
+	m.mode = modeSessions
+	return nil
+}
+
+// assistantOpened attaches to the assistant A opened.
+func (m *Model) assistantOpened(msg assistantMsg) tea.Cmd {
+	m.assisting = false
+	if msg.err != nil {
+		m.setErr(fmt.Errorf("assistant: %w", msg.err))
+		return nil
+	}
+	if !m.canTakeOver() {
+		// As for open: don't attach over another mode.
+		text := "assistant ready — press A again"
+		if msg.hint != "" {
+			text += "; " + msg.hint
+		}
+		m.setStatus(text)
+		return nil
+	}
+	if msg.hint != "" {
+		m.setStatus(msg.hint)
+	}
+	return m.exec("assistant", "", msg.cmd)
+}
+
+// execDone reports a command run with the terminal handed over (exec).
+func (m *Model) execDone(msg execDoneMsg) tea.Cmd {
+	if msg.err != nil {
+		prefix := strings.TrimSpace(msg.op + " " + msg.slug)
+		text := prefix + ": " + msg.err.Error()
+		if msg.stderr != nil {
+			if s := lastLine(msg.stderr.String()); s != "" {
+				text = prefix + ": " + s
+			}
+		}
+		m.setStatusErr(text, true)
+	} else if msg.op == "open" {
+		m.setOK("attached " + msg.slug)
+	}
+	return m.reload()
 }
 
 func lastLine(s string) string {
@@ -1390,20 +1447,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		}
 		return nil
 	case "n":
-		if m.creating {
-			m.setStatus("busy: a task is being created")
-			return nil
-		}
-		if m.lastForm != nil {
-			m.form = m.lastForm
-		} else {
-			m.form = newTaskForm(m.projects)
-		}
-		m.form.projects = m.projects
-		m.form.projErr, m.form.projErrFor = "", "" // retry a failed project load
-		m.form.setWidth(m.formInputWidth())
-		m.mode = modeForm
-		return tea.Batch(m.projectsCmd(), m.syncProject())
+		return m.openForm()
 	case "?":
 		m.mode = modeHelp
 		return nil
@@ -1479,14 +1523,7 @@ func (m *Model) normalKey(key string) tea.Cmd {
 	case "m":
 		return m.openNotes(t)
 	case "t":
-		m.renameID, m.renameSlug, m.renameOrig = t.Task.ID, slug, clean(t.Task.Title)
-		m.renameInput.SetValue(m.renameOrig)
-		m.renameFill = m.renameInput.Value()
-		m.renameInput.CursorEnd()
-		m.renameInput.SetWidth(m.renameInputWidth())
-		m.renameInput.Focus()
-		m.setStatus("")
-		m.mode = modeRename
+		m.startRename(t)
 		return nil
 	case "D":
 		return m.exec("diff", slug, m.diffCmd(slug))
@@ -1504,6 +1541,38 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		})
 	}
 	return nil
+}
+
+// openForm opens the new-task form (`n`): the one kept to retry (see
+// lastForm), else a blank one.
+func (m *Model) openForm() tea.Cmd {
+	if m.creating {
+		m.setStatus("busy: a task is being created")
+		return nil
+	}
+	if m.lastForm != nil {
+		m.form = m.lastForm
+	} else {
+		m.form = newTaskForm(m.projects)
+	}
+	m.form.projects = m.projects
+	m.form.projErr, m.form.projErrFor = "", "" // retry a failed project load
+	m.form.setWidth(m.formInputWidth())
+	m.mode = modeForm
+	return tea.Batch(m.projectsCmd(), m.syncProject())
+}
+
+// startRename opens the title input for task t (`t`), prefilled with its
+// title.
+func (m *Model) startRename(t *app.TaskView) {
+	m.renameID, m.renameSlug, m.renameOrig = t.Task.ID, t.Task.Slug, clean(t.Task.Title)
+	m.renameInput.SetValue(m.renameOrig)
+	m.renameFill = m.renameInput.Value()
+	m.renameInput.CursorEnd()
+	m.renameInput.SetWidth(m.renameInputWidth())
+	m.renameInput.Focus()
+	m.setStatus("")
+	m.mode = modeRename
 }
 
 // assistant opens the atelier assistant, pointed at the selected task if

@@ -891,72 +891,10 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 	if !t.Status.Open() {
 		return fmt.Errorf("task %s is already %s", t.Slug, t.Status)
 	}
-	type wt struct {
-		name, repo, path string
-		missing          bool
+	wts, err := a.closeWorktrees(ctx, t, force)
+	if err != nil {
+		return err
 	}
-	var wts []wt
-	for _, r := range t.Repos {
-		if r.Mode != model.ModeRW {
-			continue
-		}
-		// What is not a worktree of the repo's clone any more (a symlink
-		// the task put there, say) is left alone: git would act on
-		// whatever it names.
-		p, cerr := a.checkWorktree(ctx, t, r)
-		missing := errors.Is(cerr, os.ErrNotExist)
-		if cerr != nil && !missing {
-			if !force {
-				return fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, r.Name, cerr)
-			}
-			a.warnf("repo %s: %v; left alone", r.Name, cerr)
-			continue
-		}
-		wts = append(wts, wt{r.Name, a.Paths.RepoPath(r.Name), p, missing})
-	}
-	// Commits only HEAD reaches (detached HEAD, stopped rebase) would be
-	// lost with the worktree; --force never discards commits.
-	var orphans []string
-	for _, w := range wts {
-		if w.missing {
-			continue
-		}
-		n, err := gitx.OrphanCommits(ctx, w.path)
-		if err != nil {
-			if !force {
-				return fmt.Errorf("task %s: repo %s: %w (use --force to remove anyway)", t.Slug, w.name, err)
-			}
-			a.warnf("repo %s: %v", w.name, err)
-			continue
-		}
-		if n > 0 {
-			orphans = append(orphans, fmt.Sprintf("%s: HEAD has %d commit(s) not on any branch", w.name, n))
-		}
-	}
-	if len(orphans) > 0 {
-		return fmt.Errorf("task %s: %s (detached HEAD or rebase in progress); put them on a branch first",
-			t.Slug, strings.Join(orphans, "; "))
-	}
-	if !force {
-		var dirty []string
-		for _, w := range wts {
-			if w.missing {
-				continue
-			}
-			d, err := gitx.IsDirty(ctx, w.path)
-			if err != nil {
-				return fmt.Errorf("task %s: repo %s: %w (use --force to remove anyway)", t.Slug, w.name, err)
-			}
-			if d {
-				dirty = append(dirty, w.name)
-			}
-		}
-		if len(dirty) > 0 {
-			return fmt.Errorf("task %s has uncommitted changes in %s; commit or stash them, or use --force to discard",
-				t.Slug, strings.Join(dirty, ", "))
-		}
-	}
-
 	if err := a.Tmux.KillSession(ctx, tmux.SessionName(t.Slug)); err != nil && !errors.Is(err, exec.ErrNotFound) {
 		if !force {
 			return fmt.Errorf("task %s: kill tmux session: %w", t.Slug, err)
@@ -1009,13 +947,108 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 	}
 	// Before the worktrees go: the task's containers may hold them mounted.
 	a.removeSandbox(ctx, t)
-	var removed []wt
+	removed, err := a.removeWorktrees(ctx, t, wts, force)
+	if err != nil {
+		return err
+	}
+	for _, w := range removed {
+		a.cleanupBranch(ctx, w.name, w.repo, t.Branch)
+	}
+	a.removeTaskDir(t.Slug)
+	if err := a.Store.SetTaskStatus(ctx, t.ID, to); err != nil {
+		return err
+	}
+	closed = true
+	return nil
+}
+
+// closeWorktree is an rw worktree of a task being closed.
+type closeWorktree struct {
+	name, repo, path string
+	missing          bool // its dir was deleted by hand: only pruned
+}
+
+// closeWorktrees returns the rw worktrees closing task t removes, after
+// the checks that must pass before anything of the task is torn down: no
+// commits that only HEAD reaches (even with force) and, unless force, no
+// uncommitted changes. A repo whose path is no longer a worktree of its
+// clone is an error, or with force a warning and left out.
+func (a *App) closeWorktrees(ctx context.Context, t *model.Task, force bool) ([]closeWorktree, error) {
+	var wts []closeWorktree
+	for _, r := range t.Repos {
+		if r.Mode != model.ModeRW {
+			continue
+		}
+		// What is not a worktree of the repo's clone any more (a symlink
+		// the task put there, say) is left alone: git would act on
+		// whatever it names.
+		p, cerr := a.checkWorktree(ctx, t, r)
+		missing := errors.Is(cerr, os.ErrNotExist)
+		if cerr != nil && !missing {
+			if !force {
+				return nil, fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, r.Name, cerr)
+			}
+			a.warnf("repo %s: %v; left alone", r.Name, cerr)
+			continue
+		}
+		wts = append(wts, closeWorktree{r.Name, a.Paths.RepoPath(r.Name), p, missing})
+	}
+	// Commits only HEAD reaches (detached HEAD, stopped rebase) would be
+	// lost with the worktree; --force never discards commits.
+	var orphans []string
+	for _, w := range wts {
+		if w.missing {
+			continue
+		}
+		n, err := gitx.OrphanCommits(ctx, w.path)
+		if err != nil {
+			if !force {
+				return nil, fmt.Errorf("task %s: repo %s: %w (use --force to remove anyway)", t.Slug, w.name, err)
+			}
+			a.warnf("repo %s: %v", w.name, err)
+			continue
+		}
+		if n > 0 {
+			orphans = append(orphans, fmt.Sprintf("%s: HEAD has %d commit(s) not on any branch", w.name, n))
+		}
+	}
+	if len(orphans) > 0 {
+		return nil, fmt.Errorf("task %s: %s (detached HEAD or rebase in progress); put them on a branch first",
+			t.Slug, strings.Join(orphans, "; "))
+	}
+	if !force {
+		var dirty []string
+		for _, w := range wts {
+			if w.missing {
+				continue
+			}
+			d, err := gitx.IsDirty(ctx, w.path)
+			if err != nil {
+				return nil, fmt.Errorf("task %s: repo %s: %w (use --force to remove anyway)", t.Slug, w.name, err)
+			}
+			if d {
+				dirty = append(dirty, w.name)
+			}
+		}
+		if len(dirty) > 0 {
+			return nil, fmt.Errorf("task %s has uncommitted changes in %s; commit or stash them, or use --force to discard",
+				t.Slug, strings.Join(dirty, ", "))
+		}
+	}
+	return wts, nil
+}
+
+// removeWorktrees removes the worktrees wts of task t, once nothing of the
+// task runs any more, and returns those it removed. Without force the first
+// failure is returned; with force failures are warnings.
+func (a *App) removeWorktrees(ctx context.Context, t *model.Task, wts []closeWorktree, force bool) ([]closeWorktree, error) {
+	var removed []closeWorktree
 	for _, w := range wts {
 		// Again, now that nothing of the task runs any more: what it left
 		// there last is what git would remove.
 		if err := gitx.CheckWorktree(ctx, w.path, w.repo); err != nil && !errors.Is(err, os.ErrNotExist) {
 			if !force {
-				return fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, w.name, err)
+				return nil, fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, w.name, err)
 			}
 			a.warnf("repo %s: %v; left alone", w.name, err)
 			continue
@@ -1024,20 +1057,23 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 			if !force {
 				// It was clean before teardown, so teardown left changes.
 				if d, derr := gitx.IsDirty(ctx, w.path); derr == nil && d {
-					return fmt.Errorf("task %s: repo %s: worktree has changes after teardown (%w); re-run with --force to discard them",
+					return nil, fmt.Errorf("task %s: repo %s: worktree has changes after teardown (%w); re-run with --force to discard them",
 						t.Slug, w.name, err)
 				}
-				return fmt.Errorf("task %s: repo %s: %w", t.Slug, w.name, err)
+				return nil, fmt.Errorf("task %s: repo %s: %w", t.Slug, w.name, err)
 			}
 			a.warnf("remove worktree %s: %v", w.path, err)
 			continue
 		}
 		removed = append(removed, w)
 	}
-	for _, w := range removed {
-		a.cleanupBranch(ctx, w.name, w.repo, t.Branch)
-	}
-	dir := a.Paths.TaskDir(t.Slug)
+	return removed, nil
+}
+
+// removeTaskDir removes task slug's generated files, then its task dir if
+// that is empty; failures are warnings.
+func (a *App) removeTaskDir(slug string) {
+	dir := a.Paths.TaskDir(slug)
 	if err := os.Remove(filepath.Join(dir, "CLAUDE.md")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		a.warnf("%v", err)
 	}
@@ -1051,11 +1087,6 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 			a.warnf("left %s: %v", dir, err)
 		}
 	}
-	if err := a.Store.SetTaskStatus(ctx, t.ID, to); err != nil {
-		return err
-	}
-	closed = true
-	return nil
 }
 
 // beforeBranchDelete, if set (tests only), runs in cleanupBranch between the

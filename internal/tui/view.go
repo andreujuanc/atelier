@@ -376,20 +376,27 @@ func (m *Model) listLines(w, h int) []string {
 	return out
 }
 
+// groupLine renders status group header r at width w: the status, its
+// task count (shown/total when the closed limit leaves some out) and a rule.
+func (r row) groupLine(w int) string {
+	c := lipgloss.NewStyle().Foreground(statusColor(r.status)).Bold(true)
+	label := strings.ToUpper(string(r.status))
+	count := strconv.Itoa(r.count)
+	if r.total > r.count {
+		count += "/" + strconv.Itoa(r.total)
+	}
+	text := " " + c.Render(label) + " " + labelStyle.Render(count)
+	used := ansi.StringWidth(" "+label+" "+count) + 1
+	if n := w - used; n > 0 {
+		text += " " + ruleStyle.Render(strings.Repeat("─", n))
+	}
+	return trunc(text, w)
+}
+
+// rowLine renders list row r at width w, highlighted if sel.
 func (m *Model) rowLine(r row, sel bool, w int) string {
 	if r.header {
-		c := lipgloss.NewStyle().Foreground(statusColor(r.status)).Bold(true)
-		label := strings.ToUpper(string(r.status))
-		count := strconv.Itoa(r.count)
-		if r.total > r.count {
-			count += "/" + strconv.Itoa(r.total)
-		}
-		text := " " + c.Render(label) + " " + labelStyle.Render(count)
-		used := ansi.StringWidth(" "+label+" "+count) + 1
-		if n := w - used; n > 0 {
-			text += " " + ruleStyle.Render(strings.Repeat("─", n))
-		}
-		return trunc(text, w)
+		return r.groupLine(w)
 	}
 	t := r.task
 	agg := aggregate(t.Sessions)
@@ -524,6 +531,18 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 	}
 
 	add(rule("Repos", w))
+	out = append(out, m.repoLines(task, w)...)
+	add(rule("Sessions", w))
+	out = append(out, m.sessionLines(t.Sessions, w)...)
+	return out
+}
+
+// repoLines lists task's repos at width w for the details pane: with
+// their state (missing, dirty, ...) once the details read for the task
+// have it.
+func (m *Model) repoLines(task model.Task, w int) []string {
+	var out []string
+	add := func(s string) { out = append(out, trunc(s, w)) }
 	var status []app.RepoStatus
 	if m.detail != nil && m.detail.Task.ID == task.ID {
 		status = m.detail.RepoStatus
@@ -565,17 +584,22 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 	if len(task.Repos) == 0 && len(status) == 0 {
 		add(dimStyle.Render(" none"))
 	}
+	return out
+}
 
-	add(rule("Sessions", w))
-	if len(t.Sessions) == 0 {
+// sessionLines lists sessions at width w for the details pane.
+func (m *Model) sessionLines(sessions []model.Session, w int) []string {
+	var out []string
+	add := func(s string) { out = append(out, trunc(s, w)) }
+	if len(sessions) == 0 {
 		add(dimStyle.Render(" none — ") + keyStyle.Render("s") + dimStyle.Render(" starts one"))
 	}
 	now := m.now()
 	sessW := 0
-	for _, s := range t.Sessions {
+	for _, s := range sessions {
 		sessW = max(sessW, ansi.StringWidth(sessionName(s)))
 	}
-	for _, s := range t.Sessions {
+	for _, s := range sessions {
 		age := "-"
 		if !s.LastEventAt.IsZero() {
 			age = humanAge(now.Sub(s.LastEventAt))
@@ -1100,36 +1124,7 @@ func (m *Model) formLines(w, h int) []string {
 			label = keyStyle.Render(fmt.Sprintf("%-12s", fieldLabels[i]))
 			focusRow = len(out)
 		}
-		var val string
-		switch i {
-		case fieldBacklog:
-			val = dimStyle.Render("[ ]")
-			if f.backlog {
-				val = keyStyle.Render("[x]")
-			}
-			val += dimStyle.Render(" space / ctrl+b toggles")
-		case fieldBase:
-			on, off := keyStyle.Render("●"), dimStyle.Render("○")
-			auto, prod := on+" auto (dev → develop → default)", off+dimStyle.Render(" production patch (default branch)")
-			if f.prodBase {
-				auto, prod = off+dimStyle.Render(" auto (dev → develop → default)"), on+" production patch (default branch)"
-			}
-			val = auto + "\n" + prod
-		case fieldRepos:
-			switch {
-			case len(f.repos) > 0:
-				val = styledSummary(f.repos)
-			case f.project() != "" && f.project() != f.preProject:
-				val = dimStyle.Render("project " + clean(f.project()) + "'s repos")
-			default:
-				val = dimStyle.Render("none")
-			}
-			if i == f.focus {
-				val += dimStyle.Render("  ⏎ pick")
-			}
-		default:
-			val = f.inputs[i].View()
-		}
+		val := f.fieldView(i)
 		for j, v := range strings.Split(val, "\n") {
 			if j == 0 {
 				add(cursor + " " + label + v)
@@ -1175,6 +1170,42 @@ func (m *Model) formLines(w, h int) []string {
 		out = out[start : start+h]
 	}
 	return out
+}
+
+// fieldView draws the value of form field i (more than one line for the
+// base choice).
+func (f *newForm) fieldView(i int) string {
+	var val string
+	switch i {
+	case fieldBacklog:
+		val = dimStyle.Render("[ ]")
+		if f.backlog {
+			val = keyStyle.Render("[x]")
+		}
+		val += dimStyle.Render(" space / ctrl+b toggles")
+	case fieldBase:
+		on, off := keyStyle.Render("●"), dimStyle.Render("○")
+		auto, prod := on+" auto (dev → develop → default)", off+dimStyle.Render(" production patch (default branch)")
+		if f.prodBase {
+			auto, prod = off+dimStyle.Render(" auto (dev → develop → default)"), on+" production patch (default branch)"
+		}
+		val = auto + "\n" + prod
+	case fieldRepos:
+		switch {
+		case len(f.repos) > 0:
+			val = styledSummary(f.repos)
+		case f.project() != "" && f.project() != f.preProject:
+			val = dimStyle.Render("project " + clean(f.project()) + "'s repos")
+		default:
+			val = dimStyle.Render("none")
+		}
+		if i == f.focus {
+			val += dimStyle.Render("  ⏎ pick")
+		}
+	default:
+		val = f.inputs[i].View()
+	}
+	return val
 }
 
 // listWindow is the range of rows the list shows in h lines.
