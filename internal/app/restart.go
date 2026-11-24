@@ -123,6 +123,9 @@ func (a *App) AddRepos(ctx context.Context, ref string, repos []RepoArg, o AddOp
 				if _, _, err := resolveBase(ctx, w.name, a.Paths.RepoPath(w.name), t.Base); err != nil {
 					return err
 				}
+				if err := checkBranchFree(ctx, w.name, a.Paths.RepoPath(w.name), t.Branch); err != nil {
+					return err
+				}
 			}
 			return nil
 		}()
