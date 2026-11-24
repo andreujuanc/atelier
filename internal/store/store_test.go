@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -813,26 +814,32 @@ func TestOpenCurrentSchemaNoWriteLock(t *testing.T) {
 	}
 }
 
+// TestOpenConcurrentFreshDB: concurrent first opens of a fresh database (a
+// hook and the TUI on first run, several hooks at once) all succeed: none
+// gets SQLITE_BUSY from the switch to WAL mode instead of waiting.
 func TestOpenConcurrentFreshDB(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "fresh.db")
-	var wg sync.WaitGroup
-	errs := make(chan error, 8)
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s, err := Open(path)
-			if err != nil {
-				errs <- err
-				return
-			}
-			s.Close()
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
+	dir := t.TempDir()
+	for round := 0; round < 20; round++ {
+		path := filepath.Join(dir, fmt.Sprintf("fresh%d.db", round))
+		var wg sync.WaitGroup
+		errs := make(chan error, 16)
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s, err := Open(path)
+				if err != nil {
+					errs <- err
+					return
+				}
+				s.Close()
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Error(err)
+		}
 	}
 }
 
@@ -901,4 +908,34 @@ func TestListTasksConsistentRepos(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestOpenWaitsForWALSwitch: Open of a database not yet in WAL mode waits
+// for a lock another connection holds, as for any other statement, instead
+// of failing at once with SQLITE_BUSY when it switches the file to WAL.
+func TestOpenWaitsForWALSwitch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fresh.db")
+	db, err := sql.Open("sqlite", path) // rollback journal, like a fresh file
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ctx := context.Background()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE x (y)"); err != nil {
+		t.Fatal(err)
+	}
+	time.AfterFunc(300*time.Millisecond, func() { conn.ExecContext(ctx, "COMMIT") })
+	s, err := OpenWithTimeout(path, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
 }

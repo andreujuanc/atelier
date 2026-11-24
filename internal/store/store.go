@@ -12,7 +12,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // registers the "sqlite" driver
+	"modernc.org/sqlite" // also registers the "sqlite" driver
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 var (
@@ -116,7 +117,8 @@ func Open(path string) (*Store, error) { return OpenWithTimeout(path, DefaultBus
 // with SQLITE_BUSY.
 //
 // Pragmas are passed as DSN "_pragma" parameters so the driver applies them
-// to every pooled connection. Transactions use BEGIN IMMEDIATE ("_txlock")
+// to every pooled connection, except journal_mode, which is persistent and
+// set once (see setWAL). Transactions use BEGIN IMMEDIATE ("_txlock")
 // so concurrent writers wait on busy_timeout instead of failing with
 // SQLITE_BUSY on a read→write lock upgrade.
 func OpenWithTimeout(path string, busy time.Duration) (*Store, error) {
@@ -134,7 +136,6 @@ func OpenWithTimeout(path string, busy time.Duration) (*Store, error) {
 	}
 	q := url.Values{}
 	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busy.Milliseconds()))
-	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "foreign_keys(ON)")
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Set("_txlock", "immediate")
@@ -142,12 +143,37 @@ func OpenWithTimeout(path string, busy time.Duration) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
+	if err := setWAL(context.Background(), db, busy); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: open %s: set WAL mode: %w", path, err)
+	}
 	s := &Store{db: db}
 	if err := s.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate %s: %w", path, err)
 	}
 	return s, nil
+}
+
+// setWAL puts the database in WAL mode, which is recorded in the file, so
+// once per Open is enough. On a database not yet in WAL mode (a fresh one)
+// the switch needs an exclusive lock, and while another connection opens
+// it too SQLite fails it with SQLITE_BUSY at once instead of waiting on
+// busy_timeout; setWAL retries it until busy has passed.
+func setWAL(ctx context.Context, db *sql.DB, busy time.Duration) error {
+	deadline := time.Now().Add(busy)
+	for {
+		_, err := db.ExecContext(ctx, "PRAGMA journal_mode = WAL")
+		var se *sqlite.Error
+		if err == nil || !errors.As(err, &se) || se.Code()&0xff != sqlite3.SQLITE_BUSY || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // ErrSchemaVersion is returned (wrapped) by OpenReadOnly when the
