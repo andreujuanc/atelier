@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -65,6 +66,10 @@ type Gate struct {
 	// every project's. A task may not create or move these tags (see
 	// checkTag); an error refuses every request that would.
 	Reserved func() ([]string, error)
+	// HostRoutes returns the routes of the host the daemon runs on, which a
+	// network's subnet may not overlap (see checkIPAM); nil: hostRoutes,
+	// read where the gate runs.
+	HostRoutes func() ([]netip.Prefix, error)
 
 	once   sync.Once
 	client *http.Client
@@ -823,6 +828,10 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 	scope, serr := as[string]("Scope", body["Scope"])
 	if derr != nil || serr != nil || !oneOf(driver, "", "bridge") || !oneOf(scope, "", "local") {
 		g.deny(w, r, http.StatusForbidden, "only local bridge networks are allowed")
+		return
+	}
+	if err := g.checkIPAM(body["IPAM"]); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
 		return
 	}
 	g.label(body)

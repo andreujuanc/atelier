@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -328,6 +329,7 @@ func newGateWith(t *testing.T, setup func(*Gate)) *gateClient {
 	// The task's own container is the daemon's "agent" (atl names it
 	// atl-<id>, see ContainerName).
 	g := &Gate{ID: testID, Root: root, SocketHost: "/host/run/docker.sock", Agent: "agent", Upstream: upstream}
+	g.HostRoutes = func() ([]netip.Prefix, error) { return nil, nil } // not the routes of the machine the tests run on
 	if setup != nil {
 		setup(g)
 	}
@@ -1391,4 +1393,89 @@ func TestGatePatternsCompile(t *testing.T) {
 		compile(fmt.Sprintf("gateRoutes[%d] (%s)", i, rt.methods), rt.re)
 	}
 	compile("refTag", refTag)
+}
+
+// TestGateNetworkAddresses: a network's bridge is an interface of the host,
+// and its subnet a route there. A subnet of public addresses (a resolver's,
+// half the internet's) or one that overlaps a route the host has (its LAN,
+// a VPN: a more specific one wins) would send the host's own traffic, and
+// every container's, into a container of the task. A network's subnets
+// must be private and new to the host.
+func TestGateNetworkAddresses(t *testing.T) {
+	c := newGateWith(t, func(g *Gate) {
+		g.HostRoutes = func() ([]netip.Prefix, error) {
+			return []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("192.168.1.0/24"),
+				netip.MustParsePrefix("::/0"), netip.MustParsePrefix("fd7a:115c:a1e0::/48")}, nil
+		}
+	})
+	network := func(ipam string) string { return `{"Name":"n","Driver":"bridge","IPAM":` + ipam + `}` }
+	for _, ipam := range []string{
+		`{"Config":[{"Subnet":"8.8.8.0/24"}]}`,
+		`{"Config":[{"Subnet":"0.0.0.0/1"}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24"},{"Subnet":"1.1.1.0/24"}]}`,
+		`{"Config":[{"Subnet":"192.168.1.0/25"}]}`, // the host's LAN, its gateway
+		`{"Config":[{"Subnet":"192.168.0.0/16"}]}`,
+		`{"Config":[{"Subnet":"2000::/3"}]}`,
+		`{"Config":[{"Subnet":"::ffff:8.8.8.0/120"}]}`,
+		`{"Config":[{"Subnet":"fd7a:115c:a1e0:ab12::/64"}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","Gateway":"8.8.8.8"}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","IPRange":"8.8.8.0/24"}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","AuxiliaryAddresses":{"dns":"8.8.8.8"}}]}`,
+		`{"Config":[{"Gateway":"8.8.8.8"}]}`,
+		`{"Config":[{"Subnet":"not a subnet"}]}`,
+		`{"Config":[{"Subnet":["8.8.8.0/24"]}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","subnet":"8.8.8.0/24"}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","Other":"x"}]}`,
+		`{"Config":{"Subnet":"8.8.8.0/24"}}`,
+		`{"Driver":"remote-ipam","Config":[]}`,
+		`{"Options":{"x":"y"}}`,
+		`{"config":[{"Subnet":"8.8.8.0/24"}]}`,
+		`"8.8.8.0/24"`,
+	} {
+		if status, out := c.do("POST", "/networks/create", network(ipam)); status != http.StatusForbidden {
+			t.Errorf("IPAM %s: status %d (%s), want 403", ipam, status, out)
+		}
+	}
+	for _, ipam := range []string{
+		`null`,
+		`{}`,
+		`{"Driver":"default","Config":[],"Options":{}}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","IPRange":"10.1.0.128/25","Gateway":"10.1.0.1","AuxiliaryAddresses":{"a":"10.1.0.2"}}]}`,
+		`{"Config":[{"Subnet":"172.28.0.0/16"},{"Subnet":"fd12:3456:789a::/64","Gateway":"fd12:3456:789a::1"}]}`,
+		`{"Config":[{"Subnet":"192.168.2.0/24"}]}`,
+	} {
+		if status, out := c.do("POST", "/networks/create", network(ipam)); status >= 400 {
+			t.Errorf("IPAM %s: status %d (%s), want it forwarded", ipam, status, out)
+		}
+	}
+	// Without the host's routes, no subnet is taken.
+	c = newGateWith(t, func(g *Gate) {
+		g.HostRoutes = func() ([]netip.Prefix, error) { return nil, errors.New("no /proc") }
+	})
+	if status, _ := c.do("POST", "/networks/create", network(`{"Config":[{"Subnet":"10.1.0.0/24"}]}`)); status != http.StatusForbidden {
+		t.Errorf("subnet without the host's routes: status %d, want 403", status)
+	}
+	if status, out := c.do("POST", "/networks/create", network(`{}`)); status >= 400 {
+		t.Errorf("no subnet without the host's routes: status %d (%s)", status, out)
+	}
+}
+
+func TestParseRoutes(t *testing.T) {
+	v4 := "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" +
+		"eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" +
+		"eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n" +
+		"docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n"
+	v6 := "fd7a115ca1e000000000000000000000 30 00000000000000000000000000000000 00 00000000000000000000000000000000 00000400 00000001 00000000 00000001 tailscale0\n" +
+		"00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003 eth0\n"
+	got, err := parseRoutes(v4, v6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"0.0.0.0/0", "192.168.1.0/24", "172.17.0.0/16", "fd7a:115c:a1e0::/48", "::/0"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("routes = %v, want %v", got, want)
+	}
+	if _, err := parseRoutes("Iface\tDestination\nbad", ""); err == nil {
+		t.Error("an unreadable route table parsed")
+	}
 }
