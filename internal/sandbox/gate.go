@@ -517,6 +517,12 @@ func gateContainer(g *Gate, w http.ResponseWriter, r *http.Request, m []string) 
 		g.deny(w, r, http.StatusForbidden, "this is the task's own container: it cannot be stopped, removed or renamed from inside")
 		return
 	}
+	if action == "start" && (r.ContentLength > 7 || r.ContentLength == -1) {
+		// What dockerd reads as a HostConfig: Docker 24 and older apply
+		// it for API versions before 1.24; later ones refuse it.
+		g.deny(w, r, http.StatusForbidden, "a container start takes no settings; they go in the create")
+		return
+	}
 	if action == "rename" {
 		if err := checkName(r); err != nil {
 			g.deny(w, r, http.StatusForbidden, err.Error())
@@ -852,12 +858,31 @@ var hostAllowed = map[string]bool{
 	"ExtraHosts": true, "Dns": true, "DnsOptions": true, "DnsSearch": true, "CapDrop": true,
 }
 
+// createFields are the top-level fields of a container create: the
+// container's Config (MacAddress: up to API 1.43), HostConfig and
+// NetworkingConfig. Any other is refused unless unset (see checkCreate).
+var createFields = []string{
+	"Hostname", "Domainname", "User", "AttachStdin", "AttachStdout", "AttachStderr", "ExposedPorts", "Tty",
+	"OpenStdin", "StdinOnce", "Env", "Cmd", "Healthcheck", "ArgsEscaped", "Image", "Volumes", "WorkingDir",
+	"Entrypoint", "NetworkDisabled", "MacAddress", "OnBuild", "Labels", "StopSignal", "StopTimeout", "Shell",
+	"HostConfig", "NetworkingConfig",
+}
+
 // hostChecked are the HostConfig settings checkCreate checks by value.
 var hostChecked = []string{"Binds", "Mounts", "NetworkMode", "VolumesFrom", "LogConfig", "IpcMode", "CgroupnsMode", "MaskedPaths", "ReadonlyPaths"}
 
 func (g *Gate) checkCreate(body map[string]any) error {
 	if err := fieldKeys(body, "HostConfig", "NetworkingConfig", "Labels"); err != nil {
 		return err
+	}
+	// Docker 24 and older also read HostConfig settings at the top level:
+	// all of them when there is no HostConfig, a few besides one.
+	for k, v := range body {
+		known := slices.ContainsFunc(createFields, func(f string) bool { return strings.EqualFold(k, f) })
+		paths := strings.EqualFold(k, "MaskedPaths") || strings.EqualFold(k, "ReadonlyPaths")
+		if !known && (!isZero(v) || paths && v != nil) {
+			return fmt.Errorf("container setting %s is not allowed here (host settings go in HostConfig)", k)
+		}
 	}
 	hc, _ := body["HostConfig"].(map[string]any)
 	if err := fieldKeys(hc, append(slices.Collect(maps.Keys(hostAllowed)), hostChecked...)...); err != nil {

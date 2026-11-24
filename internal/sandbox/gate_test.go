@@ -365,6 +365,12 @@ func TestGateRefusesHostReachingContainers(t *testing.T) {
 			`"NetworkingConfig":{"EndpointsConfig":{"hostnet":{"NetworkID":"` + mynetID + `"}}}}`,
 		"syslog log driver": `{"HostConfig":{"LogConfig":{"Type":"syslog","Config":{"syslog-address":"tcp://127.0.0.1:22"}}}}`,
 		"gelf log driver":   `{"HostConfig":{"LogConfig":{"Type":"gelf","Config":{"gelf-address":"udp://127.0.0.1:1"}}}}`,
+		// Docker 24 and older read HostConfig settings at the top level
+		// (all of them without a HostConfig, some besides one).
+		"top-level privileged": `{"Image":"x","Privileged":true}`,
+		"top-level bind":       `{"Image":"x","Binds":["/:/host"]}`,
+		"top-level unmasked":   `{"Image":"x","maskedpaths":[]}`,
+		"top-level driver":     `{"Image":"x","HostConfig":{},"VolumeDriver":"evil"}`,
 	} {
 		status, out := c.do("POST", "/v1.45/containers/create", body)
 		if status != http.StatusForbidden || !strings.Contains(out, "atelier gate:") {
@@ -824,6 +830,9 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/networks/create", `{"Name":"n","Driver":"host"}`},
 		{"POST", "/networks/create", `{"Name":"n","Options":{"com.docker.network.bridge.name":"docker0"}}`},
 		{"POST", "/networks/create", `{"Name":"n","ConfigFrom":{"Network":"hostnet"}}`},
+		// API versions before 1.24 (Docker 24 and older) apply a
+		// HostConfig sent with a start.
+		{"POST", "/v1.23/containers/mine/start", `{"Privileged":true,"Binds":["/:/host"]}`},
 	} {
 		before := len(c.d.requests)
 		if status, out := c.do(tc.method, tc.uri, tc.body); status != http.StatusForbidden {
@@ -843,6 +852,13 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/images/create?fromImage=postgres&tag=17", ""},
 		{"POST", "/build?networkmode=default", ""},
 		{"POST", "/volumes/create", `{"Name":"data"}`},
+		{"POST", "/containers/mine/start", ""},
+		{"POST", "/containers/mine/start", "{}"},
+		{"POST", "/containers/create", `{"Hostname":"h","Domainname":"d","User":"1000","AttachStdin":false,"AttachStdout":true,` +
+			`"AttachStderr":true,"ExposedPorts":{"5432/tcp":{}},"Tty":true,"OpenStdin":true,"StdinOnce":false,"Env":["A=1"],` +
+			`"Cmd":["x"],"Healthcheck":{"Test":["NONE"]},"ArgsEscaped":false,"Image":"postgres","Volumes":{"/d":{}},` +
+			`"WorkingDir":"/","Entrypoint":["sh"],"NetworkDisabled":false,"MacAddress":"","OnBuild":null,"Labels":{},` +
+			`"StopSignal":"SIGINT","StopTimeout":5,"Shell":["sh"],"HostConfig":{},"NetworkingConfig":{}}`},
 		{"POST", "/networks/create", `{"Name":"n","Driver":"bridge","IPAM":{"Config":[{"Subnet":"10.1.0.0/24"}]}}`},
 	} {
 		if status, out := c.do(tc.method, tc.uri, tc.body); status >= 400 {
