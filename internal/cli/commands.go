@@ -786,76 +786,83 @@ func (c *cli) gateCmd() *cobra.Command {
 					return fmt.Errorf("--ro-mount: %w", err)
 				}
 			}
-			dir := p.TaskDir(slug)
-			root, err := filepath.EvalSymlinks(dir)
-			if err != nil {
-				return fmt.Errorf("task dir: %w", err)
-			}
-			runDir := p.RunDir(slug)
-			id := sandbox.ID(slug, dir)
-			bin, err := atlBin()
-			if err != nil {
-				return err
-			}
-			// The task by database id, checked against the slug once: a
-			// request never names a task.
-			ts, err := hook.OpenTaskServer(p, taskID, slug)
-			if err != nil {
-				return err
-			}
-			defer ts.Close()
-			g := &sandbox.Gate{
-				ID:         id,
-				Root:       root,
-				SocketHost: sandbox.SocketPath(runDir),
-				Agent:      sandbox.ContainerName(id),
-				Upstream:   sandbox.UpstreamSocket(),
-				Log:        sandbox.NewLogger(),
-				Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
-				Ident:      sandbox.Ident(taskID, bin, roMounts),
-				ROMounts:   roMounts,
-				Reserved:   reservedImages(p, os.Getenv("ATL_SANDBOX_IMAGE"), os.Getenv("ATL_BOX_IMAGE")),
-			}
-			ts.SetROMounts(roMounts)
-			// A session ended (Claude exits): what it left running in the
-			// container goes once Claude is gone.
-			ts.OnSessionEnd(func(session int64) {
-				go func() {
-					if err := g.EndSession(session); err != nil {
-						g.Log.Printf("note  end what session %d left running: %v", session, err)
-					}
-				}()
-			})
-			ctx, cancel := context.WithCancel(cmd.Context())
-			defer cancel()
-			go func() { // a gate outliving its task stops
-				tick := time.NewTicker(10 * time.Second)
-				defer tick.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-tick.C:
-						if gone, _ := ts.Gone(ctx); gone {
-							g.Log.Printf("task %d (%s) is gone; stopping", taskID, slug)
-							cancel()
-							return
-						}
-					}
-				}
-			}()
-			ctl := &sandbox.Control{Slug: slug, TaskID: taskID, Atl: bin, Task: ts, Log: g.Log}
-			// The copy relay (wl-copy in the container): to the terminal
-			// attached to this task's tmux session, on atl's tmux server.
-			tc, session := tmux.New(), tmux.SessionName(slug)
-			ctl.Copy = func(ctx context.Context, text []byte) error { return tc.Copy(ctx, session, text) }
-			return sandbox.Serve(ctx, g, ctl, runDir)
+			return c.taskGate(cmd.Context(), p, slug, taskID, roMounts)
 		},
 	}
 	cmd.Flags().Int64Var(&taskID, "task-id", 0, "the task's database id (must still have this slug)")
 	cmd.Flags().StringArrayVar(&roMounts, "ro-mount", nil, "a host path of $"+sandbox.MountsVar+" (resolved) the task may bind-mount, read-only only")
 	cmd.Flags().BoolVar(&assistant, "assistant", false, "serve the assistant's container of the workspace instead of a task's")
 	return cmd
+}
+
+// taskGate is `atl gate <slug> --task-id ID`: the gate of task slug, whose
+// database id is taskID, with the read-only mount sources roMounts (both
+// checked by the caller). It stops once the task is gone.
+func (c *cli) taskGate(ctx context.Context, p config.Paths, slug string, taskID int64, roMounts []string) error {
+	dir := p.TaskDir(slug)
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return fmt.Errorf("task dir: %w", err)
+	}
+	runDir := p.RunDir(slug)
+	id := sandbox.ID(slug, dir)
+	bin, err := atlBin()
+	if err != nil {
+		return err
+	}
+	// The task by database id, checked against the slug once: a
+	// request never names a task.
+	ts, err := hook.OpenTaskServer(p, taskID, slug)
+	if err != nil {
+		return err
+	}
+	defer ts.Close()
+	g := &sandbox.Gate{
+		ID:         id,
+		Root:       root,
+		SocketHost: sandbox.SocketPath(runDir),
+		Agent:      sandbox.ContainerName(id),
+		Upstream:   sandbox.UpstreamSocket(),
+		Log:        sandbox.NewLogger(),
+		Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
+		Ident:      sandbox.Ident(taskID, bin, roMounts),
+		ROMounts:   roMounts,
+		Reserved:   reservedImages(p, os.Getenv("ATL_SANDBOX_IMAGE"), os.Getenv("ATL_BOX_IMAGE")),
+	}
+	ts.SetROMounts(roMounts)
+	// A session ended (Claude exits): what it left running in the
+	// container goes once Claude is gone.
+	ts.OnSessionEnd(func(session int64) {
+		go func() {
+			if err := g.EndSession(session); err != nil {
+				g.Log.Printf("note  end what session %d left running: %v", session, err)
+			}
+		}()
+	})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { // a gate outliving its task stops
+		tick := time.NewTicker(10 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if gone, _ := ts.Gone(ctx); gone {
+					g.Log.Printf("task %d (%s) is gone; stopping", taskID, slug)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	ctl := &sandbox.Control{Slug: slug, TaskID: taskID, Atl: bin, Task: ts, Log: g.Log}
+	// The copy relay (wl-copy in the container): to the terminal
+	// attached to this task's tmux session, on atl's tmux server.
+	tc, session := tmux.New(), tmux.SessionName(slug)
+	ctl.Copy = func(ctx context.Context, text []byte) error { return tc.Copy(ctx, session, text) }
+	return sandbox.Serve(ctx, g, ctl, runDir)
 }
 
 // reservedImages is a task gate's sandbox.Gate.Reserved: the image names
