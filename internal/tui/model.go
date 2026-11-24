@@ -281,7 +281,7 @@ type Model struct {
 	switching bool
 
 	// workspace is the name of the workspace the TUI runs in ("" unknown),
-	// shown on the status line.
+	// shown in the top bar (headerLine).
 	workspace string
 
 	// spinFrame is the busy spinner's frame; spinning: its tick is armed.
