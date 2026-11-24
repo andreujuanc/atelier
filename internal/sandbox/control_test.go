@@ -294,3 +294,49 @@ func TestControlClientNeedsAGate(t *testing.T) {
 		t.Error("no error without a gate")
 	}
 }
+
+// loudTask answers every request with more output than a socket holds,
+// and says on started when it has begun.
+type loudTask struct{ started chan struct{} }
+
+func (l loudTask) Do(req ControlRequest, body []byte, stdout, stderr io.Writer) int {
+	l.started <- struct{}{}
+	stdout.Write(bytes.Repeat([]byte("x"), 4<<20))
+	return 0
+}
+
+// TestControlTaskClientStopsReading: a client of a task operation that
+// stops reading the reply holds the gate for one write timeout at most:
+// two such requests with large bodies do not keep the task's next large
+// hook input waiting for a slot until it fails.
+func TestControlTaskClientStopsReading(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "atl.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	task := loudTask{started: make(chan struct{}, 10)}
+	go (&Control{Slug: "t1", TaskID: 7, Task: task, WriteTimeout: 200 * time.Millisecond}).Serve(l)
+
+	body := make([]byte, bigBody+1)
+	line, _ := json.Marshal(ControlRequest{Op: OpHook, Event: "Stop", Body: int64(len(body))})
+	for range maxBigBodies {
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conn.Write(append(line, '\n'))
+		conn.Write(body) // and never read
+		select {
+		case <-task.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the request never reached Task")
+		}
+	}
+	code, ran, err := Ask(sock, ControlRequest{Op: OpHook, Event: "Stop"}, body, io.Discard, io.Discard, 5*time.Second)
+	if err != nil || !ran || code != 0 {
+		t.Errorf("large hook input after clients that stopped reading: exit %d, ran %v, %v", code, ran, err)
+	}
+}
