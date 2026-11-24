@@ -14,6 +14,10 @@
 
 The slug never changes, also after `atl rename`. `atl add` of an rw repo whose clone already
 has `atl/<slug>` (or `atl/<slug>/…`), locally or under `origin/`, fails and keeps that branch.
+One exception: what an `atl add` of that repo killed before it recorded the repo left behind
+(a worktree of the clone at `<task dir>/<repo>`, on `atl/<slug>`, with no uncommitted changes
+and no commit that another branch or remote-tracking ref lacks) is removed, worktree and
+branch, and the add goes on. If that worktree holds work, the add fails and keeps it.
 
 Titles: trimmed, spaces collapsed, at most 200 characters, no control characters.
 `atl rename` (TUI `t`) changes only the title and rewrites the task's `CLAUDE.md`.
