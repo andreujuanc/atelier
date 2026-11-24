@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1816,6 +1817,54 @@ func TestOrderedSend(t *testing.T) {
 		t.Fatalf("fallback %q", fallback.String())
 	}
 }
+
+// TestOrderedSendStopKeepsQueued: lines still queued when stop is called
+// are not delivered (the program is gone) but written to the fallback, in
+// order, before the lines sent after stop.
+func TestOrderedSendStopKeepsQueued(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	var delivered []string
+	var fallback bytes.Buffer
+	send, _, stop := orderedSend(func(s string) {
+		mu.Lock()
+		delivered = append(delivered, s)
+		mu.Unlock()
+		if s == "0" {
+			close(started)
+			<-release
+		}
+	}, writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return fallback.Write(p)
+	}))
+	for i := 0; i < 10; i++ {
+		send(fmt.Sprint(i))
+	}
+	<-started // "0" is being delivered, the others are queued
+	stop()
+	close(release)
+	send("late")
+	want := "1\n2\n3\n4\n5\n6\n7\n8\n9\nlate\n"
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got, gotDelivered := fallback.String(), slices.Clone(delivered)
+		mu.Unlock()
+		if got == want && reflect.DeepEqual(gotDelivered, []string{"0"}) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivered %q, fallback %q; want [0] and %q", gotDelivered, got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 func TestSanitize(t *testing.T) {
 	if got := clean("a\n\nb\x1b[31mc\t\r d\x00\x7f"); got != "a b [31mc d" {
