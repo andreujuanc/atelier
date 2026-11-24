@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -349,6 +350,24 @@ func decodeBody(r *http.Request) (map[string]any, error) {
 	return body, nil
 }
 
+// fieldKeys refuses an object of a request body that has a key dockerd
+// would take for one of fields, the names the gate reads it by, without
+// being spelled exactly so. dockerd decodes request bodies with
+// encoding/json, which matches a key to a field in any case, Unicode case
+// folding included ("hoſtconfig" is HostConfig), and lets a later spelling
+// add to or override what an earlier one set; the gate, reading a map,
+// sees only the exact name. Docker's clients send the exact names.
+func fieldKeys(obj map[string]any, fields ...string) error {
+	for k := range obj {
+		for _, f := range fields {
+			if k != f && strings.EqualFold(k, f) {
+				return fmt.Errorf("setting %q is not accepted: spell it %s", k, f)
+			}
+		}
+	}
+	return nil
+}
+
 var errNotFound = errors.New("not found")
 
 // owner returns who a container, network or volume belongs to: "task" if it
@@ -575,6 +594,10 @@ func gateExecCreate(g *Gate, w http.ResponseWriter, r *http.Request, m []string)
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := fieldKeys(body, "Privileged"); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	if !isZero(body["Privileged"]) {
 		g.deny(w, r, http.StatusForbidden, "privileged exec is not allowed")
 		return
@@ -639,6 +662,10 @@ func gateVolumeCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []strin
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := fieldKeys(body, "Driver", "DriverOpts", "ClusterVolumeSpec", "Labels"); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	// The local driver's options can bind any host path (type=none,o=bind,device=/).
 	if d, _ := body["Driver"].(string); !oneOf(d, "", "local") || !isZero(body["DriverOpts"]) || !isZero(body["ClusterVolumeSpec"]) {
 		g.deny(w, r, http.StatusForbidden, "volume drivers and driver options are not allowed")
@@ -657,6 +684,10 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 	body, err := decodeBody(r)
 	if err != nil {
 		g.deny(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := fieldKeys(body, slices.Collect(maps.Keys(networkKeys))...); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
 		return
 	}
 	for k, v := range body {
@@ -746,6 +777,14 @@ func gateNetworkConnect(g *Gate, w http.ResponseWriter, r *http.Request, m []str
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	err = fieldKeys(body, "Container", "EndpointConfig")
+	if ep, ok := body["EndpointConfig"].(map[string]any); ok && err == nil {
+		err = fieldKeys(ep, "NetworkID")
+	}
+	if err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	nid, ok := g.checkOwned(w, r, "networks", m[1])
 	if !ok {
 		return
@@ -807,8 +846,17 @@ var hostAllowed = map[string]bool{
 	"ExtraHosts": true, "Dns": true, "DnsOptions": true, "DnsSearch": true, "CapDrop": true,
 }
 
+// hostChecked are the HostConfig settings checkCreate checks by value.
+var hostChecked = []string{"Binds", "Mounts", "NetworkMode", "VolumesFrom", "LogConfig", "IpcMode", "CgroupnsMode", "MaskedPaths", "ReadonlyPaths"}
+
 func (g *Gate) checkCreate(body map[string]any) error {
+	if err := fieldKeys(body, "HostConfig", "NetworkingConfig", "Labels"); err != nil {
+		return err
+	}
 	hc, _ := body["HostConfig"].(map[string]any)
+	if err := fieldKeys(hc, append(slices.Collect(maps.Keys(hostAllowed)), hostChecked...)...); err != nil {
+		return err
+	}
 	for k, v := range hc {
 		var err error
 		switch k {
@@ -836,6 +884,9 @@ func (g *Gate) checkCreate(body map[string]any) error {
 			}
 		case "LogConfig":
 			lc, _ := v.(map[string]any)
+			if err = fieldKeys(lc, "Type"); err != nil {
+				break
+			}
 			if t, _ := lc["Type"].(string); !oneOf(t, "", "json-file", "local", "none") {
 				err = fmt.Errorf("log driver %s is not allowed (json-file, local and none are)", t)
 			}
@@ -861,6 +912,9 @@ func (g *Gate) checkCreate(body map[string]any) error {
 		}
 	}
 	nc, _ := body["NetworkingConfig"].(map[string]any)
+	if err := fieldKeys(nc, "EndpointsConfig"); err != nil {
+		return err
+	}
 	endpoints, _ := nc["EndpointsConfig"].(map[string]any)
 	if nc != nil && endpoints == nil && !isZero(nc["EndpointsConfig"]) {
 		return errors.New("unreadable endpoint settings")
@@ -870,6 +924,9 @@ func (g *Gate) checkCreate(body map[string]any) error {
 		ep, ok := v.(map[string]any)
 		if !ok && v != nil {
 			return errors.New("unreadable endpoint settings")
+		}
+		if err := fieldKeys(ep, "NetworkID"); err != nil {
+			return err
 		}
 		id, err := g.network(name)
 		if err != nil {
@@ -979,13 +1036,22 @@ func (g *Gate) mounts(v any) error {
 	list, _ := v.([]any)
 	for _, item := range list {
 		m, _ := item.(map[string]any)
+		if err := fieldKeys(m, "Type", "Source", "ReadOnly", "BindOptions", "VolumeOptions"); err != nil {
+			return err
+		}
+		bindOpts, _ := m["BindOptions"].(map[string]any)
+		if err := fieldKeys(bindOpts, "Propagation", "ReadOnlyNonRecursive"); err != nil {
+			return err
+		}
+		volumeOpts, _ := m["VolumeOptions"].(map[string]any)
+		if err := fieldKeys(volumeOpts, "DriverConfig"); err != nil {
+			return err
+		}
 		src, _ := m["Source"].(string)
 		switch m["Type"] {
 		case "bind":
-			if opts, _ := m["BindOptions"].(map[string]any); opts != nil {
-				if p, _ := opts["Propagation"].(string); !oneOf(p, "", "private", "rprivate") {
-					return fmt.Errorf("mount propagation %s is not allowed", p)
-				}
+			if p, _ := bindOpts["Propagation"].(string); !oneOf(p, "", "private", "rprivate") {
+				return fmt.Errorf("mount propagation %s is not allowed", p)
 			}
 			if !strings.HasPrefix(src, "/") {
 				return fmt.Errorf("unreadable mount source %q", src)
@@ -999,7 +1065,7 @@ func (g *Gate) mounts(v any) error {
 				g.readOnlyMount(real, m)
 			}
 		case "volume":
-			if opts, _ := m["VolumeOptions"].(map[string]any); opts != nil && !isZero(opts["DriverConfig"]) {
+			if !isZero(volumeOpts["DriverConfig"]) {
 				return errors.New("volume drivers and driver options are not allowed")
 			}
 			if src != "" {

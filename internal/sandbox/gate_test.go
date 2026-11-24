@@ -831,6 +831,53 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 	}
 }
 
+// TestGateKeysInAnyCase: dockerd decodes a request body with encoding/json,
+// which takes a key for a field in any case, Unicode folding included
+// ("hoſtconfig" is HostConfig), and lets a later spelling add to or
+// override what an earlier one set. A key the gate reads, in another
+// spelling, would reach the daemon unchecked: it is refused. Keys of
+// maps (labels, tmpfs paths) are not field names and stay as they are.
+func TestGateKeysInAnyCase(t *testing.T) {
+	c := newGate(t)
+	for _, tc := range []struct{ uri, body string }{
+		{"/containers/create", `{"Image":"x","hostconfig":{"Privileged":true}}`},
+		{"/containers/create", `{"Image":"x","HostConfig":{},"hoſtconfig":{"Binds":["/:/host"]}}`},
+		{"/containers/create", `{"HostConfig":{"maskedpaths":[]}}`},
+		{"/containers/create", `{"HostConfig":{"LogConfig":{"type":"syslog"}}}`},
+		{"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"volume","type":"bind","source":"/","Target":"/h"}]}}`},
+		{"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + c.root + `","Target":"/h","BindOptions":{"propagation":"shared"}}]}}`},
+		{"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"volume","Source":"myvol","Target":"/h","VolumeOptions":{"driverconfig":{"Name":"x"}}}]}}`},
+		{"/containers/create", `{"Labels":{},"labels":null}`},
+		{"/containers/create", `{"networkingconfig":{"EndpointsConfig":{"hostnet":{}}}}`},
+		{"/containers/create", `{"NetworkingConfig":{"endpointsconfig":{"hostnet":{}}}}`},
+		{"/containers/create", `{"NetworkingConfig":{"EndpointsConfig":{"mynet":{"networkid":"` + hostnetID + `"}}}}`},
+		{"/containers/mine/exec", `{"Cmd":["id"],"privileged":true}`},
+		{"/volumes/create", `{"Name":"evil","driveropts":{"type":"none","o":"bind","device":"/"}}`},
+		{"/networks/create", `{"Name":"n","labels":null}`},
+		{"/networks/mynet/connect", `{"Container":"mine","container":"other"}`},
+		{"/networks/mynet/connect", `{"Container":"mine","endpointconfig":{"NetworkID":"` + hostnetID + `"}}`},
+		{"/networks/mynet/connect", `{"Container":"mine","EndpointConfig":{"networkid":"` + hostnetID + `"}}`},
+	} {
+		c.d.mu.Lock()
+		before := len(c.d.requests)
+		c.d.mu.Unlock()
+		if status, out := c.do("POST", tc.uri, tc.body); status != http.StatusForbidden || !strings.Contains(out, "atelier gate:") {
+			t.Errorf("POST %s %s: status %d (%s), want a refusal", tc.uri, tc.body, status, out)
+		}
+		c.d.mu.Lock()
+		for _, r := range c.d.requests[before:] {
+			if !strings.HasPrefix(r, "GET ") {
+				t.Errorf("POST %s %s: %s reached the daemon", tc.uri, tc.body, r)
+			}
+		}
+		c.d.mu.Unlock()
+	}
+	body := `{"Labels":{"labels":"1","Type":"x"},"HostConfig":{"Tmpfs":{"/hostconfig":""}},"Volumes":{"/source":{}}}`
+	if status, out := c.do("POST", "/containers/create", body); status != http.StatusCreated {
+		t.Errorf("create with such map keys: status %d (%s), want it forwarded", status, out)
+	}
+}
+
 // TestGateImageNames: a build or a pull may not create or move a tag that
 // atl runs its own containers from (the default task image, the box image,
 // the workspace's and the projects' images, in any spelling dockerd reads
