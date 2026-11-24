@@ -1254,7 +1254,11 @@ func oneOf(s string, options ...string) bool {
 }
 
 // isZero reports whether a decoded JSON value is unset: null, false, 0, "",
-// or a list or object holding nothing but such values.
+// or an empty list or object. An object with a key is set, whatever its
+// value: the settings that are maps (sysctls, annotations, driver options)
+// act on a key with an empty value too (it overrides the daemon's default
+// sysctl; containerd's shim groups containers by an annotation whatever its
+// value).
 func isZero(v any) bool {
 	switch v := v.(type) {
 	case nil:
@@ -1269,12 +1273,7 @@ func isZero(v any) bool {
 	case []any:
 		return len(v) == 0
 	case map[string]any:
-		for _, item := range v {
-			if !isZero(item) {
-				return false
-			}
-		}
-		return true
+		return len(v) == 0
 	}
 	return false
 }

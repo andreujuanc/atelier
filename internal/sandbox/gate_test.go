@@ -368,6 +368,11 @@ func TestGateRefusesHostReachingContainers(t *testing.T) {
 		"unmasked paths":       `{"HostConfig":{"MaskedPaths":[]}}`,
 		"runtime":              `{"HostConfig":{"Runtime":"other"}}`,
 		"sysctls":              `{"HostConfig":{"Sysctls":{"kernel.x":"1"}}}`,
+		"empty sysctl":         `{"HostConfig":{"Sysctls":{"net.ipv4.ip_unprivileged_port_start":""}}}`,
+		"shim group":           `{"HostConfig":{"Annotations":{"io.containerd.runc.v2.group":""}}}`,
+		"empty storage opt":    `{"HostConfig":{"StorageOpt":{"size":""}}}`,
+		"empty volume opt":     `{"HostConfig":{"Mounts":[{"Type":"volume","Source":"myvol","Target":"/e","VolumeOptions":{"DriverConfig":{"Options":{"type":""}}}}]}}`,
+		"top-level sysctl":     `{"Image":"x","Sysctls":{"net.ipv4.ip_unprivileged_port_start":""}}`,
 		"unknown setting":      `{"HostConfig":{"FutureHostThing":"x"}}`,
 		"another's network":    `{"HostConfig":{"NetworkMode":"hostnet"}}`,
 		"another's endpoint":   `{"NetworkingConfig":{"EndpointsConfig":{"hostnet":{}}}}`,
@@ -881,6 +886,8 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/networks/create", `{"Name":"n","Driver":"host"}`},
 		{"POST", "/networks/create", `{"Name":"n","Options":{"com.docker.network.bridge.name":"docker0"}}`},
 		{"POST", "/networks/create", `{"Name":"n","ConfigFrom":{"Network":"hostnet"}}`},
+		{"POST", "/networks/create", `{"Name":"n","Options":{"com.docker.network.bridge.name":""}}`},
+		{"POST", "/volumes/create", `{"Name":"evil","DriverOpts":{"type":""}}`},
 		// API versions before 1.24 (Docker 24 and older) apply a
 		// HostConfig sent with a start.
 		{"POST", "/v1.23/containers/mine/start", `{"Privileged":true,"Binds":["/:/host"]}`},
@@ -903,13 +910,15 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/images/create?fromImage=postgres&tag=17", ""},
 		{"POST", "/build?networkmode=default", ""},
 		{"POST", "/volumes/create", `{"Name":"data"}`},
+		{"POST", "/volumes/create", `{"Name":"data","DriverOpts":{}}`},
+		{"POST", "/networks/create", `{"Name":"n","Options":{},"ConfigFrom":null}`},
 		{"POST", "/containers/mine/start", ""},
 		{"POST", "/containers/mine/start", "{}"},
 		{"POST", "/containers/create", `{"Hostname":"h","Domainname":"d","User":"1000","AttachStdin":false,"AttachStdout":true,` +
 			`"AttachStderr":true,"ExposedPorts":{"5432/tcp":{}},"Tty":true,"OpenStdin":true,"StdinOnce":false,"Env":["A=1"],` +
 			`"Cmd":["x"],"Healthcheck":{"Test":["NONE"]},"ArgsEscaped":false,"Image":"postgres","Volumes":{"/d":{}},` +
 			`"WorkingDir":"/","Entrypoint":["sh"],"NetworkDisabled":false,"MacAddress":"","OnBuild":null,"Labels":{},` +
-			`"StopSignal":"SIGINT","StopTimeout":5,"Shell":["sh"],"HostConfig":{},"NetworkingConfig":{}}`},
+			`"StopSignal":"SIGINT","StopTimeout":5,"Shell":["sh"],"HostConfig":{"Sysctls":{},"Annotations":null},"NetworkingConfig":{}}`},
 		{"POST", "/networks/create", `{"Name":"n","Driver":"bridge","IPAM":{"Config":[{"Subnet":"10.1.0.0/24"}]}}`},
 	} {
 		if status, out := c.do(tc.method, tc.uri, tc.body); status >= 400 {
