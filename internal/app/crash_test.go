@@ -242,12 +242,12 @@ func TestRecoverAfterKilledNewSession(t *testing.T) {
 // atl adds a worktree itself (gitx.AddWorktree). worktreeAddCall matches
 // the git call in rw repo name's clone right before it makes anything of
 // the worktree (the new branch, or the check that the branch is free);
-// worktreeCheckoutCall the checkout that ends the add (after it, only the
-// registration's lock is left to remove).
+// worktreeCheckoutCall the checkout that writes its files (after it, only
+// the index's stat data and the registration's lock are left to write).
 func worktreeAddCall(name string) string {
 	return `*"/repos/` + name + ` "*" branch --quiet "*|*"/repos/` + name + ` worktree list "*`
 }
-func worktreeCheckoutCall(name string) string { return `*"/` + name + ` "*" reset --hard "*` }
+func worktreeCheckoutCall(name string) string { return `*"/` + name + ` "*" checkout-index "*` }
 
 // atl removes a worktree itself (gitx.RemoveWorktree), after git calls in
 // it. worktreeCheckCall matches the check of rw repo name's worktree (the

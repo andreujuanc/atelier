@@ -308,12 +308,15 @@ func (d *Dir) Remove(rel string) error {
 	return nil
 }
 
-// ReadDirNames returns the names of the entries of the directory rel, in
-// no particular order.
+// ReadDirNames returns the names of the entries of the directory rel (".":
+// d itself), in no particular order.
 func (d *Dir) ReadDirNames(rel string) ([]string, error) {
-	fd, base, err := d.parent("readdir", rel)
-	if err != nil {
-		return nil, err
+	fd, base := d.fd, "."
+	if rel != "." {
+		var err error
+		if fd, base, err = d.parent("readdir", rel); err != nil {
+			return nil, err
+		}
 	}
 	defer d.closeParent(fd)
 	dir, err := unix.Openat(fd, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)

@@ -313,7 +313,9 @@ func (ix *gitIndex) changed(e *indexEntry, d *nofollow.Dir, fileMode func() bool
 	default:
 		return true, nil
 	}
-	if uint32(fi.Size()) != e.size {
+	// Size 0 is what git records before it has the file's stat data
+	// (read-tree): then, as git does, the content decides.
+	if uint32(fi.Size()) != e.size && e.size != 0 {
 		return true, nil
 	}
 	st, ok := fi.Sys().(*unix.Stat_t)

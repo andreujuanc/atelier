@@ -264,3 +264,20 @@ func touch(t *testing.T, path string, secs int) {
 		t.Fatal(err)
 	}
 }
+
+// TestIsDirtyIndexWithoutStatData: an index read from a tree (read-tree, as
+// an interrupted add leaves it) has no stat data for its entries: the
+// content decides, as git decides.
+func TestIsDirtyIndexWithoutStatData(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "x")
+	git(t, wt, "read-tree", "HEAD")
+	if dirty, err := IsDirty(ctx, wt); err != nil || dirty {
+		t.Fatalf("IsDirty = %v, %v; want clean", dirty, err)
+	}
+	writeFile(t, filepath.Join(wt, "README.md"), "changed\n")
+	if dirty, err := IsDirty(ctx, wt); err != nil || !dirty {
+		t.Fatalf("IsDirty after a change = %v, %v", dirty, err)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -169,6 +170,11 @@ func branchCommit(ctx context.Context, dir, ref string) (string, error) {
 		return "", fmt.Errorf("read %s: %w", ref, err)
 	}
 	defer d.Close()
+	if reftable, err := usesReftable(ctx, dir); err != nil {
+		return "", err
+	} else if reftable {
+		return reftableCommit(ctx, dir, d, ref)
+	}
 	data, err := d.ReadFile(ref, 1024)
 	if err == nil {
 		id := strings.TrimSuffix(string(data), "\n")
@@ -702,4 +708,87 @@ func failureLine(s string) string {
 		}
 	}
 	return lines[len(lines)-1]
+}
+
+// reftableName matches the name of a table of a reftable stack.
+var reftableName = regexp.MustCompile(`^0x[0-9a-f]{12,16}-0x[0-9a-f]{12,16}-[0-9a-f]{8}\.(ref|log)$`)
+
+// reftableCommit is branchCommit for a repo whose refs are in reftable,
+// common the common git dir of the repo at dir. git follows a symlink in place of the
+// reftable dir or one of its tables (the task could point one at another
+// repo's), so the stack is copied, read without following symlinks, into
+// a temporary git dir of atl's, and git reads ref there.
+func reftableCommit(ctx context.Context, dir string, common *nofollow.Dir, ref string) (string, error) {
+	fail := func(err error) (string, error) { return "", fmt.Errorf("read %s: %w", ref, err) }
+	objFormat, err := run(ctx, dir, "rev-parse", "--show-object-format")
+	if err != nil {
+		return "", err
+	}
+	list, err := common.ReadFile("reftable/tables.list", 1<<20)
+	if err != nil {
+		return fail(err)
+	}
+	priv, err := os.MkdirTemp("", "atl-refs-")
+	if err != nil {
+		return fail(err)
+	}
+	defer os.RemoveAll(priv)
+	if _, err := run(ctx, os.TempDir(), "init", "--bare", "--quiet", "--template=", "--ref-format=reftable", "--object-format="+objFormat, priv); err != nil {
+		return "", err
+	}
+	stack := filepath.Join(priv, "reftable")
+	if err := os.RemoveAll(stack); err != nil {
+		return fail(err)
+	}
+	if err := os.Mkdir(stack, 0o700); err != nil {
+		return fail(err)
+	}
+	for _, name := range strings.Fields(string(list)) {
+		if !reftableName.MatchString(name) {
+			return fail(fmt.Errorf("unexpected table %q in reftable/tables.list", firstChars(name, 80)))
+		}
+		if err := copyOut(common, "reftable/"+name, filepath.Join(stack, name)); err != nil {
+			return fail(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(stack, "tables.list"), list, 0o600); err != nil {
+		return fail(err)
+	}
+	out, err := run(ctx, priv, "for-each-ref", "--format=%(refname)%00%(symref)%00%(objectname)", ref)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(line, "\x00")
+		if len(f) != 3 || f[0] != ref {
+			continue
+		}
+		if f[1] != "" {
+			return fail(errors.New("is a symbolic ref"))
+		}
+		if !objectID.MatchString(f[2]) {
+			return fail(fmt.Errorf("not a commit id: %q", firstChars(f[2], 80)))
+		}
+		return f[2], nil
+	}
+	return "", fmt.Errorf("no branch %s", ref)
+}
+
+// copyOut copies the regular file rel of d (not through a symlink) to the
+// new file dst.
+func copyOut(d *nofollow.Dir, rel, dst string) error {
+	in, err := d.OpenFile(rel)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
