@@ -98,6 +98,18 @@ func TestCrashHelper(t *testing.T) {
 		_, err = a.NewSession(ctx, op[1])
 	case "resume":
 		_, err = a.Resume(ctx, op[1])
+	case "new": // title repo...
+		var repos []RepoArg
+		for _, r := range op[2:] {
+			repos = append(repos, RepoArg{Name: r, Mode: model.ModeRW})
+		}
+		_, err = a.NewTask(ctx, NewTaskOpts{Title: op[1], Repos: repos, NoFetch: true})
+	case "add": // task repo
+		_, err = a.AddRepo(ctx, op[1], RepoArg{Name: op[2], Mode: model.ModeRW}, true)
+	case "done":
+		_, err = a.Done(ctx, op[1], false)
+	case "reopen":
+		err = a.SetStatus(ctx, op[1], model.StatusActive)
 	default:
 		t.Fatalf("unknown op %q", op[0])
 	}
@@ -213,6 +225,193 @@ func TestRecoverAfterKilledNewSession(t *testing.T) {
 			}
 			if got := e.session(t, foreign.ID); got.State != model.StateIdle {
 				t.Fatalf("hook row: %+v", got)
+			}
+		})
+	}
+}
+
+// worktreeAddCall matches the git call that adds rw repo name's worktree.
+func worktreeAddCall(name string) string { return `*" worktree add "*/` + name + `" "*` }
+
+// worktreeRemoveCall matches the git call that removes rw repo name's worktree.
+func worktreeRemoveCall(name string) string { return `*" worktree remove "*/` + name }
+
+// assertClosedClean fails unless task slug is closed and nothing of it is
+// left on disk: no task dir, no worktree or branch in the clones of repos.
+func assertClosedClean(t *testing.T, e *taskEnv, slug string, repos ...string) {
+	t.Helper()
+	tk, err := e.app.Store.GetTaskBySlug(context.Background(), slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk.Status.Open() {
+		t.Errorf("task %s is %s", slug, tk.Status)
+	}
+	if exists(e.app.Paths.TaskDir(slug)) {
+		t.Errorf("task dir of %s left", slug)
+	}
+	for _, r := range repos {
+		if n := worktreeCount(t, e.canonical(r)); n != 1 {
+			t.Errorf("%s has %d worktrees", r, n)
+		}
+		if branchExists(e.canonical(r), "atl/"+slug) {
+			t.Errorf("branch atl/%s left in %s", slug, r)
+		}
+	}
+}
+
+// assertOpenWhole fails unless task slug is open with a worktree of each of
+// repos on its branch, and its generated files.
+func assertOpenWhole(t *testing.T, e *taskEnv, slug string, repos ...string) {
+	t.Helper()
+	tk, err := e.app.Store.GetTaskBySlug(context.Background(), slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tk.Status.Open() || len(tk.Repos) != len(repos) {
+		t.Fatalf("task %s: %s, repos %+v", slug, tk.Status, tk.Repos)
+	}
+	for _, r := range repos {
+		if b := git(t, e.app.Paths.WorktreePath(slug, r), "branch", "--show-current"); b != "atl/"+slug {
+			t.Errorf("%s worktree on %q", r, b)
+		}
+	}
+	for _, f := range []string{"CLAUDE.md", ".claude/settings.json"} {
+		if !exists(filepath.Join(e.app.Paths.TaskDir(slug), f)) {
+			t.Errorf("%s missing", f)
+		}
+	}
+}
+
+// TestKilledNewTask: atl new killed before or after it adds a worktree
+// leaves the task, open, with what it had made. Cancelling it removes all
+// of that, and the title can be used again.
+func TestKilledNewTask(t *testing.T) {
+	for _, kill := range []killPoint{
+		{Cmd: "git", Args: worktreeAddCall("api")},
+		{Cmd: "git", Args: worktreeAddCall("web")},
+		{Cmd: "git", Args: worktreeAddCall("web"), After: true},
+	} {
+		t.Run(fmt.Sprintf("%+v", kill), func(t *testing.T) {
+			e := newTaskEnv(t)
+			ctx := context.Background()
+			e.addRepo(t, "api", "main")
+			e.addRepo(t, "web", "main")
+			crashRun(t, e.app, kill, "new", "x", "api", "web")
+			if _, err := e.app.Cancel(ctx, "x", false); err != nil {
+				t.Fatal(err)
+			}
+			assertClosedClean(t, e, "x", "api", "web")
+			tk, err := e.app.NewTask(ctx, NewTaskOpts{Title: "x", NoFetch: true,
+				Repos: []RepoArg{{"api", model.ModeRW}, {"web", model.ModeRW}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertOpenWhole(t, e, tk.Slug, "api", "web")
+		})
+	}
+}
+
+// TestKilledAddRepo: atl add killed before or after it adds the worktree,
+// before it records the repo. Adding the repo again works (through AddRepo,
+// or AddRepos as atl add and the TUI do): the worktree and branch the
+// killed add left are removed first, as its rollback would have, unless
+// they hold work, which is refused and kept.
+func TestKilledAddRepo(t *testing.T) {
+	for i, kill := range []killPoint{
+		{Cmd: "git", Args: worktreeAddCall("web")},
+		{Cmd: "git", Args: worktreeAddCall("web"), After: true},
+		{Cmd: "git", Args: worktreeAddCall("web"), After: true},
+	} {
+		t.Run(fmt.Sprintf("%d %+v", i, kill), func(t *testing.T) {
+			e := newTaskEnv(t)
+			ctx := context.Background()
+			e.addRepo(t, "api", "main")
+			e.addRepo(t, "web", "main")
+			if _, err := e.app.NewTask(ctx, NewTaskOpts{Title: "x", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}}); err != nil {
+				t.Fatal(err)
+			}
+			crashRun(t, e.app, kill, "add", "x", "web")
+			if i == 2 {
+				// Work in what the killed add left: refused, kept.
+				wt := e.app.Paths.WorktreePath("x", "web")
+				commitIn(t, wt, "w.txt", "w\n")
+				if _, err := e.app.AddRepo(ctx, "x", RepoArg{Name: "web", Mode: model.ModeRW}, true); err == nil ||
+					!strings.Contains(err.Error(), "already exists") {
+					t.Fatalf("add over work: %v", err)
+				}
+				if !exists(filepath.Join(wt, "w.txt")) || !branchExists(e.canonical("web"), "atl/x") {
+					t.Fatal("work removed")
+				}
+				return
+			}
+			res, err := e.app.AddRepos(ctx, "x", []RepoArg{{Name: "web", Mode: model.ModeRW}}, AddOpts{NoFetch: true})
+			if err != nil || len(res.Added) != 1 {
+				t.Fatalf("add again: %+v, %v", res, err)
+			}
+			assertOpenWhole(t, e, "x", "api", "web")
+			if _, err := e.app.Done(ctx, "x", false); err != nil {
+				t.Fatal(err)
+			}
+			assertClosedClean(t, e, "x", "api", "web")
+		})
+	}
+}
+
+// TestKilledDone: atl done killed while it removes the worktrees leaves the
+// task open with some of them gone. atl done again closes it.
+func TestKilledDone(t *testing.T) {
+	for _, kill := range []killPoint{
+		{Cmd: "git", Args: worktreeRemoveCall("api")},
+		{Cmd: "git", Args: worktreeRemoveCall("web")},
+		{Cmd: "git", Args: worktreeRemoveCall("web"), After: true},
+	} {
+		t.Run(fmt.Sprintf("%+v", kill), func(t *testing.T) {
+			e := newTaskEnv(t)
+			ctx := context.Background()
+			e.addRepo(t, "api", "main")
+			e.addRepo(t, "web", "main")
+			if _, err := e.app.NewTask(ctx, NewTaskOpts{Title: "x", NoFetch: true,
+				Repos: []RepoArg{{"api", model.ModeRW}, {"web", model.ModeRW}}}); err != nil {
+				t.Fatal(err)
+			}
+			crashRun(t, e.app, kill, "done", "x")
+			if _, err := e.app.Done(ctx, "x", false); err != nil {
+				t.Fatalf("done again: %v", err)
+			}
+			assertClosedClean(t, e, "x", "api", "web")
+		})
+	}
+}
+
+// TestKilledReopen: reopening killed while it adds the worktrees leaves the
+// task closed with some of them there. Reopening again makes the rest.
+func TestKilledReopen(t *testing.T) {
+	for _, kill := range []killPoint{
+		{Cmd: "git", Args: worktreeAddCall("api")},
+		{Cmd: "git", Args: worktreeAddCall("web")},
+		{Cmd: "git", Args: worktreeAddCall("web"), After: true},
+	} {
+		t.Run(fmt.Sprintf("%+v", kill), func(t *testing.T) {
+			e := newTaskEnv(t)
+			ctx := context.Background()
+			e.addRepo(t, "api", "main")
+			e.addRepo(t, "web", "main")
+			if _, err := e.app.NewTask(ctx, NewTaskOpts{Title: "x", NoFetch: true,
+				Repos: []RepoArg{{"api", model.ModeRW}, {"web", model.ModeRW}}}); err != nil {
+				t.Fatal(err)
+			}
+			commitIn(t, e.app.Paths.WorktreePath("x", "api"), "a.txt", "a\n") // kept branch in api
+			if _, err := e.app.Done(ctx, "x", false); err != nil {
+				t.Fatal(err)
+			}
+			crashRun(t, e.app, kill, "reopen", "x")
+			if err := e.app.SetStatus(ctx, "x", model.StatusActive); err != nil {
+				t.Fatalf("reopen again: %v", err)
+			}
+			assertOpenWhole(t, e, "x", "api", "web")
+			if !exists(filepath.Join(e.app.Paths.WorktreePath("x", "api"), "a.txt")) {
+				t.Error("api's commit lost")
 			}
 		})
 	}

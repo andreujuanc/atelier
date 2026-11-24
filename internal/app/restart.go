@@ -117,6 +117,9 @@ func (a *App) AddRepos(ctx context.Context, ref string, repos []RepoArg, o AddOp
 				return errors.New("given twice")
 			}
 			seen[w.name] = true
+			if err := a.undoKilledAdd(ctx, t, w.name, w.mode); err != nil {
+				return err
+			}
 			if _, err := a.checkAdd(ctx, t, w.name, w.mode); err != nil {
 				return err
 			}
