@@ -710,7 +710,9 @@ func (c *cli) doctorCmd() *cobra.Command {
 			failed := false
 			tw := tabwriter.NewWriter(c.stdout, 0, 0, 2, ' ', 0)
 			for _, ch := range ap.Doctor(cmd.Context()) {
-				fmt.Fprintf(tw, "%s\t%s\t%s\n", ch.Level(), ch.Name, ch.Detail)
+				// What a check found may come from a task (a repo's config, the
+				// worktrees git lists for it).
+				fmt.Fprintf(tw, "%s\t%s\t%s\n", ch.Level(), sanitize(ch.Name), sanitize(ch.Detail))
 				failed = failed || !ch.OK
 			}
 			if err := tw.Flush(); err != nil {

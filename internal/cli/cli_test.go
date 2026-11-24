@@ -555,3 +555,23 @@ func TestResumeAndDiff(t *testing.T) {
 		t.Fatalf("resume of a missing task: %d %s", code, errs)
 	}
 }
+
+// TestDoctorPrintsNoControlCharacters: atl doctor names what it finds in a
+// repo's config and the worktrees git lists for it, which a task can write
+// (a registration's path included): its rows reach the terminal without
+// control characters.
+func TestDoctorPrintsNoControlCharacters(t *testing.T) {
+	root := setup(t)
+	repo := filepath.Join(root, "repos", "api")
+	wt := filepath.Join(root, "tasks", "x\x1b]0;pwned\x07")
+	git(t, repo, "worktree", "add", "-q", "-b", "x", wt)
+	git(t, repo, "config", "extensions.worktreeConfig", "true")
+	git(t, wt, "config", "--worktree", "filter.x\x1b[2J.clean", "cat")
+	_, out, errs := atl(t, "doctor")
+	if !strings.Contains(out, "filter.x") {
+		t.Fatalf("doctor did not report the setting: %s %s", out, errs)
+	}
+	if strings.ContainsAny(out, "\x1b\x07") {
+		t.Errorf("doctor printed control characters: %q", out)
+	}
+}

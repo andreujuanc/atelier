@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"unicode"
 )
 
 // op is a kind of git command that a setting in a repo's own config could
@@ -126,7 +128,7 @@ func hazards(ctx context.Context, dir string, origin *Origin, cfgArgs []string) 
 	var out []Hazard
 	add := func(e scopedEntry, ops op, why string) {
 		if ops != 0 {
-			out = append(out, Hazard{Scope: e.scope, Key: e.key, Value: e.value, Why: why, ops: ops})
+			out = append(out, Hazard{Scope: e.scope, Key: printable(e.key), Value: printable(e.value), Why: why, ops: ops})
 		}
 	}
 	ifLFS := func(o op) op {
@@ -167,8 +169,8 @@ func hazards(ctx context.Context, dir string, origin *Origin, cfgArgs []string) 
 			return nil, err
 		}
 		if !ok || !now.Equal(*origin) {
-			out = append(out, Hazard{Scope: "local", Key: "remote.origin.url", Value: now.String(), ops: opCheckout,
-				Why: "git-lfs would download from, not from the pinned origin " + origin.String()})
+			out = append(out, Hazard{Scope: "local", Key: "remote.origin.url", Value: printable(now.String()), ops: opCheckout,
+				Why: "git-lfs would download from, not from the pinned origin " + printable(origin.String())})
 		}
 	}
 	return out, nil
@@ -216,4 +218,24 @@ func scanConfig(ctx context.Context, dir, pattern string, cfgArgs []string) ([]s
 		out = append(out, scopedEntry{f[i], key, value})
 	}
 	return out, nil
+}
+
+// printable is s, text of a repo's config (which a task can write), with
+// its control and format characters escaped (\x1b, ‮): atl prints a
+// Hazard to the user's terminal.
+func printable(s string) string {
+	hidden := func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }
+	if strings.IndexFunc(s, hidden) < 0 {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if hidden(r) {
+			q := strconv.QuoteRuneToASCII(r)
+			b.WriteString(q[1 : len(q)-1])
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
