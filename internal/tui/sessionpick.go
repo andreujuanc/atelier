@@ -11,7 +11,6 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
-	"github.com/andreujuanc/atelier/internal/palette"
 )
 
 // sessionPicker is the modal list Enter shows for a task that has sessions
@@ -106,18 +105,7 @@ func (p *sessionPicker) lines(w, h int, now time.Time) []string {
 	}
 	listH := h - len(head)
 	out := append([]string(nil), head...)
-	if p.cursor < p.offset {
-		p.offset = p.cursor
-	}
-	if p.cursor >= p.offset+listH {
-		p.offset = p.cursor - listH + 1
-	}
-	if max := p.rows() - listH; p.offset > max {
-		p.offset = max
-	}
-	if p.offset < 0 {
-		p.offset = 0
-	}
+	p.offset = scrollOffset(p.cursor, p.offset, p.rows(), listH)
 	for i := p.offset; i < p.rows() && i < p.offset+listH; i++ {
 		if i == 0 {
 			out = append(out, p.newRow(i == p.cursor, w))
@@ -159,16 +147,10 @@ func choiceRow(c app.SessionChoice, cur bool, w int, now time.Time) string {
 	if !s.LastEventAt.IsZero() {
 		age = humanAge(now.Sub(s.LastEventAt)) + " ago"
 	}
-	glyph := palette.StateLook(s.State).Glyph
-	if glyph == " " {
-		glyph = "·"
-	}
+	glyph := sessionGlyph(s.State)
 	state := fmt.Sprintf("%-7s", clean(string(s.State)))
 	ageCol := fmt.Sprintf("%-7s", age)
-	name := clean(s.Name)
-	if name == "" {
-		name = "claude-" + strconv.FormatInt(s.ID, 10)
-	}
+	name := sessionName(s)
 	title := clean(c.Title)
 	if title == "" {
 		title = name

@@ -404,19 +404,7 @@ func (m *WorkspacePicker) move(delta int) {
 }
 
 func (m *WorkspacePicker) clampOffset() {
-	h := m.listHeight()
-	if m.sel < m.offset {
-		m.offset = m.sel
-	}
-	if h > 0 && m.sel >= m.offset+h {
-		m.offset = m.sel - h + 1
-	}
-	if m.offset > len(m.vis)-h {
-		m.offset = len(m.vis) - h
-	}
-	if m.offset < 0 {
-		m.offset = 0
-	}
+	m.offset = scrollOffset(m.sel, m.offset, len(m.vis), m.listHeight())
 }
 
 // --- view ---

@@ -345,18 +345,7 @@ func (p *picker) lines(w, h int) []string {
 	case len(vis) == 0:
 		list = []string{dimStyle.Render(trunc("no git repos found in $ATL_REPOS", w))}
 	default:
-		if p.cursor < p.offset {
-			p.offset = p.cursor
-		}
-		if p.cursor >= p.offset+listH {
-			p.offset = p.cursor - listH + 1
-		}
-		if max := len(vis) - listH; p.offset > max {
-			p.offset = max
-		}
-		if p.offset < 0 {
-			p.offset = 0
-		}
+		p.offset = scrollOffset(p.cursor, p.offset, len(vis), listH)
 		for i := p.offset; i < len(vis) && i < p.offset+listH; i++ {
 			list = append(list, p.row(vis[i], i == p.cursor, w))
 		}

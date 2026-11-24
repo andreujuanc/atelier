@@ -8,7 +8,6 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/app"
 )
@@ -251,14 +250,7 @@ func (r *restartState) lines(w, h int, spin string) []string {
 	if w <= 0 || h <= 0 {
 		return nil
 	}
-	ww := min(w, restartWrap)
-	wrap := func(s string, st lipgloss.Style) []string {
-		var out []string
-		for _, l := range strings.Split(ansi.Wrap(s, ww, ""), "\n") {
-			out = append(out, st.Render(trunc(strings.TrimRight(l, " "), w)))
-		}
-		return out
-	}
+	wrap := func(s string, st lipgloss.Style) []string { return wrapText(s, min(w, restartWrap), w, st) }
 	head := wrap("Cannot add "+clean(summary(r.repos))+" to "+clean(r.slug)+" yet", titleStyle)
 	why := wrap("Running sessions cannot see a repo added under them, so adding it restarts them: "+
 		"they are closed and the same conversations resumed. Things are running in the task now:", lipgloss.NewStyle())
@@ -282,11 +274,7 @@ func (r *restartState) lines(w, h int, spin string) []string {
 		wait = wrap(spin+" Restarting the sessions and adding…", markStyle)
 	} else {
 		wait = wrap(spin+" Waiting: added, with the restart, as soon as nothing runs.", dimStyle)
-		box := dimStyle.Render("[ ]") + " Force restart (ends what runs)"
-		if r.ticked {
-			box = errStyle.Bold(true).Render("[x]") + " Force restart (ends what runs)"
-		}
-		last = []string{trunc(box, w)}
+		last = []string{trunc(checkbox(r.ticked, "Force restart (ends what runs)"), w)}
 		if r.unticked {
 			last = append(last, wrap("Tick the box with space to force the restart.", markStyle)...)
 		}
