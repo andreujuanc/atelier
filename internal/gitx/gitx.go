@@ -84,6 +84,9 @@ func stripEnv(kv string) bool {
 //     another git (e.g. Claude's) runs in the same worktree;
 //   - GIT_NO_LAZY_FETCH=1: in a partial clone, a missing object would be
 //     fetched from the promisor remote the repo's config names;
+//   - GIT_NO_REPLACE_OBJECTS=1: refs/replace is the task's to write, and a
+//     replace ref (a symlink to another repo's branch, say) would show
+//     other history and files as the repo's;
 //   - GIT_EDITOR, GIT_SEQUENCE_EDITOR and GIT_PAGER set to programs of our
 //     own (they outrank core.editor, sequence.editor and core.pager; no
 //     command here opens an editor, and --no-pager is given too);
@@ -97,7 +100,7 @@ func gitEnv(transport bool) []string {
 			env = append(env, kv)
 		}
 	}
-	env = append(env, "LC_ALL=C", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "GIT_NO_LAZY_FETCH=1",
+	env = append(env, "LC_ALL=C", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "GIT_NO_LAZY_FETCH=1", "GIT_NO_REPLACE_OBJECTS=1",
 		"GIT_EDITOR=:", "GIT_SEQUENCE_EDITOR=:", "GIT_PAGER=cat")
 	if !transport {
 		env = append(env, "GIT_ALLOW_PROTOCOL=")

@@ -1,12 +1,14 @@
 package gitx
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -184,4 +186,36 @@ func swapOnDelete(t *testing.T, dir, target string, names []string) (stop func()
 		}
 	}()
 	return func() { close(done); <-ended }
+}
+
+// TestReplaceRefsAreNotRead: a task writes the clone's git dir, refs/replace
+// too. A replace ref for the task's base commit that is a symlink to a
+// branch of another repo on the host (whose objects it lists as
+// alternates) would have atl's git on the host show that repo's history
+// and files as the task's (atl diff, atl show: what the assistant reads).
+func TestReplaceRefsAreNotRead(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, base := f.addWorktree(t, ctx, "x")
+	secret := filepath.Join(t.TempDir(), "secret")
+	git(t, f.root, "init", "-q", "-b", "main", secret)
+	commitFile(t, secret, "creds", "hunter2\n", "the user's private work")
+	writeFile(t, filepath.Join(f.repo, ".git", "objects", "info", "alternates"), filepath.Join(secret, ".git", "objects")+"\n")
+	commitFile(t, wt, "work.txt", "work\n", "the task's work")
+	head := git(t, wt, "rev-parse", "HEAD")
+	for _, id := range []string{base, head} {
+		replace := filepath.Join(f.repo, ".git", "refs", "replace", id)
+		must(t, os.MkdirAll(filepath.Dir(replace), 0o755))
+		must(t, os.Symlink(filepath.Join(secret, ".git", "refs", "heads", "main"), replace))
+	}
+	var out bytes.Buffer
+	if err := Diff(ctx, wt, base, false, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "hunter2") {
+		t.Errorf("diff shows another repo's file:\n%s", out.String())
+	}
+	if _, subject, _, err := LastCommit(ctx, wt); err != nil || strings.Contains(subject, "private") {
+		t.Errorf("last commit = %q, %v", subject, err)
+	}
 }
