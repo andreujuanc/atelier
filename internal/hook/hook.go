@@ -578,7 +578,13 @@ func transitionState(ctx context.Context, event string, in Input, id int64, st *
 	case EventStop:
 		return st.SetIdle(ctx, id, strings.Join(backgroundLines(in.BackgroundTasks), "\n"), now)
 	case EventSessionEnd:
-		return st.SetSessionState(ctx, id, model.StateEnded, now)
+		// Only a live session ends: one atl stopped or ended itself gets this
+		// from its Claude being killed, and stays as atl left it (resumable).
+		ok, err := st.EndLive(ctx, id, now)
+		if err != nil || ok {
+			return err
+		}
+		return st.TouchSession(ctx, id, now)
 	}
 	return nil
 }

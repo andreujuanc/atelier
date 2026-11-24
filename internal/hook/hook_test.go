@@ -148,6 +148,11 @@ func TestTransitions(t *testing.T) {
 		{"posttool leaves stopped", model.StateStopped, EventPostToolUse, Input{}, model.StateStopped, true},
 		{"stop", model.StateRunning, EventStop, Input{}, model.StateIdle, true},
 		{"session end", model.StateIdle, EventSessionEnd, Input{Source: "exit"}, model.StateEnded, true},
+		{"session end from running", model.StateRunning, EventSessionEnd, Input{}, model.StateEnded, true},
+		// A SessionEnd that comes after atl stopped the session itself (a
+		// failed done put the sessions it ended back to stopped; a restart;
+		// Recover) is its Claude being killed: the session stays resumable.
+		{"late session end leaves stopped", model.StateStopped, EventSessionEnd, Input{}, model.StateStopped, true},
 		{"pretooluse no state change", model.StateRunning, EventPreToolUse, Input{ToolName: "Edit", ToolInput: json.RawMessage(`{"file_path":"x"}`)}, model.StateRunning, false},
 		{"unknown event", model.StateRunning, "SubagentStop", Input{}, model.StateRunning, false},
 	}

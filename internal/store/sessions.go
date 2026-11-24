@@ -275,6 +275,15 @@ func (s *Store) SetClaudeSessionID(ctx context.Context, id int64, claudeSessionI
 		claudeSessionID, toMS(normTime(at)), id)
 }
 
+// EndLive sets a live session (running, waiting, idle) ended (last_event_at
+// = at, now if zero), reporting whether it was live. A session atl itself
+// stopped or ended is left as it is: a SessionEnd from its Claude being
+// killed then must not make it unresumable.
+func (s *Store) EndLive(ctx context.Context, id int64, at time.Time) (bool, error) {
+	return s.changed(ctx, `UPDATE sessions SET state = 'ended', last_event_at = ?, background = ''
+		WHERE id = ? AND state IN ('running', 'waiting', 'idle')`, toMS(normTime(at)), id)
+}
+
 // SetStateIf moves a session from state from to state to (last_event_at =
 // at, now if zero) only if it is currently in from, reporting whether the
 // row changed. An unknown id is not an error.
