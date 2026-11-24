@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -61,9 +60,7 @@ func (c *cli) workspaceListCmd() *cobra.Command {
 				out = append(out, jsonWorkspace{Name: e.Name, Path: e.Dir, Adopted: e.Workspace, Current: filepath.Clean(e.Dir) == current})
 			}
 			if asJSON {
-				enc := json.NewEncoder(c.stdout)
-				enc.SetIndent("", "  ")
-				return enc.Encode(out)
+				return c.printJSON(out)
 			}
 			if len(out) == 0 {
 				fmt.Fprintf(c.stderr, "atl: no workspaces in %s: create one with `atl workspace new <name>`\n", root)
@@ -198,12 +195,9 @@ var execProcess = syscall.Exec
 // nothing of this workspace leaks into the next one. It returns only on
 // failure.
 func (c *cli) reexec(args ...string) error {
-	bin := os.Getenv("ATL_BIN")
-	if bin == "" {
-		var err error
-		if bin, err = os.Executable(); err != nil {
-			return fmt.Errorf("locate atl binary (set $ATL_BIN): %w", err)
-		}
+	bin, err := atlBin()
+	if err != nil {
+		return err
 	}
 	if c.app != nil {
 		c.app.Close()
