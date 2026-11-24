@@ -724,3 +724,34 @@ func TestTaskServerEdges(t *testing.T) {
 		t.Fatalf("Gone after delete = %v, %v", gone, err)
 	}
 }
+
+// TestViaGateLongRequestLine: when JSON escaping makes the request line too
+// long, PreToolUse goes to the gate without the container's landings and
+// ATL_CONTEXT, and the gate still guards the targets itself; the
+// assistant's guard, which may not go without them, refuses.
+func TestViaGateLongRequestLine(t *testing.T) {
+	f := setup(t)
+	sock := gated(t, f)
+	odd := strings.Repeat("\x01", 16000) // \u0001 on the line: six bytes each
+	target := filepath.Join(f.p.RepoPath("docs"), odd)
+	in := hookInput(Input{SessionID: "s", Cwd: f.p.TaskDir("fix"), ToolName: "Write", ToolInput: json.RawMessage(`{"file_path":` + strconvQuote(target) + `}`)})
+	if l := containerLandings([]byte(in)); len(l) == 0 {
+		t.Fatal("no landings: the test does not make a long line")
+	}
+	r := hookVia(t, f, sock, EventPreToolUse, in, map[string]string{envContextVar: strings.Repeat("\x01", 8000), "ATL_LAUNCH": strings.Repeat("\x01", 8000)})
+	if r.code != 2 || !strings.Contains(r.stderr, "inside read-only repo docs") {
+		t.Fatalf("long PreToolUse into ro: %+v", r)
+	}
+	rw := hookInput(Input{SessionID: "s", Cwd: f.p.TaskDir("fix"), ToolName: "Write",
+		ToolInput: json.RawMessage(`{"file_path":` + strconvQuote(filepath.Join(f.p.WorktreePath("fix", "api"), odd)) + `}`)})
+	if r := hookVia(t, f, sock, EventPreToolUse, rw, nil); r.code != 0 || r.stderr != "" {
+		t.Fatalf("long PreToolUse into rw: %+v", r)
+	}
+	var out, errb bytes.Buffer
+	code := run([]string{EventAssistantGuard}, strings.NewReader(in), &out, &errb, inContainer(sock, nil))
+	if code != 2 || !strings.Contains(errb.String(), "too long to check") {
+		t.Fatalf("long assistant guard: %d %q", code, errb.String())
+	}
+}
+
+func strconvQuote(s string) string { b, _ := json.Marshal(s); return string(b) }
