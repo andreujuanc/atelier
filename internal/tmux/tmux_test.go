@@ -687,7 +687,14 @@ func TestArgsEndingInSemicolon(t *testing.T) {
 	if e, err := c.run(ctx, "show-environment", "-t", "=atl-x", "E"); err == nil && e != "" && e != "E=v;" {
 		t.Errorf("session env = %q", e)
 	}
-	for _, text := range []string{"text;", `text\;`} {
+	// tmux takes a final `\;` for ";" whatever comes before it: any number
+	// of backslashes before a final ";" reach the command as they are.
+	texts := []string{"text;", ";", "text;;"}
+	for n := 1; n <= 3; n++ {
+		bs := strings.Repeat(`\`, n)
+		texts = append(texts, "text"+bs+";", bs+";", "text"+bs+";;")
+	}
+	for _, text := range texts {
 		if err := c.SetBuffer(ctx, text); err != nil {
 			t.Fatal(err)
 		}
