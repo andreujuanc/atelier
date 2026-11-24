@@ -281,7 +281,7 @@ func (c *Client) runCmds(ctx context.Context, stdin string, cmds ...[]string) (s
 // sessionVars are what a tmux server started from inside a session (a
 // Claude window, a task container's gate) must not take into its global
 // environment, which every window it opens later inherits.
-var sessionVars = []string{"CLAUDECODE", "ATL_SESSION", "ATL_CONTROL_SOCK", "ATL_TASK", "ATL_TASK_DIR", "ATL_PORT_OFFSET"}
+var sessionVars = []string{"CLAUDECODE", "ATL_SESSION", "ATL_LAUNCH", "ATL_CONTROL_SOCK", "ATL_TASK", "ATL_TASK_DIR", "ATL_PORT_OFFSET"}
 
 // serverEnv is the environment of the tmux commands c runs (a command that
 // starts the server gives it this one): atl's, without sessionVars, and,

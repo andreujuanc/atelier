@@ -256,10 +256,10 @@ func TestTeardownProjectGone(t *testing.T) {
 
 func TestLaunchEnvProject(t *testing.T) {
 	e := newTaskEnv(t)
-	e.writeProject(t, "shop", "[env]\nFOO = \"bar\"\nATL_PORT_OFFSET = \"9999\"\nATL_SESSION = \"x\"\n")
+	e.writeProject(t, "shop", "[env]\nFOO = \"bar\"\nATL_PORT_OFFSET = \"9999\"\nATL_SESSION = \"x\"\nATL_LAUNCH = \"99\"\n")
 	task := &model.Task{Slug: "s", Project: "shop", PortOffset: 300}
-	env := e.app.launchEnv(task, &model.Session{ID: 7})
-	want := map[string]string{"FOO": "bar", "ATL_PORT_OFFSET": "300", "ATL_SESSION": "7", "ATL_TASK": "s",
+	env := e.app.launchEnv(task, &model.Session{ID: 7, LaunchSeq: 2})
+	want := map[string]string{"FOO": "bar", "ATL_PORT_OFFSET": "300", "ATL_SESSION": "7", "ATL_LAUNCH": "2", "ATL_TASK": "s",
 		"ATL_TASK_DIR": e.app.Paths.TaskDir("s")}
 	if len(env) != len(want) {
 		t.Fatalf("env = %v", env)
@@ -271,7 +271,7 @@ func TestLaunchEnvProject(t *testing.T) {
 	}
 	// Project file gone (or no project): ATL_* only.
 	task.Project = "missing"
-	if env := e.app.launchEnv(task, &model.Session{ID: 7}); len(env) != 4 || env["ATL_PORT_OFFSET"] != "300" {
+	if env := e.app.launchEnv(task, &model.Session{ID: 7}); len(env) != 5 || env["ATL_PORT_OFFSET"] != "300" {
 		t.Fatalf("env = %v", env)
 	}
 	if !strings.Contains(e.outString(), `warning: project "missing" not found`) ||

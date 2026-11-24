@@ -653,7 +653,7 @@ func TestSessionTransitions(t *testing.T) {
 		t.Errorf("second ClaimFrom(ended) = %v, %v", ok, err)
 	}
 
-	// SetSessionLaunch: only target and name.
+	// SetSessionLaunch: only target and name, and a new launch.
 	ss := mk(model.StateRunning)
 	before := get(ss.ID)
 	if err := s.SetSessionLaunch(ctx, ss.ID, "@42", "claude-x"); err != nil {
@@ -661,7 +661,7 @@ func TestSessionTransitions(t *testing.T) {
 	}
 	g := get(ss.ID)
 	want := *before
-	want.TmuxTarget, want.Name = "@42", "claude-x"
+	want.TmuxTarget, want.Name, want.LaunchSeq = "@42", "claude-x", before.LaunchSeq+1
 	if *g != want {
 		t.Errorf("after SetSessionLaunch: %+v, want %+v", g, want)
 	}

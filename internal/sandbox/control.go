@@ -89,7 +89,7 @@ type ControlRequest struct {
 // The variables of the caller's environment a request may carry. Nothing else
 // of the container's environment reaches the gate.
 var (
-	HookEnv       = []string{"ATL_SESSION", "ATL_CONTEXT"}
+	HookEnv       = []string{"ATL_SESSION", "ATL_LAUNCH", "ATL_CONTEXT"}
 	StatusLineEnv = []string{"NO_COLOR", "COLORFGBG"}
 )
 

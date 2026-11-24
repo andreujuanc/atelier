@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -117,6 +118,50 @@ func (f *fixture) get(t *testing.T, id int64) *model.Session {
 
 func envOf(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
+}
+
+// A resume claims the session (live again) and then kills its old Claude,
+// whose SessionEnd may come after the claim, even after the new launch is
+// recorded: it carries its own launch (ATL_LAUNCH) and does not end the
+// resumed session. The new Claude's own SessionEnd does.
+func TestLateSessionEndOfOldLaunch(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	s := f.session(t, model.StateIdle, "cid")
+	old := strconv.FormatInt(f.get(t, s.ID).LaunchSeq, 10) // the launch the old Claude was started for
+	end := func(launch string) {
+		t.Helper()
+		in := Input{SessionID: "cid", Cwd: f.p.TaskDir("fix")}
+		env := envOf(map[string]string{"ATL_SESSION": itoa(s.ID), "ATL_TASK": "fix", "ATL_LAUNCH": launch})
+		if exit, msg, err := Handle(ctx, EventSessionEnd, in, env, f.st, f.p, now); exit != 0 || msg != "" || err != nil {
+			t.Fatalf("Handle = %d, %q, %v", exit, msg, err)
+		}
+	}
+	if err := f.st.SetSessionLaunch(ctx, s.ID, "@3", "claude-x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.SetSessionState(ctx, s.ID, model.StateStopped, now); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := f.st.ClaimStopped(ctx, s.ID, now); !ok || err != nil {
+		t.Fatalf("ClaimStopped: %v, %v", ok, err)
+	}
+	resumed := strconv.FormatInt(f.get(t, s.ID).LaunchSeq, 10)
+	end(old) // between the claim and the new window's record
+	if g := f.get(t, s.ID); g.State != model.StateIdle {
+		t.Fatalf("the old Claude's SessionEnd before the launch was recorded: %s", g.State)
+	}
+	if err := f.st.SetSessionLaunch(ctx, s.ID, "@4", "claude-x"); err != nil {
+		t.Fatal(err)
+	}
+	end(old)
+	if g := f.get(t, s.ID); g.State != model.StateIdle {
+		t.Fatalf("the old Claude's SessionEnd after the launch was recorded: %s", g.State)
+	}
+	end(resumed)
+	if g := f.get(t, s.ID); g.State != model.StateEnded {
+		t.Fatalf("the resumed Claude's SessionEnd: %s", g.State)
+	}
 }
 
 func TestTransitions(t *testing.T) {

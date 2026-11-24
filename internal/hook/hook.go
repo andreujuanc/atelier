@@ -489,7 +489,7 @@ func (d db) transition(ctx context.Context, event string, in Input, env func(str
 		return task.ID, st.CreateSession(ctx, &model.Session{TaskID: task.ID, ClaudeSessionID: in.SessionID,
 			State: model.StateIdle, CreatedAt: now, LastEventAt: now, TranscriptPath: in.TranscriptPath})
 	}
-	if err := transitionState(ctx, event, in, sess.ID, st, now); err != nil {
+	if err := transitionState(ctx, event, in, sess.ID, envLaunch(env, sess.ID), st, now); err != nil {
 		return sess.TaskID, err
 	}
 	if event == EventSessionEnd && d.ended != nil {
@@ -546,8 +546,9 @@ func transcriptIn(dir, path string) error {
 	return nil
 }
 
-// transitionState applies event's state change to session id.
-func transitionState(ctx context.Context, event string, in Input, id int64, st *store.Store, now time.Time) error {
+// transitionState applies event's state change to session id; launch is
+// the session's launch the event's Claude was started at (envLaunch).
+func transitionState(ctx context.Context, event string, in Input, id, launch int64, st *store.Store, now time.Time) error {
 	switch event {
 	case EventSessionStart:
 		if in.Source == "compact" {
@@ -580,7 +581,7 @@ func transitionState(ctx context.Context, event string, in Input, id int64, st *
 	case EventSessionEnd:
 		// Only a live session ends: one atl stopped or ended itself gets this
 		// from its Claude being killed, and stays as atl left it (resumable).
-		ok, err := st.EndLive(ctx, id, now)
+		ok, err := st.EndLive(ctx, id, launch, now)
 		if err != nil || ok {
 			return err
 		}
@@ -664,6 +665,20 @@ func idChangingSource(source string) bool {
 		return true
 	}
 	return false
+}
+
+// envLaunch returns $ATL_LAUNCH, the LaunchSeq of session id at which atl
+// started the hook's Claude, if atl started it for id (its $ATL_SESSION);
+// else -1 (unknown: a Claude started before atl passed it, or not by atl).
+func envLaunch(env func(string) string, id int64) int64 {
+	if s, err := strconv.ParseInt(env("ATL_SESSION"), 10, 64); err != nil || s != id {
+		return -1
+	}
+	n, err := strconv.ParseInt(env("ATL_LAUNCH"), 10, 64)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
 }
 
 // envSession returns the ATL_SESSION row if it is set, parses, exists and

@@ -264,6 +264,7 @@ func TestNewSession(t *testing.T) {
 	for _, want := range []string{
 		fmt.Sprintf("ATL_SESSION=%d\n", s.ID),
 		"ATL_TASK=fix-login\n",
+		"ATL_LAUNCH=0\n",
 		"ATL_PORT_OFFSET=100\n",
 		"ATL_TASK_DIR=" + e.app.Paths.TaskDir("fix-login") + "\n",
 	} {
@@ -492,6 +493,12 @@ func TestResume(t *testing.T) {
 	want := []string{"--resume=cid-1", "--add-dir", e.app.Paths.RepoPath("docs")}
 	if argv := e.argv(t, s1.ID); !reflect.DeepEqual(argv, want) {
 		t.Errorf("resumed argv = %q, want %q", argv, want)
+	}
+	// Its Claude knows the launch it was started at: the claim's, one before
+	// the recorded window's (see hook.envLaunch).
+	if envb, _ := os.ReadFile(filepath.Join(e.out, fmt.Sprintf("env-%d", s1.ID))); !strings.Contains(string(envb),
+		fmt.Sprintf("ATL_LAUNCH=%d\n", e.session(t, s1.ID).LaunchSeq-1)) {
+		t.Errorf("resumed claude env lacks ATL_LAUNCH=%d", e.session(t, s1.ID).LaunchSeq-1)
 	}
 	if st := e.session(t, s2.ID).State; st != model.StateEnded {
 		t.Errorf("stopped session without claude id: %s, want ended", st)

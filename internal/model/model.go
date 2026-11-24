@@ -189,6 +189,10 @@ type Session struct {
 	// it. Any other state change clears it: it only means something for an
 	// idle session. (A string keeps Session comparable.)
 	Background string
+	// LaunchSeq numbers the session's launches: bumped when it is claimed
+	// for a resume and when a window is recorded for it. A Claude is
+	// started with the value at its launch as $ATL_LAUNCH.
+	LaunchSeq int64
 }
 
 // Note authors.

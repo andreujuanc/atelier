@@ -10,14 +10,14 @@ import (
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
-const sessionCols = `id, task_id, claude_session_id, tmux_target, name, state, created_at, last_event_at, transcript_path, background`
+const sessionCols = `id, task_id, claude_session_id, tmux_target, name, state, created_at, last_event_at, transcript_path, background, launch_seq`
 
 func scanSession(sc scanner) (*model.Session, error) {
 	var ss model.Session
 	var state string
 	var created, last int64
 	if err := sc.Scan(&ss.ID, &ss.TaskID, &ss.ClaudeSessionID, &ss.TmuxTarget, &ss.Name,
-		&state, &created, &last, &ss.TranscriptPath, &ss.Background); err != nil {
+		&state, &created, &last, &ss.TranscriptPath, &ss.Background, &ss.LaunchSeq); err != nil {
 		return nil, err
 	}
 	ss.State = model.SessionState(state)
@@ -276,12 +276,16 @@ func (s *Store) SetClaudeSessionID(ctx context.Context, id int64, claudeSessionI
 }
 
 // EndLive sets a live session (running, waiting, idle) ended (last_event_at
-// = at, now if zero), reporting whether it was live. A session atl itself
+// = at, now if zero), reporting whether it did. A session atl itself
 // stopped or ended is left as it is: a SessionEnd from its Claude being
-// killed then must not make it unresumable.
-func (s *Store) EndLive(ctx context.Context, id int64, at time.Time) (bool, error) {
+// killed then must not make it unresumable. launch, if not negative, is
+// the LaunchSeq the ending Claude was started at: a session launched again
+// since (claimed for a resume, which bumps it past launch+1) is left as it
+// is too, as that is its old Claude ending late.
+func (s *Store) EndLive(ctx context.Context, id, launch int64, at time.Time) (bool, error) {
 	return s.changed(ctx, `UPDATE sessions SET state = 'ended', last_event_at = ?, background = ''
-		WHERE id = ? AND state IN ('running', 'waiting', 'idle')`, toMS(normTime(at)), id)
+		WHERE id = ? AND state IN ('running', 'waiting', 'idle') AND (? < 0 OR launch_seq <= ? + 1)`,
+		toMS(normTime(at)), id, launch, launch)
 }
 
 // SetStateIf moves a session from state from to state to (last_event_at =
