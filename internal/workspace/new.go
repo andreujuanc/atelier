@@ -411,7 +411,7 @@ type AdoptDBError struct{ Name, Dir string }
 
 func (e *AdoptDBError) Error() string {
 	return fmt.Sprintf("%s has a database (a devcontainer box's workspace?) and no repos were found (no ATL_REPOS in %s): adopt it with %s, "+
-		"giving the box's repos and mounts (see \"Moving from a devcontainer box\" in atelier's README)", e.Dir, DevcontainerFile, adoptCommand(e.Dir))
+		"giving the box's repos and mounts (see \"Moving from a devcontainer box\" in atelier's docs/workspaces.md)", e.Dir, DevcontainerFile, adoptCommand(e.Dir))
 }
 
 // reposKnown reports whether adopting dir finds its repos without a flag:

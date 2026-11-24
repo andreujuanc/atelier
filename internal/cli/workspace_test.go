@@ -350,7 +350,7 @@ func TestWorkspaceAdoptTmux(t *testing.T) {
 	host := mkdb("host")
 	code, out, errs = atl(t, "workspace", "new", "host")
 	if code != exitErr || out != "" || !strings.Contains(errs, "atl workspace new host --repos DIR [--mount PATH]...") ||
-		!strings.Contains(errs, "Moving from a devcontainer box") {
+		!strings.Contains(errs, `"Moving from a devcontainer box" in atelier's docs/workspaces.md`) {
 		t.Errorf("new host, no repos: %d %q %q", code, out, errs)
 	}
 	for _, p := range []string{"atelier.toml", "repos"} {
