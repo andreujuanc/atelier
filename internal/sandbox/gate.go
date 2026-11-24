@@ -770,8 +770,43 @@ func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 			g.deny(w, r, http.StatusForbidden, err.Error())
 			return
 		}
-		g.forward(w, r, nil)
+		g.forwardBuild(w, r)
 	}
+}
+
+// forwardBuild forwards a build once its context, which it reads into a
+// file of its own, passes checkBuildContext: the daemon gets those very
+// bytes.
+func (g *Gate) forwardBuild(w http.ResponseWriter, r *http.Request) {
+	spool, err := os.CreateTemp("", "atl-build-context-")
+	if err != nil {
+		g.deny(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	os.Remove(spool.Name()) // the open file is all that is needed
+	defer spool.Close()
+	if err := checkBuildContext(r, spool); err != nil {
+		status := http.StatusBadRequest
+		var refusal *buildRefusal
+		if errors.As(err, &refusal) {
+			status = http.StatusForbidden
+		}
+		g.deny(w, r, status, err.Error())
+		return
+	}
+	size, err := spool.Seek(0, io.SeekCurrent)
+	if err == nil {
+		_, err = spool.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		g.deny(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	r.Body = io.NopCloser(spool)
+	r.ContentLength = size
+	r.TransferEncoding = nil
+	r.Header.Set("Content-Length", strconv.FormatInt(size, 10))
+	g.forward(w, r, nil)
 }
 
 func (g *Gate) label(body map[string]any) {

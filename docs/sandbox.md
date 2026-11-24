@@ -115,6 +115,7 @@ The session's start context tells Claude all of this.
 | images: pull and build allowed, remove refused; build from a remote URL refused | images are shared; the daemon would fetch with host credentials |
 | a pull or build may not name a tag atl's own containers run from (`atelier-task`, `atelier`, the workspace's and every project's image, in any spelling); a build may not name a tag whose image has no `atelier.task` label (yours, or pulled: build under another tag), nor pull (`--pull`, `--platform`: pull the base image first); builds get the task's label; pulling all tags, tag, import, load, commit refused | a task could swap what later tasks, the assistant and `atl token` run |
 | BuildKit refused (`DOCKER_BUILDKIT=0` is set) | the gate cannot inspect BuildKit sessions |
+| a build's Dockerfile may not have `ONBUILD`, nor `ADD` from a URL or with a variable in a source (use `COPY`, or download in a `RUN` step); it must be a regular file in the context, sent uncompressed or gzipped | the daemon fetches an `ADD` URL from the host's network (its loopback services, a cloud's metadata address) |
 | the task's container is joined to every network the task creates; the task cannot stop, remove, or impersonate (`atl-<slug>-<hash>` names) it | services answer by compose service name |
 | form-encoded request bodies refused | Docker would read values the gate did not check |
 
@@ -237,6 +238,8 @@ refuses, `atl push`/`atl fetch`) and names the mounted host paths. `context` /
 - A task can write (never read) your clipboard while your terminal is on its tmux session.
   Read what you paste into a shell.
 - No BuildKit.
+- A base image's `ONBUILD` instructions run in a build `FROM` it unchecked: one from a registry with
+  `ADD <url>` fetches from the host's network.
 - Tasks can bind any free host port; no network egress policy.
 - Project setup and teardown scripts run on the host.
 - No git credentials or `gh` in the task: use `atl push`/`atl fetch`; `atl pr` runs on the
