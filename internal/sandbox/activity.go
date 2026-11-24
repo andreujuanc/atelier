@@ -1,8 +1,9 @@
 package sandbox
 
 import (
+	"maps"
 	"path"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -94,7 +95,7 @@ func ParseActivity(out string) (procs []Proc, roots map[int64]bool) {
 		children[ppid] = append(children[ppid], pid)
 	}
 	for _, c := range children {
-		sort.Ints(c)
+		slices.Sort(c)
 	}
 	argv0 := func(p *proc) string {
 		a := p.args
@@ -135,7 +136,7 @@ func ParseActivity(out string) (procs []Proc, roots map[int64]bool) {
 		}
 		procs = append(procs, Proc{PID: p.pid, Session: session, Command: command(p)})
 	}
-	for _, pid := range sortedKeys(all) {
+	for _, pid := range slices.Sorted(maps.Keys(all)) {
 		p := all[pid]
 		if pid == 1 || ours(p) {
 			continue
@@ -161,13 +162,4 @@ func ParseActivity(out string) (procs []Proc, roots map[int64]bool) {
 		}
 	}
 	return procs, roots
-}
-
-func sortedKeys[V any](m map[int]V) []int {
-	keys := make([]int, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Ints(keys)
-	return keys
 }
