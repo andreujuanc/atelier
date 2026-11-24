@@ -773,3 +773,55 @@ func TestTransportArgsKeepTheUsersOwnSettings(t *testing.T) {
 		t.Errorf("fetch args with $GIT_SSH_COMMAND, local origin: %q", args)
 	}
 }
+
+// A failed push or fetch names what failed, not the advice git prints
+// after it (hint: lines, "Please make sure you have the correct access
+// rights and the repository exists.").
+func TestTransportErrorSaysWhatFailed(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "t1")
+	commitFile(t, wt, "work.txt", "work\n", "work")
+	origin := to(f.origin)
+	if err := PushBranch(ctx, wt, origin, "atl/t1", false, nil); err != nil {
+		t.Fatal(err)
+	}
+	git(t, wt, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+		"commit", "-q", "--amend", "-m", "work, amended")
+	var out bytes.Buffer
+	err := PushBranch(ctx, wt, origin, "atl/t1", false, &out)
+	if err == nil || !strings.Contains(err.Error(), "[rejected]") || !strings.Contains(err.Error(), "non-fast-forward") {
+		t.Errorf("non-fast-forward push: %v\ngit wrote:\n%s", err, out.String())
+	}
+
+	gone := to(filepath.Join(f.root, "gone.git"))
+	out.Reset()
+	err = FetchOrigin(ctx, f.repo, gone, &out)
+	if err == nil || !strings.Contains(err.Error(), "does not appear to be a git repository") {
+		t.Errorf("fetch from a missing origin: %v\ngit wrote:\n%s", err, out.String())
+	}
+}
+
+func TestFailureLine(t *testing.T) {
+	for _, c := range []struct{ out, want string }{
+		{"", ""},
+		{"boom\n", "boom"},
+		{"To /o.git\n ! [rejected]        atl/x -> atl/x (non-fast-forward)\nerror: failed to push some refs to '/o.git'\n" +
+			"hint: Updates were rejected because the tip of your current branch is behind\nhint: its remote counterpart.\n",
+			"! [rejected]        atl/x -> atl/x (non-fast-forward)"},
+		{"fatal: '/o.git' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\n" +
+			"Please make sure you have the correct access rights\nand the repository exists.\n",
+			"fatal: '/o.git' does not appear to be a git repository"},
+		{"git@github.com: Permission denied (publickey).\r\nfatal: Could not read from remote repository.\n\nPlease make sure…\n",
+			"fatal: Could not read from remote repository."},
+		{"remote: error: GH006: Protected branch update failed\nTo github.com:o/r.git\n" +
+			" ! [remote rejected] atl/x -> atl/x (protected branch hook declined)\nerror: failed to push some refs to 'github.com:o/r.git'\n",
+			"! [remote rejected] atl/x -> atl/x (protected branch hook declined)"},
+		{"error: src refspec atl/x does not match any\nerror: failed to push some refs to '/o.git'\n",
+			"error: src refspec atl/x does not match any"},
+	} {
+		if got := failureLine(c.out); got != c.want {
+			t.Errorf("failureLine(%q) = %q, want %q", c.out, got, c.want)
+		}
+	}
+}

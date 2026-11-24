@@ -314,6 +314,51 @@ func TestAddRepoRefusals(t *testing.T) {
 	}
 }
 
+// A repo added rw whose origin already has atl/<slug> (or a branch below
+// it), say another workspace's task of the same slug, is refused: atl never
+// takes over a branch it did not create (atl show would call the task's
+// branch pushed, atl pr open a PR for that branch, push --force replace it).
+// Nothing is created.
+func TestAddRepoRefusesBranchOnOrigin(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "web", "main")
+	e.addRepo(t, "lib", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Clash", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}, {"lib", model.ModeRO}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.pushBranch(t, "web", "main", task.Branch, "theirs")
+	e.pushBranch(t, "lib", "main", task.Branch+"/sub", "theirs")
+	for _, c := range []struct {
+		repo string
+		add  func() error
+	}{
+		{"web", func() error { _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"web", model.ModeRW}, false); return err }},
+		{"lib", func() error { // an upgrade from ro
+			res, err := e.app.AddRepos(ctx, task.Slug, []RepoArg{{"lib", model.ModeRW}}, AddOpts{})
+			if err == nil {
+				err = errors.Join(res.Failed...)
+			}
+			return err
+		}},
+	} {
+		err := c.add()
+		if err == nil || !strings.Contains(err.Error(), task.Branch) {
+			t.Errorf("%s: err = %v, want a refusal naming %s", c.repo, err, task.Branch)
+		}
+		if exists(e.app.Paths.WorktreePath(task.Slug, c.repo)) || worktreeCount(t, e.canonical(c.repo)) != 1 {
+			t.Errorf("%s: worktree created", c.repo)
+		}
+		noBranch(t, e.canonical(c.repo), task.Branch)
+	}
+	got, _ := e.app.Store.GetTask(ctx, task.ID)
+	if len(got.Repos) != 2 || got.Repos[1].Mode != model.ModeRO {
+		t.Fatalf("repos after the refusals: %+v", got.Repos)
+	}
+}
+
 func noBranch(t *testing.T, repo, branch string) {
 	t.Helper()
 	if out, err := exec.Command("git", "-C", repo, "rev-parse", "--verify", "-q", "refs/heads/"+branch).CombinedOutput(); err == nil {

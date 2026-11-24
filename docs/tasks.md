@@ -13,7 +13,7 @@
   create.
 
 The slug never changes, also after `atl rename`. `atl add` of an rw repo whose clone already
-has `atl/<slug>` fails and keeps that branch.
+has `atl/<slug>` (or `atl/<slug>/…`), locally or under `origin/`, fails and keeps that branch.
 
 Titles: trimmed, spaces collapsed, at most 200 characters, no control characters.
 `atl rename` (TUI `t`) changes only the title and rewrites the task's `CLAUDE.md`.

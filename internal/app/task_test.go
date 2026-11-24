@@ -977,6 +977,24 @@ func TestDoctorMissingRepos(t *testing.T) {
 	}
 }
 
+// In a workspace the repos dir defaults to <workspace>/repos, not ~/repos:
+// the hint for a missing one names that default.
+func TestDoctorMissingReposInWorkspace(t *testing.T) {
+	e := newTaskEnv(t)
+	ws := filepath.Join(e.root, "ws")
+	e.app.Paths.Workspace = ws
+	for _, c := range e.app.Doctor(context.Background()) {
+		if c.Name != "repos dir" {
+			continue
+		}
+		if !c.Warn || strings.Contains(c.Detail, "~/repos") || !strings.Contains(c.Detail, "(default "+filepath.Join(ws, "repos")+")") {
+			t.Errorf("repos check = %+v", c)
+		}
+		return
+	}
+	t.Fatal("no repos dir check")
+}
+
 func TestTmuxVersionCheck(t *testing.T) {
 	for out, level := range map[string]string{
 		"tmux 3.5a": "ok", "tmux 3.2": "ok", "tmux 4.0": "ok", "tmux next-3.6": "ok",

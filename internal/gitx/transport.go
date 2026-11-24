@@ -571,8 +571,8 @@ func newTransportCommand(ctx context.Context, dir string, args []string) *exec.C
 }
 
 // runTransport runs git with args in dir, its stdout and stderr going to
-// out. A failure's Error carries the last line git wrote (the rest went to
-// out already).
+// out. A failure's Error carries the line that says what failed (see
+// failureLine; all of git's output went to out already).
 func runTransport(ctx context.Context, dir string, out io.Writer, args []string) error {
 	if out == nil {
 		out = io.Discard
@@ -582,7 +582,7 @@ func runTransport(ctx context.Context, dir string, out io.Writer, args []string)
 	w := &teeWriter{w: out}
 	cmd.Stdout, cmd.Stderr = w, w
 	if err := cmd.Run(); err != nil {
-		return wrap(ctx, args, lastLine(w.buf.String()), err)
+		return wrap(ctx, args, failureLine(w.buf.String()), err)
 	}
 	return nil
 }
@@ -611,7 +611,23 @@ func (t *teeWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func lastLine(s string) string {
+// failureLine is the line of git's output s that says what failed: a
+// rejected ref (" ! [rejected] …"), else git's first "fatal:" or "error:"
+// line, else the last line. git ends with advice (hint: lines, "Please make
+// sure you have the correct access rights…") that does not say it.
+func failureLine(s string) string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
-	return strings.TrimSpace(lines[len(lines)-1])
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+	for _, prefixes := range [][]string{{"! "}, {"fatal: ", "error: "}} {
+		for _, l := range lines {
+			for _, p := range prefixes {
+				if strings.HasPrefix(l, p) {
+					return l
+				}
+			}
+		}
+	}
+	return lines[len(lines)-1]
 }

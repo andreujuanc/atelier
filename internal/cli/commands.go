@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -676,6 +677,10 @@ func (c *cli) finishCmd(verb string) *cobra.Command {
 			if verb == "cancel" {
 				finish = ap.Cancel
 			}
+			// Closing kills the task's tmux session: run from a window
+			// of it, this process gets its SIGHUP and would die with the
+			// task half closed (worktrees left, status still open).
+			signal.Ignore(syscall.SIGHUP)
 			t, err := finish(cmd.Context(), a[0], force)
 			if err != nil {
 				return err

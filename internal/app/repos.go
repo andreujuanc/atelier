@@ -195,6 +195,9 @@ func (a *App) addRepoLocked(ctx context.Context, id int64, name string, mode mod
 		if tr.BaseBranch, tr.BaseCommit, err = resolveBase(ctx, name, repo, t.Base); err != nil {
 			return nil, err
 		}
+		if err := checkBranchFree(ctx, name, repo, t.Branch); err != nil {
+			return nil, err
+		}
 		if _, err := os.Lstat(wt); err == nil {
 			return nil, fmt.Errorf("repo %s: %s already exists; remove it first", name, wt)
 		}
@@ -320,6 +323,24 @@ func (a *App) undoWorktree(ctx context.Context, name, wt, branch string, removeW
 			a.warnf("rollback: delete branch %s in %s: %v", branch, name, derr)
 		}
 	}
+}
+
+// checkBranchFree refuses to create the task branch in rw repo name (clone
+// at repo) when the clone has it, or a branch below it, locally or under
+// origin/ (as of the last fetch): like a new task's slug (see slugTaken),
+// atl never takes over a branch it did not create.
+func checkBranchFree(ctx context.Context, name, repo, branch string) error {
+	for _, ref := range []string{"refs/heads/" + branch, "refs/remotes/origin/" + branch} {
+		ok, err := gitx.RefOrBelowExists(ctx, repo, ref)
+		if err != nil {
+			return fmt.Errorf("repo %s: %w", name, err)
+		}
+		if ok {
+			return fmt.Errorf("repo %s: %s (or a branch below it) already exists in its clone; atl does not take over a branch it did not create",
+				name, strings.TrimPrefix(strings.TrimPrefix(ref, "refs/heads/"), "refs/remotes/"))
+		}
+	}
+	return nil
 }
 
 // checkAdd checks that repo name can be added to t in mode: not in the task
