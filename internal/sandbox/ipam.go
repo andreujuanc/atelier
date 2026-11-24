@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/bits"
@@ -25,7 +26,7 @@ var ipamConfigFields = []string{"Subnet", "IPRange", "Gateway", "AuxiliaryAddres
 
 // checkIPAM checks a network create's IPAM: the default driver, no options,
 // and subnets (with the addresses in them) that are private (privateRanges)
-// and overlap no route of the host but a default one. A bridge network's
+// and overlap no route of the host but a default one (or a /1). A bridge network's
 // subnet becomes a route of the host, to the bridge: one of public
 // addresses (a resolver's), or one inside a route the host has (its LAN's,
 // its gateway's, a VPN's: the more specific route wins), would send the
@@ -96,7 +97,9 @@ func (g *Gate) checkIPAM(v any) error {
 			}
 		}
 		for _, r := range routes {
-			if r.Bits() > 0 && r.Overlaps(subnet) {
+			// A default route (or half of one: a VPN's two /1 routes, as
+			// OpenVPN's def1 sets them) is no route to a network.
+			if r.Bits() > 1 && r.Overlaps(subnet) {
 				return fmt.Errorf("subnet %s overlaps the host's route to %s: leave the subnet out and Docker picks a free one", subnet, r)
 			}
 		}
@@ -186,8 +189,11 @@ func parseRoutes(v4, v6 string) ([]netip.Prefix, error) {
 		if err1 != nil || err2 != nil {
 			return nil, bad(line)
 		}
-		addr := netip.AddrFrom4([4]byte{byte(dst), byte(dst >> 8), byte(dst >> 16), byte(dst >> 24)})
-		out = append(out, netip.PrefixFrom(addr, bits.OnesCount32(uint32(mask))).Masked())
+		// The kernel prints the addresses as numbers in the host's byte
+		// order.
+		var a [4]byte
+		binary.NativeEndian.PutUint32(a[:], uint32(dst))
+		out = append(out, netip.PrefixFrom(netip.AddrFrom4(a), bits.OnesCount32(uint32(mask))).Masked())
 	}
 	for _, line := range strings.Split(v6, "\n") {
 		f := strings.Fields(line)
