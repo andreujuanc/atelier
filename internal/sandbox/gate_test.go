@@ -29,7 +29,9 @@ type daemon struct {
 	requests []string          // "METHOD path?query"
 	bodies   map[string]string // last body per "METHOD path"
 	objects  []*object
-	execIn   []string // IDs of the containers execs were created in
+	execIn   []string        // IDs of the containers execs were created in
+	execs    int             // execs created: the next one is new<execs+1>
+	execGone map[string]bool // execs the daemon has forgotten: their inspect is a 404
 	// onInspect, if set, runs before an inspect of an object is answered.
 	onInspect func(kind, ref string)
 	// volumesMissing are the volumes a container create named by name that
@@ -57,7 +59,7 @@ const (
 
 func newDaemon(t *testing.T) (*daemon, string) {
 	t.Helper()
-	d := &daemon{bodies: map[string]string{}, objects: []*object{
+	d := &daemon{bodies: map[string]string{}, execGone: map[string]bool{}, objects: []*object{
 		{"containers", mineID, "mine", map[string]string{LabelTask: testID}},
 		{"containers", agentID, "agent", map[string]string{LabelAgent: testID}},
 		{"containers", otherID, "other", map[string]string{LabelTask: "someone-else"}},
@@ -157,9 +159,21 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "POST" && len(parts) == 3 && parts[2] == "exec" && obj != nil:
 		d.mu.Lock()
 		d.execIn = append(d.execIn, obj.id)
+		d.execs++
+		id := fmt.Sprintf("new%d", d.execs)
 		d.mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
-		io.WriteString(w, `{"Id":"new1"}`)
+		fmt.Fprintf(w, `{"Id":%q}`, id)
+	case r.Method == "GET" && len(parts) == 3 && parts[0] == "exec" && parts[2] == "json":
+		d.mu.Lock()
+		gone := d.execGone[parts[1]]
+		d.mu.Unlock()
+		if gone {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"message":"no such exec"}`)
+			return
+		}
+		io.WriteString(w, `{}`)
 	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/create"):
 		w.WriteHeader(http.StatusCreated)
 		io.WriteString(w, `{"Id":"new1"}`)
@@ -536,6 +550,43 @@ func TestGateOwnership(t *testing.T) {
 	if b := c.d.body("POST /v1.45/networks/" + mynetID + "/connect"); !strings.Contains(b, `"NetworkID":"`+mynetID+`"`) ||
 		!strings.Contains(b, `"Container":"`+agentID+`"`) {
 		t.Errorf("connect body = %s", b)
+	}
+}
+
+// TestGateForgetsGoneExecs: the daemon forgets an exec some minutes after
+// it ended (or with its container), and so does the gate, once it has seen
+// enough new ones: a task that runs docker exec in a loop does not grow it
+// without bound. The execs the daemon still knows stay the task's.
+func TestGateForgetsGoneExecs(t *testing.T) {
+	c := newGate(t)
+	create := func() string {
+		t.Helper()
+		status, out := c.do("POST", "/containers/mine/exec", `{"Cmd":["true"]}`)
+		var created struct{ Id string }
+		if status != http.StatusCreated || json.Unmarshal([]byte(out), &created) != nil {
+			t.Fatalf("exec create: %d %s", status, out)
+		}
+		return created.Id
+	}
+	gone, kept := create(), create()
+	c.d.mu.Lock()
+	c.d.execGone[gone] = true
+	c.d.mu.Unlock()
+	for range execsPruneMin {
+		create()
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if status, _ := c.do("GET", "/exec/"+gone+"/json", ""); status == http.StatusForbidden {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the gate still holds an exec the daemon has forgotten")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status, out := c.do("GET", "/exec/"+kept+"/json", ""); status != http.StatusOK {
+		t.Errorf("an exec the daemon still knows: %d %s", status, out)
 	}
 }
 
