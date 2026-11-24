@@ -69,12 +69,12 @@ func (a *App) AvailableRepos(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// addRepoLockWait is how long lockTask waits for another operation on the
+// taskLockWait is how long lockTask waits for another operation on the
 // same task (AddRepo, done/cancel, a CLAUDE.md rewrite) to finish.
-const addRepoLockWait = 30 * time.Second
+const taskLockWait = 30 * time.Second
 
 // lockTask takes an exclusive flock on <StateDir>/locks/task-<id>.lock,
-// waiting up to addRepoLockWait (or until ctx ends). The returned func
+// waiting up to taskLockWait (or until ctx ends). The returned func
 // releases it.
 func (a *App) lockTask(ctx context.Context, id int64) (func(), error) {
 	dir := filepath.Join(a.Paths.StateDir, "locks")
@@ -82,7 +82,7 @@ func (a *App) lockTask(ctx context.Context, id int64) (func(), error) {
 		return nil, fmt.Errorf("create lock dir: %w", err)
 	}
 	path := filepath.Join(dir, fmt.Sprintf("task-%d.lock", id))
-	return lockFile(ctx, path, addRepoLockWait, "another operation on this task is in progress")
+	return lockFile(ctx, path, taskLockWait, "another operation on this task is in progress")
 }
 
 // lockFile takes an exclusive flock on path (created if missing), waiting

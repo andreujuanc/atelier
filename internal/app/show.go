@@ -273,7 +273,10 @@ func (a *App) keepNotes(slug, notes string) error {
 	}
 	defer f.Close()
 	fi, err := f.Stat()
-	if err != nil || !fi.Mode().IsRegular() {
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", path)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {

@@ -126,12 +126,11 @@ func (a *App) mergeRepos(o NewTaskOpts) ([]model.TaskRepo, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, r := range pr.Repos {
-			if o.ExactRepos {
-				break
-			}
-			if err := add(r.Name, r.Mode); err != nil {
-				return nil, err
+		if !o.ExactRepos {
+			for _, r := range pr.Repos {
+				if err := add(r.Name, r.Mode); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -261,8 +260,8 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 		a.warnf("%s", w)
 	}
 	avoid := store.Avoid{SlugTaken: a.slugTaken(ctx, repos)}
-	for _, o := range others.Tasks {
-		avoid.PortOffsets = append(avoid.PortOffsets, o.PortOffset)
+	for _, ot := range others.Tasks {
+		avoid.PortOffsets = append(avoid.PortOffsets, ot.PortOffset)
 	}
 	if err := a.Store.CreateTaskAutoPort(ctx, t, avoid); err != nil {
 		return nil, err
