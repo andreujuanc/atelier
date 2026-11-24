@@ -96,6 +96,10 @@ repository: `.git/objects/info/alternates` (a clone made with `--reference`: run
 `git repack -a -d` in it, then remove the file), a symlink in `.git/objects/`, or a `commondir`
 file in the clone's `.git`. `atl show` reads HEAD and its branch without following a symlink.
 
+Push and fetch run git in a git dir of atl's own (a copy of the repo's refs, its objects, your config
+as it applies to the repo) and then copy the refs that changed into the repo without following a
+symlink: no `FETCH_HEAD` or reflog is written in the repo.
+
 Worktree checks: before running git or a project script in a worktree, atl checks that it is
 a real directory (not a symlink) and a worktree of that repo's canonical clone. If not, the
 command fails for that repo; `atl done`/`cancel` refuse (with `--force`, close the task and

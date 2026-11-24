@@ -132,3 +132,126 @@ func symlinkHEAD(t *testing.T, head, target string) {
 	must(t, err)
 	must(t, os.Symlink("refs/../"+rel, head))
 }
+
+// TestTransportWritesOnlyTheRepo: a task writes its clone's git dir. A
+// directory there that git writes into for a fetch or push (refs/remotes/
+// origin and below, their reflogs in logs/) made a symlink to one of the
+// user's directories had atl's git on the host create or replace a file
+// named after a branch there, and FETCH_HEAD a symlink to a file of the
+// user's had it overwritten. Nothing outside the git dir is written, and
+// the refs git did not write there are not written at all.
+func TestTransportWritesOnlyTheRepo(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, base := f.addWorktree(t, ctx, "x")
+	commitFile(t, wt, "work.txt", "work\n", "the task's work")
+	f.pushFromOtherClone(t, "new")
+	gitDir := filepath.Join(f.repo, ".git")
+	// The user's directory: another repo's refs, say.
+	victim := t.TempDir()
+	content := map[string]string{"main": base + "\n", "x": base + "\n", "HEAD": "ref: refs/heads/main\n"}
+	precious := filepath.Join(t.TempDir(), "precious")
+	writeFile(t, precious, "the user's\n")
+	for name, c := range content {
+		writeFile(t, filepath.Join(victim, name), c)
+	}
+	untouched := func(name string) {
+		t.Helper()
+		entries, _ := os.ReadDir(victim)
+		if len(entries) != len(content) {
+			t.Errorf("%s: the user's directory has %d entries, want %d", name, len(entries), len(content))
+		}
+		if data, _ := os.ReadFile(precious); string(data) != "the user's\n" {
+			t.Errorf("%s: the user's file now has %q", name, data)
+		}
+		for n, c := range content {
+			if data, _ := os.ReadFile(filepath.Join(victim, n)); string(data) != c {
+				t.Errorf("%s: the user's file %s now has %q", name, n, data)
+			}
+		}
+	}
+	swap := func(rel, target string) (restore func()) {
+		p := filepath.Join(gitDir, rel)
+		must(t, os.MkdirAll(p, 0o755))
+		must(t, os.Rename(p, p+".saved"))
+		must(t, os.Symlink(target, p))
+		return func() {
+			must(t, os.Remove(p))
+			must(t, os.Rename(p+".saved", p))
+		}
+	}
+
+	restore := swap("refs/remotes/origin", victim)
+	FetchOrigin(ctx, f.repo, to(f.origin), io.Discard)
+	untouched("fetch, refs/remotes/origin a symlink")
+	restore()
+
+	restore = swap("logs/refs/remotes/origin", victim)
+	FetchOrigin(ctx, f.repo, to(f.origin), io.Discard)
+	untouched("fetch, its reflogs' dir a symlink")
+	restore()
+
+	os.Remove(filepath.Join(gitDir, "FETCH_HEAD"))
+	must(t, os.Symlink(precious, filepath.Join(gitDir, "FETCH_HEAD")))
+	if err := FetchOrigin(ctx, f.repo, to(f.origin), io.Discard); err != nil {
+		t.Errorf("fetch: %v", err)
+	}
+	untouched("fetch, FETCH_HEAD a symlink")
+	must(t, os.Remove(filepath.Join(gitDir, "FETCH_HEAD")))
+
+	restore = swap("refs/remotes/origin/atl", victim)
+	PushBranch(ctx, wt, to(f.origin), "atl/x", false, io.Discard)
+	untouched("push, refs/remotes/origin/atl a symlink")
+	restore()
+
+	restore = swap("logs/refs/remotes/origin", victim)
+	commitFile(t, wt, "more.txt", "more\n", "more work")
+	PushBranch(ctx, wt, to(f.origin), "atl/x", false, io.Discard)
+	untouched("push, its reflogs' dir a symlink")
+	restore()
+
+	// Without symlinks, the refs are where they belong.
+	if err := FetchOrigin(ctx, f.repo, to(f.origin), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := git(t, f.repo, "rev-parse", "refs/remotes/origin/main"), git(t, f.origin, "rev-parse", "main"); got != want {
+		t.Errorf("origin/main = %s after the fetch, want %s", got, want)
+	}
+	if err := PushBranch(ctx, wt, to(f.origin), "atl/x", false, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := git(t, f.repo, "rev-parse", "refs/remotes/origin/atl/x"), git(t, wt, "rev-parse", "HEAD"); got != want {
+		t.Errorf("origin/atl/x = %s after the push, want %s", got, want)
+	}
+}
+
+// TestTransportKeepsTheUsersConditionalConfig: git runs a push or fetch in
+// a git dir of atl's own, yet the user's config applies as for the repo,
+// conditional includes too (a work identity's rules for repos under a
+// directory, say).
+func TestTransportKeepsTheUsersConditionalConfig(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "x")
+	commitFile(t, wt, "work.txt", "work\n", "the task's work")
+	tip := f.pushFromOtherClone(t, "new")
+	work := filepath.Join(t.TempDir(), "work.gitconfig")
+	writeFile(t, work, "[url \""+f.origin+"\"]\n\tinsteadOf = work:\n")
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	writeFile(t, global, "[includeIf \"gitdir:"+f.root+"/\"]\n\tpath = "+work+"\n"+
+		"[includeIf \"gitdir:/nowhere/\"]\n\tpath = /nowhere/config\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	o := Origin{URLs: []string{"work:"}}
+	if err := FetchOrigin(ctx, f.repo, o, io.Discard); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if got := git(t, f.repo, "rev-parse", "origin/main"); got != tip {
+		t.Errorf("origin/main = %s, want %s", got, tip)
+	}
+	if err := PushBranch(ctx, wt, o, "atl/x", false, io.Discard); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if got, want := git(t, f.origin, "rev-parse", "atl/x"), git(t, wt, "rev-parse", "HEAD"); got != want {
+		t.Errorf("origin atl/x = %s, want %s", got, want)
+	}
+}

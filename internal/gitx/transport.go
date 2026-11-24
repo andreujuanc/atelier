@@ -132,6 +132,9 @@ func configList(ctx context.Context, dir, key string) ([]string, error) {
 // to a branch of any other repo where atl runs, and list that repo's
 // objects as alternates: git would push that repo's history to origin,
 // where the task fetches it.
+//
+// The refs git updates (refs/remotes/origin/<branch>) are written to a
+// store of atl's own and copied into the repo from there (refStore).
 func PushBranch(ctx context.Context, dir string, origin Origin, branch string, force bool, out io.Writer) error {
 	t, err := newTransport(ctx, dir, origin, true)
 	if err != nil {
@@ -147,7 +150,15 @@ func PushBranch(ctx context.Context, dir string, origin Origin, branch string, f
 		args = append(args, "--force-with-lease")
 	}
 	args = append(args, "--receive-pack="+packProgram(true, t.local), t.name, commit+":"+ref)
-	return runTransport(ctx, dir, out, args)
+	store, err := newRefStore(ctx, dir)
+	if err != nil {
+		return err
+	}
+	defer store.close()
+	if err := runTransport(ctx, dir, out, store.env, args); err != nil {
+		return err
+	}
+	return store.sync()
 }
 
 // branchCommit returns the commit id ref (a branch, refs/heads/...) names
@@ -174,6 +185,9 @@ func firstChars(s string, n int) string {
 // with the same guards as PushBranch. git's output goes to out. Like `git
 // fetch` since git 2.48, it creates refs/remotes/origin/HEAD when it is
 // missing (see setOriginHead).
+//
+// git writes refs (and FETCH_HEAD) to a store of atl's own; the refs are
+// copied into the repo from there (refStore).
 func FetchOrigin(ctx context.Context, dir string, origin Origin, out io.Writer) error {
 	t, err := newTransport(ctx, dir, origin, false)
 	if err != nil {
@@ -181,7 +195,15 @@ func FetchOrigin(ctx context.Context, dir string, origin Origin, out io.Writer) 
 	}
 	args := append(t.args, "fetch", "--no-recurse-submodules", "--no-auto-gc",
 		"--upload-pack="+packProgram(false, t.local), t.name)
-	if err := runTransport(ctx, dir, out, args); err != nil {
+	store, err := newRefStore(ctx, dir)
+	if err != nil {
+		return err
+	}
+	defer store.close()
+	if err := runTransport(ctx, dir, out, store.env, args); err != nil {
+		return err
+	}
+	if err := store.sync(); err != nil {
 		return err
 	}
 	t.setOriginHead(ctx, dir)
@@ -276,7 +298,8 @@ func newTransport(ctx context.Context, dir string, origin Origin, push bool) (*t
 // when it is missing and that branch was fetched, as `git fetch` does since
 // git 2.48 (remote.origin.followRemoteHEAD=create; "never" in the repo's
 // config is respected). The stand-in remote cannot do it: git names the ref
-// after the remote. Best effort: failures are ignored.
+// after the remote. It is written without following a symlink, as refStore
+// writes refs. Best effort: failures are ignored.
 func (t *transport) setOriginHead(ctx context.Context, dir string) {
 	const head = "refs/remotes/origin/HEAD"
 	if _, err := run(ctx, dir, "symbolic-ref", "--quiet", head); err == nil {
@@ -301,8 +324,10 @@ func (t *transport) setOriginHead(ctx context.Context, dir string) {
 		if !ok || branch == "" {
 			continue
 		}
-		if ok, err := RefExists(ctx, dir, "refs/remotes/origin/"+branch); err == nil && ok {
-			_, _ = run(ctx, dir, "symbolic-ref", "-m", "atl fetch: origin's HEAD", head, "refs/remotes/origin/"+branch)
+		if target := "refs/remotes/origin/" + branch; plainRefName(target) {
+			if ok, err := RefExists(ctx, dir, target); err == nil && ok {
+				writeSymref(ctx, dir, head, target)
+			}
 		}
 		return
 	}
@@ -601,14 +626,15 @@ func newTransportCommand(ctx context.Context, dir string, args []string) *exec.C
 	return cmd
 }
 
-// runTransport runs git with args in dir, its stdout and stderr going to
-// out. A failure's Error carries the line that says what failed (see
+// runTransport runs git with args in dir, and env on top of its own, its
+// stdout and stderr going to out. A failure's Error carries the line that says what failed (see
 // failureLine; all of git's output went to out already).
-func runTransport(ctx context.Context, dir string, out io.Writer, args []string) error {
+func runTransport(ctx context.Context, dir string, out io.Writer, env, args []string) error {
 	if out == nil {
 		out = io.Discard
 	}
 	cmd := newTransportCommand(ctx, dir, args)
+	cmd.Env = append(cmd.Env, env...)
 	// One writer for both: exec then never calls it from two goroutines.
 	w := &teeWriter{w: out}
 	cmd.Stdout, cmd.Stderr = w, w
