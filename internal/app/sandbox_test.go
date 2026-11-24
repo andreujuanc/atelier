@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -249,6 +250,38 @@ func TestSandboxLeavesAContainerNotItsOwn(t *testing.T) {
 	}
 }
 
+// TestCloseStopsTheGateFirst: closing a task stops its gate before it
+// lists the containers the task made. A container of the task that has the
+// gate's socket (mounted as its Docker socket) could otherwise create
+// another one after the list, which would outlive the task, its worktrees'
+// removal included, with them mounted.
+func TestCloseStopsTheGateFirst(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	task := e.task(t, "boxed", model.StatusActive, true)
+	runDir := e.app.Paths.RunDir(task.Slug)
+	if err := sandbox.MakeRunDir(runDir); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("unix", sandbox.SocketPath(runDir)) // the gate
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	listed, aliveThen := false, false
+	fd.onPs = func() {
+		if !listed {
+			listed, aliveThen = true, sandbox.Alive(runDir)
+		}
+	}
+	if _, err := e.app.Done(ctx, "boxed", true); err != nil {
+		t.Fatal(err)
+	}
+	if !listed || aliveThen {
+		t.Errorf("the task's containers listed: %v, with its gate still up: %v", listed, aliveThen)
+	}
+}
+
 // fakeDocker records docker CLI calls. No container exists until one is
 // "run"; then inspect reports it running with the spec label it was given.
 type fakeDocker struct {
@@ -261,6 +294,7 @@ type fakeDocker struct {
 	down    bool            // the daemon cannot be reached
 	ps      string          // what the activity probe prints (sandbox.ActivityArgs)
 	onRm    func()          // called on docker rm
+	onPs    func()          // called on docker ps
 }
 
 // fakeContainerID is the full ID of fakeDocker's container.
@@ -310,6 +344,10 @@ func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 			}
 		}
 		return fakeContainerID, nil
+	case "ps":
+		if f.onPs != nil {
+			f.onPs()
+		}
 	case "rm":
 		f.label = ""
 		if f.onRm != nil {

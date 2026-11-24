@@ -218,9 +218,8 @@ func start(atlBin string, args []string, ident, what, runDir, logPath string) er
 		if strings.TrimSpace(string(cur)) == ident {
 			return nil
 		}
-		Stop(runDir)
 		// One that missed the signal notices its socket is gone within 10s.
-		if err := awaitUnlocked(runDir, 15*time.Second); err != nil {
+		if err := StopAndWait(runDir, 15*time.Second); err != nil {
 			return fmt.Errorf("replace the gate for %s: %w", what, err)
 		}
 	}
@@ -296,6 +295,17 @@ func Stop(runDir string) {
 		}
 	}
 	os.Remove(socketPath(runDir))
+}
+
+// StopAndWait is Stop, then waits up to wait until the gate has exited (it
+// holds the run dir's lock until then), so that it answers no request any
+// more. Without a gate there is nothing to wait for.
+func StopAndWait(runDir string, wait time.Duration) error {
+	Stop(runDir)
+	if _, err := os.Stat(lockPath(runDir)); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return awaitUnlocked(runDir, wait)
 }
 
 // NewLogger returns the logger a gate process writes to (its stderr, which

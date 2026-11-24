@@ -320,12 +320,17 @@ func (a *App) removeSandbox(ctx context.Context, t *model.Task) {
 	if a.Sandbox == nil && !fileExists(runDir) && !fileExists(a.Paths.ClaudeDir(t.Slug)) {
 		return
 	}
-	// The container goes first: then nothing writes to the Claude dir.
+	// The containers go first: then nothing writes to the Claude dir.
 	defer a.pruneClaudeDir(t)
+	// The gate before them: a container of the task with the gate's socket
+	// could otherwise create another after Cleanup has listed them, which
+	// would outlive the task (and the removal of its worktrees, mounted).
+	if err := sandbox.StopAndWait(runDir, 15*time.Second); err != nil {
+		a.warnf("task %s: stop its gate: %v", t.Slug, err)
+	}
 	if err := sandbox.Cleanup(ctx, a.docker(), a.sandboxID(t)); err != nil {
 		a.warnf("task %s: clean up its containers: %v", t.Slug, err)
 	}
-	sandbox.Stop(runDir)
 	if err := os.RemoveAll(runDir); err != nil {
 		a.warnf("%v", err)
 	}

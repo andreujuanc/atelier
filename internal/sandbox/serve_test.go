@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -148,6 +149,36 @@ func TestStartReplacesStaleGate(t *testing.T) {
 	if Ident(2, bin, []string{"/a", "/b"}) == Ident(2, bin, []string{"/a/b"}) || Ident(2, bin, nil) != Ident(2, bin, []string{}) {
 		t.Error("Ident does not tell the lists apart")
 	}
+	// StopAndWait returns once the gate process has exited.
+	if err := StopAndWait(runDir, 15*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(atoi(t, pid), 0); !errors.Is(err, syscall.ESRCH) && !exited(pid) {
+		t.Errorf("gate %s still runs after StopAndWait (%v)", pid, err)
+	}
+	if err := StopAndWait(filepath.Join(dir, "none"), time.Second); err != nil {
+		t.Errorf("StopAndWait without a gate: %v", err)
+	}
+}
+
+func atoi(t *testing.T, s string) int {
+	t.Helper()
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// exited reports whether process pid is gone or a zombie (exited, not yet
+// reaped by Start's goroutine).
+func exited(pid string) bool {
+	stat, err := os.ReadFile("/proc/" + pid + "/stat")
+	if err != nil {
+		return true
+	}
+	_, rest, _ := strings.Cut(string(stat), ") ")
+	return strings.HasPrefix(rest, "Z")
 }
 
 // TestServeRunDirIsPrivate: the run dir is the owner's only (an older atl
