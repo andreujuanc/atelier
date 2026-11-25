@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/andreujuanc/atelier/internal/update"
 )
 
 // TestBuildImagesUnderCDPATH: build-images run by a relative path, with a
@@ -151,5 +153,73 @@ func TestNextVersion(t *testing.T) {
 				t.Errorf("got %q, %v; want %q", got, err, c.want)
 			}
 		})
+	}
+}
+
+// TestSignRelease: .github/sign-release.sh signs with openssl what
+// internal/update verifies (with a public key file holding a rotated-out
+// key first), and refuses to sign with a key that file does not hold.
+func TestSignRelease(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not installed")
+	}
+	script, err := filepath.Abs(filepath.Join("..", ".github", "sign-release.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	run := func(name string, args ...string) error {
+		t.Helper()
+		cmd := exec.Command(name, args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Logf("%s %v: %s", name, args, out)
+		}
+		return err
+	}
+	for _, k := range []string{"old", "key", "stranger"} {
+		if err := run("openssl", "genpkey", "-algorithm", "ed25519", "-out", k+".pem"); err != nil {
+			t.Fatal(err)
+		}
+		if err := run("openssl", "pkey", "-in", k+".pem", "-pubout", "-out", k+".pub"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old, _ := os.ReadFile(filepath.Join(dir, "old.pub"))
+	cur, _ := os.ReadFile(filepath.Join(dir, "key.pub"))
+	pubs := filepath.Join(dir, "release-key.pub")
+	if err := os.WriteFile(pubs, []byte("# comment\n"+string(old)+string(cur)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sums := []byte(strings.Repeat("ab", 32) + "  atl-linux-arm64\n")
+	if err := os.WriteFile(filepath.Join(dir, "SHA256SUMS"), sums, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run("sh", script, "key.pem", "v0.1.1", "SHA256SUMS", "SHA256SUMS.sig", pubs); err != nil {
+		t.Fatal("signing with a listed key failed")
+	}
+	sig, err := os.ReadFile(filepath.Join(dir, "SHA256SUMS.sig"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := update.ParseKeys([]byte("# comment\n" + string(old) + string(cur)))
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("ParseKeys: %d keys, %v", len(keys), err)
+	}
+	if err := update.VerifySums(keys, "v0.1.1", sums, sig); err != nil {
+		t.Errorf("atl refuses what sign-release.sh signed: %v", err)
+	}
+	if err := update.VerifySums(keys, "v0.1.2", sums, sig); err == nil {
+		t.Error("the signature vouches for another tag")
+	}
+
+	os.Remove(filepath.Join(dir, "SHA256SUMS.sig"))
+	if err := run("sh", script, "stranger.pem", "v0.1.1", "SHA256SUMS", "SHA256SUMS.sig", pubs); err == nil {
+		t.Error("signed with a key release-key.pub does not hold")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "SHA256SUMS.sig")); err == nil {
+		t.Error("left a signature atl would refuse")
 	}
 }

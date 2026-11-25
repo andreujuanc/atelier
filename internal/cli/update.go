@@ -25,11 +25,11 @@ func (c *cli) updateCmd() *cobra.Command {
 	var check, force bool
 	cmd := &cobra.Command{
 		Use:   "update [--check] [--force]",
-		Short: "replace atl with its latest release (checked against SHA256SUMS and its build attestation, with gh)",
-		Long: "Replaces the running atl binary with the latest release from GitHub, once its\n" +
-			"checksum matches and `gh attestation verify` shows it was built by atelier's release\n" +
-			"workflow from main. Running sessions and gates keep the old binary until they restart;\n" +
-			"the TUI restarts itself when you update from it (U).\n\n" +
+		Short: "replace atl with its latest release (signed with the release key, checksum checked)",
+		Long: "Replaces the running atl binary with the latest release from GitHub, once the\n" +
+			"release's SHA256SUMS.sig checks out with the release key built into atl and the\n" +
+			"binary's checksum is the signed one. Running sessions and gates keep the old binary\n" +
+			"until they restart; the TUI restarts itself when you update from it (U).\n\n" +
 			"A local build (version dev) is only replaced with --force.",
 		Args: args(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {

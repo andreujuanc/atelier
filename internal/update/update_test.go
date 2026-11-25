@@ -1,10 +1,16 @@
 package update
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
-	"errors"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,14 +22,38 @@ import (
 	"time"
 )
 
+func newKey(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	_, k, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+func pub(k ed25519.PrivateKey) ed25519.PublicKey { return k.Public().(ed25519.PublicKey) }
+
 // fakeGitHub serves a latest release tag with assets atl-linux-arm64
-// (bin) and SHA256SUMS (sums; computed from bin when empty).
+// (bin), SHA256SUMS (sums; computed from bin when empty) and
+// SHA256SUMS.sig (made with key for signTag, default tag; sig if set).
 type fakeGitHub struct {
 	tag      string
 	bin      []byte
 	sums     string
 	noAssets bool
+	key      ed25519.PrivateKey
+	signTag  string
+	sig      []byte
+	noSig    bool
 	calls    atomic.Int32
+}
+
+func (f *fakeGitHub) sumsText() string {
+	if f.sums != "" {
+		return f.sums
+	}
+	h := sha256.Sum256(f.bin)
+	return hex.EncodeToString(h[:]) + "  atl-linux-amd64\n" + hex.EncodeToString(h[:]) + " *atl-linux-arm64\n"
 }
 
 func (f *fakeGitHub) serve(t *testing.T) *httptest.Server {
@@ -41,20 +71,28 @@ func (f *fakeGitHub) serve(t *testing.T) *httptest.Server {
 				http.NotFound(w, r)
 				return
 			}
-			assets := fmt.Sprintf(`[{"name":"atl-linux-arm64","browser_download_url":"%[1]s/dl/bin"},{"name":"SHA256SUMS","browser_download_url":"%[1]s/dl/sums"}]`, srv.URL)
-			if f.noAssets {
-				assets = "[]"
+			assets := fmt.Sprintf(`{"name":"atl-linux-arm64","browser_download_url":"%[1]s/dl/bin"},{"name":"SHA256SUMS","browser_download_url":"%[1]s/dl/sums"}`, srv.URL)
+			if !f.noSig {
+				assets += fmt.Sprintf(`,{"name":"SHA256SUMS.sig","browser_download_url":"%s/dl/sig"}`, srv.URL)
 			}
-			fmt.Fprintf(w, `{"tag_name":%q,"assets":%s}`, f.tag, assets)
+			if f.noAssets {
+				assets = ""
+			}
+			fmt.Fprintf(w, `{"tag_name":%q,"assets":[%s]}`, f.tag, assets)
 		case "/dl/bin":
 			w.Write(f.bin)
 		case "/dl/sums":
-			sums := f.sums
-			if sums == "" {
-				h := sha256.Sum256(f.bin)
-				sums = hex.EncodeToString(h[:]) + "  atl-linux-amd64\n" + hex.EncodeToString(h[:]) + " *atl-linux-arm64\n"
+			fmt.Fprint(w, f.sumsText())
+		case "/dl/sig":
+			if f.sig != nil {
+				w.Write(f.sig)
+				return
 			}
-			fmt.Fprint(w, sums)
+			tag := f.signTag
+			if tag == "" {
+				tag = f.tag
+			}
+			w.Write(ed25519.Sign(f.key, SignedMessage(tag, []byte(f.sumsText()))))
 		default:
 			http.NotFound(w, r)
 		}
@@ -63,10 +101,9 @@ func (f *fakeGitHub) serve(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// testUpdater talks to srv; the binary "runs" by printing its contents'
-// first line (RunVersion), and its attestation checks out unless verify
-// says otherwise.
-func testUpdater(t *testing.T, srv *httptest.Server) *Updater {
+// testUpdater talks to srv and trusts key; the binary "runs" by printing
+// its contents' first line (RunVersion).
+func testUpdater(t *testing.T, srv *httptest.Server, key ed25519.PrivateKey) *Updater {
 	t.Helper()
 	return &Updater{
 		API:      srv.URL,
@@ -74,7 +111,7 @@ func testUpdater(t *testing.T, srv *httptest.Server) *Updater {
 		Arch:     "arm64",
 		Now:      func() time.Time { return time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC) },
 		Cache:    filepath.Join(t.TempDir(), "state", "update-check.json"),
-		Verify:   func(context.Context, string) error { return nil },
+		Keys:     []ed25519.PublicKey{pub(key)},
 		CheckBin: func(string) error { return nil },
 		RunVersion: func(_ context.Context, path string) (string, error) {
 			data, err := os.ReadFile(path)
@@ -97,10 +134,9 @@ func target(t *testing.T) string {
 }
 
 func TestInstall(t *testing.T) {
-	gh := &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\nbinary")}
-	u := testUpdater(t, gh.serve(t))
-	var verified string
-	u.Verify = func(_ context.Context, path string) error { verified = path; return nil }
+	key := newKey(t)
+	gh := &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\nbinary"), key: key}
+	u := testUpdater(t, gh.serve(t), key)
 	rel, err := u.Latest(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -116,39 +152,57 @@ func TestInstall(t *testing.T) {
 	if fi, _ := os.Stat(dst); fi.Mode().Perm() != 0o755 {
 		t.Errorf("mode %v, want 0755", fi.Mode().Perm())
 	}
-	if verified == "" || verified == dst {
-		t.Errorf("verified %q: want the download, before it replaced the target", verified)
-	}
 	assertNoTemp(t, dst)
 }
 
-// TestInstallRefuses: whatever fails, the target stays as it was and no
-// temp file is left.
+// TestInstallRotation: during a key rotation atl trusts both keys and
+// installs a release signed with either.
+func TestInstallRotation(t *testing.T) {
+	oldKey, newKey := newKey(t), newKey(t)
+	gh := &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: newKey}
+	u := testUpdater(t, gh.serve(t), oldKey)
+	u.Keys = append(u.Keys, pub(newKey))
+	rel, err := u.Latest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := u.Install(context.Background(), rel, target(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestInstallRefuses: whatever fails, the target stays as it was, no temp
+// file is left, and a binary is never run unless its release is signed.
 func TestInstallRefuses(t *testing.T) {
+	key, other := newKey(t), newKey(t)
 	for _, c := range []struct {
 		name  string
 		gh    *fakeGitHub
 		setup func(u *Updater)
 		want  string
 	}{
-		{"checksum", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), sums: strings.Repeat("ab", 32) + "  atl-linux-arm64\n"}, nil, "checksum"},
-		{"no checksum line", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), sums: strings.Repeat("ab", 32) + "  atl-linux-amd64\n"}, nil, "no checksum for atl-linux-arm64"},
-		{"no build for arch", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n")}, func(u *Updater) { u.Arch = "riscv64" }, "no build for linux/riscv64"},
+		{"unsigned", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), noSig: true}, nil, "has no SHA256SUMS.sig (it is not signed)"},
+		{"other key", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: other}, nil, "does not check out with atl's release key"},
+		{"signed for another tag", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.4\n"), key: key, signTag: "v0.1.4"}, nil, "does not check out with atl's release key"},
+		{"garbage signature", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), sig: bytes.Repeat([]byte{7}, ed25519.SignatureSize)}, nil, "does not check out"},
+		{"short signature", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), sig: []byte("sig\n")}, nil, "not an Ed25519 signature"},
+		{"no release key", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: key}, func(u *Updater) { u.Keys = nil }, "no release key"},
+		{"checksum", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: key, sums: strings.Repeat("ab", 32) + "  atl-linux-arm64\n"}, nil, "checksum"},
+		{"no checksum line", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: key, sums: strings.Repeat("ab", 32) + "  atl-linux-amd64\n"}, nil, "no checksum for atl-linux-arm64"},
+		{"no build for arch", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: key}, func(u *Updater) { u.Arch = "riscv64" }, "no build for linux/riscv64"},
 		{"no assets", &fakeGitHub{tag: "v0.1.5", noAssets: true}, nil, "has no atl-linux-arm64"},
-		{"attestation", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n")}, func(u *Updater) {
-			u.Verify = func(context.Context, string) error { return errors.New("attestation does not check out") }
-		}, "attestation does not check out"},
-		{"not static", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n")}, func(u *Updater) {
+		{"not static", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: key}, func(u *Updater) {
 			u.CheckBin = func(p string) error { return fmt.Errorf("%s is dynamically linked", p) }
 		}, "dynamically linked"},
-		{"wrong version", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.4\n")}, nil, `says it is "v0.1.4"`},
-		{"runs only after verify", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n")}, func(u *Updater) {
-			u.Verify = func(context.Context, string) error { return errors.New("bad provenance") }
-			u.RunVersion = func(context.Context, string) (string, error) { panic("ran an unverified binary") }
-		}, "bad provenance"},
+		{"wrong version", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.4\n"), key: key}, nil, `says it is "v0.1.4"`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			u := testUpdater(t, c.gh.serve(t))
+			u := testUpdater(t, c.gh.serve(t), key)
+			badSig := c.gh.noSig || c.gh.sig != nil || c.gh.key == nil || !bytes.Equal(c.gh.key, key) || c.gh.signTag != ""
+			if badSig {
+				// Not validly signed: its binary must never run.
+				u.RunVersion = func(context.Context, string) (string, error) { panic("ran a binary from an unsigned release") }
+			}
 			if c.setup != nil {
 				c.setup(u)
 			}
@@ -179,9 +233,37 @@ func assertNoTemp(t *testing.T, dst string) {
 	}
 }
 
+func pemOf(t *testing.T, k any) string {
+	t.Helper()
+	der, err := x509.MarshalPKIXPublicKey(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+}
+
+func TestParseKeys(t *testing.T) {
+	a, b := newKey(t), newKey(t)
+	keys, err := ParseKeys([]byte("# comment\n" + pemOf(t, pub(a)) + "\nmore text\n" + pemOf(t, pub(b))))
+	if err != nil || len(keys) != 2 || !keys[0].Equal(pub(a)) || !keys[1].Equal(pub(b)) {
+		t.Errorf("ParseKeys = %d keys, %v", len(keys), err)
+	}
+	ec, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseKeys([]byte(pemOf(t, &ec.PublicKey))); err == nil {
+		t.Error("an ECDSA key was accepted")
+	}
+	// The key built into atl parses.
+	if _, err := ParseKeys(releaseKeyPEM); err != nil {
+		t.Errorf("release-key.pub: %v", err)
+	}
+}
+
 func TestLatest(t *testing.T) {
 	gh := &fakeGitHub{}
-	u := testUpdater(t, gh.serve(t))
+	u := testUpdater(t, gh.serve(t), newKey(t))
 	if _, err := u.Latest(context.Background()); err == nil || !strings.Contains(err.Error(), "no release yet") {
 		t.Errorf("no release: err %v", err)
 	}
@@ -193,7 +275,7 @@ func TestLatest(t *testing.T) {
 
 func TestCheckCaches(t *testing.T) {
 	gh := &fakeGitHub{tag: "v0.1.5"}
-	u := testUpdater(t, gh.serve(t))
+	u := testUpdater(t, gh.serve(t), newKey(t))
 	now := u.Now()
 	ctx := context.Background()
 	for i, c := range []struct {

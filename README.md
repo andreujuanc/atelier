@@ -35,17 +35,25 @@ the clone stays for the task image (step 2).
 
 **1. Get `atl`** (a static Linux binary; it also runs inside containers).
 
-From the latest release (every merge to `main` is one), checked like `atl update` checks it:
+From the latest release (every merge to `main` is one), checked as `atl update` checks it:
+the signature of `SHA256SUMS` against the release key in your clone, then the checksum.
+Needs curl and openssl ≥ 3.
 
 ```bash
+src=~/src/atelier-build
 arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
-mkdir -p ~/.local/bin && cd "$(mktemp -d)" \
-  && gh release download --repo andreujuanc/atelier --pattern "atl-linux-$arch" --pattern SHA256SUMS \
-  && sha256sum --check --ignore-missing SHA256SUMS \
-  && gh attestation verify "atl-linux-$arch" --repo andreujuanc/atelier \
-       --signer-workflow andreujuanc/atelier/.github/workflows/release.yml --source-ref refs/heads/main \
-  && install -m 0755 "atl-linux-$arch" ~/.local/bin/atl && cd ~/src/atelier-build
+gh=https://github.com/andreujuanc/atelier/releases
+tag=$(curl -fsS -o /dev/null -w '%{redirect_url}' "$gh/latest" | sed 's|.*/tag/||'); echo "$tag"
+cd "$(mktemp -d)"
+for f in "atl-linux-$arch" SHA256SUMS SHA256SUMS.sig; do curl -fsSLO "$gh/download/$tag/$f"; done
+{ printf 'atelier release %s\n' "$tag"; cat SHA256SUMS; } > signed
+openssl pkeyutl -verify -pubin -inkey "$src/internal/update/release-key.pub" -rawin -in signed -sigfile SHA256SUMS.sig
+sha256sum --check --ignore-missing SHA256SUMS
+mkdir -p ~/.local/bin && install -m 0755 "atl-linux-$arch" ~/.local/bin/atl && atl version
 ```
+
+Run it line by line: stop if `openssl` does not say `Signature Verified Successfully` or
+`sha256sum` does not say `OK`.
 
 Or build it without Go (the Dockerfile's `build` stage writes `/out/atl`):
 
@@ -97,10 +105,12 @@ atl update --check   # is there a newer release?
 atl update           # install it
 ```
 
-An update is installed only when its SHA-256 matches the release's `SHA256SUMS` and
-`gh attestation verify` shows it was built by `.github/workflows/release.yml` from `main` of
-this repository, on GitHub's runners. A task can push branches, and a workflow on such a
-branch could publish a release, but that release would not pass this check. Live sessions
+An update is installed only when the release's `SHA256SUMS.sig` is a valid signature of its
+`SHA256SUMS` and tag, made with the release key (atl has its public half built in), and the
+binary's SHA-256 is the one listed. Nothing else is needed on the host: no `gh`, no login.
+Only the release workflow on `main` can sign (see [Releases](#releases)). A task can push
+branches, and a workflow on such a branch could publish a release, but it could not sign it,
+so atl refuses it. Live sessions
 and gates keep the old binary until they restart. A local build (`atl version` says `dev`)
 is replaced only with `atl update --force`. When a release changes the task image, its notes
 say so: `git pull` in your build clone and run `ATL_BUILD_BOX=0 ./build-images` again.
@@ -293,9 +303,35 @@ Design notes: [docs/WORKSPACES.md](docs/WORKSPACES.md), [docs/PLAN.md](docs/PLAN
 
 Every merge to `main` that changes more than docs is released automatically:
 `.github/workflows/release.yml` runs the tests, builds static `atl-linux-amd64` and
-`atl-linux-arm64` with the version built in, writes `SHA256SUMS`, attests the build's
-provenance and publishes GitHub release `v<VERSION>.<n>`. `VERSION` holds MAJOR.MINOR
-(`0.1`), and each release takes the next patch number. To start `v0.2.0`, raise `VERSION` in a PR.
+`atl-linux-arm64` with the version built in, writes `SHA256SUMS`, signs it
+(`SHA256SUMS.sig`, `.github/sign-release.sh`), attests the build's provenance and publishes
+GitHub release `v<VERSION>.<n>`. `VERSION` holds MAJOR.MINOR (`0.1`), and each release
+takes the next patch number. To start `v0.2.0`, raise `VERSION` in a PR.
+
+### The release key
+
+Releases are signed with an Ed25519 key. Its public half is
+`internal/update/release-key.pub`, built into atl. Its private half exists only as the
+secret `RELEASE_SIGNING_KEY` of the repository's `release` environment, which only `main`
+may use. Workflows on other branches, PRs included, never see it. The release job checks
+each signature against `release-key.pub` before it publishes.
+
+Set it up once, on your host (never in a task container, which a task could read):
+
+1. `openssl genpkey -algorithm ed25519 -out atl-release.pem && chmod 600 atl-release.pem`
+2. `openssl pkey -in atl-release.pem -pubout` prints the public key: it goes into
+   `internal/update/release-key.pub`, in a PR.
+3. On GitHub, go to Settings → Environments → **New environment** `release`. Under
+   **Deployment branches and tags**, choose **Selected branches and tags** and add `main`.
+   Under **Environment secrets**, add `RELEASE_SIGNING_KEY` with the whole contents of
+   `atl-release.pem`. It must be an environment secret, not a repository secret: workflows
+   on any branch can read repository secrets.
+4. Keep `atl-release.pem` in your password manager, then delete the file.
+
+If the key is lost or leaks, make a new one. Put both public keys in `release-key.pub`
+(atl accepts either) and swap the secret. Copies of atl from before the change trust only the
+old key, so they refuse releases signed with the new one: reinstall those by hand (step 1 of
+the install).
 
 Pull requests run `ci.yml` (gofmt, vet, `go test ./...` including e2e, the static build) and,
 when they change the `Dockerfile` or `build-images`, `image.yml` (builds the task image).

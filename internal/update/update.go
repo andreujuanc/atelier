@@ -2,16 +2,18 @@
 // running binary with it (`atl update`, the TUI's U).
 //
 // Every merge to main is released by .github/workflows/release.yml: a
-// static binary per architecture, SHA256SUMS, and a build provenance
-// attestation. Install takes a binary only when its checksum matches and
-// its attestation says it was built by that workflow from main of the
-// atelier repository (`gh attestation verify`): a release made any other
-// way (e.g. by a workflow on a pushed task branch) is refused.
+// static binary per architecture, SHA256SUMS, and SHA256SUMS.sig, an
+// Ed25519 signature of SignedMessage made with the release key. That key
+// is a secret of the repository's "release" environment, which only main
+// may use, so a workflow on a pushed task branch cannot sign. Install takes
+// a binary only when the signature checks out with a public key built into
+// atl (release-key.pub) and the binary's checksum is the signed one.
 package update
 
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -30,12 +32,11 @@ import (
 	"github.com/andreujuanc/atelier/internal/version"
 )
 
-// Where releases come from, and what their attestation must say.
+// Where releases come from, and what they hold besides the binaries.
 const (
 	Repo      = "andreujuanc/atelier"
-	Workflow  = Repo + "/.github/workflows/release.yml"
-	SourceRef = "refs/heads/main"
 	SumsAsset = "SHA256SUMS"
+	SigAsset  = "SHA256SUMS.sig"
 )
 
 // CheckVar turns the TUI's background check for a newer release off when
@@ -74,8 +75,9 @@ type Updater struct {
 	Arch  string // GOARCH of the binary to install
 	Now   func() time.Time
 	Cache string // the check's cache file ("" none)
-	// Verify checks path's build provenance (see GhVerify).
-	Verify func(ctx context.Context, path string) error
+	// Keys are the public keys a release's signature may be made with
+	// (ReleaseKeys); none: Install refuses.
+	Keys []ed25519.PublicKey
 	// CheckBin checks that path is a binary task containers can run
 	// (sandbox.CheckStaticBin).
 	CheckBin func(path string) error
@@ -91,7 +93,7 @@ func New() *Updater {
 		Arch:       runtime.GOARCH,
 		Now:        time.Now,
 		Cache:      cachePath(),
-		Verify:     GhVerify,
+		Keys:       ReleaseKeys(),
 		CheckBin:   sandbox.CheckStaticBin,
 		RunVersion: runVersion,
 	}
@@ -203,10 +205,11 @@ func Target() (string, error) {
 	return bin, nil
 }
 
-// Install replaces target with rel's binary for u.Arch, once its checksum
-// matches SHA256SUMS, it is a static Linux binary, its attestation checks
-// out (u.Verify) and it says it is rel.Tag. The new file replaces target
-// in one rename: running atl processes go on with the old one.
+// Install replaces target with rel's binary for u.Arch, once SHA256SUMS
+// carries a valid signature for rel.Tag (VerifySums), the binary's
+// checksum is the one it lists, it is a static Linux binary and it says
+// it is rel.Tag. The new file replaces target in one rename: running atl
+// processes go on with the old one.
 func (u *Updater) Install(ctx context.Context, rel *Release, target string) error {
 	name := AssetName(u.Arch)
 	binURL, ok := rel.Assets[name]
@@ -217,9 +220,20 @@ func (u *Updater) Install(ctx context.Context, rel *Release, target string) erro
 	if !ok {
 		return fmt.Errorf("release %s has no %s", rel.Tag, SumsAsset)
 	}
+	sigURL, ok := rel.Assets[SigAsset]
+	if !ok {
+		return fmt.Errorf("release %s has no %s (it is not signed)", rel.Tag, SigAsset)
+	}
 	sums, err := u.get(ctx, sumsURL, maxSmall)
 	if err != nil {
 		return fmt.Errorf("download %s: %w", SumsAsset, err)
+	}
+	sig, err := u.get(ctx, sigURL, 1024)
+	if err != nil {
+		return fmt.Errorf("download %s: %w", SigAsset, err)
+	}
+	if err := VerifySums(u.Keys, rel.Tag, sums, sig); err != nil {
+		return fmt.Errorf("release %s: %w", rel.Tag, err)
 	}
 	want, err := sumFor(sums, name)
 	if err != nil {
@@ -254,10 +268,7 @@ func (u *Updater) Install(ctx context.Context, rel *Release, target string) erro
 	if err := u.CheckBin(tmp.Name()); err != nil {
 		return fmt.Errorf("release %s: %w", rel.Tag, err)
 	}
-	if err := u.Verify(ctx, tmp.Name()); err != nil {
-		return fmt.Errorf("release %s: %w", rel.Tag, err)
-	}
-	// Only now is it ours to run.
+	// Signed and checked: only now is it ours to run.
 	out, err := u.RunVersion(ctx, tmp.Name())
 	if err != nil {
 		return fmt.Errorf("release %s: run its atl version: %w", rel.Tag, err)
@@ -337,28 +348,6 @@ func (u *Updater) download(ctx context.Context, url string, w io.Writer) error {
 	}
 	if n > maxBinary {
 		return fmt.Errorf("more than %d bytes", maxBinary)
-	}
-	return nil
-}
-
-// GhVerify checks with `gh attestation verify` that path was built by
-// atelier's release workflow from main, on a GitHub-hosted runner.
-func GhVerify(ctx context.Context, path string) error {
-	gh, err := exec.LookPath("gh")
-	if err != nil {
-		return errors.New("gh not found on PATH: atl update checks where the release was built with `gh attestation verify`")
-	}
-	cmd := exec.CommandContext(ctx, gh, "attestation", "verify", path,
-		"--repo", Repo,
-		"--signer-workflow", Workflow,
-		"--source-ref", SourceRef,
-		"--deny-self-hosted-runners")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return fmt.Errorf("its build attestation does not check out (built by %s from %s?): %s", Workflow, SourceRef, msg)
 	}
 	return nil
 }
