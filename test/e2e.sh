@@ -100,7 +100,15 @@ export ATL_WORKSPACE="$WS"
 
 tm() { tmux -L "$SOCK" "$@"; }
 
+# start_tmux starts the isolated server. After `tm kill-server` the old
+# server may still be exiting: a client that reaches it fails with "server
+# exited unexpectedly", so it tries again for a few seconds.
 start_tmux() {
+	local i
+	for i in $(seq 50); do
+		tm -f /dev/null new-session -d -s placeholder "sleep 86400" 2>/dev/null && return
+		sleep 0.1
+	done
 	tm -f /dev/null new-session -d -s placeholder "sleep 86400" || fail "start tmux server"
 }
 

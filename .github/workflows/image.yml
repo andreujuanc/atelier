@@ -1,0 +1,21 @@
+# Builds the task image when a pull request changes it (slow: it downloads
+# Claude Code and Node.js, so only then).
+name: image
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - build-images
+
+permissions:
+  contents: read
+
+jobs:
+  task-image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: ATL_BUILD_BOX=0 ./build-images

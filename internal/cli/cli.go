@@ -252,14 +252,15 @@ func args(v cobra.PositionalArgs) cobra.PositionalArgs {
 // insideContainer refuses, in a sandboxed task's container, every command
 // but the ones that work there: they ask the task's gate and never open
 // atelier's database, which is not in the container (hook, statusline,
-// note, notes, push, fetch), or need nothing at all (help, completion).
+// note, notes, push, fetch), or need nothing at all (help, completion,
+// version).
 func insideContainer(cmd *cobra.Command) error {
 	if !sandbox.Inside() {
 		return nil
 	}
 	for c := cmd; c.HasParent(); c = c.Parent() {
 		switch c.Name() {
-		case "hook", "statusline", "note", "notes", "push", "fetch", "help", "completion":
+		case "hook", "statusline", "note", "notes", "push", "fetch", "help", "completion", "version":
 			return nil
 		}
 	}
@@ -307,6 +308,7 @@ func (c *cli) rootCmd() *cobra.Command {
 		c.diffCmd(), c.prCmd(), c.finishCmd("done"), c.finishCmd("cancel"), c.doctorCmd(), c.hookCmd(), c.statuslineCmd(), c.gateCmd(),
 		c.remoteCmd(true), c.remoteCmd(false), c.tokenCmd(),
 		c.showCmd(), c.transcriptCmd(), c.noteCmd(), c.notesCmd(), c.assistantCmd(), c.workspaceCmd(),
+		c.versionCmd(), c.updateCmd(),
 	)
 	return root
 }

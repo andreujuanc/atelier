@@ -41,6 +41,7 @@ func RunContext(ctx context.Context, a *app.App) error {
 	if a.Workspace != nil && a.Workspace.Workspace != nil {
 		m.workspace = a.Workspace.Name
 	}
+	m.updater = NewUpdater()
 	bin, err := os.Executable()
 	if err != nil || bin == "" {
 		bin = a.AtlBin
@@ -78,6 +79,9 @@ func RunContext(ctx context.Context, a *app.App) error {
 	}
 	if err == nil && m.SwitchRequested() && ctx.Err() == nil {
 		return ErrSwitchWorkspace
+	}
+	if err == nil && m.RestartRequested() && ctx.Err() == nil {
+		return ErrRestart
 	}
 	return err
 }

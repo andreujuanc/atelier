@@ -137,7 +137,9 @@ func TestGlobalEnv(t *testing.T) {
 	if got := launch("running"); got != "token="+secret+"\n" {
 		t.Errorf("with a server running: window saw %q", got)
 	}
-	if out, err := c.run(ctx, "show-environment", "-g", "ATL_T_TOKEN"); err != nil || out != "ATL_T_TOKEN="+secret {
+	// tmux 3.4 prints a $ in the value as \$ (the value itself is intact:
+	// the window above saw it).
+	if out, err := c.run(ctx, "show-environment", "-g", "ATL_T_TOKEN"); err != nil || strings.ReplaceAll(out, `\$`, "$") != "ATL_T_TOKEN="+secret {
 		t.Errorf("global env = %q, %v", out, err)
 	}
 	if _, err := c.run(ctx, "kill-server"); err != nil {

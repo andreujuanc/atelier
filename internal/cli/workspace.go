@@ -223,6 +223,15 @@ func (c *cli) runTUI(ctx context.Context) error {
 		_ = workspace.SaveLast(root, current) // only a convenience
 	}
 	err = tui.RunContext(ctx, ap)
+	if errors.Is(err, tui.ErrRestart) {
+		// Updated from the TUI (U): the same TUI again, on the new binary
+		// (os.Executable names the replaced file's path, which now holds
+		// it).
+		if c.ws != nil && c.ws.Workspace != nil {
+			return c.reexec("--workspace", c.ws.Dir)
+		}
+		return c.reexec()
+	}
 	if !errors.Is(err, tui.ErrSwitchWorkspace) {
 		return err
 	}
