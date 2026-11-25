@@ -1,2 +1,7 @@
-# The release key: PEM public keys release.yml signs with (see keys.go).
-# Placeholder: replaced by the real key before the next release.
+# The release key: the PEM public keys atl accepts release signatures from
+# (see keys.go and README "The release key"). release.yml checks every
+# signature it makes against this file. To rotate, add the new key below
+# this one, then drop the old one a few releases later.
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA8DBTzGwuji31XZuLUZxpdJ49i1rC4LYRkZyCd4u7DR4=
+-----END PUBLIC KEY-----
