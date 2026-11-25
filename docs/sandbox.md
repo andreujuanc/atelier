@@ -50,8 +50,8 @@ config dir, atelier's database, state dir (logs) or config dir (projects).
 
 - Created on the task's first session; reused by later ones (installed tools persist);
   restarted after a reboot; removed by `atl done`/`atl cancel`.
-- Replaced when the task's repos, image or mounts change, at the next session start while no
-  other session runs in it. A running container cannot get a new mount, so adding a repo
+- Replaced when the task's repos, image, mounts or environment change, at the next session
+  start while no other session runs in it. A running container cannot get a new mount, so adding a repo
   (`atl add`, TUI `a`) to a task with live sessions restarts them: their windows close, the
   container is removed and the same conversations are resumed (`claude --resume`) in a new
   one that has the repo. While things run in the task (Claude mid-turn, background work an
@@ -117,7 +117,14 @@ The session's start context tells Claude all of this.
 | BuildKit refused (`DOCKER_BUILDKIT=0` is set) | the gate cannot inspect BuildKit sessions |
 | a build's Dockerfile may not have `ONBUILD`, nor `ADD` from a URL or with a variable in a source (use `COPY`, or download in a `RUN` step); it must be a regular file in the context, sent uncompressed or gzipped | the daemon fetches an `ADD` URL from the host's network (its loopback services, a cloud's metadata address) |
 | the task's container is joined to every network the task creates; the task cannot stop, remove, or impersonate (`atl-<slug>-<hash>` names) it | services answer by compose service name |
+| new network and volume names (also a volume a mount names, if it does not exist yet) must be the task's namespace `atl_<6 hex>` or start with it and `_` or `-`; so must a `com.docker.compose.project` label; a container name that starts with any `atl_<6 hex>` must be in the task's; a container without that label gets it empty | tasks' compose names do not collide; a task cannot squat another's names, nor plant a network or volume that a compose project on the host would adopt; an image's labels cannot put a container in a host project |
 | form-encoded request bodies refused | Docker would read values the gate did not check |
+
+The namespace is `atl_` and the hash in the task's container name. atl sets `COMPOSE_PROJECT_NAME` to
+it in the container and in sessions, over a project's `[env]` value (with a warning), so compose names
+everything in it (`atl_4a2f21-db-1`, `atl_4a2f21_default`). A second compose project in one task (two
+repos) needs `-p $COMPOSE_PROJECT_NAME-<repo>`. Volumes the task made before keep their names. A
+refusal names what to use instead.
 
 ## Host files for every task
 
@@ -241,6 +248,9 @@ refuses, `atl push`/`atl fetch`) and names the mounted host paths. `context` /
 - A base image's `ONBUILD` instructions run in a build `FROM` it unchecked: one from a registry with
   `ADD <url>` fetches from the host's network.
 - Tasks can bind any free host port; no network egress policy.
+- Container names outside the `atl_<6 hex>` pattern are free: a task can take the name a compose project
+  on the host would give a container (`shop-db-1`), so that project's `up` fails. Denial of service
+  only: compose finds its containers by label, not name.
 - Project setup and teardown scripts run on the host.
 - No git credentials or `gh` in the task: use `atl push`/`atl fetch`; `atl pr` runs on the
   host.

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -302,6 +303,78 @@ func TestIDDiffersPerWorkspace(t *testing.T) {
 	for _, slug := range []string{"fix-login", "x", "a.b_c-1"} {
 		if name := ContainerName(ID(slug, "/ws/tasks/"+slug)); !ReservedName(name) || !ReservedName("/"+strings.ToUpper(name)) {
 			t.Errorf("%s is not reserved", name)
+		}
+	}
+}
+
+// TestComposeProject: a task's namespace is atl_ and the 6 hex digits of
+// its ID; no name is in two tasks' namespaces (a namespace is never a
+// prefix of another's), every name in one is in the pattern the gate keeps
+// container names of (Namespaced), and neither a namespace's names nor the
+// pattern meet atl's task container names (ReservedName, atl-...).
+func TestComposeProject(t *testing.T) {
+	if got := ComposeProject("fix-login-4a2f21"); got != "atl_4a2f21" {
+		t.Errorf("ComposeProject = %q", got)
+	}
+	// An ID that ID did not make still gets atl_ and 6 hex digits.
+	for _, id := range []string{"plain", "x-ABCDEF", "x-abc12", "", "x-"} {
+		if ns := ComposeProject(id); !regexp.MustCompile(`^atl_[0-9a-f]{6}$`).MatchString(ns) {
+			t.Errorf("ComposeProject(%q) = %q", id, ns)
+		}
+	}
+	var spaces []string
+	for i := range 300 {
+		slug := fmt.Sprintf("t%d", i%7) // equal slugs in other dirs
+		id := ID(slug, fmt.Sprintf("/ws%d/tasks/%s", i, slug))
+		ns := ComposeProject(id)
+		if ns != "atl_"+id[len(id)-6:] || len(ns) != len("atl_")+6 {
+			t.Fatalf("ComposeProject(%q) = %q", id, ns)
+		}
+		if slices.Contains(spaces, ns) {
+			continue // the same hash for two dirs: one namespace
+		}
+		spaces = append(spaces, ns)
+		for _, name := range []string{ns, ns + "_default", ns + "-web-1", "/" + ns + "-db-1", strings.ToUpper(ns) + "_X"} {
+			if !Namespaced(name) {
+				t.Errorf("%q is not in the namespace pattern", name)
+			}
+		}
+		if Namespaced(ContainerName(id)) || ReservedName(ns+"-db-1") || ReservedName(ns+"-x-"+id[len(id)-6:]) {
+			t.Errorf("%s and %s overlap atl's container names", ns, ContainerName(id))
+		}
+	}
+	for _, a := range spaces {
+		for _, b := range spaces {
+			if a == b {
+				continue
+			}
+			for _, name := range []string{b, b + "_data", b + "-web_default", b + "x"} {
+				if InNamespace(a, name) {
+					t.Errorf("%q is in %s and %s", name, a, b)
+				}
+			}
+			if strings.HasPrefix(b, a) {
+				t.Errorf("%s is a prefix of %s", a, b)
+			}
+		}
+	}
+	ns := "atl_4a2f21"
+	for name, want := range map[string]bool{
+		ns: true, ns + "_data": true, ns + "-api_default": true, ns + "-": true,
+		ns + "x": false, "atl_4a2f211": false, "ATL_4A2F21_data": false, "Atl_4a2f21": false,
+		"/" + ns: false, " " + ns: false, "shop_data": false, "atl-4a2f21_data": false, "": false,
+	} {
+		if InNamespace(ns, name) != want {
+			t.Errorf("InNamespace(%s, %q) = %v", ns, name, !want)
+		}
+	}
+	for name, want := range map[string]bool{
+		"atl_4a2f21": true, "atl_ffffff-x": true, "//ATL_ABCDEF_x": true, "Atl_0a1B2c": true,
+		"atl_4a2f211": false, "atl_4a2f2": false, "atl_xyz123-db": false, "atl-4a2f21": false,
+		"x-atl_4a2f21": false, "db": false, "testcontainers-ryuk-1": false,
+	} {
+		if Namespaced(name) != want {
+			t.Errorf("Namespaced(%q) = %v", name, !want)
 		}
 	}
 }

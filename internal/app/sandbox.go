@@ -86,6 +86,9 @@ func (a *App) sandboxSpecFor(ctx context.Context, t *model.Task, image string) (
 			"DOCKER_BUILDKIT": "0", // the gate does not carry BuildKit sessions
 			sandbox.InEnv:     id,
 			"ATL_CONTAINER":   sandbox.ContainerName(id),
+			// The names the gate allows (see composeEnv); also for what
+			// runs in the container without a session's env (docker exec).
+			composeVar: sandbox.ComposeProject(id),
 		},
 	}
 	for _, k := range []string{"LANG", "LC_ALL", "TZ"} {
@@ -148,6 +151,28 @@ func (a *App) sandboxSpecFor(ctx context.Context, t *model.Task, image string) (
 		same(m, true)
 	}
 	return spec, nil
+}
+
+// composeVar names compose's variable for the project name, which wins over
+// a compose file's `name:`, a .env file and the directory's name.
+const composeVar = "COMPOSE_PROJECT_NAME"
+
+// composeEnv sets composeVar in env, the environment of something that runs
+// in t's container, to the task's Docker namespace
+// (sandbox.ComposeProject), over the project's own value: the task's gate
+// allows new network and volume names only in it, and two tasks of a
+// project (or of a repo, whose directory name compose would take) would
+// otherwise collide on every name. A project that sets the variable gets
+// one warning per atl process.
+func (a *App) composeEnv(t *model.Task, env map[string]string) {
+	ns := sandbox.ComposeProject(a.sandboxID(t))
+	if v, ok := env[composeVar]; ok && v != ns {
+		if _, warned := a.composeWarned.LoadOrStore(t.Project, true); !warned {
+			a.warnf("project %s sets %s=%s; sandboxed tasks use their own (%s for task %s): the Docker gate allows names only in it",
+				t.Project, composeVar, v, ns, t.Slug)
+		}
+	}
+	env[composeVar] = ns
 }
 
 // taskImage returns the image of the task's container and where its name
@@ -299,7 +324,7 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) 
 		return "", fmt.Errorf("task container (image %s): %w", spec.Image, err)
 	}
 	if stale {
-		a.warnf("task %s: its container predates a change (repos, image, atl paths or $%s); it is replaced once the task has no running sessions",
+		a.warnf("task %s: its container predates a change (repos, image, atl paths or environment, or $%s); it is replaced once the task has no running sessions",
 			t.Slug, sandbox.MountsVar)
 	}
 	return container, nil
