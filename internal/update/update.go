@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,12 +47,14 @@ const CheckVar = "ATL_UPDATE_CHECK"
 // CheckEvery is how old the cached result of the TUI's check may be.
 const CheckEvery = 6 * time.Hour
 
-// maxBinary bounds a downloaded binary, maxSmall the API answer and
-// SHA256SUMS.
+// maxBinary bounds a downloaded binary, maxSmall SHA256SUMS.
 const (
 	maxBinary = 512 << 20
 	maxSmall  = 4 << 20
 )
+
+// errNotFound is a download GitHub answered with 404 Not Found.
+var errNotFound = errors.New("not found")
 
 // CheckEnabled reports whether the TUI checks for newer releases: not for
 // a dev build (nothing to compare with), not when $ATL_UPDATE_CHECK=off.
@@ -62,15 +65,20 @@ func CheckEnabled() bool {
 // AssetName is the release asset of atl for GOARCH arch.
 func AssetName(arch string) string { return "atl-linux-" + arch }
 
-// Release is a GitHub release: its tag and its assets' download URLs.
+// Release is a GitHub release: its tag, and where its assets are.
 type Release struct {
-	Tag    string
-	Assets map[string]string
+	Tag  string
+	base string // <web>/<repo>/releases/download/<tag>
 }
 
-// Updater talks to GitHub. The zero value is not usable: see New.
+// URL is where the release's asset name is.
+func (r *Release) URL(name string) string { return r.base + "/" + url.PathEscape(name) }
+
+// Updater talks to GitHub's web pages, not its API: the API answers 60
+// requests an hour to everyone behind one address, and nothing here needs
+// it. The zero value is not usable: see New.
 type Updater struct {
-	API   string // GitHub's API, without a trailing slash
+	Web   string // GitHub, without a trailing slash
 	HTTP  *http.Client
 	Arch  string // GOARCH of the binary to install
 	Now   func() time.Time
@@ -88,7 +96,7 @@ type Updater struct {
 // New returns the Updater for atelier's GitHub releases.
 func New() *Updater {
 	return &Updater{
-		API:        "https://api.github.com",
+		Web:        "https://github.com",
 		HTTP:       &http.Client{Timeout: 5 * time.Minute},
 		Arch:       runtime.GOARCH,
 		Now:        time.Now,
@@ -113,30 +121,42 @@ func cachePath() string {
 	return filepath.Join(dir, "atelier", "update-check.json")
 }
 
-// Latest asks GitHub for the latest release.
+// Latest finds the latest release: github.com/<repo>/releases/latest
+// redirects to .../releases/tag/<tag> (to .../releases while there is
+// none).
 func (u *Updater) Latest(ctx context.Context) (*Release, error) {
-	body, err := u.get(ctx, u.API+"/repos/"+Repo+"/releases/latest", maxSmall)
+	page := u.Web + "/" + Repo + "/releases/latest"
+	req, err := http.NewRequestWithContext(ctx, "GET", page, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "atl/"+version.Current())
+	c := *u.HTTP
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("latest release: %w", err)
 	}
-	var r struct {
-		TagName string `json:"tag_name"`
-		Assets  []struct {
-			Name string `json:"name"`
-			URL  string `json:"browser_download_url"`
-		} `json:"assets"`
+	resp.Body.Close()
+	loc, err := resp.Location()
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, errors.New("latest release: no release yet")
+	case resp.StatusCode < 300 || resp.StatusCode > 399 || err != nil:
+		return nil, fmt.Errorf("latest release: GET %s: %s, not a redirect to the release", page, resp.Status)
 	}
-	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("latest release: %w", err)
+	escaped, found := strings.CutPrefix(loc.EscapedPath(), "/"+Repo+"/releases/tag/")
+	if !found {
+		return nil, errors.New("latest release: no release yet")
 	}
-	if _, ok := version.Parse(r.TagName); !ok {
-		return nil, fmt.Errorf("latest release: tag %q is not a version (vMAJOR.MINOR.PATCH)", r.TagName)
+	tag, err := url.PathUnescape(escaped)
+	if err != nil {
+		return nil, fmt.Errorf("latest release: %s: %w", loc, err)
 	}
-	rel := &Release{Tag: r.TagName, Assets: map[string]string{}}
-	for _, a := range r.Assets {
-		rel.Assets[a.Name] = a.URL
+	if _, ok := version.Parse(tag); !ok {
+		return nil, fmt.Errorf("latest release: tag %q is not a version (vMAJOR.MINOR.PATCH)", tag)
 	}
-	return rel, nil
+	return &Release{Tag: tag, base: u.Web + "/" + Repo + "/releases/download/" + url.PathEscape(tag)}, nil
 }
 
 type cached struct {
@@ -212,23 +232,17 @@ func Target() (string, error) {
 // processes go on with the old one.
 func (u *Updater) Install(ctx context.Context, rel *Release, target string) error {
 	name := AssetName(u.Arch)
-	binURL, ok := rel.Assets[name]
-	if !ok {
-		return fmt.Errorf("release %s has no %s (no build for linux/%s)", rel.Tag, name, u.Arch)
-	}
-	sumsURL, ok := rel.Assets[SumsAsset]
-	if !ok {
+	sums, err := u.get(ctx, rel.URL(SumsAsset), maxSmall)
+	if errors.Is(err, errNotFound) {
 		return fmt.Errorf("release %s has no %s", rel.Tag, SumsAsset)
 	}
-	sigURL, ok := rel.Assets[SigAsset]
-	if !ok {
-		return fmt.Errorf("release %s has no %s (it is not signed)", rel.Tag, SigAsset)
-	}
-	sums, err := u.get(ctx, sumsURL, maxSmall)
 	if err != nil {
 		return fmt.Errorf("download %s: %w", SumsAsset, err)
 	}
-	sig, err := u.get(ctx, sigURL, 1024)
+	sig, err := u.get(ctx, rel.URL(SigAsset), 1024)
+	if errors.Is(err, errNotFound) {
+		return fmt.Errorf("release %s has no %s (it is not signed)", rel.Tag, SigAsset)
+	}
 	if err != nil {
 		return fmt.Errorf("download %s: %w", SigAsset, err)
 	}
@@ -237,7 +251,7 @@ func (u *Updater) Install(ctx context.Context, rel *Release, target string) erro
 	}
 	want, err := sumFor(sums, name)
 	if err != nil {
-		return fmt.Errorf("release %s: %w", rel.Tag, err)
+		return fmt.Errorf("release %s: %w (no build for linux/%s)", rel.Tag, err, u.Arch)
 	}
 
 	dir := filepath.Dir(target)
@@ -245,7 +259,7 @@ func (u *Updater) Install(ctx context.Context, rel *Release, target string) erro
 	if err != nil {
 		return fmt.Errorf("cannot write next to %s: %w", target, err)
 	}
-	ok = false
+	ok := false
 	defer func() {
 		if !ok {
 			tmp.Close()
@@ -253,7 +267,10 @@ func (u *Updater) Install(ctx context.Context, rel *Release, target string) erro
 		}
 	}()
 	h := sha256.New()
-	if err := u.download(ctx, binURL, io.MultiWriter(tmp, h)); err != nil {
+	if err := u.download(ctx, rel.URL(name), io.MultiWriter(tmp, h)); err != nil {
+		if errors.Is(err, errNotFound) {
+			return fmt.Errorf("release %s has no %s (no build for linux/%s)", rel.Tag, name, u.Arch)
+		}
 		return fmt.Errorf("download %s: %w", name, err)
 	}
 	if err := tmp.Close(); err != nil {
@@ -297,31 +314,30 @@ func sumFor(sums []byte, name string) (string, error) {
 	return "", fmt.Errorf("%s has no checksum for %s", SumsAsset, name)
 }
 
-func (u *Updater) request(ctx context.Context, url string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+// request GETs addr (following redirects: assets are served from another
+// host); 404 is errNotFound.
+func (u *Updater) request(ctx context.Context, addr string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", addr, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "atl/"+version.Current())
-	if strings.HasPrefix(url, u.API+"/") {
-		req.Header.Set("Accept", "application/vnd.github+json")
-	}
 	resp, err := u.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusNotFound && strings.HasSuffix(url, "/releases/latest") {
-			return nil, errors.New("no release yet")
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("GET %s: %w", addr, errNotFound)
 		}
-		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
+		return nil, fmt.Errorf("GET %s: %s", addr, resp.Status)
 	}
 	return resp, nil
 }
 
-func (u *Updater) get(ctx context.Context, url string, limit int64) ([]byte, error) {
-	resp, err := u.request(ctx, url)
+func (u *Updater) get(ctx context.Context, addr string, limit int64) ([]byte, error) {
+	resp, err := u.request(ctx, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -331,13 +347,13 @@ func (u *Updater) get(ctx context.Context, url string, limit int64) ([]byte, err
 		return nil, err
 	}
 	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("GET %s: more than %d bytes", url, limit)
+		return nil, fmt.Errorf("GET %s: more than %d bytes", addr, limit)
 	}
 	return data, nil
 }
 
-func (u *Updater) download(ctx context.Context, url string, w io.Writer) error {
-	resp, err := u.request(ctx, url)
+func (u *Updater) download(ctx context.Context, addr string, w io.Writer) error {
+	resp, err := u.request(ctx, addr)
 	if err != nil {
 		return err
 	}
