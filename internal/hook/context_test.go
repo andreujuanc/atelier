@@ -528,7 +528,8 @@ func TestRenderSandboxContext(t *testing.T) {
 	now := time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC)
 
 	got := renderSandboxContext(task, "", p, "", true, nil, now)
-	if !strings.Contains(got, "\nATL_PORT_OFFSET=300\n\n"+sandboxNote+"\n") || !strings.Contains(got, "run a repo in its own container setup, if any (`.devcontainer`") {
+	if !strings.Contains(got, "\nATL_PORT_OFFSET=300\n\n"+sandboxNote+"\n") || !strings.Contains(got, "run a repo in its own container setup, if any (`.devcontainer`") ||
+		!strings.Contains(got, "network/volume names start with $COMPOSE_PROJECT_NAME") || !strings.Contains(got, "`-p $COMPOSE_PROJECT_NAME-<repo>`") {
 		t.Errorf("sandbox note missing or misplaced:\n%s", got)
 	}
 	if plain := renderSandboxContext(task, "", p, "", false, []string{"/x"}, now); strings.Contains(plain, "Sandbox:") || strings.Contains(plain, mountsHead) {

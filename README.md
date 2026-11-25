@@ -198,7 +198,7 @@ setup = "npm ci"                      # sh -c in each rw worktree after creation
 image = "shop-dev"                    # task container image, e.g. built FROM atelier-task
 
 [env]                                 # added to sessions and scripts
-COMPOSE_PROJECT_NAME = "shop"
+NODE_ENV = "development"
 
 [[repos]]
 name = "api"
@@ -230,7 +230,8 @@ A variable set in the environment wins over `atelier.toml`.
 
 Sessions and project scripts get `ATL_TASK`, `ATL_TASK_DIR` and `ATL_PORT_OFFSET` (0, 100,
 200…, chosen to avoid other open tasks in every workspace: add it to every port you bind) plus the
-project's `env`. Scripts also get `ATL_REPO`, `ATL_WORKTREE` and `ATL_BRANCH`.
+project's `env`. Scripts also get `ATL_REPO`, `ATL_WORKTREE` and `ATL_BRANCH`. Sandboxed sessions get
+`COMPOSE_PROJECT_NAME` set to the task's Docker namespace, over the project's ([docs/sandbox.md](docs/sandbox.md#the-docker-gate)).
 
 ## Docs
 

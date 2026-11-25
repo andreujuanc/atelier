@@ -158,7 +158,8 @@ ATL_SCRIPT = "forged"
 	env := readFile(t, filepath.Join(wt, "env.out"))
 	for _, want := range []string{"FOO=bar", "ATL_REPO=api", "ATL_WORKTREE=" + wt, "ATL_TASK=" + task.Slug,
 		"ATL_TASK_DIR=" + e.app.Paths.TaskDir(task.Slug), "ATL_BRANCH=atl/boxed-setup",
-		"ATL_PORT_OFFSET=" + strconv.Itoa(task.PortOffset), "PATH=" + sandbox.RunMount + "/bin:"} {
+		"ATL_PORT_OFFSET=" + strconv.Itoa(task.PortOffset), "PATH=" + sandbox.RunMount + "/bin:",
+		"COMPOSE_PROJECT_NAME=" + sandbox.ComposeProject(e.app.sandboxID(task))} {
 		if !strings.Contains("\n"+env, "\n"+want) {
 			t.Errorf("setup env lacks %s:\n%s", want, env)
 		}

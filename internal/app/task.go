@@ -458,7 +458,10 @@ func (a *App) runScript(ctx context.Context, pr *project.Project, kind, script s
 	if container == "" {
 		err = project.RunScript(ctx, script, se.Worktree, pr.EnvFor(se), pw)
 	} else {
-		err = a.runInContainer(ctx, t, container, se.Worktree, pr.ScriptVars(se), script, pw)
+		vars := pr.ScriptVars(se)
+		// docker exec -e would override the container's own value.
+		a.composeEnv(t, vars)
+		err = a.runInContainer(ctx, t, container, se.Worktree, vars, script, pw)
 	}
 	pw.Flush()
 	return err

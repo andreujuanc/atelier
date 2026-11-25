@@ -126,6 +126,40 @@ func ReservedName(name string) bool {
 	return reservedName.MatchString(strings.TrimLeft(name, "/"))
 }
 
+// ComposeProject is the Docker name namespace of sandbox id: atl sets it as
+// the task container's $COMPOSE_PROJECT_NAME, and the task's gate allows
+// new network and volume names, compose project labels and container
+// names in the pattern of any task's namespace (Namespaced) only in it
+// (see InNamespace). It is atl_ and the 6 hex digits of the ID (the hash
+// of the task dir); an ID not made by ID gets a hash of its own. Every
+// namespace has the same length, so none is a prefix of another's; and
+// its underscore keeps it apart from ContainerName's atl-.
+func ComposeProject(id string) string {
+	hash := id[strings.LastIndexByte(id, '-')+1:]
+	if !composeHash.MatchString(hash) {
+		hash = shortHash(id, 6)
+	}
+	return "atl_" + hash
+}
+
+var composeHash = regexp.MustCompile(`^[0-9a-f]{6}$`)
+
+// namespaced matches every name in the pattern of a ComposeProject
+// namespace, in any case and with any leading slash.
+var namespaced = regexp.MustCompile(`(?i)^/*atl_[0-9a-f]{6}($|[-_])`)
+
+// InNamespace reports whether name, a network, volume or compose project
+// name, is in namespace ns (a ComposeProject): ns itself, or ns followed
+// by - or _ and more. It compares exactly, as dockerd and compose do (the
+// case counts: compose project names are lower case).
+func InNamespace(ns, name string) bool {
+	return name == ns || strings.HasPrefix(name, ns+"-") || strings.HasPrefix(name, ns+"_")
+}
+
+// Namespaced reports whether name is in the pattern of any task's
+// namespace (see ComposeProject), in any case and with any leading slash.
+func Namespaced(name string) bool { return namespaced.MatchString(name) }
+
 // Mount is a bind mount of a host path into the task container.
 type Mount struct {
 	Src, Dst string
