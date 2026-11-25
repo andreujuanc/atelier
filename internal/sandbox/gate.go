@@ -260,6 +260,15 @@ func (g *Gate) checkNewName(what, name string) error {
 		what, name, ns, ns, ns, instead, ns)
 }
 
+// randomName matches a canonical lower-case UUID, which a network may also
+// be named, outside the namespace: testcontainers names its networks so
+// (Java's Network.newNetwork(), testcontainers-go's network.New, Node,
+// Python). No task can guess another's to take it first, and compose names
+// none so (<project>_<network>).
+var randomName = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+})
+
 // composeProject is the label by which compose finds the containers,
 // networks and volumes of a project.
 const composeProject = "com.docker.compose.project"
@@ -938,7 +947,7 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 		return
 	}
 	name, err := as[string]("Name", body["Name"])
-	if err == nil {
+	if err == nil && !randomName().MatchString(name) {
 		err = g.checkNewName("network", name)
 	}
 	if err == nil {

@@ -940,6 +940,33 @@ func TestGateNamespace(t *testing.T) {
 	if status, body := c.do("POST", "/networks/create", `{"Name":"default"}`); !strings.Contains(body, "name it atl_abc123_default, or use -p atl_abc123-") {
 		t.Errorf("refusal %d %s does not say what to do", status, body)
 	}
+	// A network may also be named a canonical lower-case UUID, as
+	// testcontainers names its networks; nothing else outside the
+	// namespace, and no volume. Its compose project label is checked all
+	// the same.
+	uuid := "0b1f6a2e-3c4d-4e5f-8a9b-0c1d2e3f4a5b"
+	if status, body := c.do("POST", "/networks/create", `{"Name":"`+uuid+`","Labels":{"org.testcontainers":"true"}}`); status != http.StatusCreated {
+		t.Errorf("network named %s: status %d (%s)", uuid, status, body)
+	}
+	if b := c.d.body("POST /networks/create"); !strings.Contains(b, `"Name":"`+uuid+`"`) || !strings.Contains(b, `"`+LabelTask+`":"`+testID+`"`) {
+		t.Errorf("network create reached the daemon as %s", b)
+	}
+	before := reached("POST /networks/create")
+	for _, name := range []string{strings.ToUpper(uuid), "{" + uuid + "}", uuid + "-x", uuid + "_default", "x" + uuid, " " + uuid,
+		"0b1f6a2e3c4d4e5f8a9b0c1d2e3f4a5b", "0b1f6a2e-3c4d-4e5f-8a9b-0c1d2e3f4a5", "0b1f6a2e-3c4d-4e5f-8a9b-0c1d2e3f4a5g"} {
+		if status, body := c.do("POST", "/networks/create", `{"Name":"`+name+`"}`); status != http.StatusForbidden {
+			t.Errorf("network named %q: status %d (%s), want a refusal", name, status, body)
+		}
+	}
+	if status, body := c.do("POST", "/networks/create", `{"Name":"`+uuid+`","Labels":{"com.docker.compose.project":"shop"}}`); status != http.StatusForbidden {
+		t.Errorf("UUID network with a host project label: status %d (%s), want a refusal", status, body)
+	}
+	if reached("POST /networks/create") != before {
+		t.Error("a refused network create reached the daemon")
+	}
+	if status, body := c.do("POST", "/volumes/create", `{"Name":"`+uuid+`"}`); status != http.StatusForbidden {
+		t.Errorf("volume named %s: status %d (%s), want a refusal", uuid, status, body)
+	}
 
 	// Volumes named in mounts: a new one only in the namespace; one the
 	// task has, by any name.
