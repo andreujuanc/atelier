@@ -130,13 +130,16 @@ func TestReopenFromOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.commitIn(t, task.Slug, "api", "one")
+	one := e.commitIn(t, task.Slug, "api", "one")
 	wt := e.app.Paths.WorktreePath(task.Slug, "api")
 	git(t, wt, "push", "-q", e.origin("api"), "atl/pushed")
 	git(t, e.canonical("api"), "fetch", "-q", "origin")
-	// A later push that the canonical clone has not fetched yet.
+	// A later push that the canonical clone has not fetched yet. Newer git
+	// (2.5x) updates origin's tracking ref when pushing to origin's URL:
+	// put it back, as a push from elsewhere would leave it.
 	tip := e.commitIn(t, task.Slug, "api", "two")
 	git(t, wt, "push", "-q", e.origin("api"), "atl/pushed")
+	git(t, e.canonical("api"), "update-ref", "refs/remotes/origin/atl/pushed", one)
 	if _, err := e.app.Cancel(ctx, task.Slug, false); err != nil {
 		t.Fatal(err)
 	}
