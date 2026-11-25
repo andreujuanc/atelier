@@ -79,8 +79,8 @@ const sandboxNote = "Sandbox: you run in the task's own container. " +
 	"Else work here, installing what's missing (system packages: " +
 	"`docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`); installs are lost with this container: " +
 	"tell the user what the image lacks. " +
-	"Docker gate: bind mounts only from the task dir; network/volume names start with $COMPOSE_PROJECT_NAME " +
-	"(set per task; a 2nd compose project: `-p $COMPOSE_PROJECT_NAME-<repo>`); no privileged or host modes; " +
+	"Docker gate: bind mounts only from the task dir; network/volume names, build tags start with $COMPOSE_PROJECT_NAME " +
+	"(per task; a 2nd compose project: `-p $COMPOSE_PROJECT_NAME-<repo>`); no privileged or host modes; " +
 	"classic builder only (DOCKER_BUILDKIT=0); pull build bases first (allowed registries); " +
 	"you see only this task's containers, networks, volumes; services answer by service name. " +
 	"If a setup needs something refused (host file mount, privileged, BuildKit), don't edit " +

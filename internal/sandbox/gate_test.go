@@ -1320,10 +1320,10 @@ func TestGateKeysInAnyCase(t *testing.T) {
 // TestGateImageNames: a build or a pull may not create or move a tag that
 // atl runs its own containers from (the default task image, the box image,
 // the workspace's and the projects' images, in any spelling dockerd reads
-// as the same); a build may not name a tag that points to an image no task
-// built (the user's, a pulled one), but may build over one a task built,
-// while a pull may re-pull any (it brings only what the registry has under
-// that name); a pull by digest moves no tag; a build may not pull (--pull,
+// as the same); a build may only name tags in the task's namespace (see
+// TestGateBuildTagNamespace), while a pull may re-pull any (it brings only
+// what the registry has under that name); a pull by digest moves no tag; a
+// build may not pull (--pull,
 // --platform: the builder would store FROM images under their names); and
 // every image a task builds carries its label. The other endpoints that
 // name images (tag, import, load, commit) stay refused.
@@ -1338,7 +1338,7 @@ func TestGateImageNames(t *testing.T) {
 		"/build?t=library/atelier-task",
 		"/build?t=atelier",
 		"/build?t=GHCR.IO/you/alpha-dev:2",
-		"/build?t=localstack/localstack:4", // pulled by someone
+		"/build?t=localstack/localstack:4", // pulled by someone, outside the namespace
 		"/build?t=Bad/Name",
 		"/build?pull=1",
 		"/build?t=new-tool&pull=true",
@@ -1369,10 +1369,10 @@ func TestGateImageNames(t *testing.T) {
 		}
 	}
 	for _, uri := range []string{
-		"/build?t=new-tool",
-		"/build?t=my-tool:dev&t=new-tool:2",
-		"/build?t=other-tool", // another task built it
-		"/build?t=new-tool&pull=0&platform=",
+		"/build?t=atl_abc123-new-tool",
+		"/build?t=atl_abc123-my-tool:dev&t=atl_abc123/new-tool:2",
+		"/build?t=atl_abc123",
+		"/build?t=atl_abc123_tool&pull=0&platform=",
 		"/build",
 		"/images/create?fromImage=postgres&tag=17",
 		"/images/create?fromImage=atelier-task@sha256:" + strings.Repeat("a", 64),
@@ -1387,21 +1387,20 @@ func TestGateImageNames(t *testing.T) {
 			t.Errorf("POST %s: status %d (%s), want it forwarded", uri, status, out)
 		}
 	}
-	if _, out := c.do("POST", "/build?t=localstack/localstack:4", ""); !strings.Contains(out, "build under another tag") ||
-		!strings.Contains(out, "docker rmi localstack/localstack:4") {
-		t.Errorf("refusal of a pulled image's tag: %s", out)
+	if _, out := c.do("POST", "/build?t=localstack/localstack:4", ""); !strings.Contains(out, "-t atl_abc123-") {
+		t.Errorf("refusal of a tag outside the namespace: %s", out)
 	}
 	if got := c.d.saw("POST /build?"); !strings.Contains(got, `"atelier.task":"`+testID+`"`) {
 		t.Errorf("build not labelled: %s", got)
 	}
-	if status, _ := c.do("POST", "/build?t=x&labels="+url.QueryEscape(`{"atelier.agent":"`+testID+`","a":"b"}`), ""); status >= 400 {
+	if status, _ := c.do("POST", "/build?t=atl_abc123-x&labels="+url.QueryEscape(`{"atelier.agent":"`+testID+`","a":"b"}`), ""); status >= 400 {
 		t.Errorf("build with labels: %d", status)
 	} else if got := c.d.saw("POST /build?"); strings.Contains(got, "atelier.agent") || !strings.Contains(got, `"a":"b"`) {
 		t.Errorf("build labels: %s", got)
 	}
 	// What atl uses cannot be read: refused.
 	c.g.Reserved = func() ([]string, error) { return nil, errors.New("projects unreadable") }
-	if status, out := c.do("POST", "/build?t=new-tool", ""); status != http.StatusForbidden {
+	if status, out := c.do("POST", "/build?t=atl_abc123-new-tool", ""); status != http.StatusForbidden {
 		t.Errorf("unreadable reserved names: %d %s", status, out)
 	}
 }

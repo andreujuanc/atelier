@@ -128,7 +128,7 @@ The session's start context tells Claude all of this.
 | a mount of `/var/run/docker.sock` becomes the gate's socket | testcontainers/localstack stay under the same rules |
 | refused: privileged, host network/PID/IPC, added capabilities, devices, security options, other runtimes, volume driver options, log drivers other than `json-file`/`local`/`none`, unknown container settings | each is a way out of the container |
 | images: pull and build allowed, remove refused; build from a remote URL refused; a pull (also `/distribution`) only from an [allowed registry](#registries-tasks-may-pull-from) | images are shared; the daemon fetches from the host's network, with host credentials |
-| a pull or build may not name a tag atl's own containers run from (`atelier-task`, `atelier`, the workspace's and every project's image, in any spelling); a build may not name a tag whose image has no `atelier.task` label (yours, or pulled: build under another tag), nor pull (`--pull`, `--platform`: pull the base image first); builds get the task's label; pulling all tags, tag, import, load, commit refused | a task could swap what later tasks, the assistant and `atl token` run |
+| a pull or build may not name a tag atl's own containers run from (`atelier-task`, `atelier`, the workspace's and every project's image, in any spelling); a build may only tag in the task's namespace (`atl_4a2f21`, `atl_4a2f21-api`, `atl_4a2f21_x`, `atl_4a2f21/x`, with any `:tag`; no registry, no digest: compose's `<project>-<service>` names are in it), nor pull (`--pull`, `--platform`: pull the base image first); builds get the task's label; pulling all tags, tag, import, load, commit refused | a task could swap what later tasks, the assistant and `atl token` run, or what a host-side `docker run` or compose project runs (`shop-api`, an unpulled `postgres:16`), or another task's images |
 | BuildKit refused (`DOCKER_BUILDKIT=0` is set) | the gate cannot inspect BuildKit sessions |
 | a build's Dockerfile may not have `ONBUILD`, nor `ADD` from a URL or with a variable in a source (use `COPY`, or download in a `RUN` step); it must be a regular file in the context, sent uncompressed or gzipped | the daemon fetches an `ADD` URL from the host's network (its loopback services, a cloud's metadata address) |
 | a build's base images (each `FROM` image, each `COPY --from` that is no earlier stage) must be here already (`docker pull` them first), from an allowed registry, without `ONBUILD` triggers; the daemon gets the Dockerfile naming each by its ID | the builder would pull a missing one from any registry; triggers run in the build, unchecked (an `ADD` URL in one is fetched from the host's network); a tag moved during the build changes nothing |
@@ -275,8 +275,7 @@ refuses, `atl push`/`atl fetch`) and names the mounted host paths. `context` /
   permission prompt runs in the assistant's container, so a hostile one skips it: the gate's
   allowlist is the only real limit ([assistant.md](assistant.md#permissions)).
 - Image names: rules are checked when the request arrives (a tag created while a build runs
-  is overwritten); tasks can build over each other's tags (and an image built `FROM` a
-  task's carries its label).
+  is overwritten); an image built `FROM` a task's carries its label.
 - The assistant's container can read the token too; it has no repo, task dir or Docker.
 - A task can write (never read) your clipboard while your terminal is on its tmux session.
   Read what you paste into a shell.

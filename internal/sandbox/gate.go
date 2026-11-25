@@ -129,8 +129,8 @@ var gateRoutes = []gateRoute{
 	route("GET", `/exec/([^/]+)/json`, gateExec),
 
 	// Images are shared between tasks: reading is fine, removing is not; a
-	// pull or a build may only name a tag that is neither atl's nor
-	// another's (checkTag). Tagging, importing, loading and committing are
+	// pull may not name a tag of atl's (checkTag), a build only one in the
+	// task's namespace (checkBuildTag). Tagging, importing, loading and committing are
 	// not in this table: refused.
 	route("GET", `/images/json`, gatePass),
 	route("GET", `/images/(.+)/(json|history)`, gatePass),
