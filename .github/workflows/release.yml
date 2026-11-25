@@ -1,9 +1,11 @@
 # Every merge to main is a release: tests, then static binaries for
-# linux/amd64 and linux/arm64, SHA256SUMS and a build provenance
-# attestation, published as GitHub release v<VERSION>.<n> (see
-# .github/next-version.sh). `atl update` installs a release only when its
-# attestation says it was built by this workflow from refs/heads/main:
-# keep this file's path and the branch in step with internal/update.
+# linux/amd64 and linux/arm64, SHA256SUMS, its signature SHA256SUMS.sig
+# and a build provenance attestation, published as GitHub release
+# v<VERSION>.<n> (see .github/next-version.sh). `atl update` installs a
+# release only when SHA256SUMS.sig checks out with the public key built
+# into atl (internal/update/release-key.pub). The private key is the
+# secret RELEASE_SIGNING_KEY of the "release" environment, which only
+# main may deploy to (README: Releases).
 name: release
 
 on:
@@ -31,6 +33,9 @@ jobs:
   release:
     needs: test
     runs-on: ubuntu-24.04
+    # Holds the secret RELEASE_SIGNING_KEY. Its deployment branch rule
+    # admits main only: no other branch's workflow gets the key.
+    environment: release
     permissions:
       contents: write # create the tag and the release
       id-token: write # sign the attestation
@@ -61,6 +66,20 @@ jobs:
           done
           test "$(dist/atl-linux-amd64 version)" = "$TAG"
           (cd dist && sha256sum atl-linux-* > SHA256SUMS && cat SHA256SUMS)
+      - name: Sign
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "no RELEASE_SIGNING_KEY in the release environment (README: Releases)"; exit 1
+          fi
+          key="$RUNNER_TEMP/release-key.pem"
+          (umask 077 && printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key")
+          .github/sign-release.sh "$key" "$TAG" dist/SHA256SUMS dist/SHA256SUMS.sig internal/update/release-key.pub
+          rm -f "$key"
+      # Not what atl checks (that is the signature), but anyone can check
+      # it with `gh attestation verify`.
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/atl-linux-*
