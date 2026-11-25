@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,30 +61,36 @@ func (f *fakeGitHub) serve(t *testing.T) *httptest.Server {
 	t.Helper()
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/" + Repo + "/releases/latest":
+		if r.Header.Get("User-Agent") == "" {
+			http.Error(w, "no user agent", http.StatusForbidden)
+			return
+		}
+		releases := "/" + Repo + "/releases"
+		if r.URL.Path == releases+"/latest" {
+			// As github.com: to the release's page, absolute.
 			f.calls.Add(1)
-			if r.Header.Get("User-Agent") == "" {
-				http.Error(w, "no user agent", http.StatusForbidden)
+			if f.tag == "" {
+				http.Redirect(w, r, srv.URL+releases, http.StatusFound)
 				return
 			}
-			if f.tag == "" {
+			http.Redirect(w, r, srv.URL+releases+"/tag/"+url.PathEscape(f.tag), http.StatusFound)
+			return
+		}
+		// Assets: redirected to another path first, as to GitHub's asset host.
+		if name, ok := strings.CutPrefix(r.URL.Path, releases+"/download/"+f.tag+"/"); ok && f.tag != "" && !f.noAssets {
+			http.Redirect(w, r, "/assets/"+name, http.StatusFound)
+			return
+		}
+		switch r.URL.Path {
+		case "/assets/atl-linux-arm64":
+			w.Write(f.bin)
+		case "/assets/SHA256SUMS":
+			fmt.Fprint(w, f.sumsText())
+		case "/assets/SHA256SUMS.sig":
+			if f.noSig {
 				http.NotFound(w, r)
 				return
 			}
-			assets := fmt.Sprintf(`{"name":"atl-linux-arm64","browser_download_url":"%[1]s/dl/bin"},{"name":"SHA256SUMS","browser_download_url":"%[1]s/dl/sums"}`, srv.URL)
-			if !f.noSig {
-				assets += fmt.Sprintf(`,{"name":"SHA256SUMS.sig","browser_download_url":"%s/dl/sig"}`, srv.URL)
-			}
-			if f.noAssets {
-				assets = ""
-			}
-			fmt.Fprintf(w, `{"tag_name":%q,"assets":[%s]}`, f.tag, assets)
-		case "/dl/bin":
-			w.Write(f.bin)
-		case "/dl/sums":
-			fmt.Fprint(w, f.sumsText())
-		case "/dl/sig":
 			if f.sig != nil {
 				w.Write(f.sig)
 				return
@@ -106,7 +113,7 @@ func (f *fakeGitHub) serve(t *testing.T) *httptest.Server {
 func testUpdater(t *testing.T, srv *httptest.Server, key ed25519.PrivateKey) *Updater {
 	t.Helper()
 	return &Updater{
-		API:      srv.URL,
+		Web:      srv.URL,
 		HTTP:     srv.Client(),
 		Arch:     "arm64",
 		Now:      func() time.Time { return time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC) },
@@ -190,7 +197,7 @@ func TestInstallRefuses(t *testing.T) {
 		{"checksum", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: key, sums: strings.Repeat("ab", 32) + "  atl-linux-arm64\n"}, nil, "checksum"},
 		{"no checksum line", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: key, sums: strings.Repeat("ab", 32) + "  atl-linux-amd64\n"}, nil, "no checksum for atl-linux-arm64"},
 		{"no build for arch", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: key}, func(u *Updater) { u.Arch = "riscv64" }, "no build for linux/riscv64"},
-		{"no assets", &fakeGitHub{tag: "v0.1.5", noAssets: true}, nil, "has no atl-linux-arm64"},
+		{"no assets", &fakeGitHub{tag: "v0.1.5", noAssets: true}, nil, "has no SHA256SUMS"},
 		{"not static", &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: key}, func(u *Updater) {
 			u.CheckBin = func(p string) error { return fmt.Errorf("%s is dynamically linked", p) }
 		}, "dynamically linked"},
@@ -299,4 +306,22 @@ func TestCheckCaches(t *testing.T) {
 			t.Errorf("%d: Check = %q after %d calls, want %q after %d", i, got, gh.calls.Load(), c.want, c.calls)
 		}
 	}
+}
+
+// TestNoBinaryForArch: SHA256SUMS lists a build the release lacks.
+func TestNoBinaryForArch(t *testing.T) {
+	key := newKey(t)
+	gh := &fakeGitHub{tag: "v0.1.5", bin: []byte("v0.1.5\n"), key: key,
+		sums: strings.Repeat("ab", 32) + "  atl-linux-riscv64\n"}
+	u := testUpdater(t, gh.serve(t), key)
+	u.Arch = "riscv64"
+	rel, err := u.Latest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := target(t)
+	if err := u.Install(context.Background(), rel, dst); err == nil || !strings.Contains(err.Error(), "has no atl-linux-riscv64 (no build for linux/riscv64)") {
+		t.Errorf("Install error %v", err)
+	}
+	assertNoTemp(t, dst)
 }
