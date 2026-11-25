@@ -66,6 +66,10 @@ type Gate struct {
 	// every project's. A task may not create or move these tags (see
 	// checkTag); an error refuses every request that would.
 	Reserved func() ([]string, error)
+	// Registries returns the registries a task may pull from (docker
+	// pull, a build's FROM and COPY --from), besides DefaultRegistries
+	// (see checkRegistry); an error refuses every pull.
+	Registries func() ([]string, error)
 	// HostRoutes returns the routes of the host the daemon runs on, which a
 	// network's subnet may not overlap (see checkIPAM); nil: hostRoutes,
 	// read where the gate runs.
@@ -130,7 +134,7 @@ var gateRoutes = []gateRoute{
 	// not in this table: refused.
 	route("GET", `/images/json`, gatePass),
 	route("GET", `/images/(.+)/(json|history)`, gatePass),
-	route("GET", `/distribution/(.+)/json`, gatePass),
+	route("GET", `/distribution/(.+)/json`, gateDistribution),
 	route("POST", `/images/create`, gateImagePull),
 	route("POST", `/build`, gateBuild),
 

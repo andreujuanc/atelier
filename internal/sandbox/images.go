@@ -171,9 +171,10 @@ func (g *Gate) checkTag(s string, reserved []imageRef, build bool) error {
 	return nil
 }
 
-// gateImagePull allows a pull from a registry (never an import, fromSrc)
-// whose tag is not reserved (checkTag); a pull by digest moves no tag. A pull of
-// every tag of a repository (no tag at all) is refused.
+// gateImagePull allows a pull from a registry tasks may pull from
+// (checkRegistry; never an import, fromSrc) whose tag is not reserved
+// (checkTag); a pull by digest moves no tag. A pull of every tag of a
+// repository (no tag at all) is refused.
 func gateImagePull(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 	q := r.URL.Query()
 	if len(q["fromImage"]) != 1 || q.Get("fromImage") == "" || q.Has("fromSrc") || q.Has("repo") || len(q["tag"]) > 1 {
@@ -183,6 +184,10 @@ func gateImagePull(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) 
 	ref, err := parseImageRef(q.Get("fromImage"))
 	if err != nil {
 		g.deny(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := g.checkRegistry(ref); err != nil {
+		g.deny(w, r, http.StatusForbidden, "pull "+q.Get("fromImage")+": "+err.Error())
 		return
 	}
 	if tag := q.Get("tag"); tag != "" {
@@ -205,6 +210,22 @@ func gateImagePull(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) 
 			g.deny(w, r, http.StatusForbidden, err.Error())
 			return
 		}
+	}
+	g.forward(w, r, nil)
+}
+
+// gateDistribution allows a look at an image in its registry (the daemon
+// fetches its manifest there) only in a registry tasks may pull from
+// (checkRegistry).
+func gateDistribution(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
+	ref, err := parseImageRef(m[1])
+	if err != nil {
+		g.deny(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := g.checkRegistry(ref); err != nil {
+		g.deny(w, r, http.StatusForbidden, m[1]+": "+err.Error())
+		return
 	}
 	g.forward(w, r, nil)
 }

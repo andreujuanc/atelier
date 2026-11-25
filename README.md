@@ -180,6 +180,7 @@ Strict TOML: every key optional, unknown keys are an error. `~/` expands in `rep
 | `[sandbox] image` | `"atelier-task"` | task container image (a project's `image` wins) |
 | `[sandbox] mounts` | none | host paths every task gets read-only ([docs/sandbox.md](docs/sandbox.md#host-files-for-every-task)) |
 | `[sandbox] context` | none | text added to sandboxed sessions' start context (max 1000 bytes) |
+| `[sandbox] registries` | none | registries tasks may pull from besides Docker Hub, ghcr.io, quay.io, mcr.microsoft.com, gcr.io, registry.k8s.io, public.ecr.aws (`"localhost:5000"`, `"*.pkg.dev"`; [docs/sandbox.md](docs/sandbox.md#registries-tasks-may-pull-from)) |
 
 ```toml
 repos = "~/src/work"
@@ -225,6 +226,7 @@ A variable set in the environment wins over `atelier.toml`.
 | `ATL_SANDBOX_IMAGE` | `[sandbox] image` | task image (also read by `build-images`) |
 | `ATL_SANDBOX_MOUNTS` | `[sandbox] mounts` | `:`-separated absolute paths |
 | `ATL_SANDBOX_CONTEXT` | `[sandbox] context` | see `[sandbox] context` |
+| `ATL_SANDBOX_REGISTRIES` | `[sandbox] registries` | separated by commas or blanks |
 | `CLAUDE_CODE_OAUTH_TOKEN` | the token from `atl token` | token for sandboxed sessions and the assistant; wins over the stored one |
 | `ANTHROPIC_API_KEY` | none | API key instead of a token (also wins) |
 

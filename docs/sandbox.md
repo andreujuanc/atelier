@@ -112,7 +112,7 @@ The session's start context tells Claude all of this.
 | bind mounts only from the task dir, or read-only from `[sandbox] mounts` | no host access |
 | a mount of `/var/run/docker.sock` becomes the gate's socket | testcontainers/localstack stay under the same rules |
 | refused: privileged, host network/PID/IPC, added capabilities, devices, security options, other runtimes, volume driver options, log drivers other than `json-file`/`local`/`none`, unknown container settings | each is a way out of the container |
-| images: pull and build allowed, remove refused; build from a remote URL refused | images are shared; the daemon would fetch with host credentials |
+| images: pull and build allowed, remove refused; build from a remote URL refused; a pull (also `/distribution`) only from an [allowed registry](#registries-tasks-may-pull-from) | images are shared; the daemon fetches from the host's network, with host credentials |
 | a pull or build may not name a tag atl's own containers run from (`atelier-task`, `atelier`, the workspace's and every project's image, in any spelling); a build may not name a tag whose image has no `atelier.task` label (yours, or pulled: build under another tag), nor pull (`--pull`, `--platform`: pull the base image first); builds get the task's label; pulling all tags, tag, import, load, commit refused | a task could swap what later tasks, the assistant and `atl token` run |
 | BuildKit refused (`DOCKER_BUILDKIT=0` is set) | the gate cannot inspect BuildKit sessions |
 | a build's Dockerfile may not have `ONBUILD`, nor `ADD` from a URL or with a variable in a source (use `COPY`, or download in a `RUN` step); it must be a regular file in the context, sent uncompressed or gzipped | the daemon fetches an `ADD` URL from the host's network (its loopback services, a cloud's metadata address) |
@@ -143,6 +143,26 @@ config (`GIT_CONFIG_GLOBAL`, `~/.gitconfig`, `~/.config/git`), the Docker socket
 agent socket, `/proc`, `/sys`, `/dev`. `atl doctor` lists each path and why it is refused.
 
 ## atl inside the container
+
+## Registries tasks may pull from
+
+The daemon pulls from the host's network, not the task's: a registry on the host's loopback,
+the LAN or a cloud's metadata address is reached though the task's container cannot reach
+it, and so is wherever a registry's auth realm or redirects point. So a task may pull
+(`docker pull`, a build's base images) only from Docker Hub (`docker.io`, also as
+`index.docker.io` and `registry-1.docker.io`), `ghcr.io`, `quay.io`, `mcr.microsoft.com`,
+`gcr.io`, `registry.k8s.io` and `public.ecr.aws`, and those you add:
+
+```toml
+[sandbox]
+registries = ["localhost:5000", "*.pkg.dev"]
+```
+
+or `ATL_SANDBOX_REGISTRIES=localhost:5000,*.pkg.dev` (commas or blanks). An entry is a
+domain, with its port if the image names one (`localhost:5000` for kind or k3d), in any
+case; `*.pkg.dev` covers every domain under `pkg.dev`. The gate reads the setting at each
+pull (the variable as it was when the gate started). Every task can then have the daemon
+reach what you list, and follow its auth realm and redirects: list only registries you trust.
 
 Only hooks, the status line, `atl note`, `atl notes` (own task only), `atl push` and
 `atl fetch` work; they ask the gate, which runs them on the host for this task only. Every

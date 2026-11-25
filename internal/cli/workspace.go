@@ -93,7 +93,7 @@ func (c *cli) workspaceNewCmd() *cobra.Command {
 		Use: "new <name> [--repos DIR] [--mount PATH]... [--image IMAGE]",
 		Short: "Create workspace <name> (atelier.toml, tasks/ data/ config/ state/), or adopt the directory if it has no atelier.toml " +
 			"(taking the box's settings from its .devcontainer/devcontainer.json); settings not given are taken from $ATL_REPOS, " +
-			"$ATL_SANDBOX_MOUNTS, $ATL_SANDBOX_IMAGE, $ATL_SANDBOX_CONTEXT and $ATL_CONTEXT",
+			"$ATL_SANDBOX_MOUNTS, $ATL_SANDBOX_IMAGE, $ATL_SANDBOX_CONTEXT, $ATL_SANDBOX_REGISTRIES and $ATL_CONTEXT",
 		Args: args(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, a []string) error {
 			name := a[0]

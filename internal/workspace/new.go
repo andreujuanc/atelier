@@ -9,15 +9,17 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 // settingKeys are atelier.toml's keys, in the order of the design's table.
-var settingKeys = []string{"repos", "git_config", "context", "tmux_socket", "sandbox.image", "sandbox.mounts", "sandbox.context"}
+var settingKeys = []string{"repos", "git_config", "context", "tmux_socket", "sandbox.image", "sandbox.mounts", "sandbox.context", "sandbox.registries"}
 
 // getKey returns setting key of c; sandbox.mounts joined with ':' (a
 // mount never contains one).
@@ -41,12 +43,15 @@ func getKey(c *Config, key string) string {
 		return strings.Join(sb.Mounts, ":")
 	case "sandbox.context":
 		return sb.Context
+	case "sandbox.registries":
+		return strings.Join(sb.Registries, ",")
 	}
 	return ""
 }
 
 // setKey sets setting key of c to v; sandbox.mounts from a ':'-separated
-// list (empty parts dropped).
+// list (empty parts dropped), sandbox.registries from a list separated by
+// commas or blanks.
 func setKey(c *Config, key, v string) {
 	if c.Sandbox == nil {
 		c.Sandbox = &SandboxConfig{}
@@ -71,6 +76,8 @@ func setKey(c *Config, key, v string) {
 		}
 	case "sandbox.context":
 		c.Sandbox.Context = v
+	case "sandbox.registries":
+		c.Sandbox.Registries = strings.FieldsFunc(v, func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
 	}
 }
 
@@ -92,7 +99,7 @@ func fill(dst *Config, src Config, from map[string]string, source func(key strin
 
 // envFillKeys are the settings `atl workspace new` takes from the user's
 // environment.
-var envFillKeys = []string{"repos", "context", "sandbox.image", "sandbox.mounts", "sandbox.context"}
+var envFillKeys = []string{"repos", "context", "sandbox.image", "sandbox.mounts", "sandbox.context", "sandbox.registries"}
 
 // keyVar is the environment variable of a setting.
 func keyVar(key string) string {
@@ -265,6 +272,11 @@ func Prepare(root, name string, flags Config) (*Plan, error) {
 		}
 	}
 	if c.Sandbox != nil {
+		for _, r := range c.Sandbox.Registries {
+			if err := sandbox.CheckRegistry(r); err != nil {
+				return nil, fmt.Errorf("sandbox.registries (from %s): %v", from["sandbox.registries"], err)
+			}
+		}
 		for i, m := range c.Sandbox.Mounts {
 			if strings.Contains(m, ":") {
 				return nil, fmt.Errorf("mount %q: a path must not contain ':'", m)

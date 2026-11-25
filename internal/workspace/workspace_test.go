@@ -24,7 +24,7 @@ func env(t *testing.T) string {
 	t.Setenv("HOME", home)
 	t.Setenv(RootVar, root)
 	for _, k := range []string{Var, VarsVar, "ATL_REPOS", "GIT_CONFIG_GLOBAL", "ATL_CONTEXT", "ATL_TMUX_SOCKET",
-		"ATL_SANDBOX_IMAGE", "ATL_SANDBOX_MOUNTS", "ATL_SANDBOX_CONTEXT"} {
+		"ATL_SANDBOX_IMAGE", "ATL_SANDBOX_MOUNTS", "ATL_SANDBOX_CONTEXT", "ATL_SANDBOX_REGISTRIES"} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
 	}
@@ -214,7 +214,8 @@ func TestLoadStrict(t *testing.T) {
 		`repos = `:                        "parse",
 		`tmux_socket = "a/b"`:             "not a path",
 		"[sandbox]\nmounts = [\"/a:/b\"]": "contains ':'",
-		`repos = 3`:                       "parse",
+		"[sandbox]\nregistries = [\"127.0.0.1:5000/x\"]": "sandbox.registries",
+		`repos = 3`: "parse",
 	} {
 		dir := mk(t, root, "w", content)
 		if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), want) {
@@ -241,13 +242,14 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	for key, want := range map[string]Setting{
-		"repos":           {Var: "ATL_REPOS", Value: filepath.Join(dir, "repos"), Source: FromDefault},
-		"git_config":      {Var: "GIT_CONFIG_GLOBAL"},
-		"tmux_socket":     {Var: "ATL_TMUX_SOCKET", Value: "atl-beta", Source: FromDefault},
-		"context":         {Var: "ATL_CONTEXT"},
-		"sandbox.image":   {Var: "ATL_SANDBOX_IMAGE"},
-		"sandbox.mounts":  {Var: "ATL_SANDBOX_MOUNTS"},
-		"sandbox.context": {Var: "ATL_SANDBOX_CONTEXT"},
+		"repos":              {Var: "ATL_REPOS", Value: filepath.Join(dir, "repos"), Source: FromDefault},
+		"git_config":         {Var: "GIT_CONFIG_GLOBAL"},
+		"tmux_socket":        {Var: "ATL_TMUX_SOCKET", Value: "atl-beta", Source: FromDefault},
+		"context":            {Var: "ATL_CONTEXT"},
+		"sandbox.image":      {Var: "ATL_SANDBOX_IMAGE"},
+		"sandbox.mounts":     {Var: "ATL_SANDBOX_MOUNTS"},
+		"sandbox.context":    {Var: "ATL_SANDBOX_CONTEXT"},
+		"sandbox.registries": {Var: "ATL_SANDBOX_REGISTRIES"},
 	} {
 		want.Key = key
 		if got := setting(ws.Settings, key); got != want {
@@ -272,19 +274,21 @@ tmux_socket = "sock"
 image = "img"
 mounts = ["~/.npmrc", "/etc/x"]
 context = "sctx"
+registries = ["registry.corp:5000", "*.pkg.dev"]
 `)
 	ws, err = Load(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for key, want := range map[string]string{
-		"repos":           filepath.Join(root, "src"),
-		"git_config":      filepath.Join(home, "gc"),
-		"context":         "ctx",
-		"tmux_socket":     "sock",
-		"sandbox.image":   "img",
-		"sandbox.mounts":  "~/.npmrc:/etc/x",
-		"sandbox.context": "sctx",
+		"repos":              filepath.Join(root, "src"),
+		"git_config":         filepath.Join(home, "gc"),
+		"context":            "ctx",
+		"tmux_socket":        "sock",
+		"sandbox.image":      "img",
+		"sandbox.mounts":     "~/.npmrc:/etc/x",
+		"sandbox.context":    "sctx",
+		"sandbox.registries": "registry.corp:5000,*.pkg.dev",
 	} {
 		if s := setting(ws.Settings, key); s.Value != want || s.Source != FromFile {
 			t.Errorf("%s = %+v, want %q from the file", key, s, want)
@@ -295,7 +299,7 @@ context = "sctx"
 		vars[i] = s.Var
 	}
 	if want := []string{"ATL_REPOS", "GIT_CONFIG_GLOBAL", "ATL_CONTEXT", "ATL_TMUX_SOCKET", "ATL_SANDBOX_IMAGE",
-		"ATL_SANDBOX_MOUNTS", "ATL_SANDBOX_CONTEXT"}; !slices.Equal(vars, want) {
+		"ATL_SANDBOX_MOUNTS", "ATL_SANDBOX_CONTEXT", "ATL_SANDBOX_REGISTRIES"}; !slices.Equal(vars, want) {
 		t.Errorf("vars %v", vars)
 	}
 }

@@ -830,6 +830,7 @@ func (c *cli) taskGate(ctx context.Context, p config.Paths, slug string, taskID 
 		Ident:      sandbox.Ident(taskID, bin, roMounts),
 		ROMounts:   roMounts,
 		Reserved:   reservedImages(p, os.Getenv("ATL_SANDBOX_IMAGE"), os.Getenv("ATL_BOX_IMAGE")),
+		Registries: registries(p, workspace.UserEnv(sandbox.RegistriesVar)),
 	}
 	ts.SetROMounts(roMounts)
 	// A session ended (Claude exits): what it left running in the
@@ -898,6 +899,29 @@ func reservedImages(p config.Paths, startImages ...string) func() ([]string, err
 			names = append(names, pr.Image)
 		}
 		return names, nil
+	}
+}
+
+// registries is a task gate's sandbox.Gate.Registries: the registries
+// tasks may pull from besides the default ones. userEnv, the user's own
+// $ATL_SANDBOX_REGISTRIES when the gate started (a variable set wins over
+// atelier.toml), else the workspace's sandbox.registries, read again on
+// each call: an entry the user adds or removes applies at once. A file
+// that cannot be read, or a bad entry, is an error: the gate then refuses
+// every pull.
+func registries(p config.Paths, userEnv string) func() ([]string, error) {
+	return func() ([]string, error) {
+		if userEnv != "" {
+			return sandbox.ParseRegistries(userEnv)
+		}
+		if p.Workspace == "" {
+			return nil, nil
+		}
+		c, err := workspace.ReadConfig(p.Workspace)
+		if err != nil || c.Sandbox == nil {
+			return nil, err
+		}
+		return c.Sandbox.Registries, nil
 	}
 }
 
