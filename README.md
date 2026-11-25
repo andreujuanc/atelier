@@ -193,8 +193,8 @@ More: [docs/workspaces.md](docs/workspaces.md).
 ### Projects: `<workspace>/config/projects/<name>.toml`
 
 ```toml
-setup = "npm ci"                      # sh -c in each rw worktree after creation (on the host)
-teardown = "docker compose down -v"   # sh -c in each rw worktree before removal (on the host)
+setup = "npm ci"                      # sh -c in each rw worktree after creation, in the task's container
+# teardown = "..."                    # likewise, before removal; not needed for Docker (docs/sandbox.md)
 image = "shop-dev"                    # task container image, e.g. built FROM atelier-task
 
 [env]                                 # added to sessions and scripts

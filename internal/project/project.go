@@ -26,8 +26,8 @@ type RepoSpec struct {
 type Project struct {
 	Name     string            `toml:"-"`
 	Repos    []RepoSpec        `toml:"repos"`
-	Setup    string            `toml:"setup"`    // sh -c in each rw worktree after creation
-	Teardown string            `toml:"teardown"` // sh -c in each rw worktree before removal
+	Setup    string            `toml:"setup"`    // sh -c in each rw worktree after creation (in the task container, sandbox on)
+	Teardown string            `toml:"teardown"` // sh -c in each rw worktree before removal (likewise)
 	Env      map[string]string `toml:"env"`
 	Image    string            `toml:"image"` // task container image when tasks are sandboxed ("" → the workspace default)
 }

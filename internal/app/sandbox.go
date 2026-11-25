@@ -2,8 +2,11 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -15,6 +18,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/project"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
@@ -78,7 +82,7 @@ func (a *App) sandboxSpecFor(ctx context.Context, t *model.Task, image string) (
 	spec := sandbox.Spec{
 		ID:      id,
 		Image:   image,
-		User:    fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		User:    sandboxUser(),
 		Workdir: dir,
 		Env: map[string]string{
 			"HOME":            home,
@@ -149,6 +153,10 @@ func (a *App) sandboxSpecFor(ctx context.Context, t *model.Task, image string) (
 	}
 	return spec, nil
 }
+
+// sandboxUser is the user ("uid:gid") a task container runs as, and what
+// atl runs in it: the user running atl.
+func sandboxUser() string { return fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()) }
 
 // taskImage returns the image of the task's container and where its name
 // comes from: the task's project, else the sandbox setting
@@ -247,6 +255,24 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) 
 	if err := a.checkSandboxNeeds(ctx); err != nil {
 		return "", err
 	}
+	return a.ensureContainer(ctx, t)
+}
+
+// ensureScriptSandbox is ensureSandbox for a project script (see
+// runScript), which needs no Claude Code token: only a Docker daemon and an
+// atl binary that runs in the container.
+func (a *App) ensureScriptSandbox(ctx context.Context, t *model.Task) (string, error) {
+	if _, err := a.checkDocker(ctx); err != nil {
+		return "", err
+	}
+	if err := a.checkAtlBin(a.AtlBin); err != nil {
+		return "", err
+	}
+	return a.ensureContainer(ctx, t)
+}
+
+// ensureContainer is ensureSandbox once its needs are checked.
+func (a *App) ensureContainer(ctx context.Context, t *model.Task) (string, error) {
 	runDir := a.Paths.RunDir(t.Slug)
 	if err := sandbox.MakeRunDir(runDir); err != nil {
 		return "", err
@@ -360,6 +386,55 @@ func (a *App) killSessionProcs(ctx context.Context, t *model.Task, id int64) {
 	if err != nil && !noContainer(err) {
 		a.warnf("task %s: end what session %d left running in its container: %v", t.Slug, id, err)
 	}
+}
+
+// scriptContainer returns the full ID of the task container the project's
+// setup and teardown scripts run in (ensureScriptSandbox: started, or
+// created, if it is not running, or was made from another spec), or "" when
+// the sandbox is off: they then run here. The task controls the worktree
+// they run in (a compose file, a Makefile, npm's lifecycle scripts): on the
+// host they would run its code outside the sandbox, with the Docker socket.
+func (a *App) scriptContainer(ctx context.Context, t *model.Task) (string, error) {
+	if a.Sandbox == nil {
+		return "", nil
+	}
+	c, err := a.ensureScriptSandbox(ctx, t)
+	if err != nil {
+		return "", fmt.Errorf("cannot start the task's container to run it in: %w", err)
+	}
+	return c, nil
+}
+
+// runInContainer runs script in the task's container (by its full ID) with
+// docker exec (sandbox.ScriptArgs): as the user sessions run as, in dir,
+// with vars over the container's own environment and nothing of atl's. Its
+// output and exit status are the script's, as with project.RunScript. On
+// a cancelled ctx the script's processes in the container end first
+// (sandbox.KillScriptArgs), then the docker client: dockerd keeps running
+// what a dead client started.
+func (a *App) runInContainer(ctx context.Context, t *model.Task, container, dir string, vars map[string]string, script string, out io.Writer) error {
+	if strings.TrimSpace(script) == "" {
+		return nil
+	}
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return err
+	}
+	run := hex.EncodeToString(b)
+	var killErr error // set in kill; read after project.Run, which waits for it
+	kill := func() {
+		kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if _, err := a.docker()(kctx, sandbox.KillScriptArgs(container, run)...); err != nil && !noContainer(err) {
+			killErr = err
+		}
+	}
+	argv := append([]string{"docker"}, sandbox.ScriptArgs(container, sandboxUser(), dir, vars, run, script)...)
+	err := project.Run(ctx, argv, "", nil, out, kill)
+	if killErr != nil {
+		a.warnf("task %s: end the interrupted script in its container: %v", t.Slug, killErr)
+	}
+	return err
 }
 
 // noContainer reports whether a docker exec failed because the container is
