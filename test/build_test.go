@@ -95,3 +95,61 @@ func pipesDownloadToShell(dockerfile string) []string {
 	flush()
 	return bad
 }
+
+// TestNextVersion: .github/next-version.sh numbers releases from VERSION
+// and the tags already there, and refuses a VERSION behind the newest tag.
+func TestNextVersion(t *testing.T) {
+	script, err := filepath.Abs(filepath.Join("..", ".github", "next-version.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name, version string
+		tags          []string
+		want          string // "" means it must fail
+	}{
+		{"first", "0.1", nil, "v0.1.0"},
+		{"next patch", "0.1", []string{"v0.1.0", "v0.1.1"}, "v0.1.2"},
+		{"numeric order", "0.1", []string{"v0.1.9", "v0.1.10", "v0.1.2"}, "v0.1.11"},
+		{"new minor", "0.2", []string{"v0.1.7"}, "v0.2.0"},
+		{"other tags ignored", "0.2", []string{"v0.1.7", "v0.2.3", "v0.2.x", "v0.2.3-rc1", "nightly"}, "v0.2.4"},
+		{"newer line refused", "0.2", []string{"v0.20.1"}, ""},
+		{"behind newest", "0.1", []string{"v0.2.0"}, ""},
+		{"bad VERSION", "1", nil, ""},
+		{"bad VERSION 3 parts", "0.1.2", nil, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			git := func(args ...string) {
+				t.Helper()
+				cmd := exec.Command("git", args...)
+				cmd.Dir = dir
+				cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("git %v: %v\n%s", args, err, out)
+				}
+			}
+			git("init", "-q")
+			git("commit", "-q", "--allow-empty", "-m", "x")
+			for _, tag := range c.tags {
+				git("tag", tag)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "VERSION"), []byte(c.version+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("sh", script)
+			cmd.Dir = dir
+			out, err := cmd.Output()
+			got := strings.TrimSpace(string(out))
+			if c.want == "" {
+				if err == nil {
+					t.Errorf("printed %q, want a failure", got)
+				}
+				return
+			}
+			if err != nil || got != c.want {
+				t.Errorf("got %q, %v; want %q", got, err, c.want)
+			}
+		})
+	}
+}

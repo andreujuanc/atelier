@@ -316,6 +316,14 @@ func (m *Model) headerLine(w int) string {
 	if ws := clean(m.workspace); ws != "" {
 		left += " " + titleStyle.Render(ws)
 	}
+	switch {
+	case m.updating:
+		left += "  " + keyStyle.Render(m.spinner()) + dimStyle.Render(" updating atl")
+	case m.updated != "":
+		left += "  " + okStyle.Render("✓") + dimStyle.Render(" atl "+clean(m.updated)+", restarting")
+	case m.available != "":
+		left += "  " + markStyle.Render("↑ atl "+clean(m.available)) + " " + keyStyle.Render("U") + descStyle.Render(" update")
+	}
 	counts := map[model.SessionState]int{}
 	open := 0
 	for _, t := range m.tasks {
@@ -1037,7 +1045,8 @@ var helpSections = []helpSection{
 	{"Sessions", []helpItem{{"enter", "open (attach or pick)"}, {"s", "new session"}, {"r", "resume stopped sessions"},
 		{"A", "the atelier assistant"}}},
 	{"Moving", []helpItem{{"↑/↓ j/k", "move"}, {"pgup/pgdn", "page"}, {"/", "filter by slug or title"},
-		{"esc", "clear the filter"}, {"w", "switch workspace"}, {"q", "quit"}}},
+		{"esc", "clear the filter"}, {"w", "switch workspace"}, {"U", "update atl (when the top bar offers it)"},
+		{"q", "quit"}}},
 }
 
 // helpColumn renders sections at width w, a blank line between them.

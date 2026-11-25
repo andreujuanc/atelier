@@ -30,11 +30,24 @@ there would run.
 git clone https://github.com/andreujuanc/atelier ~/src/atelier-build && cd ~/src/atelier-build
 ```
 
-Run the steps below there (later: `git pull` there, then again).
+Run the steps below there. Later, `atl update` keeps atl current ([Updating](#updating));
+the clone stays for the task image (step 2).
 
-**1. Build `atl`** (a static Linux binary; it also runs inside containers).
+**1. Get `atl`** (a static Linux binary; it also runs inside containers).
 
-Without Go (the Dockerfile's `build` stage writes `/out/atl`):
+From the latest release (every merge to `main` is one), checked like `atl update` checks it:
+
+```bash
+arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+mkdir -p ~/.local/bin && cd "$(mktemp -d)" \
+  && gh release download --repo andreujuanc/atelier --pattern "atl-linux-$arch" --pattern SHA256SUMS \
+  && sha256sum --check --ignore-missing SHA256SUMS \
+  && gh attestation verify "atl-linux-$arch" --repo andreujuanc/atelier \
+       --signer-workflow andreujuanc/atelier/.github/workflows/release.yml --source-ref refs/heads/main \
+  && install -m 0755 "atl-linux-$arch" ~/.local/bin/atl && cd ~/src/atelier-build
+```
+
+Or build it without Go (the Dockerfile's `build` stage writes `/out/atl`):
 
 ```bash
 mkdir -p ~/.local/bin \
@@ -71,6 +84,29 @@ atl                                         # the TUI
 
 `--repos` is the directory that holds your canonical clones (`~/src/work/api`,
 `~/src/work/web`, …). atl never edits them; tasks get worktrees.
+
+### Updating
+
+Every merge to `main` is released automatically (`v0.1.<n>`, see [Releases](#releases)).
+When a newer release exists, the TUI's top bar says so (`↑ atl v0.1.7 U update`): press
+**U**. atl downloads it, checks it, replaces itself and restarts the TUI once nothing
+runs. From the command line:
+
+```bash
+atl update --check   # is there a newer release?
+atl update           # install it
+```
+
+An update is installed only when its SHA-256 matches the release's `SHA256SUMS` and
+`gh attestation verify` shows it was built by `.github/workflows/release.yml` from `main` of
+this repository, on GitHub's runners. A task can push branches, and a workflow on such a
+branch could publish a release, but that release would not pass this check. Live sessions
+and gates keep the old binary until they restart. A local build (`atl version` says `dev`)
+is replaced only with `atl update --force`. When a release changes the task image, its notes
+say so: `git pull` in your build clone and run `ATL_BUILD_BOX=0 ./build-images` again.
+
+The TUI asks GitHub at most every 6 hours (cached in
+`~/.local/state/atelier/update-check.json`); `ATL_UPDATE_CHECK=off` stops it.
 
 Legacy: running atl itself in a container (the "box", `./build-images` without
 `ATL_BUILD_BOX=0`) still works; see [docs/workspaces.md](docs/workspaces.md#legacy-the-box).
@@ -117,6 +153,7 @@ running, idle, stopped). Colours follow the terminal's light or dark background.
 | `1`-`5` | set status: backlog, active, review, done, cancelled |
 | `/` | filter by slug or title |
 | `w` | switch workspace |
+| `U` | update atl (shown in the top bar when a newer release exists) |
 | `?` | every key, with what it does (any key closes it) |
 | `q` | quit (waits for running operations; `ctrl+c` again forces) |
 
@@ -154,6 +191,8 @@ atl repos                            # git repos in the repos dir
 atl repos pin <repo>                 # accept a changed origin URL
 atl token [--paste]                  # claude setup-token in a throwaway container; store the token
 atl doctor                           # check everything; says what to fix
+atl version                          # the release (v0.1.7), or dev for a local build
+atl update [--check] [--force]       # install the latest release (see "Updating")
 atl workspace list [--json]
 atl workspace new <name> [--repos DIR] [--mount PATH]... [--image IMAGE]
 atl workspace open [<name>]          # TUI in that workspace, or the selector
@@ -227,6 +266,7 @@ A variable set in the environment wins over `atelier.toml`.
 | `ATL_SANDBOX_MOUNTS` | `[sandbox] mounts` | `:`-separated absolute paths |
 | `ATL_SANDBOX_CONTEXT` | `[sandbox] context` | see `[sandbox] context` |
 | `ATL_SANDBOX_REGISTRIES` | `[sandbox] registries` | separated by commas or blanks |
+| `ATL_UPDATE_CHECK` | on | `off`: the TUI does not check for newer releases (`atl update` still works) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | the token from `atl token` | token for sandboxed sessions and the assistant; wins over the stored one |
 | `ANTHROPIC_API_KEY` | none | API key instead of a token (also wins) |
 
@@ -248,6 +288,17 @@ project's `env`. Scripts also get `ATL_REPO`, `ATL_WORKTREE` and `ATL_BRANCH`. S
 
 Design notes: [docs/WORKSPACES.md](docs/WORKSPACES.md), [docs/PLAN.md](docs/PLAN.md),
 [docs/PROGRESS.md](docs/PROGRESS.md).
+
+## Releases
+
+Every merge to `main` that changes more than docs is released automatically:
+`.github/workflows/release.yml` runs the tests, builds static `atl-linux-amd64` and
+`atl-linux-arm64` with the version built in, writes `SHA256SUMS`, attests the build's
+provenance and publishes GitHub release `v<VERSION>.<n>`. `VERSION` holds MAJOR.MINOR
+(`0.1`), and each release takes the next patch number. To start `v0.2.0`, raise `VERSION` in a PR.
+
+Pull requests run `ci.yml` (gofmt, vet, `go test ./...` including e2e, the static build) and,
+when they change the `Dockerfile` or `build-images`, `image.yml` (builds the task image).
 
 ## Tests
 

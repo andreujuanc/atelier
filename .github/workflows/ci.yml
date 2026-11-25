@@ -1,0 +1,38 @@
+# Tests every pull request; release.yml runs it again before each release.
+name: ci
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The e2e test (test/e2e.sh) drives a real tmux; jq is on the runner.
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-ed:"; echo "$unformatted"; exit 1
+          fi
+      - run: go vet ./...
+      - run: go test ./...
+      # Task containers run atl: it must stay a static binary.
+      - name: Static build
+        run: |
+          CGO_ENABLED=0 go build -buildmode=exe -o "$RUNNER_TEMP/atl" ./cmd/atl
+          if readelf -l "$RUNNER_TEMP/atl" | grep -q INTERP; then
+            echo "atl is dynamically linked"; exit 1
+          fi

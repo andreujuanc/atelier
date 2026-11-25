@@ -287,6 +287,16 @@ type Model struct {
 	// spinFrame is the busy spinner's frame; spinning: its tick is armed.
 	spinFrame int
 	spinning  bool
+
+	// updater finds and installs atl releases (nil: no checks, e.g. a
+	// local build). available is a newer release the top bar offers (U);
+	// updating: U's install runs; updated: the version installed, which
+	// the TUI restarts on (restartDue); restarting: it quit to do so.
+	updater    Updater
+	available  string
+	updating   bool
+	updated    string
+	restarting bool
 }
 
 // Forced reports whether the user forced the quit (second ctrl+c) while
@@ -331,7 +341,7 @@ func (m *Model) Init() tea.Cmd {
 	m.listing, m.recovering, m.dirtying = true, true, true
 	return tea.Batch(m.listCmd(), m.recoverCmd(), m.projectsCmd(), m.dirtyCmd(),
 		m.after(listEvery, listTickMsg{}), m.after(recoverEvery, recoverTickMsg{}),
-		tea.RequestBackgroundColor)
+		m.updateCheckCmd(), tea.RequestBackgroundColor)
 }
 
 // --- commands ---
@@ -666,6 +676,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.setStatus(m.quitText(n))
 	}
+	if m.restartDue() {
+		m.restarting = true
+		return m, tea.Quit
+	}
 	// The busy spinner turns while an operation runs.
 	if !m.spinning && (m.opsRunning() > 0 || m.restart != nil) {
 		m.spinning = true
@@ -764,6 +778,14 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			return m.detailCmd(t.Task.ID, t.Task.Slug)
 		}
 		return nil
+
+	case updateTickMsg:
+		// Not rescheduled here: the check's updateCheckMsg arms the next.
+		return m.updateCheckCmd()
+	case updateCheckMsg:
+		return m.updateChecked(msg)
+	case updateDoneMsg:
+		return m.updateDone(msg)
 
 	case listMsg:
 		return m.listed(msg)
@@ -1453,6 +1475,12 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		return nil
 	case "A":
 		return m.assistant()
+	case "U":
+		if m.quitRequested {
+			m.setStatus(m.quitText(m.opsRunning()))
+			return nil
+		}
+		return m.startUpdate()
 	}
 
 	t := m.selected()
@@ -1622,6 +1650,9 @@ func (m *Model) busyOps() []string {
 	if m.assisting {
 		ops = append(ops, "assistant")
 	}
+	if m.updating {
+		ops = append(ops, "update atl")
+	}
 	sort.Strings(ops)
 	return ops
 }
@@ -1633,6 +1664,9 @@ func (m *Model) opsRunning() int {
 		n++
 	}
 	if m.assisting {
+		n++
+	}
+	if m.updating {
 		n++
 	}
 	return n
