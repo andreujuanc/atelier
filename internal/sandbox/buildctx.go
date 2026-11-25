@@ -47,18 +47,26 @@ func refuseBuild(format string, args ...any) error {
 	return &buildRefusal{fmt.Sprintf(format, args...)}
 }
 
+// contextDockerfile is the Dockerfile the daemon builds from: its path in
+// the build context and its content.
+type contextDockerfile struct {
+	path    string
+	content []byte
+}
+
 // checkBuildContext reads the build context, r's body, into spool (which it
 // leaves at its end) and checks the Dockerfile the daemon would build from:
 // the dockerfile parameter ("Dockerfile" if none, then "dockerfile" if that
-// is missing), a path in the context.
-func checkBuildContext(r *http.Request, spool io.Writer) error {
+// is missing), a path in the context. It returns that Dockerfile, nil if
+// there is none (the daemon fails the build).
+func checkBuildContext(r *http.Request, spool io.Writer) (*contextDockerfile, error) {
 	name := r.URL.Query().Get("dockerfile")
 	if name == "" {
 		name = "Dockerfile"
 	}
 	want, ok := contextPath(name)
 	if !ok {
-		return refuseBuild("the Dockerfile %q is outside the build context", name)
+		return nil, refuseBuild("the Dockerfile %q is outside the build context", name)
 	}
 	wants := []string{want}
 	if name == "Dockerfile" {
@@ -67,17 +75,17 @@ func checkBuildContext(r *http.Request, spool io.Writer) error {
 	body := io.TeeReader(r.Body, spool)
 	files, err := readContext(body, wants)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := io.Copy(io.Discard, body); err != nil { // the rest goes to the daemon too
-		return err
+		return nil, err
 	}
 	for _, w := range wants {
 		if df, ok := files[w]; ok {
-			return checkDockerfile(df)
+			return &contextDockerfile{w, df}, checkDockerfile(df)
 		}
 	}
-	return nil // no Dockerfile: the daemon fails the build
+	return nil, nil
 }
 
 // contextPath is where in the context dockerd looks for name (joined to the
@@ -98,25 +106,9 @@ func contextPath(name string) (string, bool) {
 // directory at a directory on the way, and any entry under a symlink
 // (unpacked, it would go where the link points).
 func readContext(body io.Reader, wants []string) (map[string][]byte, error) {
-	br := bufio.NewReader(body)
-	head, err := br.Peek(10)
-	if err != nil && !errors.Is(err, io.EOF) {
+	rd, err := openContext(body)
+	if err != nil {
 		return nil, err
-	}
-	var rd io.Reader = br
-	switch {
-	case bytes.HasPrefix(head, []byte{0x42, 0x5A, 0x68}):
-		rd = bzip2.NewReader(br)
-	case bytes.HasPrefix(head, []byte{0x1F, 0x8B, 0x08}):
-		zr, err := gzip.NewReader(br)
-		if err != nil {
-			return nil, err
-		}
-		rd = zr
-	case bytes.HasPrefix(head, []byte{0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00}),
-		bytes.HasPrefix(head, []byte{0x28, 0xb5, 0x2f, 0xfd}),
-		len(head) >= 4 && binary.LittleEndian.Uint32(head)&0xFFFFFFF0 == 0x184D2A50:
-		return nil, refuseBuild("a build context compressed with xz or zstd is not accepted: send it uncompressed or with gzip")
 	}
 	files := map[string][]byte{}
 	links := map[string]bool{} // entries that are symlinks
@@ -170,6 +162,27 @@ func readContext(body io.Reader, wants []string) (map[string][]byte, error) {
 			}
 		}
 	}
+}
+
+// openContext is the tar stream of a build context, uncompressed as
+// dockerd detects it.
+func openContext(body io.Reader) (io.Reader, error) {
+	br := bufio.NewReader(body)
+	head, err := br.Peek(10)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	switch {
+	case bytes.HasPrefix(head, []byte{0x42, 0x5A, 0x68}):
+		return bzip2.NewReader(br), nil
+	case bytes.HasPrefix(head, []byte{0x1F, 0x8B, 0x08}):
+		return gzip.NewReader(br)
+	case bytes.HasPrefix(head, []byte{0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00}),
+		bytes.HasPrefix(head, []byte{0x28, 0xb5, 0x2f, 0xfd}),
+		len(head) >= 4 && binary.LittleEndian.Uint32(head)&0xFFFFFFF0 == 0x184D2A50:
+		return nil, refuseBuild("a build context compressed with xz or zstd is not accepted: send it uncompressed or with gzip")
+	}
+	return br, nil
 }
 
 var (

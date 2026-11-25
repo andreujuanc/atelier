@@ -116,6 +116,8 @@ The session's start context tells Claude all of this.
 | a pull or build may not name a tag atl's own containers run from (`atelier-task`, `atelier`, the workspace's and every project's image, in any spelling); a build may not name a tag whose image has no `atelier.task` label (yours, or pulled: build under another tag), nor pull (`--pull`, `--platform`: pull the base image first); builds get the task's label; pulling all tags, tag, import, load, commit refused | a task could swap what later tasks, the assistant and `atl token` run |
 | BuildKit refused (`DOCKER_BUILDKIT=0` is set) | the gate cannot inspect BuildKit sessions |
 | a build's Dockerfile may not have `ONBUILD`, nor `ADD` from a URL or with a variable in a source (use `COPY`, or download in a `RUN` step); it must be a regular file in the context, sent uncompressed or gzipped | the daemon fetches an `ADD` URL from the host's network (its loopback services, a cloud's metadata address) |
+| a build's base images (each `FROM` image, each `COPY --from` that is no earlier stage) must be here already (`docker pull` them first), from an allowed registry, without `ONBUILD` triggers; the daemon gets the Dockerfile naming each by its ID | the builder would pull a missing one from any registry; triggers run in the build, unchecked (an `ADD` URL in one is fetched from the host's network); a tag moved during the build changes nothing |
+| the gate reads `FROM` as the classic builder does: build args and the `ARG`s before the first `FROM`, as `$V`, `${V}`, `${V:-x}`, `${V-x}`, `${V:+x}`, `${V+x}` (any other form refused); `COPY --from` is not expanded; `FROM --platform` only empty (the builder then fails) or the daemon's own platform. Refused where it could read otherwise: a `FROM`/`COPY --from` on a line that continues another instruction or in a heredoc, past a heredoc it cannot delimit, an escape directive not on the first lines, an image name across lines | where the gate and the builder could differ on a stage name, the builder could pull |
 | the task's container is joined to every network the task creates; the task cannot stop, remove, or impersonate (`atl-<slug>-<hash>` names) it | services answer by compose service name |
 | form-encoded request bodies refused | Docker would read values the gate did not check |
 
@@ -142,8 +144,6 @@ the workspace, its run dir, the repos dir, the tasks dir, your Claude config dir
 config (`GIT_CONFIG_GLOBAL`, `~/.gitconfig`, `~/.config/git`), the Docker socket, the SSH
 agent socket, `/proc`, `/sys`, `/dev`. `atl doctor` lists each path and why it is refused.
 
-## atl inside the container
-
 ## Registries tasks may pull from
 
 The daemon pulls from the host's network, not the task's: a registry on the host's loopback,
@@ -163,6 +163,8 @@ domain, with its port if the image names one (`localhost:5000` for kind or k3d),
 case; `*.pkg.dev` covers every domain under `pkg.dev`. The gate reads the setting at each
 pull (the variable as it was when the gate started). Every task can then have the daemon
 reach what you list, and follow its auth realm and redirects: list only registries you trust.
+
+## atl inside the container
 
 Only hooks, the status line, `atl note`, `atl notes` (own task only), `atl push` and
 `atl fetch` work; they ask the gate, which runs them on the host for this task only. Every
@@ -252,14 +254,11 @@ refuses, `atl push`/`atl fetch`) and names the mounted host paths. `context` /
   allowlist is the only real limit ([assistant.md](assistant.md#permissions)).
 - Image names: rules are checked when the request arrives (a tag created while a build runs
   is overwritten); tasks can build over each other's tags (and an image built `FROM` a
-  task's carries its label); a build pulls a missing `FROM` image under its own name (it
-  matters only for a reserved name not built yet).
+  task's carries its label).
 - The assistant's container can read the token too; it has no repo, task dir or Docker.
 - A task can write (never read) your clipboard while your terminal is on its tmux session.
   Read what you paste into a shell.
 - No BuildKit.
-- A base image's `ONBUILD` instructions run in a build `FROM` it unchecked: one from a registry with
-  `ADD <url>` fetches from the host's network.
 - Tasks can bind any free host port; no network egress policy.
 - Project setup and teardown scripts run on the host.
 - No git credentials or `gh` in the task: use `atl push`/`atl fetch`; `atl pr` runs on the

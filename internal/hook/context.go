@@ -80,14 +80,14 @@ const sandboxNote = "Sandbox: you run in the task's own container. " +
 	"`docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`); installs are lost when this container " +
 	"is replaced: tell the user what the task keeps needing, for the project's image. " +
 	"Docker gate: bind mounts only from the task dir; no privileged or host modes; classic builder only " +
-	"(DOCKER_BUILDKIT=0 is set); you see only this task's containers, networks, volumes; " +
+	"(DOCKER_BUILDKIT=0); pull base images first (allowed registries only); " +
+	"you see only this task's containers, networks, volumes; " +
 	"services answer by compose service name. " +
 	"If a setup needs something refused (a host file mount, privileged, BuildKit-only syntax), don't edit " +
-	"the repo: override it with a file in the task dir (compose: an extra `-f` file) and tell the user " +
-	"what you overrode. " +
-	"What this session starts here ends with it (background dev servers too); what should outlive it " +
+	"the repo: override it with a file in the task dir (compose: an extra `-f` file); tell the user. " +
+	"What this session starts here ends with it (dev servers too); what should outlive it " +
 	"belongs in a Docker service. " +
-	"No git credentials here (`git push`, `gh` fail): push with `atl push`, fetch with `atl fetch`."
+	"No git credentials here (`git push`, `gh` fail): use `atl push`, `atl fetch`."
 
 // renderContext renders the SessionStart task context: plain markdown of
 // at most contextMaxLen bytes. envText (the raw ATL_CONTEXT value) is

@@ -44,6 +44,8 @@ type daemon struct {
 	// attached are the daemon's ends of attach streams, in the order they
 	// came: a quiet container, until the test writes to one or closes it.
 	attached []net.Conn
+	// onBuild are the ONBUILD triggers of images, by ID.
+	onBuild map[string][]string
 }
 
 type object struct {
@@ -115,7 +117,7 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p := versionPrefix.ReplaceAllString(r.URL.Path, ""); r.Method == "GET" && strings.HasPrefix(p, "/images/") && strings.HasSuffix(p, "/json") {
 		// An image inspect: by name as dockerd reads it.
 		if o := d.findImage(strings.TrimSuffix(strings.TrimPrefix(p, "/images/"), "/json")); o != nil {
-			json.NewEncoder(w).Encode(map[string]any{"Id": o.id, "Config": map[string]any{"Labels": o.labels}})
+			json.NewEncoder(w).Encode(map[string]any{"Id": o.id, "Config": map[string]any{"Labels": o.labels, "OnBuild": d.triggers(o.id)}})
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `{"message":"no such image"}`)
@@ -197,6 +199,8 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.mu.Unlock()
 		io.WriteString(conn, "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\n"+
 			"Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+	case r.Method == "GET" && len(parts) == 1 && parts[0] == "version":
+		io.WriteString(w, `{"Os":"linux","Arch":"amd64"}`)
 	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/create"):
 		w.WriteHeader(http.StatusCreated)
 		io.WriteString(w, `{"Id":"new1"}`)

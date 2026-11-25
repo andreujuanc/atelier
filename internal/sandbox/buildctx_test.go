@@ -132,10 +132,9 @@ func TestGateBuildRefusesHostFetches(t *testing.T) {
 		}
 	}
 
-	forwarded := []struct{ name, uri, body string }{
-		{"empty context", "/build", ""},
-		{"no Dockerfile", "/build", contextTar(t, tarEntry{name: "a.txt", body: "x"})},
-		{"plain", "/build", df(`# syntax=docker/dockerfile:1
+	// The plain Dockerfile's base image is here: the daemon gets it pinned.
+	c.d.addImage("node:20", nodeID)
+	plain := `# syntax=docker/dockerfile:1
 # escape=\
 ARG BASE=node:20
 FROM ${BASE} AS build
@@ -158,7 +157,11 @@ FROM scratch
 COPY --from=build /app /app
 LABEL url="http://example.com"
 CMD ["node", "http://not-fetched"]
-`)},
+`
+	forwarded := []struct{ name, uri, body string }{
+		{"empty context", "/build", ""},
+		{"no Dockerfile", "/build", contextTar(t, tarEntry{name: "a.txt", body: "x"})},
+		{"plain", "/build", df(plain)},
 		{"lowercase", "/build", contextTar(t, tarEntry{name: "dockerfile", body: "FROM scratch\nADD a /a\n"})},
 		{"named", "/build?dockerfile=" + url.QueryEscape(".dockerfile.1234"), contextTar(t,
 			tarEntry{name: "Dockerfile", body: "FROM scratch\nADD http://127.0.0.1/x /x\n"}, // not the one built
@@ -172,6 +175,13 @@ CMD ["node", "http://not-fetched"]
 	for _, tc := range forwarded {
 		if status, out := c.do("POST", tc.uri, tc.body); status >= 400 {
 			t.Errorf("%s: status %d (%s), want it forwarded", tc.name, status, out)
+			continue
+		}
+		if tc.name == "plain" {
+			want := strings.Replace(plain, "FROM ${BASE} AS", "FROM "+nodeID+" AS", 1)
+			if got := sentDockerfile(t, c, "Dockerfile"); got != want {
+				t.Errorf("plain: the daemon got\n%s", got)
+			}
 			continue
 		}
 		if got := c.d.body("POST /build"); got != tc.body {

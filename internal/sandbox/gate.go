@@ -779,8 +779,9 @@ func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 }
 
 // forwardBuild forwards a build once its context, which it reads into a
-// file of its own, passes checkBuildContext: the daemon gets those very
-// bytes.
+// file of its own, passes checkBuildContext and its base images pass
+// pinBaseImages: the daemon gets those very bytes, or the context with the
+// Dockerfile naming its base images by ID.
 func (g *Gate) forwardBuild(w http.ResponseWriter, r *http.Request) {
 	spool, err := os.CreateTemp("", "atl-build-context-")
 	if err != nil {
@@ -789,7 +790,15 @@ func (g *Gate) forwardBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	os.Remove(spool.Name()) // the open file is all that is needed
 	defer spool.Close()
-	if err := checkBuildContext(r, spool); err != nil {
+	df, err := checkBuildContext(r, spool)
+	if err == nil {
+		var pinned *os.File
+		if pinned, err = g.pinBaseImages(r, spool, df); pinned != nil {
+			defer pinned.Close()
+			spool = pinned
+		}
+	}
+	if err != nil {
 		status := http.StatusBadRequest
 		var refusal *buildRefusal
 		if errors.As(err, &refusal) {
