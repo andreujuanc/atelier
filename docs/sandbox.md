@@ -48,10 +48,10 @@ config dir, atelier's database, state dir (logs) or config dir (projects).
 
 ## Lifecycle
 
-- Created on the task's first session; reused by later ones (installed tools persist);
-  restarted after a reboot; removed by `atl done`/`atl cancel`.
-- Replaced when the task's repos, image or mounts change, at the next session start while no
-  other session runs in it. A running container cannot get a new mount, so adding a repo
+- Created on the task's first session, or for the project's setup; reused by later ones
+  (installed tools persist); restarted after a reboot; removed by `atl done`/`atl cancel`.
+- Replaced when the task's repos, image, mounts or environment change, at the next session
+  start (or project script) while no other session runs in it. A running container cannot get a new mount, so adding a repo
   (`atl add`, TUI `a`) to a task with live sessions restarts them: their windows close, the
   container is removed and the same conversations are resumed (`claude --resume`) in a new
   one that has the repo. While things run in the task (Claude mid-turn, background work an
@@ -72,6 +72,21 @@ config dir, atelier's database, state dir (logs) or config dir (projects).
 - atl only touches a container named like the task's if it carries atl's `atelier.agent`
   label and no `atelier.task` label. Anything else under that name makes the session start
   fail; remove or rename it yourself.
+
+## Project setup and teardown
+
+A project's `setup` and `teardown` run in the task's container (`docker exec`), as your user,
+in each rw worktree, with the project's `[env]` and the `ATL_*` variables, not atl's
+environment; `docker` in them goes through the gate. atl starts the container first if
+needed: for `setup` when the task is created or reopened or a repo is added (a container that
+cannot start is a warning, as a failed setup is), for `teardown` on `atl done`/`atl cancel`
+(one that cannot start fails the close; `--force` closes without the teardown). What a script
+leaves running ends when it exits, or when it is interrupted.
+
+At close atl removes the task's containers, networks and volumes: a teardown needs no
+`docker compose down -v`. Scripts that need host tools or credentials (a CLI only the host
+has, your SSH agent, git credentials) do not work with the sandbox on. With `ATL_SANDBOX=off`
+they run on the host, with atl's environment.
 
 ## Image and tools
 
@@ -119,7 +134,14 @@ The session's start context tells Claude all of this.
 | a build's base images (each `FROM` image, each `COPY --from` that is no earlier stage) must be here already (`docker pull` them first), from an allowed registry, without `ONBUILD` triggers; the daemon gets the Dockerfile naming each by its ID | the builder would pull a missing one from any registry; triggers run in the build, unchecked (an `ADD` URL in one is fetched from the host's network); a tag moved during the build changes nothing |
 | the gate reads `FROM` as the classic builder does: build args and the `ARG`s before the first `FROM`, as `$V`, `${V}`, `${V:-x}`, `${V-x}`, `${V:+x}`, `${V+x}` (any other form refused); `COPY --from` is not expanded; `FROM --platform` only empty (the builder then fails) or the daemon's own platform. Refused where it could read otherwise: a `FROM`/`COPY --from` on a line that continues another instruction or in a heredoc, past a heredoc it cannot delimit, an escape directive not on the first lines, an image name across lines | where the gate and the builder could differ on a stage name, the builder could pull |
 | the task's container is joined to every network the task creates; the task cannot stop, remove, or impersonate (`atl-<slug>-<hash>` names) it | services answer by compose service name |
+| new network and volume names (also a volume a mount names, if it does not exist yet) must be the task's namespace `atl_<6 hex>` or start with it and `_` or `-` (a network may also be a lower-case UUID, as testcontainers names them); so must a `com.docker.compose.project` label; a container name that starts with any `atl_<6 hex>` must be in the task's; a container without that label gets it empty | tasks' compose names do not collide; a task cannot squat another's names, nor plant a network or volume that a compose project on the host would adopt; an image's labels cannot put a container in a host project |
 | form-encoded request bodies refused | Docker would read values the gate did not check |
+
+The namespace is `atl_` and the hash in the task's container name. atl sets `COMPOSE_PROJECT_NAME` to
+it in the container and in sessions, over a project's `[env]` value (with a warning), so compose names
+everything in it (`atl_4a2f21-db-1`, `atl_4a2f21_default`). A second compose project in one task (two
+repos) needs `-p $COMPOSE_PROJECT_NAME-<repo>`. Volumes the task made before keep their names. A
+refusal names what to use instead.
 
 ## Host files for every task
 
@@ -260,7 +282,9 @@ refuses, `atl push`/`atl fetch`) and names the mounted host paths. `context` /
   Read what you paste into a shell.
 - No BuildKit.
 - Tasks can bind any free host port; no network egress policy.
-- Project setup and teardown scripts run on the host.
+- Container names outside the `atl_<6 hex>` pattern are free: a task can take the name a compose project
+  on the host would give a container (`shop-db-1`), so that project's `up` fails. Denial of service
+  only: compose finds its containers by label, not name.
 - No git credentials or `gh` in the task: use `atl push`/`atl fetch`; `atl pr` runs on the
   host.
 

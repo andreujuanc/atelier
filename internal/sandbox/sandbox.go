@@ -126,6 +126,40 @@ func ReservedName(name string) bool {
 	return reservedName.MatchString(strings.TrimLeft(name, "/"))
 }
 
+// ComposeProject is the Docker name namespace of sandbox id: atl sets it as
+// the task container's $COMPOSE_PROJECT_NAME, and the task's gate allows
+// new network and volume names, compose project labels and container
+// names in the pattern of any task's namespace (Namespaced) only in it
+// (see InNamespace). It is atl_ and the 6 hex digits of the ID (the hash
+// of the task dir); an ID not made by ID gets a hash of its own. Every
+// namespace has the same length, so none is a prefix of another's; and
+// its underscore keeps it apart from ContainerName's atl-.
+func ComposeProject(id string) string {
+	hash := id[strings.LastIndexByte(id, '-')+1:]
+	if !composeHash.MatchString(hash) {
+		hash = shortHash(id, 6)
+	}
+	return "atl_" + hash
+}
+
+var composeHash = regexp.MustCompile(`^[0-9a-f]{6}$`)
+
+// namespaced matches every name in the pattern of a ComposeProject
+// namespace, in any case and with any leading slash.
+var namespaced = regexp.MustCompile(`(?i)^/*atl_[0-9a-f]{6}($|[-_])`)
+
+// InNamespace reports whether name, a network, volume or compose project
+// name, is in namespace ns (a ComposeProject): ns itself, or ns followed
+// by - or _ and more. It compares exactly, as dockerd and compose do (the
+// case counts: compose project names are lower case).
+func InNamespace(ns, name string) bool {
+	return name == ns || strings.HasPrefix(name, ns+"-") || strings.HasPrefix(name, ns+"_")
+}
+
+// Namespaced reports whether name is in the pattern of any task's
+// namespace (see ComposeProject), in any case and with any leading slash.
+func Namespaced(name string) bool { return namespaced.MatchString(name) }
+
 // Mount is a bind mount of a host path into the task container.
 type Mount struct {
 	Src, Dst string
@@ -267,7 +301,9 @@ func WindowArgv(attach bool, exec []string) []string {
 // have). atl reads nothing of what it prints (the container is the task's).
 //
 // Arguments: mode (kill or end), session, and for tests the parent PID of
-// a root (default 0) and how long end waits (default 120 seconds).
+// a root (default 0) and how long end waits (default 120 seconds); then the
+// variable that marks the processes (default ATL_SESSION; ScriptVar for a
+// project script's, see KillScriptArgs).
 //
 // kill ends them all. end is for a session whose Claude is ending: the
 // session's roots, the processes docker exec started for it (their parent
@@ -277,7 +313,7 @@ func WindowArgv(attach bool, exec []string) []string {
 // anew). A root that is still there after the wait means the session goes
 // on (a SessionEnd for /clear, or a nested claude): nothing is touched.
 // Processes of other sessions never carry this session's ATL_SESSION.
-const sessionScript = `mode=$1 s="ATL_SESSION=$2" rootppid=${3:-0} wait=${4:-120}
+const sessionScript = `mode=$1 s="${5:-ATL_SESSION}=$2" rootppid=${3:-0} wait=${4:-120}
 # scan: the session's processes but this script, one per line, roots as r<pid>
 scan() {
 	for d in /proc/[0-9]*; do
@@ -333,6 +369,86 @@ func EndSessionCmd(session int64) []string { return sessionCmd("end", session) }
 
 func sessionCmd(mode string, session int64) []string {
 	return []string{"sh", "-c", sessionScript, "atl-" + mode + "-session", mode, strconv.FormatInt(session, 10)}
+}
+
+// ScriptVar marks the processes of one run of a project's setup or
+// teardown script in a task container (ScriptArgs), with a value of its
+// own per run, for KillScriptArgs to find them.
+const ScriptVar = "ATL_SCRIPT"
+
+// scriptKiller is $0 of the script that ends a script run's processes
+// (sessionScript, mode kill). ParseActivity does not leave it out as it
+// does the session clean-ups: scriptWrapper has the name in its text, and a
+// script that runs is activity.
+const scriptKiller = "atl-kill-script"
+
+// scriptWrapper runs, in a task container, a project script ($3) with sh
+// -c, its processes marked with ScriptVar=$2 and the run dir's atl first on
+// PATH (as in a session, see ExecArgv), and exits with its status. When the
+// script's shell exits, what it left running ends (sessionScript, $1, mode
+// kill); the wrapper and its copier are not marked, so that leaves them
+// alone.
+//
+// docker exec returns only once nothing in the container holds its output
+// open, and a process the script started without the mark (env -u) would
+// hold it, and atl, for as long as it runs. So the script writes to a FIFO
+// of the wrapper's, which cat copies to docker exec's output; once the
+// script's shell has exited, cat gets 5 seconds to copy what is left (it
+// ends at once when no writer is left), then it is killed, and the wrapper
+// exits: then nothing holds docker exec's output. Without a FIFO (no
+// mktemp or mkfifo, or no writable /tmp in the image) the script writes
+// to docker exec's output itself.
+const scriptWrapper = `k=$1 run=$2
+d=$(mktemp -d 2> /dev/null) && mkfifo "$d/out" 2> /dev/null || { [ -z "$d" ] || rmdir "$d"; d=; }
+if [ -n "$d" ]; then
+	cat "$d/out" &
+	c=$!
+	PATH=` + RunMount + `/bin:$PATH ` + ScriptVar + `=$run sh -c "$3" > "$d/out" 2>&1
+else
+	PATH=` + RunMount + `/bin:$PATH ` + ScriptVar + `=$run sh -c "$3"
+fi
+st=$?
+sh -c "$k" ` + scriptKiller + ` kill "$run" 0 0 ` + ScriptVar + ` > /dev/null 2>&1
+if [ -n "$d" ]; then
+	i=0
+	while [ $i -lt 50 ] && kill -0 $c 2> /dev/null; do
+		sleep 0.1 2> /dev/null || { sleep 1; i=$((i + 9)); }
+		i=$((i + 1))
+	done
+	kill $c 2> /dev/null
+	rm -rf "$d"
+fi
+exit $st`
+
+// ScriptArgs are the docker arguments that run a project's setup or
+// teardown script in the task container (by the full ID Ensure returned) as
+// user ("uid:gid"), in workdir, with env as its only variables besides the
+// container's own (whose DOCKER_HOST is the task's gate): nothing of the
+// docker client's environment goes in. run marks the script's processes
+// (ScriptVar) for KillScriptArgs; what the script leaves running ends when
+// it exits (scriptWrapper). No terminal, no stdin.
+func ScriptArgs(container, user, workdir string, env map[string]string, run, script string) []string {
+	args := []string{"exec", "-u", user, "-w", workdir}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		if k != ScriptVar {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		args = append(args, "-e", k+"="+env[k])
+	}
+	return append(args, container, "sh", "-c", scriptWrapper, "atl-script", sessionScript, run, script)
+}
+
+// KillScriptArgs are the docker arguments that end, in the task container,
+// every process of the script run run (ScriptArgs): TERM, then KILL after
+// 5 seconds (sessionScript, mode kill). A docker exec client that is
+// killed leaves what it started running in the container: this is what
+// stops an interrupted script.
+func KillScriptArgs(container, run string) []string {
+	return []string{"exec", container, "sh", "-c", sessionScript, scriptKiller, "kill", run, "0", "0", ScriptVar}
 }
 
 // Runner runs the docker CLI with args and returns its trimmed stdout; a

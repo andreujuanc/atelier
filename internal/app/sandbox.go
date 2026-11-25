@@ -2,8 +2,11 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -15,6 +18,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/project"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
@@ -78,7 +82,7 @@ func (a *App) sandboxSpecFor(ctx context.Context, t *model.Task, image string) (
 	spec := sandbox.Spec{
 		ID:      id,
 		Image:   image,
-		User:    fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		User:    sandboxUser(),
 		Workdir: dir,
 		Env: map[string]string{
 			"HOME":            home,
@@ -86,6 +90,9 @@ func (a *App) sandboxSpecFor(ctx context.Context, t *model.Task, image string) (
 			"DOCKER_BUILDKIT": "0", // the gate does not carry BuildKit sessions
 			sandbox.InEnv:     id,
 			"ATL_CONTAINER":   sandbox.ContainerName(id),
+			// The names the gate allows (see composeEnv); also for what
+			// runs in the container without a session's env (docker exec).
+			composeVar: sandbox.ComposeProject(id),
 		},
 	}
 	for _, k := range []string{"LANG", "LC_ALL", "TZ"} {
@@ -148,6 +155,32 @@ func (a *App) sandboxSpecFor(ctx context.Context, t *model.Task, image string) (
 		same(m, true)
 	}
 	return spec, nil
+}
+
+// sandboxUser is the user ("uid:gid") a task container runs as, and what
+// atl runs in it: the user running atl.
+func sandboxUser() string { return fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()) }
+
+// composeVar names compose's variable for the project name, which wins over
+// a compose file's `name:`, a .env file and the directory's name.
+const composeVar = "COMPOSE_PROJECT_NAME"
+
+// composeEnv sets composeVar in env, the environment of something that runs
+// in t's container, to the task's Docker namespace
+// (sandbox.ComposeProject), over the project's own value: the task's gate
+// allows new network and volume names only in it, and two tasks of a
+// project (or of a repo, whose directory name compose would take) would
+// otherwise collide on every name. A project that sets the variable gets
+// one warning per atl process.
+func (a *App) composeEnv(t *model.Task, env map[string]string) {
+	ns := sandbox.ComposeProject(a.sandboxID(t))
+	if v, ok := env[composeVar]; ok && v != ns {
+		if _, warned := a.composeWarned.LoadOrStore(t.Project, true); !warned {
+			a.warnf("project %s sets %s=%s; sandboxed tasks use their own (%s for task %s): the Docker gate allows names only in it",
+				t.Project, composeVar, v, ns, t.Slug)
+		}
+	}
+	env[composeVar] = ns
 }
 
 // taskImage returns the image of the task's container and where its name
@@ -247,6 +280,24 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) 
 	if err := a.checkSandboxNeeds(ctx); err != nil {
 		return "", err
 	}
+	return a.ensureContainer(ctx, t)
+}
+
+// ensureScriptSandbox is ensureSandbox for a project script (see
+// runScript), which needs no Claude Code token: only a Docker daemon and an
+// atl binary that runs in the container.
+func (a *App) ensureScriptSandbox(ctx context.Context, t *model.Task) (string, error) {
+	if _, err := a.checkDocker(ctx); err != nil {
+		return "", err
+	}
+	if err := a.checkAtlBin(a.AtlBin); err != nil {
+		return "", err
+	}
+	return a.ensureContainer(ctx, t)
+}
+
+// ensureContainer is ensureSandbox once its needs are checked.
+func (a *App) ensureContainer(ctx context.Context, t *model.Task) (string, error) {
 	runDir := a.Paths.RunDir(t.Slug)
 	if err := sandbox.MakeRunDir(runDir); err != nil {
 		return "", err
@@ -299,7 +350,7 @@ func (a *App) ensureSandbox(ctx context.Context, t *model.Task) (string, error) 
 		return "", fmt.Errorf("task container (image %s): %w", spec.Image, err)
 	}
 	if stale {
-		a.warnf("task %s: its container predates a change (repos, image, atl paths or $%s); it is replaced once the task has no running sessions",
+		a.warnf("task %s: its container predates a change (repos, image, atl paths or environment, or $%s); it is replaced once the task has no running sessions",
 			t.Slug, sandbox.MountsVar)
 	}
 	return container, nil
@@ -360,6 +411,55 @@ func (a *App) killSessionProcs(ctx context.Context, t *model.Task, id int64) {
 	if err != nil && !noContainer(err) {
 		a.warnf("task %s: end what session %d left running in its container: %v", t.Slug, id, err)
 	}
+}
+
+// scriptContainer returns the full ID of the task container the project's
+// setup and teardown scripts run in (ensureScriptSandbox: started, or
+// created, if it is not running, or was made from another spec), or "" when
+// the sandbox is off: they then run here. The task controls the worktree
+// they run in (a compose file, a Makefile, npm's lifecycle scripts): on the
+// host they would run its code outside the sandbox, with the Docker socket.
+func (a *App) scriptContainer(ctx context.Context, t *model.Task) (string, error) {
+	if a.Sandbox == nil {
+		return "", nil
+	}
+	c, err := a.ensureScriptSandbox(ctx, t)
+	if err != nil {
+		return "", fmt.Errorf("cannot start the task's container to run it in: %w", err)
+	}
+	return c, nil
+}
+
+// runInContainer runs script in the task's container (by its full ID) with
+// docker exec (sandbox.ScriptArgs): as the user sessions run as, in dir,
+// with vars over the container's own environment and nothing of atl's. Its
+// output and exit status are the script's, as with project.RunScript. On
+// a cancelled ctx the script's processes in the container end first
+// (sandbox.KillScriptArgs), then the docker client: dockerd keeps running
+// what a dead client started.
+func (a *App) runInContainer(ctx context.Context, t *model.Task, container, dir string, vars map[string]string, script string, out io.Writer) error {
+	if strings.TrimSpace(script) == "" {
+		return nil
+	}
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return err
+	}
+	run := hex.EncodeToString(b)
+	var killErr error // set in kill; read after project.Run, which waits for it
+	kill := func() {
+		kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if _, err := a.docker()(kctx, sandbox.KillScriptArgs(container, run)...); err != nil && !noContainer(err) {
+			killErr = err
+		}
+	}
+	argv := append([]string{"docker"}, sandbox.ScriptArgs(container, sandboxUser(), dir, vars, run, script)...)
+	err := project.Run(ctx, argv, "", nil, out, kill)
+	if killErr != nil {
+		a.warnf("task %s: end the interrupted script in its container: %v", t.Slug, killErr)
+	}
+	return err
 }
 
 // noContainer reports whether a docker exec failed because the container is

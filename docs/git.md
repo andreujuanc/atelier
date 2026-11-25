@@ -98,7 +98,13 @@ file in the clone's `.git`. `atl show` reads HEAD and its branch without followi
 
 Push and fetch run git in a git dir of atl's own (a copy of the repo's refs, its objects, your config
 as it applies to the repo) and then copy the refs that changed into the repo without following a
-symlink: no `FETCH_HEAD` or reflog is written in the repo.
+symlink: no `FETCH_HEAD` or reflog is written in the repo. Each ref (and `.git/shallow`) is
+compared and swapped under git's lock files, as git updates one: it changes only if it still has
+the value it had when the push or fetch started. One that another push or fetch of the same clone
+changed meanwhile is left as it is: a fetch then runs once more from the refs as they are, and
+only if that one also finds a ref changed meanwhile does it fail naming it (the other refs are
+updated; run `atl fetch` again); `atl push`, whose push is done, prints a warning. A pruned ref
+also leaves `packed-refs`, so an older packed value does not come back.
 
 Worktree checks: before running git or a project script in a worktree, atl checks that it is
 a real directory (not a symlink) and a worktree of that repo's canonical clone. If not, the

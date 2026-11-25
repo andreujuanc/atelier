@@ -295,6 +295,7 @@ type fakeDocker struct {
 	ps      string          // what the activity probe prints (sandbox.ActivityArgs)
 	onRm    func()          // called on docker rm
 	onPs    func()          // called on docker ps
+	onExec  func([]string)  // called on docker exec, with its arguments
 }
 
 // fakeContainerID is the full ID of fakeDocker's container.
@@ -354,6 +355,9 @@ func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 			f.onRm()
 		}
 	case "exec":
+		if f.onExec != nil {
+			f.onExec(args)
+		}
 		if args[len(args)-1] == "atl-activity" {
 			return f.ps, nil
 		}
@@ -1389,6 +1393,66 @@ func TestSandboxProjectPath(t *testing.T) {
 	}
 	if strings.HasPrefix(cmd, "env ") {
 		t.Errorf("window command runs with the project's PATH: %s", cmd)
+	}
+}
+
+// TestSandboxComposeProject: a sandboxed task's container and sessions get
+// COMPOSE_PROJECT_NAME set to the task's Docker namespace, over the
+// project's own value, which atl warns about once; with the sandbox off,
+// the project's value stands, and nothing is said.
+func TestSandboxComposeProject(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	pf := e.app.Paths.ProjectFile("shop")
+	if err := os.MkdirAll(filepath.Dir(pf), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pf, []byte("[env]\nCOMPOSE_PROJECT_NAME = \"shop\"\nFOO = \"bar\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := &model.Task{Slug: "boxed", Title: "boxed", Status: model.StatusActive, Branch: "atl/boxed", Project: "shop"}
+	if err := e.app.Store.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(e.app.Paths.TaskDir("boxed"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ns := sandbox.ComposeProject(sandbox.ID("boxed", e.app.Paths.TaskDir("boxed")))
+	var ids []int64
+	for range 2 {
+		s, err := e.app.NewSession(ctx, "boxed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.argv(t, s.ID) // the stub claude ran
+		ids = append(ids, s.ID)
+	}
+	if runs := fd.find("run"); len(runs) != 1 || !slices.Contains(runs[0], "COMPOSE_PROJECT_NAME="+ns) {
+		t.Errorf("docker run = %q, want --env COMPOSE_PROJECT_NAME=%s", runs, ns)
+	}
+	for _, id := range ids {
+		if env := "\n" + readFile(t, filepath.Join(e.out, "env-"+strconv.FormatInt(id, 10))); !strings.Contains(env, "\nCOMPOSE_PROJECT_NAME="+ns+"\n") ||
+			!strings.Contains(env, "\nFOO=bar\n") {
+			t.Errorf("session %d: claude's env:\n%s", id, env)
+		}
+	}
+	out := e.app.Out.(*bytes.Buffer).String()
+	if n := strings.Count(out, "warning: project shop sets COMPOSE_PROJECT_NAME=shop; sandboxed tasks use their own ("+ns+" for task boxed)"); n != 1 {
+		t.Errorf("%d warnings, want 1:\n%s", n, out)
+	}
+
+	// Sandbox off: the project's.
+	e.app.Sandbox = nil
+	e.app.Out.(*bytes.Buffer).Reset()
+	if env := e.app.launchEnv(task, &model.Session{ID: 9}); env["COMPOSE_PROJECT_NAME"] != "shop" {
+		t.Errorf("without the sandbox: COMPOSE_PROJECT_NAME=%q, want the project's", env["COMPOSE_PROJECT_NAME"])
+	}
+	task.Project = ""
+	if env := e.app.launchEnv(task, &model.Session{ID: 9}); env["COMPOSE_PROJECT_NAME"] != "" {
+		t.Errorf("without the sandbox or a project: COMPOSE_PROJECT_NAME=%q", env["COMPOSE_PROJECT_NAME"])
+	}
+	if out := e.app.Out.(*bytes.Buffer).String(); out != "" {
+		t.Errorf("output without the sandbox: %q", out)
 	}
 }
 

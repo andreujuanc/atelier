@@ -74,19 +74,19 @@ func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID
 // package sandbox) what that changes: a repo with its own container setup
 // is built and tested in it, through the gate (whose refusals it lists).
 const sandboxNote = "Sandbox: you run in the task's own container. " +
-	"Build, test and run a repo in its own container setup, if any (`.devcontainer`, compose, " +
-	"or per its docs/CLAUDE.md), via `docker`/`docker compose`. " +
-	"If none, work here, installing what is missing (system packages: " +
-	"`docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`); installs are lost when this container " +
-	"is replaced: tell the user what the task keeps needing, for the project's image. " +
-	"Docker gate: bind mounts only from the task dir; no privileged or host modes; classic builder only " +
-	"(DOCKER_BUILDKIT=0); pull base images first (allowed registries only); " +
-	"you see only this task's containers, networks, volumes; " +
-	"services answer by compose service name. " +
-	"If a setup needs something refused (a host file mount, privileged, BuildKit-only syntax), don't edit " +
-	"the repo: override it with a file in the task dir (compose: an extra `-f` file); tell the user. " +
-	"What this session starts here ends with it (dev servers too); what should outlive it " +
-	"belongs in a Docker service. " +
+	"Build, test, run a repo in its own container setup, if any (`.devcontainer`, compose, " +
+	"or per its docs/CLAUDE.md). " +
+	"Else work here, installing what's missing (system packages: " +
+	"`docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`); installs are lost with this container: " +
+	"tell the user what the image lacks. " +
+	"Docker gate: bind mounts only from the task dir; network/volume names start with $COMPOSE_PROJECT_NAME " +
+	"(set per task; a 2nd compose project: `-p $COMPOSE_PROJECT_NAME-<repo>`); no privileged or host modes; " +
+	"classic builder only (DOCKER_BUILDKIT=0); pull build bases first (allowed registries); " +
+	"you see only this task's containers, networks, volumes; services answer by service name. " +
+	"If a setup needs something refused (host file mount, privileged, BuildKit), don't edit " +
+	"the repo: override it in a task-dir file (compose: an extra `-f`) and tell the user. " +
+	"What this session starts ends with it (dev servers too); what should outlive it " +
+	"goes in a Docker service. " +
 	"No git credentials here (`git push`, `gh` fail): use `atl push`, `atl fetch`."
 
 // renderContext renders the SessionStart task context: plain markdown of

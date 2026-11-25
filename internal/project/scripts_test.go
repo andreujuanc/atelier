@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +93,29 @@ func TestEnvFor(t *testing.T) {
 	pr.Env["ATL_SESSION"] = "7"
 	if _, ok := envMap(t, pr.EnvFor(se))["ATL_SESSION"]; ok {
 		t.Fatal("project ATL_SESSION must be dropped")
+	}
+}
+
+// TestScriptVars: what a script in the task container gets from atl is the
+// project's env and the ATL_* variables only: nothing of atl's own
+// environment, and no ATL_SESSION.
+func TestScriptVars(t *testing.T) {
+	t.Setenv("ATL_TEST_INHERITED", "inherited")
+	t.Setenv("ATL_SESSION", "42")
+	pr := &Project{Env: map[string]string{"FOO": "bar", "ATL_REPO": "project-repo", "ATL_SESSION": "7"}}
+	se := ScriptEnv{
+		Task:    model.Task{Slug: "fix-it", Branch: "atl/fix-it", PortOffset: 200},
+		TaskDir: "/tasks/fix-it", Repo: "api", Worktree: "/tasks/fix-it/api",
+	}
+	want := map[string]string{"FOO": "bar", "ATL_TASK": "fix-it", "ATL_TASK_DIR": "/tasks/fix-it", "ATL_REPO": "api",
+		"ATL_WORKTREE": "/tasks/fix-it/api", "ATL_BRANCH": "atl/fix-it", "ATL_PORT_OFFSET": "200"}
+	if got := pr.ScriptVars(se); !maps.Equal(got, want) {
+		t.Errorf("ScriptVars = %v, want %v", got, want)
+	}
+	var none *Project
+	delete(want, "FOO")
+	if got := none.ScriptVars(se); !maps.Equal(got, want) {
+		t.Errorf("nil project: ScriptVars = %v, want %v", got, want)
 	}
 }
 

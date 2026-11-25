@@ -79,7 +79,8 @@ closed tasks.
 
 ## Closing: done and cancel
 
-`atl done` / `atl cancel` (TUI `d` / `c`) run the project's teardown, remove each worktree,
+`atl done` / `atl cancel` (TUI `d` / `c`) run the project's teardown (in the task's
+container, see [sandbox.md](sandbox.md#project-setup-and-teardown)), remove each worktree,
 the task dir, the task's container and everything the task created on Docker (containers,
 networks, volumes), and kill its tmux session.
 
@@ -106,7 +107,7 @@ The task's Claude dir keeps its transcripts after closing; delete
 Setting a done or cancelled task back to `backlog`, `active` or `review` reopens it. First
 what is left of its sandbox is removed: its container and every container, network and volume
 the task created (volume data included), its gate, and its Claude dir except transcripts; its
-next session starts a new container. Then the task dir, `CLAUDE.md` and settings come back,
+project's setup or next session starts a new container. Then the task dir, `CLAUDE.md` and settings come back,
 each rw worktree is recreated on `atl/<slug>` (from the kept local branch, else
 `origin/atl/<slug>`, else a new branch from the base, with a warning), and the project's
 setup runs. The task gets its old port offset back. Nothing is resumed automatically. If a

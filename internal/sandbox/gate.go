@@ -225,12 +225,82 @@ func formBody(r *http.Request) bool {
 // checkName refuses a container name in the query (all of them, should it
 // be given twice) that is in the pattern of atl's own task containers
 // (ReservedName): another task's session would run in a container the task
-// made, and get its Claude token there.
-func checkName(r *http.Request) error {
+// made, and get its Claude token there. A name in the pattern of a task's
+// namespace (Namespaced) must be in this task's: compose names a project's
+// containers <project>-<service>-<n>, and another task's compose would
+// find its names taken. Other names are free.
+func (g *Gate) checkName(r *http.Request) error {
 	for _, name := range r.URL.Query()["name"] {
 		if ReservedName(name) {
 			return fmt.Errorf("container names like %s are reserved for atl's task containers", name)
 		}
+		// dockerd strips one leading slash (and refuses a second).
+		if ns := g.namespace(); Namespaced(name) && !InNamespace(ns, strings.TrimPrefix(name, "/")) {
+			return fmt.Errorf("container name %s is in another task's compose namespace: a name that starts with atl_<6 hex digits> "+
+				"must start with %s (this task's compose project; COMPOSE_PROJECT_NAME is set)", name, ns)
+		}
+	}
+	return nil
+}
+
+// namespace is the task's Docker name namespace (see ComposeProject).
+func (g *Gate) namespace() string { return ComposeProject(g.ID) }
+
+// checkNewName refuses a name for a new network or volume (what) that is
+// not in the task's namespace (see InNamespace): tasks' names would collide,
+// and a compose project on the host would adopt a network or volume of the
+// name it looks for, made (and filled, or joined) by the task.
+func (g *Gate) checkNewName(what, name string) error {
+	ns := g.namespace()
+	if InNamespace(ns, name) {
+		return nil
+	}
+	instead := ns + "_<name>"
+	if name != "" {
+		instead = ns + "_" + name
+	}
+	return fmt.Errorf("%s name %q: new network and volume names must be %s or start with %s_ or %s- "+
+		"(this task's compose project; COMPOSE_PROJECT_NAME is set): name it %s, or use -p %s-<name> for another compose project",
+		what, name, ns, ns, ns, instead, ns)
+}
+
+// randomName matches a canonical lower-case UUID, which a network may also
+// be named, outside the namespace: testcontainers names its networks so
+// (Java's Network.newNetwork(), testcontainers-go's network.New, Node,
+// Python). No task can guess another's to take it first, and compose names
+// none so (<project>_<network>).
+var randomName = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+})
+
+// composeProject is the label by which compose finds the containers,
+// networks and volumes of a project.
+const composeProject = "com.docker.compose.project"
+
+// checkProjectLabel refuses labels (a create's Labels) whose compose
+// project is not in the task's namespace: a compose project on the host
+// would take the object for its own. The key is read exactly, as dockerd
+// stores labels and compose filters them (another spelling is another
+// label, which compose does not read; the gate forwards the map it read,
+// so a key given twice is the one it checked). An empty value is no
+// project.
+func (g *Gate) checkProjectLabel(labels any) error {
+	m, err := as[map[string]any]("Labels", labels)
+	if err != nil {
+		return err
+	}
+	v, ok := m[composeProject]
+	if !ok {
+		return nil
+	}
+	project, isString := v.(string)
+	if !isString {
+		return fmt.Errorf("label %s has the wrong type", composeProject)
+	}
+	if ns := g.namespace(); project != "" && !InNamespace(ns, project) {
+		return fmt.Errorf("label %s=%s: the compose project must be %s or start with %s_ or %s- "+
+			"(this task's; COMPOSE_PROJECT_NAME is set): use -p %s-<name> for another compose project",
+			composeProject, project, ns, ns, ns, ns)
 	}
 	return nil
 }
@@ -594,7 +664,7 @@ func gateContainer(g *Gate, w http.ResponseWriter, r *http.Request, m []string) 
 		return
 	}
 	if action == "rename" {
-		if err := checkName(r); err != nil {
+		if err := g.checkName(r); err != nil {
 			g.deny(w, r, http.StatusForbidden, err.Error())
 			return
 		}
@@ -838,13 +908,24 @@ func gateVolumeCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []strin
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := fieldKeys(body, "Driver", "DriverOpts", "ClusterVolumeSpec", "Labels"); err != nil {
+	if err := fieldKeys(body, "Name", "Driver", "DriverOpts", "ClusterVolumeSpec", "Labels"); err != nil {
 		g.deny(w, r, http.StatusForbidden, err.Error())
 		return
 	}
 	// The local driver's options can bind any host path (type=none,o=bind,device=/).
 	if d, err := as[string]("Driver", body["Driver"]); err != nil || !oneOf(d, "", "local") || !isZero(body["DriverOpts"]) || !isZero(body["ClusterVolumeSpec"]) {
 		g.deny(w, r, http.StatusForbidden, "volume drivers and driver options are not allowed")
+		return
+	}
+	name, err := as[string]("Name", body["Name"])
+	if err == nil && name != "" { // no name: the daemon makes one up (an anonymous volume)
+		err = g.checkNewName("volume", name)
+	}
+	if err == nil {
+		err = g.checkProjectLabel(body["Labels"])
+	}
+	if err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
 		return
 	}
 	g.label(body)
@@ -878,7 +959,17 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 		g.deny(w, r, http.StatusForbidden, "only local bridge networks are allowed")
 		return
 	}
-	if err := g.checkIPAM(body["IPAM"]); err != nil {
+	name, err := as[string]("Name", body["Name"])
+	if err == nil && !randomName().MatchString(name) {
+		err = g.checkNewName("network", name)
+	}
+	if err == nil {
+		err = g.checkProjectLabel(body["Labels"])
+	}
+	if err == nil {
+		err = g.checkIPAM(body["IPAM"])
+	}
+	if err != nil {
 		g.deny(w, r, http.StatusForbidden, err.Error())
 		return
 	}
@@ -995,7 +1086,7 @@ func gateNetworkConnect(g *Gate, w http.ResponseWriter, r *http.Request, m []str
 // the daemon has created the container, no volume delete of the task's
 // runs (see Gate.volumes); the body is read before that.
 func gateContainerCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
-	if err := checkName(r); err != nil {
+	if err := g.checkName(r); err != nil {
 		g.deny(w, r, http.StatusForbidden, err.Error())
 		return
 	}
@@ -1011,6 +1102,13 @@ func gateContainerCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []st
 		return
 	}
 	g.label(body)
+	// A container takes the labels of its image that its own do not set,
+	// and the task can build or pull an image with any compose project
+	// label; an empty one is no project. (The image a name stands for may
+	// change until the daemon reads it: so always.)
+	if labels := body["Labels"].(map[string]any); labels[composeProject] == nil {
+		labels[composeProject] = ""
+	}
 	g.forward(w, r, body)
 }
 
@@ -1043,6 +1141,9 @@ var hostChecked = []string{"Binds", "Mounts", "NetworkMode", "VolumesFrom", "Log
 // gate forwards otherwise (see checkHostConfig and checkNetworking).
 func (g *Gate) checkCreate(body map[string]any) error {
 	if err := fieldKeys(body, "HostConfig", "NetworkingConfig", "Labels"); err != nil {
+		return err
+	}
+	if err := g.checkProjectLabel(body["Labels"]); err != nil {
 		return err
 	}
 	// Docker 24 and older also read HostConfig settings at the top level:
@@ -1359,7 +1460,8 @@ func (g *Gate) readOnlyMount(src string, m map[string]any) {
 }
 
 // source checks the left side of a mount and returns what to mount instead:
-// a volume of this task, the gate's own socket in place of the Docker socket
+// a volume of this task (made, labelled, if none has the name and the name
+// is in the task's namespace), the gate's own socket in place of the Docker socket
 // (so nested Docker clients stay gated), or a path inside the task directory
 // with its symlinks resolved. A path that resolves to one of ROMounts, or
 // into one, is allowed too, if it exists (the daemon would create a missing
@@ -1369,6 +1471,12 @@ func (g *Gate) source(src string) (path string, ro bool, err error) {
 		// By name, as the daemon looks it up: exactly, no prefix.
 		_, err := g.owned("volumes", src)
 		if err == errNotFound { // created on the fly by the daemon otherwise, without the label
+			// A new name only in the task's namespace (see
+			// gateVolumeCreate); a volume of the task's of any name, as
+			// above, stays its to mount.
+			if err := g.checkNewName("volume", src); err != nil {
+				return "", false, err
+			}
 			status, out, cerr := g.call("POST", "/volumes/create", map[string]any{"Name": src, "Labels": map[string]string{LabelTask: g.ID}})
 			if cerr != nil || status != http.StatusCreated {
 				return "", false, fmt.Errorf("cannot create volume %s: %v %s", src, cerr, out)
