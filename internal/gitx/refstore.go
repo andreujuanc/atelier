@@ -24,7 +24,9 @@ import (
 // repo's refs (and shallow file), and the repo's objects are its objects
 // ($GIT_OBJECT_DIRECTORY). git writes every ref, reflog, lock file and
 // FETCH_HEAD there; sync then copies the refs that changed into the repo,
-// through file descriptors that follow no symlink (package nofollow).
+// through file descriptors that follow no symlink (package nofollow), each
+// only while it still has the value copied in (another push or fetch of
+// the repo may run at the same time).
 //
 // Run in the repo itself, git writes them by path, and a task writes the
 // repo's git dir: it could make a directory on the way (refs/remotes/origin
@@ -178,13 +180,19 @@ func (s *refStore) close() { os.RemoveAll(s.dir) }
 
 // sync copies into the repo at dir the refs git changed in the store, and
 // its shallow file if git changed it, without following a symlink: one in
-// the way fails that ref. In a files repo, a ref git deleted (a prune) is
-// deleted only if it is a loose ref in the repo; a packed one stays. In a
-// reftable repo the changes go in as new tables (syncReftable).
-func (s *refStore) sync(ctx context.Context, dir string) error {
+// the way fails that ref. Each is compared and swapped, as git updates a
+// ref: it changes only while it still has the value it had when the store
+// was filled. One that changed meanwhile (another push or fetch of the
+// repo finished first, or the task's git moved it) is left as it is and
+// returned in stale, a name for each (shallow for the shallow file); the
+// caller reports them (staleError). In a files repo that is done under the
+// ref's lock (updateRef), and a ref git deleted (a prune) leaves
+// packed-refs too; in a reftable repo the old values go with the changes
+// (syncReftable).
+func (s *refStore) sync(ctx context.Context, dir string) (stale []string, err error) {
 	sd, err := nofollow.Open(s.dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer sd.Close()
 	var after map[string]string
@@ -194,15 +202,15 @@ func (s *refStore) sync(ctx context.Context, dir string) error {
 		after, err = readRefs(sd)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	shallow, err := sd.ReadFile("shallow", 64<<20)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
+		return nil, err
 	}
 	d, err := nofollow.Open(s.common)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer d.Close()
 	var errs []error
@@ -217,56 +225,129 @@ func (s *refStore) sync(ctx context.Context, dir string) error {
 			changed[name] = ""
 		}
 	}
-	if s.reftable {
-		var stdin strings.Builder
-		for _, name := range slices.Sorted(maps.Keys(changed)) {
-			if id := changed[name]; id != "" {
-				stdin.WriteString("update " + name + " " + id + "\n")
-			} else {
-				stdin.WriteString("delete " + name + "\n")
+	names := slices.Sorted(maps.Keys(changed))
+	if s.reftable && len(names) > 0 {
+		errs = append(errs, syncReftable(ctx, dir, d, func(priv string) (string, error) {
+			stale = nil // a fresh copy of the stack, a fresh look
+			now, err := listRefs(ctx, priv)
+			if err != nil {
+				return "", err
 			}
-		}
-		if stdin.Len() > 0 {
-			errs = append(errs, syncReftable(ctx, dir, d, stdin.String()))
-		}
-	} else {
-		for _, name := range slices.Sorted(maps.Keys(changed)) {
-			if id := changed[name]; id != "" {
-				if err := d.MkdirAll(path.Dir(name), 0o755); err != nil {
-					errs = append(errs, fmt.Errorf("update %s: %w", name, err))
-				} else if err := d.WriteFile(name, []byte(id+"\n"), 0o644); err != nil {
-					errs = append(errs, fmt.Errorf("update %s: %w", name, err))
+			var stdin strings.Builder
+			for _, name := range names {
+				id, old := changed[name], s.refs[name]
+				if now[name] == id {
+					continue // there already
 				}
-			} else if fi, err := d.Lstat(name); err == nil && fi.Mode().IsRegular() {
-				if err := d.Remove(name); err != nil {
-					errs = append(errs, fmt.Errorf("delete %s: %w", name, err))
+				if now[name] != old {
+					stale = append(stale, name)
+					continue
 				}
+				if id == "" {
+					stdin.WriteString("delete " + name + " " + old + "\n")
+				} else {
+					if old == "" {
+						old = strings.Repeat("0", len(id)) // it must not exist
+					}
+					stdin.WriteString("update " + name + " " + id + " " + old + "\n")
+				}
+			}
+			return stdin.String(), nil
+		}))
+	} else if !s.reftable {
+		for _, name := range names {
+			id, old := changed[name], s.refs[name]
+			err := updateRef(d, name, id, func(cur string) error {
+				if cur != old && cur != id {
+					return errStale
+				}
+				return nil
+			})
+			if errors.Is(err, errStale) {
+				stale = append(stale, name)
+			} else if err != nil {
+				errs = append(errs, fmt.Errorf("update %s: %w", name, err))
 			}
 		}
 	}
-	switch {
-	case bytes.Equal(shallow, s.shallow) && (shallow == nil) == (s.shallow == nil):
-	case shallow == nil:
-		if err := d.Remove("shallow"); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			errs = append(errs, err)
-		}
-	default:
-		if err := d.WriteFile("shallow", shallow, 0o644); err != nil {
-			errs = append(errs, err)
+	if !sameFile(shallow, s.shallow) {
+		if err := swapShallow(d, s.shallow, shallow); errors.Is(err, errStale) {
+			stale = append(stale, "shallow")
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("update shallow: %w", err))
 		}
 	}
-	return errors.Join(errs...)
+	return stale, errors.Join(errs...)
 }
 
-// syncReftable makes the changes stdin lists (git update-ref --stdin) in the
-// reftable stack of the repo at dir, d its common git dir, as git adds to a stack,
-// without following a symlink. The stack as it is now is copied into a
-// git dir of atl's (copyReftable), git makes the changes there, and the
-// tables it wrote (fresh names; its own compaction may merge old ones)
-// are written next to the repo's and its tables.list replaced by the
-// copy's: under git's lock (tables.list.lock, made exclusively), and only
-// if the stack is still the one copied; else it starts over, a few times.
-func syncReftable(ctx context.Context, dir string, d *nofollow.Dir, stdin string) error {
+// errStale is what updateRef's check returns for a ref that is no longer
+// at the value it was expected to have.
+var errStale = errors.New("changed meanwhile")
+
+// staleError is the error for the refs sync left as they were because they
+// changed meanwhile (nil if none).
+func staleError(stale []string) error {
+	if len(stale) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s changed meanwhile (another push or fetch?), so atl left it as it is; run atl fetch to update it",
+		strings.Join(stale, ", "))
+}
+
+// sameFile reports whether a and b are the same content of a file, nil
+// for none.
+func sameFile(a, b []byte) bool {
+	return bytes.Equal(a, b) && (a == nil) == (b == nil)
+}
+
+// swapShallow replaces the shallow file in d (the common git dir) with
+// data (nil: removes it) while it still holds old (nil: there is none),
+// under git's lock (shallow.lock, made exclusively), without following a
+// symlink; errStale if it does not.
+func swapShallow(d *nofollow.Dir, old, data []byte) error {
+	const lock = "shallow.lock"
+	if err := createLock(d, lock, data); err != nil {
+		return err
+	}
+	locked := true
+	defer func() {
+		if locked {
+			d.Remove(lock)
+		}
+	}()
+	now, err := d.ReadFile("shallow", 64<<20)
+	if errors.Is(err, fs.ErrNotExist) {
+		now, err = nil, nil
+	}
+	switch {
+	case err != nil:
+		return err
+	case sameFile(now, data):
+		return nil
+	case !sameFile(now, old):
+		return errStale
+	case data == nil:
+		return d.Remove("shallow")
+	}
+	if err := d.Rename(lock, "shallow"); err != nil {
+		return err
+	}
+	locked = false
+	return nil
+}
+
+// syncReftable makes the changes edits lists (git update-ref --stdin) in the
+// reftable stack of the repo at dir, d its common git dir, as git adds to a
+// stack, without following a symlink. The stack as it is now is copied into
+// a git dir of atl's (copyReftable), edits says what to change, given that
+// git dir (it may read the refs there, as they are now; "" for nothing), git
+// makes the changes there, and the tables it wrote (fresh names; its own
+// compaction may merge old ones) are written next to the repo's and its
+// tables.list replaced by the copy's: under git's lock (tables.list.lock,
+// made exclusively), and only if the stack is still the one copied; else it
+// starts over, a few times, edits called again. So old values in the
+// changes (update <ref> <new> <old>) hold for the repo's stack too.
+func syncReftable(ctx context.Context, dir string, d *nofollow.Dir, edits func(priv string) (string, error)) error {
 	const lock = "reftable/tables.list.lock"
 	var err error
 	for attempt := 0; attempt < 5; attempt++ {
@@ -282,6 +363,10 @@ func syncReftable(ctx context.Context, dir string, d *nofollow.Dir, stdin string
 			defer os.RemoveAll(priv)
 			base, err := copyReftable(ctx, dir, d, priv)
 			if err != nil {
+				return false, err
+			}
+			stdin, err := edits(priv)
+			if err != nil || stdin == "" {
 				return false, err
 			}
 			args := []string{"-c", "core.logAllRefUpdates=false", "update-ref", "--stdin"}
@@ -491,17 +576,20 @@ func deleteBranch(ctx context.Context, repo, branch, oid string) error {
 	if err := check(cur); err != nil {
 		return err
 	}
-	return syncReftable(ctx, repo, d, "delete "+ref+" "+cur+"\n")
+	return syncReftable(ctx, repo, d, func(string) (string, error) {
+		return "delete " + ref + " " + cur + "\n", nil
+	})
 }
 
 // updateRef sets ref (refs/...) in the files repo whose common git dir is
 // d to id, or deletes it if id is "", as git does, without following a
 // symlink. Under the ref's lock (<ref>.lock, made exclusively, holding id)
 // it reads the ref as it is now (liveRef: "" for none), and check, given
-// that, may refuse; nothing is done if the ref is at id already. Then the
-// lock is renamed over the ref; or, for a delete, the ref leaves
-// packed-refs (deletePacked), then its loose file goes, its reflog too: an
-// older packed value it shadowed does not come back.
+// that, may refuse (errStale for one that changed meanwhile); nothing is
+// done if the ref is at id already. Then the lock is renamed over the
+// ref; or, for a delete, the ref leaves packed-refs (deletePacked), then
+// its loose file goes, its reflog too: an older packed value it shadowed
+// does not come back.
 func updateRef(d *nofollow.Dir, ref, id string, check func(cur string) error) error {
 	dir := path.Dir(ref)
 	if err := d.MkdirAll(dir, 0o755); err != nil {

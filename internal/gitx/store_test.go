@@ -423,6 +423,122 @@ func reftableClone(t *testing.T, f fixture) string {
 	return repo
 }
 
+// storeFetch is FetchOrigin up to the sync: git fetches into a store of
+// repo's, which is returned for the test to sync.
+func storeFetch(t *testing.T, ctx context.Context, repo string, origin Origin) *refStore {
+	t.Helper()
+	s, err := newRefStore(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.close)
+	tr, err := newTransport(ctx, repo, origin, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := append(tr.args, "fetch", "--no-recurse-submodules", "--no-auto-gc", "--upload-pack="+packProgram(false, tr.local), tr.name)
+	if err := runTransport(ctx, repo, io.Discard, s.env, args); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// TestSyncKeepsRefsChangedMeanwhile: two fetches of a clone overlap (atl's
+// gate runs each push or fetch as its own process). The one that started
+// first, origin at X1, finishes last, after the other one, origin at X2:
+// origin/main stays at X2, reported as changed meanwhile, not moved back.
+// A ref the other one already put where this one would is no conflict.
+func TestSyncKeepsRefsChangedMeanwhile(t *testing.T) {
+	for _, format := range []string{"files", "reftable"} {
+		t.Run(format, func(t *testing.T) {
+			ctx := context.Background()
+			f := newFixture(t)
+			repo := f.repo
+			if format == "reftable" {
+				repo = reftableClone(t, f)
+			}
+			originMain := func() string { return git(t, repo, "rev-parse", "refs/remotes/origin/main") }
+
+			// Both fetch the same tip.
+			x := f.pushFromOtherClone(t, "a")
+			s := storeFetch(t, ctx, repo, to(f.origin))
+			if err := FetchOrigin(ctx, repo, to(f.origin), io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			if stale, err := s.sync(ctx, repo); err != nil || len(stale) > 0 {
+				t.Errorf("sync after a fetch of the same tip: stale %v, %v", stale, err)
+			}
+			if got := originMain(); got != x {
+				t.Errorf("origin/main = %s, want %s", got, x)
+			}
+
+			// The first one fetches X1, the second X2 and finishes first.
+			x1 := f.pushFromOtherClone(t, "b")
+			s = storeFetch(t, ctx, repo, to(f.origin))
+			x2 := f.pushFromOtherClone(t, "c")
+			if err := FetchOrigin(ctx, repo, to(f.origin), io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			stale, err := s.sync(ctx, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := originMain(); got != x2 {
+				t.Errorf("origin/main = %s after the late sync, want %s (x1 %s)", got, x2, x1)
+			}
+			if len(stale) != 1 || stale[0] != "refs/remotes/origin/main" {
+				t.Errorf("stale = %v, want refs/remotes/origin/main", stale)
+			}
+			if msg := staleError(stale).Error(); !strings.Contains(msg, "refs/remotes/origin/main changed meanwhile") || !strings.Contains(msg, "atl fetch") {
+				t.Errorf("error = %q", msg)
+			}
+			if format == "files" {
+				if _, err := os.Lstat(filepath.Join(repo, ".git", "refs", "remotes", "origin", "main.lock")); err == nil {
+					t.Error("main.lock left behind")
+				}
+			}
+			git(t, repo, "fsck", "--no-progress")
+		})
+	}
+}
+
+// TestFetchPrunesPackedRef: a prune deletes a remote-tracking ref whose
+// loose file shadows an older packed value: the ref is gone, packed line
+// too, not back at the older value.
+func TestFetchPrunesPackedRef(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	other := filepath.Join(f.root, "o")
+	git(t, f.root, "clone", "-q", f.origin, other)
+	git(t, other, "push", "-q", "origin", "main:feature")
+	if err := FetchOrigin(ctx, f.repo, to(f.origin), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	git(t, f.repo, "pack-refs", "--all")
+	commitFile(t, other, "f.txt", "f\n", "f")
+	git(t, other, "push", "-q", "origin", "HEAD:feature")
+	if err := FetchOrigin(ctx, f.repo, to(f.origin), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	git(t, other, "push", "-q", "origin", ":feature")
+	cfg := filepath.Join(f.root, "gitconfig")
+	writeFile(t, cfg, "[fetch]\n\tprune = true\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", cfg)
+	if err := FetchOrigin(ctx, f.repo, to(f.origin), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if out := git(t, f.repo, "for-each-ref", "refs/remotes/origin/feature"); out != "" {
+		t.Errorf("pruned ref still there: %s", out)
+	}
+	if data, err := os.ReadFile(filepath.Join(f.repo, ".git", "packed-refs")); err != nil || strings.Contains(string(data), "refs/remotes/origin/feature") {
+		t.Errorf("packed-refs after the prune (%v):\n%s", err, data)
+	}
+	if out := git(t, f.repo, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/main"); out != "refs/remotes/origin/main" {
+		t.Errorf("origin/main: %q", out)
+	}
+	git(t, f.repo, "fsck", "--no-progress")
+}
+
 // TestDeleteBranchPackedThenAdvanced: a branch packed (git gc, pack-refs)
 // that then got a commit has a loose ref ahead of its packed line. Deleting
 // it at its tip, or forced, removes both and leaves the other refs; at the
@@ -488,5 +604,56 @@ func TestDeleteBranchPackedThenAdvanced(t *testing.T) {
 				git(t, f.repo, "fsck", "--no-progress")
 			})
 		}
+	}
+}
+
+// TestSyncShallowOnlyIfUnchanged: the shallow file of a shallow clone is
+// replaced (or removed) only while it is what it was when the push or
+// fetch started.
+func TestSyncShallowOnlyIfUnchanged(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.pushFromOtherClone(t, "a")
+	repo := filepath.Join(f.root, "shallow")
+	git(t, f.root, "clone", "-q", "--depth", "1", "file://"+f.origin, repo)
+	path := filepath.Join(repo, ".git", "shallow")
+	orig, err := os.ReadFile(path)
+	must(t, err)
+	git(t, f.root, "clone", "-q", "--depth", "2", "file://"+f.origin, filepath.Join(f.root, "deeper"))
+	deeper, err := os.ReadFile(filepath.Join(f.root, "deeper", ".git", "shallow"))
+	must(t, err)
+	meanwhile := "0123456789012345678901234567890123456789\n"
+
+	s, err := newRefStore(ctx, repo)
+	must(t, err)
+	defer s.close()
+	writeFile(t, filepath.Join(s.dir, "shallow"), string(deeper)) // git deepened it
+	writeFile(t, path, meanwhile)
+	stale, err := s.sync(ctx, repo)
+	if err != nil || len(stale) != 1 || stale[0] != "shallow" {
+		t.Errorf("sync, shallow changed meanwhile: stale %v, %v", stale, err)
+	}
+	if data, _ := os.ReadFile(path); string(data) != meanwhile {
+		t.Errorf("shallow = %q, want %q", data, meanwhile)
+	}
+
+	writeFile(t, path, string(orig))
+	if stale, err := s.sync(ctx, repo); err != nil || len(stale) > 0 {
+		t.Errorf("sync: stale %v, %v", stale, err)
+	}
+	if data, _ := os.ReadFile(path); string(data) != string(deeper) {
+		t.Errorf("shallow = %q, want %q", data, deeper)
+	}
+
+	writeFile(t, path, string(orig))
+	must(t, os.Remove(filepath.Join(s.dir, "shallow"))) // git unshallowed it
+	if stale, err := s.sync(ctx, repo); err != nil || len(stale) > 0 {
+		t.Errorf("sync, unshallowed: stale %v, %v", stale, err)
+	}
+	if _, err := os.Lstat(path); err == nil {
+		t.Error("shallow still there")
+	}
+	if _, err := os.Lstat(path + ".lock"); err == nil {
+		t.Error("shallow.lock left behind")
 	}
 }

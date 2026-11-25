@@ -138,7 +138,10 @@ func configList(ctx context.Context, dir, key string) ([]string, error) {
 // where the task fetches it.
 //
 // The refs git updates (refs/remotes/origin/<branch>) are written to a
-// store of atl's own and copied into the repo from there (refStore).
+// store of atl's own and copied into the repo from there (refStore), each
+// only while it still has the value it had before: one that another push
+// or fetch changed meanwhile is left as it is, with a warning on out (the
+// push itself is done).
 func PushBranch(ctx context.Context, dir string, origin Origin, branch string, force bool, out io.Writer) error {
 	t, err := newTransport(ctx, dir, origin, true)
 	if err != nil {
@@ -162,7 +165,13 @@ func PushBranch(ctx context.Context, dir string, origin Origin, branch string, f
 	if err := runTransport(ctx, dir, out, store.env, args); err != nil {
 		return err
 	}
-	return store.sync(ctx, dir)
+	stale, err := store.sync(ctx, dir)
+	// The push is done: a ref that changed meanwhile (another push or
+	// fetch) is only a warning.
+	if serr := staleError(stale); serr != nil && out != nil {
+		fmt.Fprintf(out, "warning: %v\n", serr)
+	}
+	return err
 }
 
 // branchCommit returns the commit id ref (a branch, refs/heads/...) names
@@ -191,7 +200,10 @@ func firstChars(s string, n int) string {
 // missing (see setOriginHead).
 //
 // git writes refs (and FETCH_HEAD) to a store of atl's own; the refs are
-// copied into the repo from there (refStore).
+// copied into the repo from there (refStore), each only while it still has
+// the value it had before: one that another push or fetch changed
+// meanwhile is left as it is, and the fetch fails saying so once the
+// others are in.
 func FetchOrigin(ctx context.Context, dir string, origin Origin, out io.Writer) error {
 	t, err := newTransport(ctx, dir, origin, false)
 	if err != nil {
@@ -207,11 +219,12 @@ func FetchOrigin(ctx context.Context, dir string, origin Origin, out io.Writer) 
 	if err := runTransport(ctx, dir, out, store.env, args); err != nil {
 		return err
 	}
-	if err := store.sync(ctx, dir); err != nil {
-		return err
+	stale, err := store.sync(ctx, dir)
+	if err != nil {
+		return errors.Join(err, staleError(stale))
 	}
 	t.setOriginHead(ctx, dir)
-	return nil
+	return staleError(stale)
 }
 
 // lsRemoteArgs are the arguments of `git ls-remote <flags> <origin>` with
