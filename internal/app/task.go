@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"unicode/utf8"
 
@@ -443,33 +444,47 @@ func (a *App) scriptEnv(t *model.Task, r model.TaskRepo) project.ScriptEnv {
 }
 
 // runScript runs one setup/teardown script for rw repo r, streaming its
-// output to Out as "<kind> <repo>: <line>".
-func (a *App) runScript(ctx context.Context, pr *project.Project, kind, script string, t *model.Task, r model.TaskRepo) error {
+// output to Out as "<kind> <repo>: <line>": in the task's container if
+// container is its ID (see scriptContainer, runInContainer), else (the
+// sandbox is off) here, with atl's environment (project.EnvFor).
+func (a *App) runScript(ctx context.Context, pr *project.Project, kind, script string, t *model.Task, r model.TaskRepo, container string) error {
 	se := a.scriptEnv(t, r)
 	if _, err := a.checkWorktree(ctx, t, r); err != nil {
 		return err
 	}
 	fmt.Fprintf(a.out(), "%s %s: $ %s\n", kind, r.Name, strings.TrimSpace(script))
 	pw := &prefixWriter{w: a.out(), prefix: kind + " " + r.Name + ": "}
-	err := project.RunScript(ctx, script, se.Worktree, pr.EnvFor(se), pw)
+	var err error
+	if container == "" {
+		err = project.RunScript(ctx, script, se.Worktree, pr.EnvFor(se), pw)
+	} else {
+		err = a.runInContainer(ctx, t, container, se.Worktree, pr.ScriptVars(se), script, pw)
+	}
 	pw.Flush()
 	return err
 }
 
 // runSetup runs the project's setup script in each rw worktree (only those
-// for which only returns true, if only is not nil). A failure in one repo
-// is a warning; the remaining repos still run. The returned error is only
-// for a project that cannot be loaded.
+// for which only returns true, if only is not nil), in the task's container
+// (scriptContainer: started, or created, before the first). A failure in
+// one repo, the container's included, is a warning; the remaining repos
+// still run. The returned error is only for a project that cannot be
+// loaded.
 func (a *App) runSetup(ctx context.Context, t *model.Task, only func(model.TaskRepo) bool) error {
 	pr, err := a.taskProject(t)
 	if err != nil || pr == nil || strings.TrimSpace(pr.Setup) == "" {
 		return err
 	}
+	container := sync.OnceValues(func() (string, error) { return a.scriptContainer(ctx, t) })
 	for _, r := range t.Repos {
 		if r.Mode != model.ModeRW || (only != nil && !only(r)) {
 			continue
 		}
-		if err := a.runScript(ctx, pr, "setup", pr.Setup, t, r); err != nil {
+		c, err := container()
+		if err == nil {
+			err = a.runScript(ctx, pr, "setup", pr.Setup, t, r, c)
+		}
+		if err != nil {
 			a.warnf("setup failed in %s: %v", r.Name, err)
 		}
 	}
@@ -477,10 +492,13 @@ func (a *App) runSetup(ctx context.Context, t *model.Task, only func(model.TaskR
 }
 
 // runTeardown runs the project's teardown script in each rw worktree that
-// still exists. Without force the first failure is returned (and the
-// remaining repos are not torn down); with force failures are warnings. A
-// project that can no longer be loaded is a warning, never an error, so it
-// cannot block closing the task.
+// still exists, in the task's container (scriptContainer: started, or
+// created, before the first; the gate still runs, removeSandbox comes
+// after). Without force the first failure is returned (and the remaining
+// repos are not torn down), a container that cannot be started included;
+// with force failures are warnings, and without a container nothing runs.
+// A project that can no longer be loaded is a warning, never an error, so
+// it cannot block closing the task.
 func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error {
 	pr, err := a.taskProject(t)
 	if err != nil {
@@ -490,6 +508,7 @@ func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error 
 	if pr == nil || strings.TrimSpace(pr.Teardown) == "" {
 		return nil
 	}
+	container := sync.OnceValues(func() (string, error) { return a.scriptContainer(ctx, t) })
 	for _, r := range t.Repos {
 		if r.Mode != model.ModeRW {
 			continue
@@ -497,7 +516,15 @@ func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error 
 		if _, err := os.Lstat(a.Paths.WorktreePath(t.Slug, r.Name)); errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if err := a.runScript(ctx, pr, "teardown", pr.Teardown, t, r); err != nil { // checks the worktree
+		c, err := container()
+		if err != nil {
+			if !force {
+				return err
+			}
+			a.warnf("teardown not run: %v", err)
+			return nil
+		}
+		if err := a.runScript(ctx, pr, "teardown", pr.Teardown, t, r, c); err != nil { // checks the worktree
 			if !force {
 				return fmt.Errorf("repo %s: %w", r.Name, err)
 			}

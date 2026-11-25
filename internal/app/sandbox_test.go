@@ -295,6 +295,7 @@ type fakeDocker struct {
 	ps      string          // what the activity probe prints (sandbox.ActivityArgs)
 	onRm    func()          // called on docker rm
 	onPs    func()          // called on docker ps
+	onExec  func([]string)  // called on docker exec, with its arguments
 }
 
 // fakeContainerID is the full ID of fakeDocker's container.
@@ -354,6 +355,9 @@ func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 			f.onRm()
 		}
 	case "exec":
+		if f.onExec != nil {
+			f.onExec(args)
+		}
 		if args[len(args)-1] == "atl-activity" {
 			return f.ps, nil
 		}

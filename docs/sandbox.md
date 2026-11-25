@@ -48,10 +48,10 @@ config dir, atelier's database, state dir (logs) or config dir (projects).
 
 ## Lifecycle
 
-- Created on the task's first session; reused by later ones (installed tools persist);
-  restarted after a reboot; removed by `atl done`/`atl cancel`.
-- Replaced when the task's repos, image or mounts change, at the next session start while no
-  other session runs in it. A running container cannot get a new mount, so adding a repo
+- Created on the task's first session, or for the project's setup; reused by later ones
+  (installed tools persist); restarted after a reboot; removed by `atl done`/`atl cancel`.
+- Replaced when the task's repos, image or mounts change, at the next session start (or
+  project script) while no other session runs in it. A running container cannot get a new mount, so adding a repo
   (`atl add`, TUI `a`) to a task with live sessions restarts them: their windows close, the
   container is removed and the same conversations are resumed (`claude --resume`) in a new
   one that has the repo. While things run in the task (Claude mid-turn, background work an
@@ -72,6 +72,21 @@ config dir, atelier's database, state dir (logs) or config dir (projects).
 - atl only touches a container named like the task's if it carries atl's `atelier.agent`
   label and no `atelier.task` label. Anything else under that name makes the session start
   fail; remove or rename it yourself.
+
+## Project setup and teardown
+
+A project's `setup` and `teardown` run in the task's container (`docker exec`), as your user,
+in each rw worktree, with the project's `[env]` and the `ATL_*` variables, not atl's
+environment; `docker` in them goes through the gate. atl starts the container first if
+needed: for `setup` when the task is created or reopened or a repo is added (a container that
+cannot start is a warning, as a failed setup is), for `teardown` on `atl done`/`atl cancel`
+(one that cannot start fails the close; `--force` closes without the teardown). What a script
+leaves running ends when it exits, or when it is interrupted.
+
+At close atl removes the task's containers, networks and volumes: a teardown needs no
+`docker compose down -v`. Scripts that need host tools or credentials (a CLI only the host
+has, your SSH agent, git credentials) do not work with the sandbox on. With `ATL_SANDBOX=off`
+they run on the host, with atl's environment.
 
 ## Image and tools
 
@@ -241,7 +256,6 @@ refuses, `atl push`/`atl fetch`) and names the mounted host paths. `context` /
 - A base image's `ONBUILD` instructions run in a build `FROM` it unchecked: one from a registry with
   `ADD <url>` fetches from the host's network.
 - Tasks can bind any free host port; no network egress policy.
-- Project setup and teardown scripts run on the host.
 - No git credentials or `gh` in the task: use `atl push`/`atl fetch`; `atl pr` runs on the
   host.
 
