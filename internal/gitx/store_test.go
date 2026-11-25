@@ -410,3 +410,83 @@ func TestDeleteBranchPacked(t *testing.T) {
 	}
 	git(t, f.repo, "fsck", "--no-progress")
 }
+
+// reftableClone clones f's origin into a reftable repo and returns it, or
+// skips t where git has no reftable.
+func reftableClone(t *testing.T, f fixture) string {
+	t.Helper()
+	if _, err := exec.Command("git", "init", "-q", "--ref-format=reftable", t.TempDir()).CombinedOutput(); err != nil {
+		t.Skip("git without reftable")
+	}
+	repo := filepath.Join(f.root, "rt")
+	git(t, f.root, "clone", "-q", "--ref-format=reftable", f.origin, repo)
+	return repo
+}
+
+// TestDeleteBranchPackedThenAdvanced: a branch packed (git gc, pack-refs)
+// that then got a commit has a loose ref ahead of its packed line. Deleting
+// it at its tip, or forced, removes both and leaves the other refs; at the
+// older, packed id it is refused.
+func TestDeleteBranchPackedThenAdvanced(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		del  func(ctx context.Context, repo, tip string) error
+	}{
+		{"DeleteBranchIfAt", func(ctx context.Context, repo, tip string) error { return DeleteBranchIfAt(ctx, repo, "atl/p", tip) }},
+		{"DeleteBranch", func(ctx context.Context, repo, _ string) error { return DeleteBranch(ctx, repo, "atl/p") }},
+	} {
+		for _, format := range []string{"files", "reftable"} {
+			t.Run(tc.name+"/"+format, func(t *testing.T) {
+				ctx := context.Background()
+				f := newFixture(t)
+				if format == "reftable" {
+					f.repo = reftableClone(t, f)
+				}
+				wt, _ := f.addWorktree(t, ctx, "p")
+				commitFile(t, wt, "one.txt", "1\n", "one")
+				old := git(t, wt, "rev-parse", "HEAD")
+				git(t, f.repo, "tag", "-a", "-m", "t", "v1")
+				git(t, f.repo, "pack-refs", "--all")
+				commitFile(t, wt, "two.txt", "2\n", "two")
+				tip := git(t, wt, "rev-parse", "HEAD")
+				git(t, f.repo, "worktree", "remove", wt)
+				packed := filepath.Join(f.repo, ".git", "packed-refs")
+				if format == "files" {
+					if data, _ := os.ReadFile(packed); !strings.Contains(string(data), old+" refs/heads/atl/p\n") {
+						t.Fatalf("atl/p not packed at %s:\n%s", old, data)
+					}
+				}
+
+				if err := DeleteBranchIfAt(ctx, f.repo, "atl/p", old); err == nil {
+					t.Error("deleted at the packed, older id")
+				}
+				if got := git(t, f.repo, "rev-parse", "refs/heads/atl/p"); got != tip {
+					t.Fatalf("atl/p = %s after the refused delete, want %s", got, tip)
+				}
+				if err := tc.del(ctx, f.repo, tip); err != nil {
+					t.Fatal(err)
+				}
+				out := git(t, f.repo, "for-each-ref", "--format=%(refname)")
+				for _, want := range []string{"refs/heads/main", "refs/remotes/origin/main", "refs/tags/v1"} {
+					if !strings.Contains(out, want+"\n") && !strings.HasSuffix(out, want) {
+						t.Errorf("%s gone; refs:\n%s", want, out)
+					}
+				}
+				if strings.Contains(out, "atl/p") {
+					t.Errorf("branch left; refs:\n%s", out)
+				}
+				if format == "files" {
+					if data, _ := os.ReadFile(packed); strings.Contains(string(data), "atl/p") {
+						t.Errorf("packed-refs still has it:\n%s", data)
+					}
+					for _, lock := range []string{"packed-refs.lock", "refs/heads/atl/p.lock"} {
+						if _, err := os.Lstat(filepath.Join(f.repo, ".git", lock)); err == nil {
+							t.Errorf("%s left behind", lock)
+						}
+					}
+				}
+				git(t, f.repo, "fsck", "--no-progress")
+			})
+		}
+	}
+}

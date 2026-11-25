@@ -147,34 +147,50 @@ func readRef(common, ref string) (string, error) {
 		return "", fmt.Errorf("read %s: %w", ref, err)
 	}
 	defer d.Close()
+	id, _, err := liveRef(d, ref)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", ref, err)
+	}
+	if id == "" {
+		return "", fmt.Errorf("no ref %s", ref)
+	}
+	return id, nil
+}
+
+// liveRef returns the object id ref (refs/...) has in the files repo whose
+// common git dir is d, as git reads it, without following a symlink: its
+// loose ref file (loose is true), else its line in packed-refs; "" if
+// neither has it. A loose file that holds no object id (a symbolic ref) is
+// an error.
+func liveRef(d *nofollow.Dir, ref string) (id string, loose bool, err error) {
 	data, err := d.ReadFile(ref, 1024)
 	if err == nil {
 		id := strings.TrimSuffix(string(data), "\n")
 		if !objectID.MatchString(id) {
-			return "", fmt.Errorf("read %s: not a commit id: %q", ref, firstChars(id, 80))
+			return "", true, fmt.Errorf("not a commit id: %q", firstChars(id, 80))
 		}
-		return id, nil
+		return id, true, nil
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("read %s: %w", ref, err)
+		return "", false, err
 	}
 	f, err := d.OpenFile("packed-refs")
 	if errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("no ref %s", ref)
+		return "", false, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", ref, err)
+		return "", false, err
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(nil, 64<<10)
 	for sc.Scan() {
 		if id, name, ok := strings.Cut(sc.Text(), " "); ok && name == ref && objectID.MatchString(id) {
-			return id, nil
+			return id, false, nil
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return "", fmt.Errorf("read %s: packed-refs: %w", ref, err)
+		return "", false, fmt.Errorf("packed-refs: %w", err)
 	}
-	return "", fmt.Errorf("no ref %s", ref)
+	return "", false, nil
 }

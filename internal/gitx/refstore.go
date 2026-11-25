@@ -445,9 +445,8 @@ func writeSymref(ctx context.Context, dir, ref, target string) error {
 // packed-refs through a symlink: a task that made refs/heads/atl a symlink
 // to a directory of the user's (or packed-refs one to a file of theirs)
 // had git delete or rewrite the user's file. So the ref is deleted here,
-// without following a symlink, under git's locks (<ref>.lock,
-// packed-refs.lock, made exclusively); in a reftable repo through
-// syncReftable.
+// without following a symlink, as git deletes one (updateRef); in a
+// reftable repo through syncReftable.
 func deleteBranch(ctx context.Context, repo, branch, oid string) error {
 	ref := "refs/heads/" + branch
 	if !plainRefName(ref) {
@@ -466,54 +465,129 @@ func deleteBranch(ctx context.Context, repo, branch, oid string) error {
 	if err != nil {
 		return err
 	}
-	cur, err := refCommit(ctx, repo, common, ref)
-	if err != nil {
-		return err
-	}
-	if oid != "" && cur != oid {
-		return fmt.Errorf("branch %s is at %s, not %s", branch, cur, oid)
-	}
 	d, err := nofollow.Open(common)
 	if err != nil {
 		return err
 	}
 	defer d.Close()
+	check := func(cur string) error {
+		switch {
+		case cur == "":
+			return fmt.Errorf("no ref %s", ref)
+		case oid != "" && cur != oid:
+			return fmt.Errorf("branch %s is at %s, not %s", branch, cur, oid)
+		}
+		return nil
+	}
 	if reftable, err := usesReftable(ctx, repo); err != nil {
 		return err
-	} else if reftable {
-		return syncReftable(ctx, repo, d, "delete "+ref+" "+cur+"\n")
+	} else if !reftable {
+		return updateRef(d, ref, "", check)
 	}
-	if err := deletePacked(d, ref, cur); err != nil {
+	cur, err := refCommit(ctx, repo, common, ref)
+	if err != nil {
 		return err
 	}
-	if fi, err := d.Lstat(ref); err == nil && fi.Mode().IsRegular() {
-		if err := d.CreateExcl(ref+".lock", nil, 0o644); err != nil {
+	if err := check(cur); err != nil {
+		return err
+	}
+	return syncReftable(ctx, repo, d, "delete "+ref+" "+cur+"\n")
+}
+
+// updateRef sets ref (refs/...) in the files repo whose common git dir is
+// d to id, or deletes it if id is "", as git does, without following a
+// symlink. Under the ref's lock (<ref>.lock, made exclusively, holding id)
+// it reads the ref as it is now (liveRef: "" for none), and check, given
+// that, may refuse; nothing is done if the ref is at id already. Then the
+// lock is renamed over the ref; or, for a delete, the ref leaves
+// packed-refs (deletePacked), then its loose file goes, its reflog too: an
+// older packed value it shadowed does not come back.
+func updateRef(d *nofollow.Dir, ref, id string, check func(cur string) error) error {
+	dir := path.Dir(ref)
+	if err := d.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if id == "" {
+		defer removeEmptyDirs(d, dir) // made for the lock, or emptied
+	}
+	var data []byte
+	if id != "" {
+		data = []byte(id + "\n")
+	}
+	lock := ref + ".lock"
+	if err := createLock(d, lock, data); err != nil {
+		return err
+	}
+	locked := true
+	defer func() {
+		if locked {
+			d.Remove(lock)
+		}
+	}()
+	cur, loose, err := liveRef(d, ref)
+	if err != nil {
+		return err
+	}
+	if err := check(cur); err != nil || cur == id {
+		return err
+	}
+	if id != "" {
+		if err := d.Rename(lock, path.Base(ref)); err != nil {
 			return err
 		}
-		defer d.Remove(ref + ".lock")
-		if data, err := d.ReadFile(ref, 1024); err != nil || strings.TrimSuffix(string(data), "\n") != cur {
-			return fmt.Errorf("branch %s changed meanwhile", branch)
-		}
+		locked = false
+		return nil
+	}
+	// The packed line goes whatever its id when a loose file shadows it;
+	// else it is the ref's value, cur.
+	packed := cur
+	if loose {
+		packed = ""
+	}
+	if err := deletePacked(d, ref, packed); err != nil {
+		return err
+	}
+	if loose {
 		if err := d.Remove(ref); err != nil {
 			return err
 		}
-	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
 	}
 	d.Remove("logs/" + ref) // its reflog, as git deletes it
-	for dir := path.Dir(ref); dir != "refs/heads"; dir = path.Dir(dir) {
+	return nil
+}
+
+// removeEmptyDirs removes dir (refs/<kind>/...) of d and the directories
+// above it that are empty, up to refs/<kind>, as git does when it deletes a
+// ref.
+func removeEmptyDirs(d *nofollow.Dir, dir string) {
+	for ; strings.Count(dir, "/") >= 2; dir = path.Dir(dir) {
 		if d.Remove(dir) != nil { // only an empty one
 			break
 		}
 	}
-	return nil
 }
 
-// deletePacked removes ref (at oid) from packed-refs in d, if it is there,
-// as git does: the new packed-refs written as packed-refs.lock (made
-// exclusively, so git's own writers wait) and renamed over it, without
-// following a symlink.
-func deletePacked(d *nofollow.Dir, ref, oid string) error {
+// createLock creates the lock file rel of d, exclusively, holding data
+// (see nofollow.Dir.CreateExcl). While someone else holds it, it waits for
+// it, a second at most, as git waits for a ref's or packed-refs' lock.
+func createLock(d *nofollow.Dir, rel string, data []byte) error {
+	deadline := time.Now().Add(time.Second)
+	for {
+		err := d.CreateExcl(rel, data, 0o644)
+		if !errors.Is(err, fs.ErrExist) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// deletePacked removes ref's line (and its peeled line) from packed-refs
+// in d, if it is there, as git does: the new packed-refs written as
+// packed-refs.lock (made exclusively, so git's own writers wait) and
+// renamed over it, without following a symlink. If want is not "", the
+// line must have that id; else it goes whatever its id (a loose ref
+// shadows it).
+func deletePacked(d *nofollow.Dir, ref, want string) error {
 	data, err := d.ReadFile("packed-refs", 256<<20)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -529,8 +603,8 @@ func deletePacked(d *nofollow.Dir, ref, oid string) error {
 		}
 		skipPeeled = false
 		if id, name, ok := strings.Cut(strings.TrimSuffix(line, "\n"), " "); ok && name == ref {
-			if id != oid {
-				return fmt.Errorf("packed %s is at %s, not %s", ref, id, oid)
+			if want != "" && id != want {
+				return fmt.Errorf("packed %s is at %s, not %s", ref, id, want)
 			}
 			found, skipPeeled = true, true
 			continue
@@ -541,7 +615,7 @@ func deletePacked(d *nofollow.Dir, ref, oid string) error {
 		return nil
 	}
 	const lock = "packed-refs.lock"
-	if err := d.CreateExcl(lock, []byte(kept.String()), 0o644); err != nil {
+	if err := createLock(d, lock, []byte(kept.String())); err != nil {
 		return err
 	}
 	if now, err := d.ReadFile("packed-refs", 256<<20); err != nil || !bytes.Equal(now, data) {
