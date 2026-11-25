@@ -3,6 +3,7 @@ package gitx
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -655,5 +656,78 @@ func TestSyncShallowOnlyIfUnchanged(t *testing.T) {
 	}
 	if _, err := os.Lstat(path + ".lock"); err == nil {
 		t.Error("shallow.lock left behind")
+	}
+}
+
+// TestFetchRetriesWhenRefsChangedMeanwhile: another fetch of the clone
+// finishes while one is between git's fetch and its sync, moving
+// origin/main to a newer tip (and origin moves on again). FetchOrigin's
+// sync finds the ref changed meanwhile and fetches once more, from the
+// refs as they are then: that one is clean, so the fetch succeeds,
+// origin/main at origin's newest tip. A ref that changes meanwhile both
+// times is reported, left at what the other fetch put there.
+func TestFetchRetriesWhenRefsChangedMeanwhile(t *testing.T) {
+	for _, format := range []string{"files", "reftable"} {
+		t.Run(format, func(t *testing.T) {
+			ctx := context.Background()
+			f := newFixture(t)
+			repo := f.repo
+			if format == "reftable" {
+				repo = reftableClone(t, f)
+			}
+			t.Cleanup(func() { beforeFetchSync = nil })
+			var syncs, pushes int
+			var fetched string // what the other fetch put in origin/main
+			push := func() {
+				pushes++
+				f.pushFromOtherClone(t, fmt.Sprintf("other%d", pushes))
+			}
+			// The other fetch, overlapping the first times syncs: a whole
+			// FetchOrigin, then origin moves on.
+			overlap := func(times int) func() {
+				return func() {
+					if syncs++; syncs > times {
+						return
+					}
+					hook := beforeFetchSync
+					beforeFetchSync = nil
+					defer func() { beforeFetchSync = hook }()
+					push()
+					if err := FetchOrigin(ctx, repo, to(f.origin), io.Discard); err != nil {
+						t.Fatal(err)
+					}
+					fetched = git(t, repo, "rev-parse", "refs/remotes/origin/main")
+					push()
+				}
+			}
+			originMain := func() string { return git(t, repo, "rev-parse", "refs/remotes/origin/main") }
+
+			push()
+			beforeFetchSync = overlap(1)
+			if err := FetchOrigin(ctx, repo, to(f.origin), io.Discard); err != nil {
+				t.Errorf("fetch, a clean retry: %v", err)
+			}
+			if syncs != 2 {
+				t.Errorf("synced %d times, want 2 (a retry)", syncs)
+			}
+			if got, want := originMain(), git(t, f.origin, "rev-parse", "main"); got != want {
+				t.Errorf("origin/main = %s, want origin's newest %s", got, want)
+			}
+
+			syncs = 0
+			push()
+			beforeFetchSync = overlap(2)
+			err := FetchOrigin(ctx, repo, to(f.origin), io.Discard)
+			if err == nil || !strings.Contains(err.Error(), "refs/remotes/origin/main changed meanwhile") {
+				t.Errorf("fetch, changed meanwhile twice: %v", err)
+			}
+			if syncs != 2 {
+				t.Errorf("synced %d times, want 2 (one retry)", syncs)
+			}
+			if got := originMain(); got != fetched {
+				t.Errorf("origin/main = %s, want the other fetch's %s", got, fetched)
+			}
+			git(t, repo, "fsck", "--no-progress")
+		})
 	}
 }

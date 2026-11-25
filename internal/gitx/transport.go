@@ -201,9 +201,11 @@ func firstChars(s string, n int) string {
 //
 // git writes refs (and FETCH_HEAD) to a store of atl's own; the refs are
 // copied into the repo from there (refStore), each only while it still has
-// the value it had before: one that another push or fetch changed
-// meanwhile is left as it is, and the fetch fails saying so once the
-// others are in.
+// the value it had before. When one changed meanwhile (another push or
+// fetch of the repo finished first), the fetch runs once more, from the
+// refs as they are then, which normally settles it; one still changed
+// meanwhile after that is left as it is, and the fetch fails saying so
+// once the others are in.
 func FetchOrigin(ctx context.Context, dir string, origin Origin, out io.Writer) error {
 	t, err := newTransport(ctx, dir, origin, false)
 	if err != nil {
@@ -211,20 +213,38 @@ func FetchOrigin(ctx context.Context, dir string, origin Origin, out io.Writer) 
 	}
 	args := append(t.args, "fetch", "--no-recurse-submodules", "--no-auto-gc",
 		"--upload-pack="+packProgram(false, t.local), t.name)
-	store, err := newRefStore(ctx, dir)
-	if err != nil {
-		return err
+	var stale []string
+	for attempt := 0; attempt < 2; attempt++ {
+		if stale, err = fetchOnce(ctx, dir, out, args); err != nil || len(stale) == 0 {
+			break
+		}
 	}
-	defer store.close()
-	if err := runTransport(ctx, dir, out, store.env, args); err != nil {
-		return err
-	}
-	stale, err := store.sync(ctx, dir)
 	if err != nil {
 		return errors.Join(err, staleError(stale))
 	}
 	t.setOriginHead(ctx, dir)
 	return staleError(stale)
+}
+
+// beforeFetchSync, if set, runs in fetchOnce between git's fetch and the
+// sync: a test's seam for a push or fetch that overlaps.
+var beforeFetchSync func()
+
+// fetchOnce runs git with args (a fetch) on a new store of the repo at
+// dir and syncs it (refStore.sync).
+func fetchOnce(ctx context.Context, dir string, out io.Writer, args []string) (stale []string, err error) {
+	store, err := newRefStore(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	defer store.close()
+	if err := runTransport(ctx, dir, out, store.env, args); err != nil {
+		return nil, err
+	}
+	if beforeFetchSync != nil {
+		beforeFetchSync()
+	}
+	return store.sync(ctx, dir)
 }
 
 // lsRemoteArgs are the arguments of `git ls-remote <flags> <origin>` with
