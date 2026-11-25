@@ -41,7 +41,11 @@ func TestE2E(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "e2e.sh")
+	// From the checkout, as the script's comment says to run it, with a
+	// CDPATH that has "." (cd then prints where it went).
+	cmd := exec.CommandContext(ctx, "bash", "test/e2e.sh")
+	cmd.Dir = ".."
+	cmd.Env = append(os.Environ(), "CDPATH=.:/")
 	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {

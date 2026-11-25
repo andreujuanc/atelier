@@ -314,6 +314,51 @@ func TestAddRepoRefusals(t *testing.T) {
 	}
 }
 
+// A repo added rw whose origin already has atl/<slug> (or a branch below
+// it), say another workspace's task of the same slug, is refused: atl never
+// takes over a branch it did not create (atl show would call the task's
+// branch pushed, atl pr open a PR for that branch, push --force replace it).
+// Nothing is created.
+func TestAddRepoRefusesBranchOnOrigin(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "web", "main")
+	e.addRepo(t, "lib", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "Clash", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}, {"lib", model.ModeRO}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.pushBranch(t, "web", "main", task.Branch, "theirs")
+	e.pushBranch(t, "lib", "main", task.Branch+"/sub", "theirs")
+	for _, c := range []struct {
+		repo string
+		add  func() error
+	}{
+		{"web", func() error { _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"web", model.ModeRW}, false); return err }},
+		{"lib", func() error { // an upgrade from ro
+			res, err := e.app.AddRepos(ctx, task.Slug, []RepoArg{{"lib", model.ModeRW}}, AddOpts{})
+			if err == nil {
+				err = errors.Join(res.Failed...)
+			}
+			return err
+		}},
+	} {
+		err := c.add()
+		if err == nil || !strings.Contains(err.Error(), task.Branch) {
+			t.Errorf("%s: err = %v, want a refusal naming %s", c.repo, err, task.Branch)
+		}
+		if exists(e.app.Paths.WorktreePath(task.Slug, c.repo)) || worktreeCount(t, e.canonical(c.repo)) != 1 {
+			t.Errorf("%s: worktree created", c.repo)
+		}
+		noBranch(t, e.canonical(c.repo), task.Branch)
+	}
+	got, _ := e.app.Store.GetTask(ctx, task.ID)
+	if len(got.Repos) != 2 || got.Repos[1].Mode != model.ModeRO {
+		t.Fatalf("repos after the refusals: %+v", got.Repos)
+	}
+}
+
 func noBranch(t *testing.T, repo, branch string) {
 	t.Helper()
 	if out, err := exec.Command("git", "-C", repo, "rev-parse", "--verify", "-q", "refs/heads/"+branch).CombinedOutput(); err == nil {
@@ -633,5 +678,94 @@ func TestAddRepoRefusesUnderLiveSessions(t *testing.T) {
 	}
 	if _, err := e.app.AddRepo(ctx, task.Slug, RepoArg{"lib", model.ModeRO}, true); !errors.Is(err, ErrRestartNeeded) {
 		t.Fatalf("ro with the sandbox off: %v", err)
+	}
+}
+
+// TestConcurrentNewSameTitle: atl new run several times at once (separate
+// processes: one store each) with the same title makes as many tasks, each
+// with its own slug, branch, port offset and worktrees.
+func TestConcurrentNewSameTitle(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	const n = 5
+	apps := make([]*App, n)
+	for i := range apps {
+		st, err := store.Open(e.app.Paths.DB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		apps[i] = &App{Paths: e.app.Paths, Store: st, Tmux: e.app.Tmux, Out: &bytes.Buffer{}, Now: time.Now, AtlBin: e.app.AtlBin}
+	}
+	start := make(chan struct{})
+	tasks := make([]*model.Task, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range apps {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			tasks[i], errs[i] = apps[i].NewTask(ctx, NewTaskOpts{Title: "Same", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	slugs, offsets := map[string]bool{}, map[int]bool{}
+	for i, tk := range tasks {
+		if errs[i] != nil {
+			t.Fatalf("new %d: %v", i, errs[i])
+		}
+		if slugs[tk.Slug] || offsets[tk.PortOffset] {
+			t.Fatalf("slug %s or offset %d given twice", tk.Slug, tk.PortOffset)
+		}
+		slugs[tk.Slug], offsets[tk.PortOffset] = true, true
+		if b := git(t, e.app.Paths.WorktreePath(tk.Slug, "api"), "branch", "--show-current"); b != tk.Branch {
+			t.Errorf("%s: worktree on %s", tk.Slug, b)
+		}
+	}
+	if c := worktreeCount(t, e.canonical("api")); c != n+1 {
+		t.Fatalf("api has %d worktrees, want %d", c, n+1)
+	}
+}
+
+// TestConcurrentRenameAndDone: renames racing done never leave a CLAUDE.md
+// (or task dir) behind the closed task, and every rename sticks.
+func TestConcurrentRenameAndDone(t *testing.T) {
+	for round := 0; round < 3; round++ {
+		e := newTaskEnv(t)
+		ctx := context.Background()
+		e.addRepo(t, "api", "main")
+		tk, err := e.app.NewTask(ctx, NewTaskOpts{Title: "x", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		other, err := store.Open(e.app.Paths.DB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { other.Close() })
+		renamer := &App{Paths: e.app.Paths, Store: other, Tmux: e.app.Tmux, Out: &bytes.Buffer{}, Now: time.Now, AtlBin: e.app.AtlBin}
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				if _, err := renamer.Rename(ctx, tk.Slug, fmt.Sprintf("title %d", i)); err != nil {
+					t.Errorf("rename: %v", err)
+				}
+			}
+		}()
+		if _, err := e.app.Done(ctx, tk.Slug, false); err != nil {
+			t.Fatal(err)
+		}
+		wg.Wait()
+		if exists(e.app.Paths.TaskDir(tk.Slug)) {
+			t.Fatalf("round %d: task dir left after done", round)
+		}
+		if got, _ := e.app.Store.GetTask(ctx, tk.ID); got.Title != "title 9" || got.Status != model.StatusDone {
+			t.Fatalf("round %d: %q %s", round, got.Title, got.Status)
+		}
 	}
 }

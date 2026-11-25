@@ -251,10 +251,11 @@ func (a *App) OpenSession(ctx context.Context, ref string, sessionID int64) (*ex
 				s.ID, t.Slug, s.TranscriptPath)
 		}
 	}
-	dir, err := a.checkLaunchable(t)
+	t, dir, unlock, err := a.lockLaunch(ctx, t)
 	if err != nil {
 		return nil, err
 	}
+	defer unlock()
 	claimed, err := a.Store.ClaimFrom(ctx, s.ID, s.State, a.now())
 	if err != nil {
 		return nil, fmt.Errorf("task %s: claim session %d: %w", t.Slug, s.ID, err)

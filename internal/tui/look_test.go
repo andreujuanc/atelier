@@ -290,6 +290,30 @@ func TestScrolling(t *testing.T) {
 	}
 }
 
+// TestScrollingListGrows: when the list gets taller without a resize (the
+// help takes one line outside normal mode), it fills the new rows from
+// above rather than leaving a blank row at the bottom.
+func TestScrollingListGrows(t *testing.T) {
+	var ts []app.TaskView
+	for i := int64(1); i <= 40; i++ {
+		ts = append(ts, tv(i, fmt.Sprintf("t%02d", i), model.StatusBacklog))
+	}
+	m, _ := newTest(t, &fakeBackend{tasks: ts})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	for i := 0; i < 39; i++ {
+		key(m, "j")
+	}
+	h := m.listHeight()
+	key(m, "/")
+	if m.listHeight() <= h {
+		t.Fatalf("list height %d in filter mode, %d before", m.listHeight(), h)
+	}
+	h = m.listHeight()
+	if off, end := m.listWindow(h); end-off != h {
+		t.Fatalf("rows %d-%d shown in %d lines", off, end, h)
+	}
+}
+
 // TestHelpColumns: on a short terminal the key reference takes two
 // columns so that every key still shows.
 func TestHelpColumns(t *testing.T) {

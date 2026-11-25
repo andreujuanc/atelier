@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -771,5 +773,105 @@ func TestTransportArgsKeepTheUsersOwnSettings(t *testing.T) {
 	if args := transportArgs(false, true, userConfig(ctx, f.repo)); slices.ContainsFunc(args, func(s string) bool { return strings.HasPrefix(s, "core.sshCommand=") }) ||
 		slices.Contains(args, "protocol.file.allow=never") || slices.Contains(args, "push.pushOption=") {
 		t.Errorf("fetch args with $GIT_SSH_COMMAND, local origin: %q", args)
+	}
+}
+
+// A failed push or fetch names what failed, not the advice git prints
+// after it (hint: lines, "Please make sure you have the correct access
+// rights and the repository exists.").
+func TestTransportErrorSaysWhatFailed(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	wt, _ := f.addWorktree(t, ctx, "t1")
+	commitFile(t, wt, "work.txt", "work\n", "work")
+	origin := to(f.origin)
+	if err := PushBranch(ctx, wt, origin, "atl/t1", false, nil); err != nil {
+		t.Fatal(err)
+	}
+	git(t, wt, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+		"commit", "-q", "--amend", "-m", "work, amended")
+	var out bytes.Buffer
+	err := PushBranch(ctx, wt, origin, "atl/t1", false, &out)
+	if err == nil || !strings.Contains(err.Error(), "[rejected]") || !strings.Contains(err.Error(), "non-fast-forward") {
+		t.Errorf("non-fast-forward push: %v\ngit wrote:\n%s", err, out.String())
+	}
+
+	gone := to(filepath.Join(f.root, "gone.git"))
+	out.Reset()
+	err = FetchOrigin(ctx, f.repo, gone, &out)
+	if err == nil || !strings.Contains(err.Error(), "does not appear to be a git repository") {
+		t.Errorf("fetch from a missing origin: %v\ngit wrote:\n%s", err, out.String())
+	}
+}
+
+func TestFailureLine(t *testing.T) {
+	for _, c := range []struct{ out, want string }{
+		{"", ""},
+		{"boom\n", "boom"},
+		{"To /o.git\n ! [rejected]        atl/x -> atl/x (non-fast-forward)\nerror: failed to push some refs to '/o.git'\n" +
+			"hint: Updates were rejected because the tip of your current branch is behind\nhint: its remote counterpart.\n",
+			"! [rejected]        atl/x -> atl/x (non-fast-forward)"},
+		{"fatal: '/o.git' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\n" +
+			"Please make sure you have the correct access rights\nand the repository exists.\n",
+			"fatal: '/o.git' does not appear to be a git repository"},
+		{"git@github.com: Permission denied (publickey).\r\nfatal: Could not read from remote repository.\n\nPlease make sure…\n",
+			"fatal: Could not read from remote repository."},
+		{"remote: error: GH006: Protected branch update failed\nTo github.com:o/r.git\n" +
+			" ! [remote rejected] atl/x -> atl/x (protected branch hook declined)\nerror: failed to push some refs to 'github.com:o/r.git'\n",
+			"! [remote rejected] atl/x -> atl/x (protected branch hook declined)"},
+		{"error: src refspec atl/x does not match any\nerror: failed to push some refs to '/o.git'\n",
+			"error: src refspec atl/x does not match any"},
+	} {
+		if got := failureLine(c.out); got != c.want {
+			t.Errorf("failureLine(%q) = %q, want %q", c.out, got, c.want)
+		}
+	}
+}
+
+// TestPushBranchPushesOnlyWhatTheRepoHas: a task can write the clone's git
+// dir: make its branch's ref file a symlink to another repo's ref on the
+// host (git follows it where atl runs; the task cannot) and have that
+// repo's objects. A push of the branch must not send that
+// repo's history to origin, from where the task would fetch it.
+func TestPushBranchPushesOnlyWhatTheRepoHas(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	secret := filepath.Join(t.TempDir(), "secret")
+	git(t, f.root, "init", "-q", "-b", "main", secret)
+	commitFile(t, secret, "creds", "hunter2\n", "the user's private work")
+	// Its objects in the clone (alternates are refused: TestHostGitReadsOnlyTheRepo).
+	git(t, f.repo, "fetch", "-q", secret, "main")
+	pushed := func() string {
+		out, _ := exec.Command("git", "-C", f.origin, "log", "--format=%s", "atl/x").CombinedOutput()
+		return string(out)
+	}
+
+	// The loose ref, a symlink.
+	ref := filepath.Join(f.repo, ".git", "refs", "heads", "atl", "x")
+	must(t, os.MkdirAll(filepath.Dir(ref), 0o755))
+	must(t, os.Symlink(filepath.Join(secret, ".git", "refs", "heads", "main"), ref))
+	err := PushBranch(ctx, f.repo, to(f.origin), "atl/x", false, io.Discard)
+	if strings.Contains(pushed(), "private") || err == nil {
+		t.Fatalf("a symlinked ref: pushed %q (%v)", pushed(), err)
+	}
+	// A directory on the way, a symlink.
+	must(t, os.Remove(ref))
+	must(t, os.Remove(filepath.Dir(ref)))
+	must(t, os.Symlink(filepath.Join(secret, ".git", "refs", "heads"), filepath.Dir(ref)))
+	git(t, secret, "branch", "x")
+	err = PushBranch(ctx, f.repo, to(f.origin), "atl/x", false, io.Discard)
+	if strings.Contains(pushed(), "private") || err == nil {
+		t.Fatalf("a symlinked ref dir: pushed %q (%v)", pushed(), err)
+	}
+	// packed-refs, a symlink.
+	must(t, os.Remove(filepath.Dir(ref)))
+	git(t, secret, "branch", "-m", "x", "atl/x")
+	git(t, secret, "pack-refs", "--all")
+	packed := filepath.Join(f.repo, ".git", "packed-refs")
+	must(t, os.Remove(packed))
+	must(t, os.Symlink(filepath.Join(secret, ".git", "packed-refs"), packed))
+	err = PushBranch(ctx, f.repo, to(f.origin), "atl/x", false, io.Discard)
+	if strings.Contains(pushed(), "private") || err == nil {
+		t.Fatalf("a symlinked packed-refs: pushed %q (%v)", pushed(), err)
 	}
 }

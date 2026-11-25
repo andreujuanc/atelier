@@ -6,7 +6,7 @@
 # python3. Run from anywhere: test/e2e.sh. Prints "E2E OK" on success.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 STUBS="$ROOT/test/stubs"
 
 fail() {
@@ -54,12 +54,13 @@ mkdir -p "$W/bin"
 (cd "$ROOT" && CGO_ENABLED=0 go build -buildmode=exe -o "$W/bin/atl" ./cmd/atl) || fail "go build"
 
 # Isolated environment.
-unset TMUX TMUX_PANE ATL_WORKSPACE ATL_BIN ATL_SESSION ATL_TASK ATL_TASK_DIR ATL_PORT_OFFSET CLAUDE_CONFIG_DIR
+unset TMUX TMUX_PANE CLAUDE_CONFIG_DIR
 # git takes config from the environment too (GIT_CONFIG_PARAMETERS and
 # GIT_CONFIG_COUNT, e.g. when run under `git -c`), and GIT_DIR & co. point it
-# at the caller's repo: only the config files below may count.
+# at the caller's repo: only the config files below may count. Likewise for
+# atl's own ATL_* (e.g. ATL_SANDBOX_ID when run inside a task container).
 for v in $(compgen -e); do
-	if [[ $v == GIT_* ]]; then unset "$v"; fi
+	if [[ $v == GIT_* || $v == ATL_* ]]; then unset "$v"; fi
 done
 export PATH="$W/bin:$STUBS:$PATH"
 export HOME="$W/home"
@@ -403,7 +404,7 @@ expect_state fix-login stopped "after tmux server crash (startup recover)"
 step resume
 out="$(atl resume fix-login)" || fail "atl resume failed: $out"
 expect_eq "atl resume count" "$out" "1"
-resumed() { grep -qF "sid=$CID argv=[--resume][$CID][--add-dir][$ATL_REPOS/docs]" "$E2E_LOG"; }
+resumed() { grep -qF "sid=$CID argv=[--resume=$CID][--add-dir][$ATL_REPOS/docs]" "$E2E_LOG"; }
 wait_for "stub claude relaunched with --resume $CID" resumed
 expect_state fix-login idle "after resume"
 expect_eq "claude session id after resume" "$(sess_field fix-login claude_session_id)" "$CID"
@@ -422,7 +423,7 @@ tm kill-window -t "$(sess_field fix-login tmux_target)"
 # Attaching needs a terminal, so only the resume before it can succeed here.
 out="$(atl open fix-login --session "$SID" </dev/null 2>&1)" && fail "atl open attached without a terminal: $out"
 [[ "$out" == *"attach:"* ]] || fail "atl open --session failed before attaching: $out"
-resumed_twice() { [[ "$(grep -cF "sid=$CID argv=[--resume][$CID][--add-dir][$ATL_REPOS/docs]" "$E2E_LOG")" == 2 ]]; }
+resumed_twice() { [[ "$(grep -cF "sid=$CID argv=[--resume=$CID][--add-dir][$ATL_REPOS/docs]" "$E2E_LOG")" == 2 ]]; }
 wait_for "stub claude relaunched again with --resume $CID" resumed_twice
 expect_state fix-login idle "after open --session"
 expect_eq "session count after open --session" "$(sess_count fix-login)" "1"
@@ -563,5 +564,31 @@ out="$(atl cancel second-task 2>&1)" || fail "atl cancel (after reopen) failed: 
 	"$out" == *"deleted branch atl/second-task in docs"* ]] || fail "atl cancel (after reopen) branch messages: $out"
 [[ ! -e "$S" ]] || fail "second-task dir still exists"
 expect_eq "worktrees of api after the second cancel" "$(git -C "$ATL_REPOS/api" worktree list --porcelain | grep -c '^worktree ')" "1"
+
+# ---- done from inside the task's tmux session ------------------------------
+
+# A shell in a window of the task's own tmux session runs atl done: closing
+# kills that session, which hangs up on the shell and atl; atl still finishes.
+# Its teardown gets SIGHUP's default disposition (not atl's ignoring it):
+# it records the mask of ignored signals of its shell.
+step "done from the task's own tmux session"
+cat >"$WS/config/projects/selfclose.toml" <<'EOF'
+teardown = 'grep "^SigIgn:" /proc/$$/status >"$E2E_OUT/self-close-sigign"'
+
+[[repos]]
+name = "api"
+mode = "rw"
+EOF
+out="$(atl new "Self close" --project selfclose --no-fetch)" || fail "atl new (self close) failed: $out"
+out="$(atl session self-close)" || fail "atl session self-close failed: $out"
+tm new-window -d -t "=atl-self-close:" "atl done self-close >'$E2E_OUT/self-close.log' 2>&1; sleep 60" ||
+	fail "start a shell window in atl-self-close"
+self_closed() { [[ "$(task_field self-close status)" == done ]]; }
+wait_for "atl done run from the task's own tmux session" self_closed
+[[ ! -e "$ATL_TASKS/self-close" ]] || fail "self-close dir still exists: $(cat "$E2E_OUT/self-close.log")"
+expect_eq "worktrees of api after done from inside" "$(git -C "$ATL_REPOS/api" worktree list --porcelain | grep -c '^worktree ')" "1"
+sigign="$(sed -n 's/^SigIgn:[[:space:]]*//p' "$E2E_OUT/self-close-sigign")"
+[[ -n $sigign ]] || fail "teardown did not record its ignored signals: $(cat "$E2E_OUT/self-close.log")"
+((((16#$sigign) & 1) == 0)) || fail "teardown inherited an ignored SIGHUP (SigIgn $sigign)"
 
 echo "E2E OK"

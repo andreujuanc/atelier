@@ -221,7 +221,8 @@ func TestWriteSettingsMerge(t *testing.T) {
 }
 
 func TestWriteSettingsInvalidJSON(t *testing.T) {
-	for _, bad := range []string{`{"permissions": `, `[1,2]`, `{"hooks": []}`, `{"hooks": {"Stop": {}}}`, `null`} {
+	for _, bad := range []string{`{"permissions": `, `[1,2]`, `{"hooks": []}`, `{"hooks": {"Stop": {}}}`, `null`,
+		`{"model": "x"} {}`, `{"model": "x"} garbage`, `{"model": "x"}]`} {
 		dir := t.TempDir()
 		path := filepath.Join(dir, ".claude", "settings.json")
 		os.MkdirAll(filepath.Dir(path), 0o755)
@@ -239,6 +240,38 @@ func TestWriteSettingsInvalidJSON(t *testing.T) {
 	}
 }
 
+// TestWriteSettingsNullHooks: "hooks": null, or null for an event's list,
+// is no hooks, not an invalid file: the user's other keys and hooks are
+// kept, nothing is backed up and no null is written back.
+func TestWriteSettingsNullHooks(t *testing.T) {
+	for _, settings := range []string{
+		`{"model": "x", "hooks": null}`,
+		`{"model": "x", "hooks": {"Stop": null, "PreCompact": [{"hooks": [{"type": "command", "command": "mine"}]}]}}`,
+		`{"model": "x", "hooks": {"PreCompact": null}}`,
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".claude", "settings.json")
+		os.MkdirAll(filepath.Dir(path), 0o755)
+		if err := os.WriteFile(path, []byte(settings), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteSettings(dir, "/bin/atl"); err != nil {
+			t.Fatal(err)
+		}
+		sf, raw, text := readSettings(t, dir)
+		checkAtelierHooks(t, sf, "/bin/atl")
+		if raw["model"] != "x" || strings.Contains(settings, "mine") && !strings.Contains(text, `"mine"`) {
+			t.Errorf("%s: user settings lost:\n%s", settings, text)
+		}
+		if strings.Contains(text, "null") {
+			t.Errorf("%s: null written back:\n%s", settings, text)
+		}
+		if _, err := os.Stat(path + ".bak"); err == nil {
+			t.Errorf("%s: backed up as invalid", settings)
+		}
+	}
+}
+
 func TestWriteSettingsQuotedBin(t *testing.T) {
 	dir := t.TempDir()
 	bin := "/home/my user/it's bin/atl"
@@ -247,12 +280,15 @@ func TestWriteSettingsQuotedBin(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	sf, _, text := readSettings(t, dir)
+	sf, raw, text := readSettings(t, dir)
 	want := `'/home/my user/it'\''s bin/atl' hook Stop`
 	if HookCommand(bin, "Stop") != want {
 		t.Fatalf("HookCommand = %q, want %q", HookCommand(bin, "Stop"), want)
 	}
 	checkAtelierHooks(t, sf, bin)
+	if sl, _ := raw["statusLine"].(map[string]any); sl == nil || sl["command"] != `'/home/my user/it'\''s bin/atl' statusline` {
+		t.Errorf("statusLine = %#v, want the quoted binary:\n%s", raw["statusLine"], text)
+	}
 	// Switching binaries replaces the entries rather than adding new ones.
 	if err := WriteSettings(dir, "/usr/bin/atl"); err != nil {
 		t.Fatal(err)
@@ -321,6 +357,17 @@ func TestClaudeMDTitleWhitespace(t *testing.T) {
 	got := ClaudeMD(task, nil)
 	if !strings.Contains(got, "\n# Fix the login flow\n\n") {
 		t.Errorf("heading not collapsed:\n%s", got)
+	}
+}
+
+// TestClaudeMDDescriptionControl: a description stored with control
+// characters (before atl new sanitized it) is written as notes are stored:
+// newlines and tabs kept, \r\n made \n, the rest dropped.
+func TestClaudeMDDescriptionControl(t *testing.T) {
+	task := model.Task{Slug: "x", Title: "x", Description: "\x1b[2Jline\a one\r\n\tdetail\x00\r\n"}
+	got := ClaudeMD(task, nil)
+	if strings.ContainsAny(got, "\x1b\a\r\x00") || !strings.Contains(got, "\n[2Jline one\n\tdetail\n\n") {
+		t.Errorf("description not sanitized:\n%q", got)
 	}
 }
 

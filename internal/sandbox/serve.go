@@ -52,16 +52,36 @@ func UpstreamSocket() string {
 	return "/var/run/docker.sock"
 }
 
+// lockProbeWait is how long a starting gate tries for the run dir's lock
+// before it takes it for another gate's; shutdownWait how long a stopped
+// gate lets the requests under way finish.
+const (
+	lockProbeWait = 500 * time.Millisecond
+	shutdownWait  = 10 * time.Second
+)
+
 // MaxSocketPath is the longest unix socket path Linux accepts (sun_path
 // holds 108 bytes including the final NUL).
 const MaxSocketPath = 107
+
+// MakeRunDir creates runDir, or makes an existing one (an older atl made
+// them 0755), the owner's only: the gate's sockets in it answer whoever
+// connects. The task container runs as the owner, and the containers a
+// task mounts the Docker socket into get the socket file itself, not
+// through the dir.
+func MakeRunDir(runDir string) error {
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(runDir, 0o700)
+}
 
 // Serve runs g on the socket in runDir, and ctl (if not nil) on the control
 // socket there, until ctx ends, the task directory (g.Root) disappears or the
 // gate's socket is removed or replaced. It returns nil at once if another
 // gate already serves runDir.
 func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	if err := MakeRunDir(runDir); err != nil {
 		return err
 	}
 	sock := socketPath(runDir)
@@ -73,11 +93,19 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 		return err
 	}
 	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil // another gate has it
+	// Another gate has it if it stays taken a moment: Stop and StopAndWait
+	// take it for an instant to see whether a gate holds it.
+	for give := time.Now().Add(lockProbeWait); ; time.Sleep(20 * time.Millisecond) {
+		err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
 		}
-		return err
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return err
+		}
+		if time.Now().After(give) {
+			return nil
+		}
 	}
 	if err := os.WriteFile(pidPath(runDir), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
 		return err
@@ -129,7 +157,9 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 	srv := &http.Server{Handler: g}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		tick := time.NewTicker(10 * time.Second)
 		defer tick.Stop()
 		for {
@@ -142,11 +172,21 @@ func Serve(ctx context.Context, g *Gate, ctl *Control, runDir string) error {
 					continue
 				}
 			}
-			srv.Close()
+			// No new request; those under way are answered first (for a
+			// while): a container create relayed now lands before whoever
+			// stopped the gate (StopAndWait) lists the task's containers.
+			sctx, scancel := context.WithTimeout(context.Background(), shutdownWait)
+			defer scancel()
+			if srv.Shutdown(sctx) != nil {
+				srv.Close()
+			}
 			return
 		}
 	}()
-	if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	err = srv.Serve(l)
+	cancel()
+	<-stopped
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
@@ -206,9 +246,8 @@ func start(atlBin string, args []string, ident, what, runDir, logPath string) er
 		if strings.TrimSpace(string(cur)) == ident {
 			return nil
 		}
-		Stop(runDir)
 		// One that missed the signal notices its socket is gone within 10s.
-		if err := awaitUnlocked(runDir, 15*time.Second); err != nil {
+		if err := StopAndWait(runDir, 15*time.Second); err != nil {
 			return fmt.Errorf("replace the gate for %s: %w", what, err)
 		}
 	}
@@ -272,10 +311,11 @@ func awaitUnlocked(runDir string, wait time.Duration) error {
 }
 
 // Stop ends the gate serving runDir, if any: it signals the process named in
-// the pid file (only if that process is an `atl gate`) and removes the
-// socket, which a gate that missed the signal notices by itself.
+// the pid file (only if a gate holds runDir's lock, so the file is not one a
+// killed gate left, and only if that process is an `atl gate`) and removes
+// the socket, which a gate that missed the signal notices by itself.
 func Stop(runDir string) {
-	if data, err := os.ReadFile(pidPath(runDir)); err == nil {
+	if data, err := os.ReadFile(pidPath(runDir)); err == nil && locked(runDir) {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 1 {
 			if cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil &&
 				strings.Contains(string(cmdline), "\x00gate\x00") {
@@ -284,6 +324,33 @@ func Stop(runDir string) {
 		}
 	}
 	os.Remove(socketPath(runDir))
+}
+
+// StopAndWait is Stop, then waits up to wait until the gate has stopped
+// serving (it holds the run dir's lock until then), so that it takes no
+// request any more. Without a gate holding the lock there is nothing to
+// wait for (and Stop signalled nothing).
+func StopAndWait(runDir string, wait time.Duration) error {
+	Stop(runDir)
+	if !locked(runDir) {
+		return nil
+	}
+	return awaitUnlocked(runDir, wait)
+}
+
+// locked reports whether a gate holds runDir's lock, as Serve does while it
+// serves (and a gate that died does not): false only if the lock is
+// missing or free.
+func locked(runDir string) bool {
+	f, err := os.OpenFile(lockPath(runDir), os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	defer f.Close() // releases the lock if it was free
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil
 }
 
 // NewLogger returns the logger a gate process writes to (its stderr, which

@@ -33,7 +33,7 @@ the workspaces. `atl workspace …` needs no workspace.
 
 atl exports each `atelier.toml` setting as its environment variable (`repos` → `ATL_REPOS`,
 `git_config` → `GIT_CONFIG_GLOBAL`, `context` → `ATL_CONTEXT`, `tmux_socket` →
-`ATL_TMUX_SOCKET`, `[sandbox]` → `ATL_SANDBOX_IMAGE`, `ATL_SANDBOX_MOUNTS`,
+`ATL_TMUX_SOCKET`, `[sandbox]` → `ATL_SANDBOX_IMAGE`, `ATL_SANDBOX_MOUNTS`, `ATL_SANDBOX_REGISTRIES`,
 `ATL_SANDBOX_CONTEXT`), so everything it starts inherits them.
 
 - A variable you set wins over the file.
@@ -120,7 +120,7 @@ What carries over:
 |---|---|
 | `ATL_REPOS` | `repos` |
 | `ATL_SANDBOX_MOUNTS` | `[sandbox] mounts` |
-| `ATL_SANDBOX_IMAGE`, `ATL_SANDBOX_CONTEXT`, `ATL_CONTEXT`, `ATL_TMUX_SOCKET` | `[sandbox] image`, `[sandbox] context`, `context`, `tmux_socket` |
+| `ATL_SANDBOX_IMAGE`, `ATL_SANDBOX_CONTEXT`, `ATL_SANDBOX_REGISTRIES`, `ATL_CONTEXT`, `ATL_TMUX_SOCKET` | `[sandbox] image`, `[sandbox] context`, `[sandbox] registries`, `context`, `tmux_socket` |
 | a file mounted as `~/.gitconfig` | `git_config` (omitted for `<workspace>/gitconfig`, the default) |
 | `ATL_SANDBOX=off` | not carried over (warning) |
 | tokens, keys, secrets | never written: use `atl token` (the stored one is still in `run/`) or the environment |

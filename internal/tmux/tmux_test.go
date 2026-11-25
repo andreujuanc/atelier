@@ -448,6 +448,30 @@ func TestAttachCmdSameServer(t *testing.T) {
 	}
 }
 
+// TestAttachCmdStartsServerWithoutSessionVars: attach-session starts the
+// server when none runs (which stays if its config, e.g. the user's, makes
+// a session); like every server atl starts, it does not take the session's
+// variables into its global environment.
+func TestAttachCmdStartsServerWithoutSessionVars(t *testing.T) {
+	c := freshClient(t)
+	c.config = filepath.Join(t.TempDir(), "tmux.conf")
+	if err := os.WriteFile(c.config, []byte("new-session -d -s keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ATL_SESSION", "7")
+	t.Setenv("CLAUDECODE", "1")
+	_ = c.AttachCmd("keep").Run() // no terminal: fails once the server runs
+	env, err := c.run(context.Background(), "show-environment", "-g")
+	if err != nil {
+		t.Fatalf("no server after attach-session: %v", err)
+	}
+	for _, line := range strings.Split(env, "\n") {
+		if strings.HasPrefix(line, "ATL_SESSION=") || strings.HasPrefix(line, "CLAUDECODE=") {
+			t.Errorf("server started by attach-session has %s", line)
+		}
+	}
+}
+
 func TestNewClientFromEnv(t *testing.T) {
 	t.Setenv("ATL_TMUX_SOCKET", "abc")
 	if New().Socket != "abc" {
@@ -628,5 +652,140 @@ func TestServerEnv(t *testing.T) {
 	}
 	if !has((&Client{}).serverEnv(), "TMUX") {
 		t.Error("without a socket name TMUX picks the server; it must stay")
+	}
+}
+
+// TestArgsEndingInSemicolon: tmux splits its command line into commands at
+// every argument that ends in ";", so such an argument (a word of a prompt,
+// a value) would lose its ";" and what follows it would run as tmux
+// commands. Each one reaches its command as it is.
+func TestArgsEndingInSemicolon(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out")
+	args := []string{"do it;", `a\;`, ";", "kill-server"}
+	script := `for a; do printf '[%s]' "$a"; done > ` + out + `.tmp; echo >> ` + out + `.tmp; mv ` + out + `.tmp ` + out + `; exec sleep 300`
+	_, err := c.NewWindow(ctx, WindowSpec{
+		Session: "atl-x", Name: "w;", Dir: dir,
+		Env:       map[string]string{"E": "v;"},
+		GlobalEnv: map[string]string{"G": "g"},
+		Argv:      append([]string{"sh", "-c", script, "sh"}, args...),
+	})
+	if err != nil {
+		t.Fatalf("NewWindow: %v", err)
+	}
+	if got, want := strings.TrimSpace(waitFile(t, out)), `[do it;][a\;][;][kill-server]`; got != want {
+		t.Errorf("argv = %s, want %s", got, want)
+	}
+	if !c.HasSession(ctx, "atl-x") {
+		t.Fatal("session gone: part of an argument ran as a tmux command")
+	}
+	if names, err := c.run(ctx, "list-windows", "-t", "=atl-x", "-F", "#{window_name}"); err != nil || names != "w;" {
+		t.Errorf("window name = %q, %v", names, err)
+	}
+	if e, err := c.run(ctx, "show-environment", "-t", "=atl-x", "E"); err == nil && e != "" && e != "E=v;" {
+		t.Errorf("session env = %q", e)
+	}
+	// tmux takes a final `\;` for ";" whatever comes before it: any number
+	// of backslashes before a final ";" reach the command as they are.
+	texts := []string{"text;", ";", "text;;"}
+	for n := 1; n <= 3; n++ {
+		bs := strings.Repeat(`\`, n)
+		texts = append(texts, "text"+bs+";", bs+";", "text"+bs+";;")
+	}
+	for _, text := range texts {
+		if err := c.SetBuffer(ctx, text); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := c.run(ctx, "show-buffer"); err != nil || got != text {
+			t.Errorf("show-buffer = %q, %v; want %q", got, err, text)
+		}
+	}
+}
+
+// TestNewWindowFormatChars: tmux expands formats (#{...}, #(command)) in a
+// new window's directory, name and session name; atl's are taken as they
+// are.
+func TestNewWindowFormatChars(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "a#{session_name}##b")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pwdFile := filepath.Join(filepath.Dir(dir), "pwd")
+	script := fmt.Sprintf("pwd > %s.tmp && mv %s.tmp %s; exec sleep 300", pwdFile, pwdFile, pwdFile)
+	for _, session := range []string{"atl-#{host}", "atl-#{host}"} { // new-session, then new-window
+		if _, err := c.NewWindow(ctx, WindowSpec{Session: session, Name: "w#{window_id}", Dir: dir, Argv: []string{"sh", "-c", script}}); err != nil {
+			t.Fatalf("NewWindow: %v", err)
+		}
+		realDir, _ := filepath.EvalSymlinks(dir)
+		if got := strings.TrimSpace(waitFile(t, pwdFile)); got != dir && got != realDir {
+			t.Errorf("window dir = %q, want %q", got, dir)
+		}
+		os.Remove(pwdFile)
+	}
+	if !c.HasSession(ctx, "atl-#{host}") {
+		t.Error("session atl-#{host} missing")
+	}
+	if names, err := c.run(ctx, "list-windows", "-t", "=atl-#{host}", "-F", "#{window_name}"); err != nil || names != "w#{window_id}\nw#{window_id}" {
+		t.Errorf("window names = %q, %v", names, err)
+	}
+}
+
+// TestNewWindowPathAndShell: tmux gives a new pane its PATH (the client's,
+// or the session's) and SHELL (default-shell) after -e, so the window's
+// command gets those of WindowSpec.Env otherwise; the command is looked up
+// on that PATH, in a new session's first window and in a later one.
+func TestNewWindowPathAndShell(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "my bin's")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prog := "#!/bin/sh\nenv > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\nexec sleep 300\n"
+	if err := os.WriteFile(filepath.Join(bin, "atlt-prog"), []byte(prog), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := bin + ":" + os.Getenv("PATH")
+	for i, session := range []string{"atl-new", "atl-new"} {
+		out := filepath.Join(dir, fmt.Sprintf("env%d", i))
+		if _, err := c.NewWindow(ctx, WindowSpec{
+			Session: session, Name: "w",
+			Env:  map[string]string{"PATH": path, "SHELL": "/bin/proj-sh", "OTHER": "o"},
+			Argv: []string{"atlt-prog", out},
+		}); err != nil {
+			t.Fatalf("NewWindow %d: %v", i, err)
+		}
+		env := waitFile(t, out)
+		for _, want := range []string{"\nPATH=" + path + "\n", "\nSHELL=/bin/proj-sh\n", "\nOTHER=o\n"} {
+			if !strings.Contains("\n"+env, want) {
+				t.Errorf("window %d env missing %q:\n%s", i, want, env)
+			}
+		}
+	}
+}
+
+// TestRedact: no part of a value is left in a tmux error, also when one
+// value is part of another (whatever order the values are replaced in);
+// an error that is not tmux's is left as it is.
+func TestRedact(t *testing.T) {
+	env := map[string]string{"A": "sk-ant", "B": "sk-ant-oat01-SECRET", "C": "", "D": "SECRET-2"}
+	for i := 0; i < 50; i++ {
+		err := redact(&Error{Args: []string{"source-file"}, Stderr: "bad: sk-ant-oat01-SECRET and SECRET-2", Err: errors.New("exit status 1")}, env)
+		var te *Error
+		if !errors.As(err, &te) || te.Args[0] != "source-file" || te.Err == nil {
+			t.Fatalf("redact lost the error: %#v", err)
+		}
+		if strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "oat01") || !strings.Contains(err.Error(), "bad: ") {
+			t.Fatalf("redacted: %q", err.Error())
+		}
+	}
+	plain := errors.New("sk-ant")
+	if got := redact(plain, env); got != plain {
+		t.Fatalf("a non-tmux error changed: %v", got)
 	}
 }

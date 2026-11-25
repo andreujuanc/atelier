@@ -141,7 +141,9 @@ func CopyMain(name string, args []string, stdin io.Reader, stderr io.Writer, env
 	if a.text != nil {
 		text = []byte(strings.Join(a.text, " "))
 	} else {
-		text, err = io.ReadAll(io.LimitReader(stdin, MaxCopy+1))
+		// Up to two bytes over the cap: one more than it, also once a
+		// final newline is trimmed (else a text cut at a newline passes).
+		text, err = io.ReadAll(io.LimitReader(stdin, MaxCopy+2))
 		if err != nil {
 			fmt.Fprintf(stderr, "wl-copy: read stdin: %v\n", err)
 			return 1

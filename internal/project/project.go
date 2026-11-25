@@ -26,8 +26,8 @@ type RepoSpec struct {
 type Project struct {
 	Name     string            `toml:"-"`
 	Repos    []RepoSpec        `toml:"repos"`
-	Setup    string            `toml:"setup"`    // sh -c in each rw worktree after creation
-	Teardown string            `toml:"teardown"` // sh -c in each rw worktree before removal
+	Setup    string            `toml:"setup"`    // sh -c in each rw worktree after creation (in the task container, sandbox on)
+	Teardown string            `toml:"teardown"` // sh -c in each rw worktree before removal (likewise)
 	Env      map[string]string `toml:"env"`
 	Image    string            `toml:"image"` // task container image when tasks are sandboxed ("" → the workspace default)
 }
@@ -84,6 +84,13 @@ func Load(p config.Paths, name string) (*Project, error) {
 			return nil, fmt.Errorf("project %q: repo %q listed twice", name, r.Name)
 		}
 		seen[r.Name] = true
+	}
+	for k, v := range pr.Env {
+		// "A=B" = "v" would reach a process as A with value "B=v",
+		// overriding what EnvFor puts after the project's env.
+		if k == "" || strings.ContainsAny(k, "=\x00") || strings.ContainsRune(v, 0) {
+			return nil, fmt.Errorf("project %q: env %q: invalid variable (empty name, or '=' in the name, or a NUL byte)", name, k)
+		}
 	}
 	return &pr, nil
 }

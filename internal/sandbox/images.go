@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // BoxImage is the default name of atelier's box image ($ATL_BOX_IMAGE of
@@ -42,7 +43,9 @@ func (r imageRef) same(o imageRef) bool {
 var (
 	refDomain = regexp.MustCompile(`^(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))*(?::[0-9]+)?$`)
 	refPath   = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$`)
-	refTag    = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+	// Compiled on first use (its counted repetition is costly to build), not
+	// by every atl process (each hook) at start.
+	refTag    = sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`) })
 	refDigest = regexp.MustCompile(`^[a-z0-9]+(?:[.+_-][a-z0-9]+)*:[a-zA-Z0-9=_-]{32,}$`)
 )
 
@@ -62,7 +65,7 @@ func parseImageRef(s string) (imageRef, error) {
 	}
 	if i := strings.LastIndexByte(rest, ':'); i > strings.LastIndexByte(rest, '/') {
 		rest, r.tag = rest[:i], rest[i+1:]
-		if !refTag.MatchString(r.tag) {
+		if !refTag().MatchString(r.tag) {
 			return imageRef{}, fmt.Errorf("invalid image reference %q", s)
 		}
 	}
@@ -122,14 +125,10 @@ func (g *Gate) reservedImages() ([]imageRef, error) {
 
 // checkTag returns why the task may not make s, an image reference that
 // names a tag (latest if none), point to a new image, or nil: it is one of
-// the tags atl runs its own containers from (reservedImages), or, for a
-// build (build true), it points to an image now that has no atelier.task
-// label at all (the user's own build, one pulled: the task would put its
-// own content under a name the user runs). An image a task built (any
-// atelier.task) may be built over, as tasks sharing a repo build the same
-// compose image names. A pull may re-pull any tag: it puts only what the
-// registry has under that very name there.
-func (g *Gate) checkTag(s string, reserved []imageRef, build bool) error {
+// the tags atl runs its own containers from (reservedImages). A pull may
+// re-pull any other tag: it puts only what the registry has under that
+// very name there. A build is held to more (checkBuildTag).
+func (g *Gate) checkTag(s string, reserved []imageRef) error {
 	r, err := parseImageRef(s)
 	if err != nil {
 		return err
@@ -143,34 +142,45 @@ func (g *Gate) checkTag(s string, reserved []imageRef, build bool) error {
 			return fmt.Errorf("image name %s is reserved: atl runs its own containers from it", s)
 		}
 	}
-	if !build {
-		return nil
-	}
-	status, out, err := g.call("GET", "/images/"+r.String()+"/json", nil)
-	switch {
-	case err != nil:
-		return err
-	case status == http.StatusNotFound:
-		return nil
-	case status != http.StatusOK:
-		return fmt.Errorf("cannot inspect image %s", s)
-	}
-	var img struct {
-		Config struct{ Labels map[string]string }
-	}
-	if err := json.Unmarshal(out, &img); err != nil {
-		return fmt.Errorf("cannot inspect image %s", s)
-	}
-	if _, byTask := img.Config.Labels[LabelTask]; !byTask {
-		return fmt.Errorf("image %s exists and no task built it (yours, or pulled): build under another tag, "+
-			"or, if a task built it before atl labelled builds, remove it on the host first (docker rmi %s)", s, s)
-	}
 	return nil
 }
 
-// gateImagePull allows a pull from a registry (never an import, fromSrc)
-// whose tag is not reserved (checkTag); a pull by digest moves no tag. A pull of
-// every tag of a repository (no tag at all) is refused.
+// checkBuildTag returns why a build may not tag its image s, or nil.
+// Besides the reserved names (checkTag), a build may only name a tag in
+// the task's namespace (InNamespace, or the namespace and "/"): a
+// repository with no registry (a name a registry gives is the registry's
+// to fill), "atl_<6 hex>", "atl_<6 hex>-app", "atl_<6 hex>/app" (or
+// "library/" and one of them). Any other name a host-side `docker run` or
+// compose project could run unbuilt or unpulled ("shop-api", compose's
+// default for project shop; "postgres:16" before it is pulled), and the
+// task would put its own image there. Compose, with the namespace as
+// COMPOSE_PROJECT_NAME, names a service's image "<namespace>-<service>".
+// Another task's namespace is out of reach, so that tasks cannot build
+// over each other's tags either.
+func (g *Gate) checkBuildTag(s string, reserved []imageRef) error {
+	if err := g.checkTag(s, reserved); err != nil {
+		return err
+	}
+	ns := g.namespace()
+	repo, _, hasDigest := strings.Cut(s, "@")
+	if i := strings.LastIndexByte(repo, ':'); i > strings.LastIndexByte(repo, '/') {
+		repo = repo[:i]
+	}
+	repo = strings.TrimPrefix(repo, "library/")
+	// A registry before the namespace would make it no prefix (and a
+	// domain that starts with it, with its "_", is no valid one).
+	if !hasDigest && (InNamespace(ns, repo) || strings.HasPrefix(repo, ns+"/")) {
+		return nil
+	}
+	return fmt.Errorf("build tag %s: a build may only tag images in this task's namespace %s ($COMPOSE_PROJECT_NAME), "+
+		"with no registry or digest: -t %s-<name>[:tag]; with compose, drop the image: of built services "+
+		"(they become %s-<service>) or name them %s-<name>", s, ns, ns, ns, ns)
+}
+
+// gateImagePull allows a pull from a registry tasks may pull from
+// (checkRegistry; never an import, fromSrc) whose tag is not reserved
+// (checkTag); a pull by digest moves no tag. A pull of every tag of a
+// repository (no tag at all) is refused.
 func gateImagePull(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 	q := r.URL.Query()
 	if len(q["fromImage"]) != 1 || q.Get("fromImage") == "" || q.Has("fromSrc") || q.Has("repo") || len(q["tag"]) > 1 {
@@ -180,6 +190,10 @@ func gateImagePull(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) 
 	ref, err := parseImageRef(q.Get("fromImage"))
 	if err != nil {
 		g.deny(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := g.checkRegistry(ref); err != nil {
+		g.deny(w, r, http.StatusForbidden, "pull "+q.Get("fromImage")+": "+err.Error())
 		return
 	}
 	if tag := q.Get("tag"); tag != "" {
@@ -196,12 +210,28 @@ func gateImagePull(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) 
 	if ref.tag != "" { // with a digest too: the tag may be set as well
 		reserved, err := g.reservedImages()
 		if err == nil {
-			err = g.checkTag(ref.String(), reserved, false)
+			err = g.checkTag(ref.String(), reserved)
 		}
 		if err != nil {
 			g.deny(w, r, http.StatusForbidden, err.Error())
 			return
 		}
+	}
+	g.forward(w, r, nil)
+}
+
+// gateDistribution allows a look at an image in its registry (the daemon
+// fetches its manifest there) only in a registry tasks may pull from
+// (checkRegistry).
+func gateDistribution(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
+	ref, err := parseImageRef(m[1])
+	if err != nil {
+		g.deny(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := g.checkRegistry(ref); err != nil {
+		g.deny(w, r, http.StatusForbidden, m[1]+": "+err.Error())
+		return
 	}
 	g.forward(w, r, nil)
 }
@@ -217,7 +247,7 @@ func (g *Gate) buildTags(r *http.Request) error {
 			return err
 		}
 		for _, t := range tags {
-			if err := g.checkTag(t, reserved, true); err != nil {
+			if err := g.checkBuildTag(t, reserved); err != nil {
 				return err
 			}
 		}
@@ -229,6 +259,9 @@ func (g *Gate) buildTags(r *http.Request) error {
 	if s := q.Get("labels"); s != "" {
 		if err := json.Unmarshal([]byte(s), &labels); err != nil {
 			return errors.New("unreadable build labels")
+		}
+		if labels == nil { // "null"
+			labels = map[string]string{}
 		}
 	}
 	labels[LabelTask] = g.ID

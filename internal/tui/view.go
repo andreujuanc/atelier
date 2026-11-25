@@ -93,13 +93,15 @@ type layout struct {
 	listW, detailW int
 	// what the panes hold inside their borders
 	listInW, listInH, detailInW, detailInH int
+	help                                   []string // the help lines under the status line
 }
 
 func (m *Model) layout() layout {
 	w, h := m.width, m.height
 	var l layout
 	l.header = h >= 10
-	l.bodyH = h - 1 - len(m.helpLines(w))
+	l.help = m.helpLines(w)
+	l.bodyH = h - 1 - len(l.help)
 	if l.header {
 		l.bodyH--
 	}
@@ -211,7 +213,6 @@ func (m *Model) render() string {
 		return ""
 	}
 	l := m.layout()
-	help := m.helpLines(w)
 	var lines []string
 	if l.header {
 		lines = append(lines, m.headerLine(w))
@@ -220,7 +221,7 @@ func (m *Model) render() string {
 	if over := m.overlay(w, len(lines)); over != nil {
 		lines = composite(lines, over, w)
 	}
-	lines = append(append(lines, m.statusLine(w)), help...)
+	lines = append(append(lines, m.statusLine(w)), l.help...)
 	if len(lines) > h {
 		lines = lines[len(lines)-h:]
 	}
@@ -298,12 +299,9 @@ func (m *Model) detailPane(l layout, w, h int, focused bool) []string {
 		return m.detailLines(w, h)
 	}
 	inner := m.detailLines(w-4, h-2)
-	title := ""
+	title, right := "", ""
 	if t := m.notesTask(); t != nil {
 		title = t.Task.Slug
-	}
-	right := ""
-	if t := m.notesTask(); t != nil {
 		if op, ok := m.busy[t.Task.ID]; ok {
 			right = keyStyle.Render(m.spinner()) + " " + dimStyle.Render(trunc(clean(op), max(w/3, 8)))
 		}
@@ -378,23 +376,31 @@ func (m *Model) listLines(w, h int) []string {
 	return out
 }
 
+// groupLine renders status group header r at width w: the status, its
+// task count (shown/total when the closed limit leaves some out) and a rule.
+func (r row) groupLine(w int) string {
+	c := lipgloss.NewStyle().Foreground(statusColor(r.status)).Bold(true)
+	label := strings.ToUpper(string(r.status))
+	count := strconv.Itoa(r.count)
+	if r.total > r.count {
+		count += "/" + strconv.Itoa(r.total)
+	}
+	text := " " + c.Render(label) + " " + labelStyle.Render(count)
+	used := ansi.StringWidth(" "+label+" "+count) + 1
+	if n := w - used; n > 0 {
+		text += " " + ruleStyle.Render(strings.Repeat("─", n))
+	}
+	return trunc(text, w)
+}
+
+// rowLine renders list row r at width w, highlighted if sel.
 func (m *Model) rowLine(r row, sel bool, w int) string {
 	if r.header {
-		c := lipgloss.NewStyle().Foreground(statusColor(r.status)).Bold(true)
-		label := strings.ToUpper(string(r.status))
-		count := strconv.Itoa(r.count)
-		if r.total > r.count {
-			count += "/" + strconv.Itoa(r.total)
-		}
-		text := " " + c.Render(label) + " " + labelStyle.Render(count)
-		used := ansi.StringWidth(" "+label+" "+count) + 1
-		if n := w - used; n > 0 {
-			text += " " + ruleStyle.Render(strings.Repeat("─", n))
-		}
-		return trunc(text, w)
+		return r.groupLine(w)
 	}
 	t := r.task
-	glyph, dotStyle := dotFor(aggregate(t.Sessions))
+	agg := aggregate(t.Sessions)
+	glyph, dotStyle := dotFor(agg)
 	busy := ""
 	if _, ok := m.busy[t.Task.ID]; ok {
 		busy = " " + m.spinner()
@@ -403,12 +409,8 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 	if t.Task.Status.Open() && m.dirty[t.Task.ID] {
 		star = "*"
 	}
-	// The list shows the title only (the slug is in the details pane); a
-	// task with a blank title falls back to its slug.
-	title := clean(t.Task.Title)
-	if title == "" {
-		title = clean(t.Task.Slug)
-	}
+	// The list shows the title only (the slug is in the details pane).
+	title := taskTitle(t.Task)
 	// Width budget after the bar, the dot and busy suffix; the star is kept
 	// even when the title has to be truncated.
 	avail := w - 3 - ansi.StringWidth(busy)
@@ -420,7 +422,7 @@ func (m *Model) rowLine(r row, sel bool, w int) string {
 	switch {
 	case !t.Task.Status.Open():
 		base = dimStyle
-	case aggregate(t.Sessions) == dotWaiting:
+	case agg == dotWaiting:
 		base = base.Bold(true) // a session waits for you: stand out
 	}
 	lead := " "
@@ -504,10 +506,7 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 	add := func(s string) { out = append(out, trunc(s, w)) }
 	kv := func(k, v string) { add(labelStyle.Render(fmt.Sprintf("%-9s", k)) + " " + v) }
 
-	title := clean(task.Title)
-	if title == "" {
-		title = clean(task.Slug)
-	}
+	title := taskTitle(task)
 	// The title, the status at the right when there is room.
 	st := chip(string(task.Status), statusColor(task.Status))
 	if m.dirty[task.ID] && task.Status.Open() {
@@ -532,6 +531,18 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 	}
 
 	add(rule("Repos", w))
+	out = append(out, m.repoLines(task, w)...)
+	add(rule("Sessions", w))
+	out = append(out, m.sessionLines(t.Sessions, w)...)
+	return out
+}
+
+// repoLines lists task's repos at width w for the details pane: with
+// their state (missing, dirty, ...) once the details read for the task
+// have it.
+func (m *Model) repoLines(task model.Task, w int) []string {
+	var out []string
+	add := func(s string) { out = append(out, trunc(s, w)) }
 	var status []app.RepoStatus
 	if m.detail != nil && m.detail.Task.ID == task.ID {
 		status = m.detail.RepoStatus
@@ -573,25 +584,27 @@ func (m *Model) infoLines(t *app.TaskView, w int) []string {
 	if len(task.Repos) == 0 && len(status) == 0 {
 		add(dimStyle.Render(" none"))
 	}
+	return out
+}
 
-	add(rule("Sessions", w))
-	if len(t.Sessions) == 0 {
+// sessionLines lists sessions at width w for the details pane.
+func (m *Model) sessionLines(sessions []model.Session, w int) []string {
+	var out []string
+	add := func(s string) { out = append(out, trunc(s, w)) }
+	if len(sessions) == 0 {
 		add(dimStyle.Render(" none — ") + keyStyle.Render("s") + dimStyle.Render(" starts one"))
 	}
 	now := m.now()
 	sessW := 0
-	for _, s := range t.Sessions {
+	for _, s := range sessions {
 		sessW = max(sessW, ansi.StringWidth(sessionName(s)))
 	}
-	for _, s := range t.Sessions {
+	for _, s := range sessions {
 		age := "-"
 		if !s.LastEventAt.IsZero() {
 			age = humanAge(now.Sub(s.LastEventAt))
 		}
-		glyph := palette.StateLook(s.State).Glyph
-		if glyph == " " {
-			glyph = "·"
-		}
+		glyph := sessionGlyph(s.State)
 		st := stateStyle(s.State)
 		name := padRight(sessionName(s), sessW)
 		state := fmt.Sprintf("%-7s", clean(string(s.State)))
@@ -615,6 +628,23 @@ func sessionName(s model.Session) string {
 		return n
 	}
 	return "claude-" + strconv.FormatInt(s.ID, 10)
+}
+
+// sessionGlyph is the dot of a session in the session lists ("·" for a
+// state the palette draws blank).
+func sessionGlyph(st model.SessionState) string {
+	if g := palette.StateLook(st).Glyph; g != " " {
+		return g
+	}
+	return "·"
+}
+
+// taskTitle is t's title to show, its slug when the title is blank.
+func taskTitle(t model.Task) string {
+	if s := clean(t.Title); s != "" {
+		return s
+	}
+	return clean(t.Slug)
 }
 
 func orDash(s string) string {
@@ -684,17 +714,7 @@ func (c *confirmState) lines(w, h int) []string {
 	if w <= 0 || h <= 0 {
 		return nil
 	}
-	ww := w
-	if ww > confirmWrap {
-		ww = confirmWrap
-	}
-	wrap := func(s string, st lipgloss.Style) []string {
-		var out []string
-		for _, l := range strings.Split(ansi.Wrap(s, ww, ""), "\n") {
-			out = append(out, st.Render(trunc(strings.TrimRight(l, " "), w)))
-		}
-		return out
-	}
+	wrap := func(s string, st lipgloss.Style) []string { return wrapText(s, min(w, confirmWrap), w, st) }
 	head := "Mark " + clean(c.slug) + " done?"
 	if c.verb == "cancel" {
 		head = "Cancel " + clean(c.slug) + "?"
@@ -707,11 +727,7 @@ func (c *confirmState) lines(w, h int) []string {
 	if c.dirty {
 		blocks = append(blocks, wrap("There are uncommitted changes. They will be deleted.", errStyle.Bold(true)))
 	}
-	box := dimStyle.Render("[ ]") + " Delete them"
-	if c.ticked {
-		box = errStyle.Bold(true).Render("[x]") + " Delete them"
-	}
-	last := []string{trunc(box, w)}
+	last := []string{trunc(checkbox(c.ticked, "Delete them"), w)}
 	if c.unticked {
 		last = append(last, wrap("Tick the box with space to confirm.", markStyle)...)
 	}
@@ -734,6 +750,25 @@ func (c *confirmState) lines(w, h int) []string {
 		out = out[len(out)-h:] // keep the box visible on very short terminals
 	}
 	return out
+}
+
+// wrapText wraps a dialog's text s at ww cells, each line cut to w cells
+// and drawn in st.
+func wrapText(s string, ww, w int, st lipgloss.Style) []string {
+	var out []string
+	for _, l := range strings.Split(ansi.Wrap(s, ww, ""), "\n") {
+		out = append(out, st.Render(trunc(strings.TrimRight(l, " "), w)))
+	}
+	return out
+}
+
+// checkbox is a dialog's tick box and its label; ticked, the box is drawn
+// as the warning it is.
+func checkbox(ticked bool, label string) string {
+	if ticked {
+		return errStyle.Bold(true).Render("[x]") + " " + label
+	}
+	return dimStyle.Render("[ ]") + " " + label
 }
 
 // baseSuffix shows the origin branch a rw repo's task branch started from
@@ -1089,36 +1124,7 @@ func (m *Model) formLines(w, h int) []string {
 			label = keyStyle.Render(fmt.Sprintf("%-12s", fieldLabels[i]))
 			focusRow = len(out)
 		}
-		var val string
-		switch i {
-		case fieldBacklog:
-			val = dimStyle.Render("[ ]")
-			if f.backlog {
-				val = keyStyle.Render("[x]")
-			}
-			val += dimStyle.Render(" space / ctrl+b toggles")
-		case fieldBase:
-			on, off := keyStyle.Render("●"), dimStyle.Render("○")
-			auto, prod := on+" auto (dev → develop → default)", off+dimStyle.Render(" production patch (default branch)")
-			if f.prodBase {
-				auto, prod = off+dimStyle.Render(" auto (dev → develop → default)"), on+" production patch (default branch)"
-			}
-			val = auto + "\n" + prod
-		case fieldRepos:
-			switch {
-			case len(f.repos) > 0:
-				val = styledSummary(f.repos)
-			case f.project() != "" && f.project() != f.preProject:
-				val = dimStyle.Render("project " + clean(f.project()) + "'s repos")
-			default:
-				val = dimStyle.Render("none")
-			}
-			if i == f.focus {
-				val += dimStyle.Render("  ⏎ pick")
-			}
-		default:
-			val = f.inputs[i].View()
-		}
+		val := f.fieldView(i)
 		for j, v := range strings.Split(val, "\n") {
 			if j == 0 {
 				add(cursor + " " + label + v)
@@ -1166,11 +1172,48 @@ func (m *Model) formLines(w, h int) []string {
 	return out
 }
 
+// fieldView draws the value of form field i (more than one line for the
+// base choice).
+func (f *newForm) fieldView(i int) string {
+	var val string
+	switch i {
+	case fieldBacklog:
+		val = dimStyle.Render("[ ]")
+		if f.backlog {
+			val = keyStyle.Render("[x]")
+		}
+		val += dimStyle.Render(" space / ctrl+b toggles")
+	case fieldBase:
+		on, off := keyStyle.Render("●"), dimStyle.Render("○")
+		auto, prod := on+" auto (dev → develop → default)", off+dimStyle.Render(" production patch (default branch)")
+		if f.prodBase {
+			auto, prod = off+dimStyle.Render(" auto (dev → develop → default)"), on+" production patch (default branch)"
+		}
+		val = auto + "\n" + prod
+	case fieldRepos:
+		switch {
+		case len(f.repos) > 0:
+			val = styledSummary(f.repos)
+		case f.project() != "" && f.project() != f.preProject:
+			val = dimStyle.Render("project " + clean(f.project()) + "'s repos")
+		default:
+			val = dimStyle.Render("none")
+		}
+		if i == f.focus {
+			val += dimStyle.Render("  ⏎ pick")
+		}
+	default:
+		val = f.inputs[i].View()
+	}
+	return val
+}
+
 // listWindow is the range of rows the list shows in h lines.
 func (m *Model) listWindow(h int) (off, end int) {
-	off = m.offset
+	// The help may have taken or given back a line since the offset was
+	// set (see helpLines).
+	off = max(min(m.offset, len(m.rows)-h), 0)
 	if m.selIdx >= off+h {
-		// the help took a line since the offset was set (see helpLines)
 		off = m.selIdx - h + 1
 	}
 	end = min(off+h, len(m.rows))
@@ -1210,4 +1253,16 @@ func welcomeLines(w int) []string {
 		item("A", "ask the atelier assistant"),
 		item("?", "every key"),
 	}
+}
+
+// scrollOffset is the first of n rows to show in h lines, moved from
+// offset (the current one) just enough to show row cursor.
+func scrollOffset(cursor, offset, n, h int) int {
+	if cursor < offset {
+		offset = cursor
+	}
+	if h > 0 && cursor >= offset+h {
+		offset = cursor - h + 1
+	}
+	return max(min(offset, n-h), 0)
 }

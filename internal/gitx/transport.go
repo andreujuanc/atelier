@@ -6,14 +6,18 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // Origin is where a repo's origin points, as its config says it: the values
@@ -125,24 +129,83 @@ func configList(ctx context.Context, dir, key string) ([]string, error) {
 // git from running anything that config names (see transportArgs), and the
 // branch goes to origin's URLs, never to what the repo's config says (see
 // newTransport).
+//
+// The commit pushed is the one the branch's ref names, read here
+// (branchCommit), not by git: git follows a ref file (or packed-refs, or a
+// directory on the way) that is a symlink, and the task could make it one
+// to a branch of any other repo where atl runs, and list that repo's
+// objects as alternates: git would push that repo's history to origin,
+// where the task fetches it.
+//
+// The refs git updates (refs/remotes/origin/<branch>) are written to a
+// store of atl's own and copied into the repo from there (refStore), each
+// only while it still has the value it had before: one that another push
+// or fetch changed meanwhile is left as it is, with a warning on out (the
+// push itself is done).
 func PushBranch(ctx context.Context, dir string, origin Origin, branch string, force bool, out io.Writer) error {
 	t, err := newTransport(ctx, dir, origin, true)
 	if err != nil {
 		return err
 	}
 	ref := "refs/heads/" + branch
+	commit, err := branchCommit(ctx, dir, ref)
+	if err != nil {
+		return err
+	}
 	args := append(t.args, "push", "--no-follow-tags", "--recurse-submodules=no")
 	if force {
 		args = append(args, "--force-with-lease")
 	}
-	args = append(args, "--receive-pack="+packProgram(true, t.local), t.name, ref+":"+ref)
-	return runTransport(ctx, dir, out, args)
+	args = append(args, "--receive-pack="+packProgram(true, t.local), t.name, commit+":"+ref)
+	store, err := newRefStore(ctx, dir)
+	if err != nil {
+		return err
+	}
+	defer store.close()
+	if err := runTransport(ctx, dir, out, store.env, args); err != nil {
+		return err
+	}
+	stale, err := store.sync(ctx, dir)
+	// The push is done: a ref that changed meanwhile (another push or
+	// fetch) is only a warning.
+	if serr := staleError(stale); serr != nil && out != nil {
+		fmt.Fprintf(out, "warning: %v\n", serr)
+	}
+	return err
+}
+
+// branchCommit returns the commit id ref (a branch, refs/heads/...) names
+// in the repo at dir, read without following a symlink (see readRef).
+func branchCommit(ctx context.Context, dir, ref string) (string, error) {
+	common, err := revParsePath(ctx, dir, "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	return refCommit(ctx, dir, common, ref)
+}
+
+// objectID matches a full object id, SHA-1 or SHA-256.
+var objectID = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
+
+func firstChars(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 // FetchOrigin is `git fetch origin` in the repo at dir, from origin's URL,
 // with the same guards as PushBranch. git's output goes to out. Like `git
 // fetch` since git 2.48, it creates refs/remotes/origin/HEAD when it is
 // missing (see setOriginHead).
+//
+// git writes refs (and FETCH_HEAD) to a store of atl's own; the refs are
+// copied into the repo from there (refStore), each only while it still has
+// the value it had before. When one changed meanwhile (another push or
+// fetch of the repo finished first), the fetch runs once more, from the
+// refs as they are then, which normally settles it; one still changed
+// meanwhile after that is left as it is, and the fetch fails saying so
+// once the others are in.
 func FetchOrigin(ctx context.Context, dir string, origin Origin, out io.Writer) error {
 	t, err := newTransport(ctx, dir, origin, false)
 	if err != nil {
@@ -150,11 +213,38 @@ func FetchOrigin(ctx context.Context, dir string, origin Origin, out io.Writer) 
 	}
 	args := append(t.args, "fetch", "--no-recurse-submodules", "--no-auto-gc",
 		"--upload-pack="+packProgram(false, t.local), t.name)
-	if err := runTransport(ctx, dir, out, args); err != nil {
-		return err
+	var stale []string
+	for attempt := 0; attempt < 2; attempt++ {
+		if stale, err = fetchOnce(ctx, dir, out, args); err != nil || len(stale) == 0 {
+			break
+		}
+	}
+	if err != nil {
+		return errors.Join(err, staleError(stale))
 	}
 	t.setOriginHead(ctx, dir)
-	return nil
+	return staleError(stale)
+}
+
+// beforeFetchSync, if set, runs in fetchOnce between git's fetch and the
+// sync: a test's seam for a push or fetch that overlaps.
+var beforeFetchSync func()
+
+// fetchOnce runs git with args (a fetch) on a new store of the repo at
+// dir and syncs it (refStore.sync).
+func fetchOnce(ctx context.Context, dir string, out io.Writer, args []string) (stale []string, err error) {
+	store, err := newRefStore(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	defer store.close()
+	if err := runTransport(ctx, dir, out, store.env, args); err != nil {
+		return nil, err
+	}
+	if beforeFetchSync != nil {
+		beforeFetchSync()
+	}
+	return store.sync(ctx, dir)
 }
 
 // lsRemoteArgs are the arguments of `git ls-remote <flags> <origin>` with
@@ -221,7 +311,10 @@ func newTransport(ctx context.Context, dir string, origin Origin, push bool) (*t
 			kv = append(kv, "pushurl="+u)
 		}
 	}
-	refspecs, _ := configList(ctx, dir, "remote.origin.fetch")
+	refspecs, err := configList(ctx, dir, "remote.origin.fetch")
+	if err != nil {
+		return nil, err
+	}
 	if len(refspecs) == 0 {
 		refspecs = []string{"+refs/heads/*:refs/remotes/origin/*"}
 	}
@@ -242,7 +335,8 @@ func newTransport(ctx context.Context, dir string, origin Origin, push bool) (*t
 // when it is missing and that branch was fetched, as `git fetch` does since
 // git 2.48 (remote.origin.followRemoteHEAD=create; "never" in the repo's
 // config is respected). The stand-in remote cannot do it: git names the ref
-// after the remote. Best effort: failures are ignored.
+// after the remote. It is written without following a symlink, as refStore
+// writes refs. Best effort: failures are ignored.
 func (t *transport) setOriginHead(ctx context.Context, dir string) {
 	const head = "refs/remotes/origin/HEAD"
 	if _, err := run(ctx, dir, "symbolic-ref", "--quiet", head); err == nil {
@@ -267,8 +361,10 @@ func (t *transport) setOriginHead(ctx context.Context, dir string) {
 		if !ok || branch == "" {
 			continue
 		}
-		if ok, err := RefExists(ctx, dir, "refs/remotes/origin/"+branch); err == nil && ok {
-			_, _ = run(ctx, dir, "symbolic-ref", "-m", "atl fetch: origin's HEAD", head, "refs/remotes/origin/"+branch)
+		if target := "refs/remotes/origin/" + branch; plainRefName(target) {
+			if ok, err := RefExists(ctx, dir, target); err == nil && ok {
+				writeSymref(ctx, dir, head, target)
+			}
 		}
 		return
 	}
@@ -567,19 +663,20 @@ func newTransportCommand(ctx context.Context, dir string, args []string) *exec.C
 	return cmd
 }
 
-// runTransport runs git with args in dir, its stdout and stderr going to
-// out. A failure's Error carries the last line git wrote (the rest went to
-// out already).
-func runTransport(ctx context.Context, dir string, out io.Writer, args []string) error {
+// runTransport runs git with args in dir, and env on top of its own, its
+// stdout and stderr going to out. A failure's Error carries the line that says what failed (see
+// failureLine; all of git's output went to out already).
+func runTransport(ctx context.Context, dir string, out io.Writer, env, args []string) error {
 	if out == nil {
 		out = io.Discard
 	}
 	cmd := newTransportCommand(ctx, dir, args)
+	cmd.Env = append(cmd.Env, env...)
 	// One writer for both: exec then never calls it from two goroutines.
 	w := &teeWriter{w: out}
 	cmd.Stdout, cmd.Stderr = w, w
 	if err := cmd.Run(); err != nil {
-		return wrap(ctx, args, lastLine(w.buf.String()), err)
+		return wrap(ctx, args, failureLine(w.buf.String()), err)
 	}
 	return nil
 }
@@ -608,7 +705,127 @@ func (t *teeWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func lastLine(s string) string {
+// failureLine is the line of git's output s that says what failed: a
+// rejected ref (" ! [rejected] …"), else git's first "fatal:" or "error:"
+// line, else the last line. git ends with advice (hint: lines, "Please make
+// sure you have the correct access rights…") that does not say it.
+func failureLine(s string) string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
-	return strings.TrimSpace(lines[len(lines)-1])
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+	for _, prefixes := range [][]string{{"! "}, {"fatal: ", "error: "}} {
+		for _, l := range lines {
+			for _, p := range prefixes {
+				if strings.HasPrefix(l, p) {
+					return l
+				}
+			}
+		}
+	}
+	return lines[len(lines)-1]
+}
+
+// reftableName matches the name of a table of a reftable stack.
+var reftableName = regexp.MustCompile(`^0x[0-9a-f]{12,16}-0x[0-9a-f]{12,16}-[0-9a-f]{8}\.(ref|log)$`)
+
+// reftableCommit is refCommit for a repo whose refs are in reftable,
+// common the common git dir of the repo at dir. git follows a symlink in
+// place of the reftable dir or one of its tables (the task could point one
+// at another repo's), so the stack is copied, read without following
+// symlinks, into a temporary git dir of atl's (copyReftable), and git
+// reads ref there.
+func reftableCommit(ctx context.Context, dir string, common *nofollow.Dir, ref string) (string, error) {
+	priv, err := os.MkdirTemp("", "atl-refs-")
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", ref, err)
+	}
+	defer os.RemoveAll(priv)
+	if _, err := copyReftable(ctx, dir, common, priv); err != nil {
+		return "", fmt.Errorf("read %s: %w", ref, err)
+	}
+	refs, err := listRefs(ctx, priv, ref)
+	if err != nil {
+		return "", err
+	}
+	if id, ok := refs[ref]; ok {
+		return id, nil
+	}
+	return "", fmt.Errorf("no ref %s", ref)
+}
+
+// copyReftable makes priv (an empty directory) a bare git dir of the repo
+// at dir's object format whose reftable stack is a copy of the stack in
+// common (the repo's common git dir), read without following a symlink,
+// and returns the names of its tables, in order. Every table name is
+// checked: tables.list names files in its directory.
+func copyReftable(ctx context.Context, dir string, common *nofollow.Dir, priv string) ([]string, error) {
+	objFormat, err := run(ctx, dir, "rev-parse", "--show-object-format")
+	if err != nil {
+		return nil, err
+	}
+	list, err := common.ReadFile("reftable/tables.list", 1<<20)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := run(ctx, os.TempDir(), "init", "--bare", "--quiet", "--template=", "--ref-format=reftable", "--object-format="+objFormat, priv); err != nil {
+		return nil, err
+	}
+	stack := filepath.Join(priv, "reftable")
+	if err := os.RemoveAll(stack); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(stack, 0o700); err != nil {
+		return nil, err
+	}
+	tables := strings.Fields(string(list))
+	for _, name := range tables {
+		if !reftableName.MatchString(name) {
+			return nil, fmt.Errorf("unexpected table %q in reftable/tables.list", firstChars(name, 80))
+		}
+		if err := copyOut(common, "reftable/"+name, filepath.Join(stack, name)); err != nil {
+			return nil, err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(stack, "tables.list"), list, 0o600); err != nil {
+		return nil, err
+	}
+	return tables, nil
+}
+
+// listRefs returns the refs (not symbolic ones) of the git dir gitDir, one
+// of atl's own, that match patterns (all if none), as for-each-ref lists
+// them.
+func listRefs(ctx context.Context, gitDir string, patterns ...string) (map[string]string, error) {
+	out, err := run(ctx, gitDir, append([]string{"for-each-ref", "--format=%(refname)%00%(symref)%00%(objectname)"}, patterns...)...)
+	if err != nil {
+		return nil, err
+	}
+	refs := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(line, "\x00")
+		if len(f) == 3 && f[1] == "" && objectID.MatchString(f[2]) && plainRefName(f[0]) {
+			refs[f[0]] = f[2]
+		}
+	}
+	return refs, nil
+}
+
+// copyOut copies the regular file rel of d (not through a symlink) to the
+// new file dst.
+func copyOut(d *nofollow.Dir, rel, dst string) error {
+	in, err := d.OpenFile(rel)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }

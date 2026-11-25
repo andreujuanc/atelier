@@ -19,42 +19,6 @@ import (
 	"github.com/andreujuanc/atelier/internal/tmux"
 )
 
-// TestMain isolates git from the user's global/system config and supplies
-// an identity so commits work without any global setup.
-func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "app-test-git")
-	if err != nil {
-		panic(err)
-	}
-	cfg := filepath.Join(dir, "gitconfig")
-	if err := os.WriteFile(cfg, nil, 0o644); err != nil {
-		panic(err)
-	}
-	for k, v := range map[string]string{
-		"GIT_CONFIG_GLOBAL":   cfg,
-		"GIT_CONFIG_NOSYSTEM": "1",
-		"GIT_AUTHOR_NAME":     "Test",
-		"GIT_AUTHOR_EMAIL":    "test@example.com",
-		"GIT_COMMITTER_NAME":  "Test",
-		"GIT_COMMITTER_EMAIL": "test@example.com",
-		// No global Claude Code settings (a global statusLine would keep
-		// atelier's out of task settings, see gen.WriteSettings).
-		"CLAUDE_CONFIG_DIR": filepath.Join(dir, "claude"),
-		// The sandbox is on by default. These tests build Apps without it
-		// (sessions run next to atl) and doctor must say the same, as with
-		// ATL_SANDBOX=off; the sandbox tests set what they need.
-		"ATL_SANDBOX": "off",
-		// No other workspaces (the developer's real ones would shift the
-		// port offsets); the cross-workspace tests set their own root.
-		"ATL_WORKSPACES": filepath.Join(dir, "workspaces"),
-	} {
-		os.Setenv(k, v)
-	}
-	code := m.Run()
-	os.RemoveAll(dir)
-	os.Exit(code)
-}
-
 type taskEnv struct {
 	app  *App
 	root string
@@ -262,6 +226,8 @@ func TestNewTaskValidation(t *testing.T) {
 	}{
 		{"no title", NewTaskOpts{Title: "  ", Repos: []RepoArg{{"api", model.ModeRW}}}, "title"},
 		{"no repos", NewTaskOpts{Title: "x"}, "no repos"},
+		{"escape", NewTaskOpts{Title: "a\x1bb", Repos: []RepoArg{{"api", model.ModeRW}}}, "control characters"},
+		{"bad utf-8", NewTaskOpts{Title: "a\xffb", Repos: []RepoArg{{"api", model.ModeRW}}}, "not valid UTF-8"},
 		{"missing", NewTaskOpts{Title: "x", Repos: []RepoArg{{"nope", model.ModeRW}}}, "does not exist"},
 		{"plain dir", NewTaskOpts{Title: "x", Repos: []RepoArg{{"plain", model.ModeRO}}}, "not a git repository"},
 		{"bad name", NewTaskOpts{Title: "x", Repos: []RepoArg{{"../api", model.ModeRW}}}, "invalid repo name"},
@@ -507,6 +473,29 @@ func TestNewTaskTitleWhitespace(t *testing.T) {
 	}
 	if task.Title != "Fix the login" || task.Slug != "fix-the-login" || task.Description != "line one\nline two" {
 		t.Fatalf("task = %+v", task)
+	}
+}
+
+// TestNewTaskDescriptionControl: control characters in a description are
+// dropped as in notes (newlines and tabs kept, \r\n made \n), in the
+// database and in CLAUDE.md.
+func TestNewTaskDescriptionControl(t *testing.T) {
+	e := newTaskEnv(t)
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(context.Background(), NewTaskOpts{Title: "Fix",
+		Description: " \x1b[2Jline\a one\r\n\tdetail\x00 \n", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRO}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "[2Jline one\n\tdetail"; task.Description != want {
+		t.Fatalf("description = %q, want %q", task.Description, want)
+	}
+	md, err := os.ReadFile(filepath.Join(e.app.Paths.TaskDir(task.Slug), "CLAUDE.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(string(md), "\x1b\a\r\x00") || !strings.Contains(string(md), "[2Jline one\n\tdetail") {
+		t.Fatalf("CLAUDE.md:\n%q", md)
 	}
 }
 
@@ -1011,6 +1000,24 @@ func TestDoctorMissingRepos(t *testing.T) {
 	}
 }
 
+// In a workspace the repos dir defaults to <workspace>/repos, not ~/repos:
+// the hint for a missing one names that default.
+func TestDoctorMissingReposInWorkspace(t *testing.T) {
+	e := newTaskEnv(t)
+	ws := filepath.Join(e.root, "ws")
+	e.app.Paths.Workspace = ws
+	for _, c := range e.app.Doctor(context.Background()) {
+		if c.Name != "repos dir" {
+			continue
+		}
+		if !c.Warn || strings.Contains(c.Detail, "~/repos") || !strings.Contains(c.Detail, "(default "+filepath.Join(ws, "repos")+")") {
+			t.Errorf("repos check = %+v", c)
+		}
+		return
+	}
+	t.Fatal("no repos dir check")
+}
+
 func TestTmuxVersionCheck(t *testing.T) {
 	for out, level := range map[string]string{
 		"tmux 3.5a": "ok", "tmux 3.2": "ok", "tmux 4.0": "ok", "tmux next-3.6": "ok",
@@ -1047,5 +1054,76 @@ func TestFinishRefusesOrphanCommits(t *testing.T) {
 	git(t, wt, "branch", "keep")
 	if _, err := e.app.Cancel(ctx, task.Slug, false); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A failed check whether the task branch exists (here: ctx cancelled) is
+// not "it did not exist": the worktree is not attempted, and the kept
+// branch, with its unpushed commit, is not deleted as if this call had
+// made it.
+func TestBuildTaskDirKeepsBranchOnFailedProbe(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "kept", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := e.commitIn(t, task.Slug, "api", "work")
+	if _, err := e.app.Done(ctx, task.Slug, false); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	plan := []rwCheckout{{Repo: task.Repos[0], Existing: true}}
+	if _, err := e.app.buildTaskDir(cancelled, task, plan, true); err == nil {
+		t.Fatal("buildTaskDir worked with a cancelled ctx")
+	}
+	if got := git(t, e.canonical("api"), "rev-parse", "refs/heads/atl/kept"); got != kept {
+		t.Fatalf("kept branch at %s, want %s", got, kept)
+	}
+	if exists(e.app.Paths.TaskDir(task.Slug)) {
+		t.Fatal("task dir left behind")
+	}
+}
+
+// Doctor lists, per repo, the settings of its own config (its clone's and
+// its worktrees') that make atl refuse a git command, naming the worktree
+// a worktree-scoped one is in; repos without any pass.
+func TestDoctorRepoConfigs(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "docs", "main")
+	check := func() map[string]Check {
+		t.Helper()
+		found := map[string]Check{}
+		for _, c := range e.app.checkRepoConfigs(ctx) {
+			found[c.Name] = c
+		}
+		return found
+	}
+	if c := check()["repo configs"]; !c.OK || c.Warn || !strings.Contains(c.Detail, "2 repos") {
+		t.Fatalf("clean repos: %+v", c)
+	}
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "cfg", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	git(t, e.canonical("api"), "config", "filter.x.clean", "cat")
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	git(t, e.canonical("api"), "config", "extensions.worktreeConfig", "true")
+	git(t, wt, "config", "--worktree", "url.https://evil.example/.insteadOf", "https://github.com/")
+	found := check()
+	c, ok := found["repo api"]
+	if !ok || !c.Warn || !strings.Contains(c.Detail, "filter.x.clean = cat (local; blocks atl diff") ||
+		!strings.Contains(c.Detail, "(worktree "+wt+"; blocks atl push") {
+		t.Fatalf("repo api: %+v (all: %+v)", c, found)
+	}
+	if _, ok := found["repo docs"]; ok {
+		t.Fatalf("docs flagged: %+v", found)
+	}
+	if _, ok := found["repo configs"]; ok {
+		t.Fatalf("a pass besides the warnings: %+v", found)
 	}
 }

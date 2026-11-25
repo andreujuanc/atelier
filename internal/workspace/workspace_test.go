@@ -2,10 +2,13 @@ package workspace
 
 import (
 	"errors"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -21,7 +24,7 @@ func env(t *testing.T) string {
 	t.Setenv("HOME", home)
 	t.Setenv(RootVar, root)
 	for _, k := range []string{Var, VarsVar, "ATL_REPOS", "GIT_CONFIG_GLOBAL", "ATL_CONTEXT", "ATL_TMUX_SOCKET",
-		"ATL_SANDBOX_IMAGE", "ATL_SANDBOX_MOUNTS", "ATL_SANDBOX_CONTEXT"} {
+		"ATL_SANDBOX_IMAGE", "ATL_SANDBOX_MOUNTS", "ATL_SANDBOX_CONTEXT", "ATL_SANDBOX_REGISTRIES"} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
 	}
@@ -211,7 +214,8 @@ func TestLoadStrict(t *testing.T) {
 		`repos = `:                        "parse",
 		`tmux_socket = "a/b"`:             "not a path",
 		"[sandbox]\nmounts = [\"/a:/b\"]": "contains ':'",
-		`repos = 3`:                       "parse",
+		"[sandbox]\nregistries = [\"127.0.0.1:5000/x\"]": "sandbox.registries",
+		`repos = 3`: "parse",
 	} {
 		dir := mk(t, root, "w", content)
 		if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), want) {
@@ -238,13 +242,14 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	for key, want := range map[string]Setting{
-		"repos":           {Var: "ATL_REPOS", Value: filepath.Join(dir, "repos"), Source: FromDefault},
-		"git_config":      {Var: "GIT_CONFIG_GLOBAL"},
-		"tmux_socket":     {Var: "ATL_TMUX_SOCKET", Value: "atl-beta", Source: FromDefault},
-		"context":         {Var: "ATL_CONTEXT"},
-		"sandbox.image":   {Var: "ATL_SANDBOX_IMAGE"},
-		"sandbox.mounts":  {Var: "ATL_SANDBOX_MOUNTS"},
-		"sandbox.context": {Var: "ATL_SANDBOX_CONTEXT"},
+		"repos":              {Var: "ATL_REPOS", Value: filepath.Join(dir, "repos"), Source: FromDefault},
+		"git_config":         {Var: "GIT_CONFIG_GLOBAL"},
+		"tmux_socket":        {Var: "ATL_TMUX_SOCKET", Value: "atl-beta", Source: FromDefault},
+		"context":            {Var: "ATL_CONTEXT"},
+		"sandbox.image":      {Var: "ATL_SANDBOX_IMAGE"},
+		"sandbox.mounts":     {Var: "ATL_SANDBOX_MOUNTS"},
+		"sandbox.context":    {Var: "ATL_SANDBOX_CONTEXT"},
+		"sandbox.registries": {Var: "ATL_SANDBOX_REGISTRIES"},
 	} {
 		want.Key = key
 		if got := setting(ws.Settings, key); got != want {
@@ -269,19 +274,21 @@ tmux_socket = "sock"
 image = "img"
 mounts = ["~/.npmrc", "/etc/x"]
 context = "sctx"
+registries = ["registry.corp:5000", "*.pkg.dev"]
 `)
 	ws, err = Load(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for key, want := range map[string]string{
-		"repos":           filepath.Join(root, "src"),
-		"git_config":      filepath.Join(home, "gc"),
-		"context":         "ctx",
-		"tmux_socket":     "sock",
-		"sandbox.image":   "img",
-		"sandbox.mounts":  "~/.npmrc:/etc/x",
-		"sandbox.context": "sctx",
+		"repos":              filepath.Join(root, "src"),
+		"git_config":         filepath.Join(home, "gc"),
+		"context":            "ctx",
+		"tmux_socket":        "sock",
+		"sandbox.image":      "img",
+		"sandbox.mounts":     "~/.npmrc:/etc/x",
+		"sandbox.context":    "sctx",
+		"sandbox.registries": "registry.corp:5000,*.pkg.dev",
 	} {
 		if s := setting(ws.Settings, key); s.Value != want || s.Source != FromFile {
 			t.Errorf("%s = %+v, want %q from the file", key, s, want)
@@ -292,7 +299,7 @@ context = "sctx"
 		vars[i] = s.Var
 	}
 	if want := []string{"ATL_REPOS", "GIT_CONFIG_GLOBAL", "ATL_CONTEXT", "ATL_TMUX_SOCKET", "ATL_SANDBOX_IMAGE",
-		"ATL_SANDBOX_MOUNTS", "ATL_SANDBOX_CONTEXT"}; !slices.Equal(vars, want) {
+		"ATL_SANDBOX_MOUNTS", "ATL_SANDBOX_CONTEXT", "ATL_SANDBOX_REGISTRIES"}; !slices.Equal(vars, want) {
 		t.Errorf("vars %v", vars)
 	}
 }
@@ -566,7 +573,7 @@ func TestCreate(t *testing.T) {
 		_, _, err := create(root, "box", Config{})
 		var ae *AdoptDBError
 		if !errors.As(err, &ae) || !strings.Contains(err.Error(), "`atl workspace new box --repos DIR [--mount PATH]...`") ||
-			!strings.Contains(err.Error(), "Moving from a devcontainer box") || strings.Contains(err.Error(), "\n") {
+			!strings.Contains(err.Error(), `"Moving from a devcontainer box" in atelier's docs/workspaces.md`) || strings.Contains(err.Error(), "\n") {
 			t.Errorf("$%s=%q %q: %v", Var, ws.val, ws.vars, err)
 		}
 		for _, p := range []string{File, "repos", "tasks"} {
@@ -718,4 +725,94 @@ func create(root, name string, c Config) (string, []string, error) {
 		return "", nil, err
 	}
 	return p.Dir, p.Notes, nil
+}
+
+// A failed write of atelier.toml (a full disk) leaves no partial file
+// behind: a retry makes the workspace rather than calling it existing.
+func TestCreateWriteFails(t *testing.T) {
+	root := env(t)
+	write := writeFile
+	t.Cleanup(func() { writeFile = write })
+	writeFile = func(f *os.File, b []byte) (int, error) {
+		n, _ := f.Write(b[:len(b)/2])
+		return n, syscall.ENOSPC
+	}
+	if _, _, err := create(root, "full", Config{}); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("create on a full disk: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "full", File)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("partial %s left: %v", File, err)
+	}
+	writeFile = write
+	dir, _, err := create(root, "full", Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCreateKilledMidWrite: atl killed while it writes a new workspace's
+// atelier.toml (here: half written, then SIGKILL) leaves no atelier.toml,
+// neither a partial one (which would not load and make a retry call the
+// workspace existing) nor an empty one (which would load as the defaults):
+// a retry makes the workspace with its settings.
+func TestCreateKilledMidWrite(t *testing.T) {
+	if root := os.Getenv("CRASHTEST_WS_ROOT"); root != "" {
+		writeFile = func(f *os.File, b []byte) (int, error) {
+			f.Write(b[:len(b)/2])
+			syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			select {}
+		}
+		Create(root, "killed", Config{Repos: "/srv/repos"})
+		t.Fatal("not killed")
+	}
+	root := env(t)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCreateKilledMidWrite$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "CRASHTEST_WS_ROOT="+root)
+	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+		t.Fatalf("child not killed: %v\n%s", err, out)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "killed", File)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("%s left by the killed write: %v", File, err)
+	}
+	dir, _, err := create(root, "killed", Config{Repos: "/srv/repos"})
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	ws, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Config.Repos != "/srv/repos" {
+		t.Fatalf("repos %q", ws.Config.Repos)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, tmpPrefix+"*")); len(left) > 0 {
+		t.Fatalf("the killed write's temporary file left: %v", left)
+	}
+}
+
+// TestCreateWithoutHardLinks: on a file system without hard links,
+// atelier.toml is written in place, whole, and a second create is refused.
+func TestCreateWithoutHardLinks(t *testing.T) {
+	root := env(t)
+	l := link
+	t.Cleanup(func() { link = l })
+	link = func(string, string) error { return &os.LinkError{Op: "link", Err: syscall.EPERM} }
+	dir, _, err := create(root, "nolinks", Config{Repos: "/srv/repos"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws, err := Load(dir); err != nil || ws.Config.Repos != "/srv/repos" {
+		t.Fatalf("load: %+v, %v", ws, err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, tmpPrefix+"*")); len(left) > 0 {
+		t.Fatalf("temporary files left: %v", left)
+	}
+	if err := (&Plan{Name: "nolinks", Dir: dir}).Write(); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("second write: %v", err)
+	}
 }

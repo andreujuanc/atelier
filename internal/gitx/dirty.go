@@ -2,7 +2,6 @@ package gitx
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -16,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -85,10 +85,12 @@ func isDirty(ctx context.Context, worktree string, depth int) (bool, error) {
 		return false, err
 	}
 	defer d.Close()
-	fileMode := true
-	if v, err := run(ctx, worktree, "config", "--type=bool", "--get", "core.filemode"); err == nil {
-		fileMode = v != "false"
-	}
+	// core.filemode is read only for a file whose executable bit differs from
+	// its entry's: a clean worktree costs no git call for it.
+	fileMode := sync.OnceValue(func() bool {
+		v, err := run(ctx, worktree, "config", "--type=bool", "--get", "core.filemode")
+		return err != nil || v != "false"
+	})
 	for i := range ix.entries {
 		e := &ix.entries[i]
 		if e.stage != 0 || e.flags&ceIntentToAdd != 0 {
@@ -185,15 +187,12 @@ type gitIndex struct {
 // readIndex lists the index of the worktree with each entry's stat data
 // (`git ls-files --stage --debug`), and the index file's mtime.
 func readIndex(ctx context.Context, worktree string) (*gitIndex, error) {
-	var stdout, stderr bytes.Buffer
-	args := []string{"ls-files", "-z", "--stage", "--debug"}
-	cmd := command(ctx, worktree, args...)
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, wrap(ctx, args, stderr.String(), err)
+	stdout, err := output(ctx, worktree, "", "ls-files", "-z", "--stage", "--debug")
+	if err != nil {
+		return nil, err
 	}
 	ix := &gitIndex{}
-	r := bufio.NewReader(&stdout)
+	r := bufio.NewReader(strings.NewReader(stdout))
 	for {
 		head, err := r.ReadString(0)
 		if err == io.EOF && head == "" {
@@ -208,7 +207,7 @@ func readIndex(ctx context.Context, worktree string) (*gitIndex, error) {
 		}
 		ix.entries = append(ix.entries, e)
 	}
-	path, err := run(ctx, worktree, "rev-parse", "--git-path", "index")
+	path, err := revParsePath(ctx, worktree, "--git-path", "index")
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +290,7 @@ func parseIndexEntry(head string, r *bufio.Reader) (indexEntry, error) {
 // the entry's object. Anything that is not what the index has there (a
 // directory on the way that is a symlink; a FIFO, device or directory in
 // place of a file) is a change.
-func (ix *gitIndex) changed(e *indexEntry, d *nofollow.Dir, fileMode bool) (bool, error) {
+func (ix *gitIndex) changed(e *indexEntry, d *nofollow.Dir, fileMode func() bool) (bool, error) {
 	fi, err := d.Lstat(e.path)
 	if gone(err) {
 		return true, nil
@@ -304,7 +303,7 @@ func (ix *gitIndex) changed(e *indexEntry, d *nofollow.Dir, fileMode bool) (bool
 		if !fi.Mode().IsRegular() {
 			return true, nil
 		}
-		if fileMode && (e.mode&0o100 != 0) != (fi.Mode().Perm()&0o100 != 0) {
+		if (e.mode&0o100 != 0) != (fi.Mode().Perm()&0o100 != 0) && fileMode() {
 			return true, nil
 		}
 	case modeSymlink:
@@ -314,7 +313,9 @@ func (ix *gitIndex) changed(e *indexEntry, d *nofollow.Dir, fileMode bool) (bool
 	default:
 		return true, nil
 	}
-	if uint32(fi.Size()) != e.size {
+	// Size 0 is what git records before it has the file's stat data
+	// (read-tree): then, as git does, the content decides.
+	if uint32(fi.Size()) != e.size && e.size != 0 {
 		return true, nil
 	}
 	st, ok := fi.Sys().(*unix.Stat_t)

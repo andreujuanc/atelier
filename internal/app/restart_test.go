@@ -119,7 +119,7 @@ func TestAddReposRestartsSandboxedSessions(t *testing.T) {
 	if len(fd.find("rm")) != 1 {
 		t.Fatalf("container not replaced: %v", fd.changes())
 	}
-	if argv := e.argv(t, s.ID); !slices.Equal(argv, []string{"--resume", "cid-1", "--add-dir", p.RepoPath("docs")}) {
+	if argv := e.argv(t, s.ID); !slices.Equal(argv, []string{"--resume=cid-1", "--add-dir", p.RepoPath("docs")}) {
 		t.Fatalf("resumed argv %q", argv)
 	}
 	if got := e.session(t, s.ID); got.TmuxTarget == oldTarget || !got.State.Live() {
@@ -223,7 +223,7 @@ func TestAddReposWithoutSandbox(t *testing.T) {
 	if err != nil || res.Restarted != 1 {
 		t.Fatalf("ro idle = %+v, %v", res, err)
 	}
-	if argv := e.argv(t, s.ID); !slices.Equal(argv, []string{"--resume", "cid-2", "--add-dir", p.RepoPath("docs")}) {
+	if argv := e.argv(t, s.ID); !slices.Equal(argv, []string{"--resume=cid-2", "--add-dir", p.RepoPath("docs")}) {
 		t.Fatalf("resumed argv %q", argv)
 	}
 }
@@ -235,4 +235,39 @@ func s2task(t *testing.T, e *env, slug string) *model.Task {
 		t.Fatal(err)
 	}
 	return task
+}
+
+// A forced restart ends a live session that has not reported its Claude id
+// (it cannot be resumed) with a warning, instead of relaunching it; the
+// repo is still added.
+func TestAddReposForcedEndsUnreportedSession(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	gitInit(t, e.app.Paths.RepoPath("docs"))
+	e.task(t, "plain", model.StatusActive, true)
+	s, err := e.app.NewSession(ctx, "plain") // no SessionStart: no Claude id
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s.ID)
+	if _, err := e.app.AddRepos(ctx, "plain", []RepoArg{{"docs", model.ModeRO}}, AddOpts{NoFetch: true}); !errors.As(err, new(*BusyError)) {
+		t.Fatalf("unforced add with an unreported session: %v", err)
+	}
+	os.Remove(filepath.Join(e.out, fmt.Sprintf("argv-%d", s.ID)))
+	res, err := e.app.AddRepos(ctx, "plain", []RepoArg{{"docs", model.ModeRO}}, AddOpts{NoFetch: true, Force: true})
+	if err != nil || len(res.Added) != 1 || res.Restarted != 0 {
+		t.Fatalf("forced add = %+v, %v", res, err)
+	}
+	if got := e.session(t, s.ID); got.State != model.StateEnded {
+		t.Fatalf("unreported session is %s, want ended", got.State)
+	}
+	if out := e.app.Out.(*bytes.Buffer).String(); !strings.Contains(out, "had not reported its Claude session: ended, not resumed") {
+		t.Fatalf("no warning:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(e.out, fmt.Sprintf("argv-%d", s.ID))); err == nil {
+		t.Fatal("the unreported session was launched again")
+	}
+	if live, err := e.app.liveSessions(ctx, s2task(t, e, "plain")); err != nil || len(live) != 0 {
+		t.Fatalf("live sessions after the restart: %v, %v", live, err)
+	}
 }

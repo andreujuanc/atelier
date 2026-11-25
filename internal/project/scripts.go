@@ -37,11 +37,31 @@ func (e ScriptEnv) AtlVars() map[string]string {
 	}
 }
 
-// EnvFor returns the environment for a script: os.Environ(), overridden by
-// the project's env, overridden by the atelier variables (see AtlVars). An
-// inherited ATL_SESSION (atl run from inside a Claude window) is dropped: it
-// names a session, not the script's context. Keys are unique (last wins)
-// and sorted. pr may be nil (task without a project).
+// ScriptVars returns the variables atl gives a script: the project's env,
+// overridden by the atelier variables (see AtlVars), without ATL_SESSION.
+// A script in the task's container gets these and the container's own;
+// one on the host gets them over atl's environment (EnvFor). pr may be nil
+// (task without a project).
+func (pr *Project) ScriptVars(e ScriptEnv) map[string]string {
+	m := map[string]string{}
+	if pr != nil {
+		for k, v := range pr.Env {
+			m[k] = v
+		}
+	}
+	// A script is not a session (see EnvFor).
+	delete(m, "ATL_SESSION")
+	for k, v := range e.AtlVars() {
+		m[k] = v
+	}
+	return m
+}
+
+// EnvFor returns the environment for a script on the host: os.Environ(),
+// overridden by ScriptVars. An inherited ATL_SESSION (atl run from inside a
+// Claude window) is dropped: it names a session, not the script's context.
+// Keys are unique (last wins) and sorted. pr may be nil (task without a
+// project).
 func (pr *Project) EnvFor(e ScriptEnv) []string {
 	m := map[string]string{}
 	for _, kv := range os.Environ() {
@@ -51,14 +71,8 @@ func (pr *Project) EnvFor(e ScriptEnv) []string {
 		}
 		m[k] = v
 	}
-	if pr != nil {
-		for k, v := range pr.Env {
-			m[k] = v
-		}
-	}
-	// After the project env, so a project can't reintroduce it either.
 	delete(m, "ATL_SESSION")
-	for k, v := range e.AtlVars() {
+	for k, v := range pr.ScriptVars(e) {
 		m[k] = v
 	}
 	keys := make([]string, 0, len(m))
@@ -84,24 +98,42 @@ const scriptKillDelay = 5 * time.Second
 // background process left holding the output open does not block it for
 // more than scriptKillDelay after the shell exits.
 //
-// The script runs in its own process group. Cancelling ctx sends SIGTERM to
-// the whole group (so children such as `make` → `docker compose` are not
-// orphaned); whatever is still alive scriptKillDelay later gets SIGKILL.
+// The script runs in its own session, so in its own process group and
+// with no controlling terminal (a read of /dev/tty fails). Cancelling ctx
+// sends SIGTERM to the whole group (so children such as `make` → `docker
+// compose` are not orphaned); whatever is still alive scriptKillDelay
+// later gets SIGKILL.
 func RunScript(ctx context.Context, script, dir string, env []string, out io.Writer) error {
 	if strings.TrimSpace(script) == "" {
 		return nil
 	}
+	return Run(ctx, []string{"sh", "-c", script}, dir, env, out, nil)
+}
+
+// Run runs argv as RunScript runs its script's shell, with the same
+// errors. onCancel, if not nil, runs first when ctx is cancelled, before
+// the process group gets SIGTERM: for a command that starts what it runs
+// elsewhere (docker exec, whose client's death does not end what it
+// started in the container), it ends that.
+func Run(ctx context.Context, argv []string, dir string, env []string, out io.Writer, onCancel func()) error {
 	if out == nil {
 		out = io.Discard
 	}
-	cmd := exec.CommandContext(ctx, "sh", "-c", script)
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = env
 	cmd.Stdout = out
 	cmd.Stderr = out
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// A session of its own: its own process group, and no controlling
+	// terminal. In a process group of atl's terminal that is not the
+	// foreground one, a read of /dev/tty (ssh asking about a host key)
+	// would stop it (SIGTTIN) until Ctrl-C; without one it fails at once.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	var cancelledAt time.Time // set by Cancel; read after Run (Wait syncs with it)
 	cmd.Cancel = func() error {
+		if onCancel != nil {
+			onCancel()
+		}
 		cancelledAt = time.Now()
 		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM); err != nil {
 			return os.ErrProcessDone // the group is already gone

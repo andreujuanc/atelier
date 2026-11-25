@@ -353,12 +353,12 @@ func TestAssistantSettingsInvalidPermissions(t *testing.T) {
 }
 
 func TestRetiredAssistantRules(t *testing.T) {
-	for _, want := range []string{"Bash(atl ls:*)", "Bash(atl --help:*)", "Bash(atl --help *)", "Bash(atl help:*)", "Bash(atl open:*)", "Bash(atl note:*)"} {
+	for _, want := range []string{"Bash(atl ls:*)", "Bash(atl --help:*)", "Bash(atl --help *)", "Bash(atl help:*)", "Bash(atl open:*)", "Bash(atl note:*)", "Bash(atl repos *)", "Bash(atl repos:*)"} {
 		if !contains(retiredAssistantRules, want) {
 			t.Errorf("retired lacks %s", want)
 		}
 	}
-	if len(retiredAssistantRules) != len(assistantAllow)+len(assistantAsk)-3+len(retiredAtlHelp) { // Read, Grep, Glob
+	if len(retiredAssistantRules) != len(assistantAllow)+len(assistantAsk)-4+len(retiredAtlHelp)+len(retiredRepos) { // Read, Grep, Glob, atl repos
 		t.Errorf("retired = %v", retiredAssistantRules)
 	}
 	for _, l := range [][]string{assistantAllow, assistantAsk, assistantDeny} {
@@ -444,5 +444,27 @@ func TestAssistantHelpRule(t *testing.T) {
 	}
 	if md := AssistantClaudeMD(true); strings.Contains(md, "atl --help") || !strings.Contains(md, "`atl help <command>`") {
 		t.Error("CLAUDE.md still offers atl --help")
+	}
+}
+
+// TestAssistantReposPinPermissions: `atl repos` (the list) runs without
+// asking, but `atl repos pin` accepts a changed origin URL, the user's
+// decision: no allow rule may let it run, however it is spelled.
+func TestAssistantReposPinPermissions(t *testing.T) {
+	matchesAny := func(rules []string, c string) bool {
+		for _, r := range rules {
+			if ruleMatches(r, c) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, c := range []string{"atl repos pin api", `atl repos "pin" api`, "atl repos  pin api", "atl repos 'pin' api web"} {
+		if matchesAny(assistantAllow, c) {
+			t.Errorf("allow rule lets %q run without asking", c)
+		}
+	}
+	if !matchesAny(assistantAllow, "atl repos") {
+		t.Error(`"atl repos" is not allowed without asking`)
 	}
 }

@@ -24,6 +24,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // DefaultImage is the task image when neither the project nor
@@ -124,6 +126,40 @@ func ReservedName(name string) bool {
 	return reservedName.MatchString(strings.TrimLeft(name, "/"))
 }
 
+// ComposeProject is the Docker name namespace of sandbox id: atl sets it as
+// the task container's $COMPOSE_PROJECT_NAME, and the task's gate allows
+// new network and volume names, compose project labels and container
+// names in the pattern of any task's namespace (Namespaced) only in it
+// (see InNamespace). It is atl_ and the 6 hex digits of the ID (the hash
+// of the task dir); an ID not made by ID gets a hash of its own. Every
+// namespace has the same length, so none is a prefix of another's; and
+// its underscore keeps it apart from ContainerName's atl-.
+func ComposeProject(id string) string {
+	hash := id[strings.LastIndexByte(id, '-')+1:]
+	if !composeHash.MatchString(hash) {
+		hash = shortHash(id, 6)
+	}
+	return "atl_" + hash
+}
+
+var composeHash = regexp.MustCompile(`^[0-9a-f]{6}$`)
+
+// namespaced matches every name in the pattern of a ComposeProject
+// namespace, in any case and with any leading slash.
+var namespaced = regexp.MustCompile(`(?i)^/*atl_[0-9a-f]{6}($|[-_])`)
+
+// InNamespace reports whether name, a network, volume or compose project
+// name, is in namespace ns (a ComposeProject): ns itself, or ns followed
+// by - or _ and more. It compares exactly, as dockerd and compose do (the
+// case counts: compose project names are lower case).
+func InNamespace(ns, name string) bool {
+	return name == ns || strings.HasPrefix(name, ns+"-") || strings.HasPrefix(name, ns+"_")
+}
+
+// Namespaced reports whether name is in the pattern of any task's
+// namespace (see ComposeProject), in any case and with any leading slash.
+func Namespaced(name string) bool { return namespaced.MatchString(name) }
+
 // Mount is a bind mount of a host path into the task container.
 type Mount struct {
 	Src, Dst string
@@ -186,7 +222,8 @@ func (s Spec) runArgs(hash string) []string {
 // ExecArgv is the command for a tmux window that runs argv in the task
 // container, named by the full ID Ensure returned (not by its name, which
 // is only checked there), in workdir. The variables named in envKeys are
-// passed on from the window's environment. The atl binary of the run dir
+// passed on from the window's environment; an entry NAME=VALUE sets NAME to
+// VALUE. The atl binary of the run dir
 // comes first on PATH, so `atl` in the container is the atl that made it,
 // and so does its wl-copy, the copy relay, which $WAYLAND_DISPLAY (set to
 // CopyDisplay) makes Claude Code use (see CopyMain).
@@ -264,7 +301,9 @@ func WindowArgv(attach bool, exec []string) []string {
 // have). atl reads nothing of what it prints (the container is the task's).
 //
 // Arguments: mode (kill or end), session, and for tests the parent PID of
-// a root (default 0) and how long end waits (default 120 seconds).
+// a root (default 0) and how long end waits (default 120 seconds); then the
+// variable that marks the processes (default ATL_SESSION; ScriptVar for a
+// project script's, see KillScriptArgs).
 //
 // kill ends them all. end is for a session whose Claude is ending: the
 // session's roots, the processes docker exec started for it (their parent
@@ -274,7 +313,7 @@ func WindowArgv(attach bool, exec []string) []string {
 // anew). A root that is still there after the wait means the session goes
 // on (a SessionEnd for /clear, or a nested claude): nothing is touched.
 // Processes of other sessions never carry this session's ATL_SESSION.
-const sessionScript = `mode=$1 s="ATL_SESSION=$2" rootppid=${3:-0} wait=${4:-120}
+const sessionScript = `mode=$1 s="${5:-ATL_SESSION}=$2" rootppid=${3:-0} wait=${4:-120}
 # scan: the session's processes but this script, one per line, roots as r<pid>
 scan() {
 	for d in /proc/[0-9]*; do
@@ -330,6 +369,86 @@ func EndSessionCmd(session int64) []string { return sessionCmd("end", session) }
 
 func sessionCmd(mode string, session int64) []string {
 	return []string{"sh", "-c", sessionScript, "atl-" + mode + "-session", mode, strconv.FormatInt(session, 10)}
+}
+
+// ScriptVar marks the processes of one run of a project's setup or
+// teardown script in a task container (ScriptArgs), with a value of its
+// own per run, for KillScriptArgs to find them.
+const ScriptVar = "ATL_SCRIPT"
+
+// scriptKiller is $0 of the script that ends a script run's processes
+// (sessionScript, mode kill). ParseActivity does not leave it out as it
+// does the session clean-ups: scriptWrapper has the name in its text, and a
+// script that runs is activity.
+const scriptKiller = "atl-kill-script"
+
+// scriptWrapper runs, in a task container, a project script ($3) with sh
+// -c, its processes marked with ScriptVar=$2 and the run dir's atl first on
+// PATH (as in a session, see ExecArgv), and exits with its status. When the
+// script's shell exits, what it left running ends (sessionScript, $1, mode
+// kill); the wrapper and its copier are not marked, so that leaves them
+// alone.
+//
+// docker exec returns only once nothing in the container holds its output
+// open, and a process the script started without the mark (env -u) would
+// hold it, and atl, for as long as it runs. So the script writes to a FIFO
+// of the wrapper's, which cat copies to docker exec's output; once the
+// script's shell has exited, cat gets 5 seconds to copy what is left (it
+// ends at once when no writer is left), then it is killed, and the wrapper
+// exits: then nothing holds docker exec's output. Without a FIFO (no
+// mktemp or mkfifo, or no writable /tmp in the image) the script writes
+// to docker exec's output itself.
+const scriptWrapper = `k=$1 run=$2
+d=$(mktemp -d 2> /dev/null) && mkfifo "$d/out" 2> /dev/null || { [ -z "$d" ] || rmdir "$d"; d=; }
+if [ -n "$d" ]; then
+	cat "$d/out" &
+	c=$!
+	PATH=` + RunMount + `/bin:$PATH ` + ScriptVar + `=$run sh -c "$3" > "$d/out" 2>&1
+else
+	PATH=` + RunMount + `/bin:$PATH ` + ScriptVar + `=$run sh -c "$3"
+fi
+st=$?
+sh -c "$k" ` + scriptKiller + ` kill "$run" 0 0 ` + ScriptVar + ` > /dev/null 2>&1
+if [ -n "$d" ]; then
+	i=0
+	while [ $i -lt 50 ] && kill -0 $c 2> /dev/null; do
+		sleep 0.1 2> /dev/null || { sleep 1; i=$((i + 9)); }
+		i=$((i + 1))
+	done
+	kill $c 2> /dev/null
+	rm -rf "$d"
+fi
+exit $st`
+
+// ScriptArgs are the docker arguments that run a project's setup or
+// teardown script in the task container (by the full ID Ensure returned) as
+// user ("uid:gid"), in workdir, with env as its only variables besides the
+// container's own (whose DOCKER_HOST is the task's gate): nothing of the
+// docker client's environment goes in. run marks the script's processes
+// (ScriptVar) for KillScriptArgs; what the script leaves running ends when
+// it exits (scriptWrapper). No terminal, no stdin.
+func ScriptArgs(container, user, workdir string, env map[string]string, run, script string) []string {
+	args := []string{"exec", "-u", user, "-w", workdir}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		if k != ScriptVar {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		args = append(args, "-e", k+"="+env[k])
+	}
+	return append(args, container, "sh", "-c", scriptWrapper, "atl-script", sessionScript, run, script)
+}
+
+// KillScriptArgs are the docker arguments that end, in the task container,
+// every process of the script run run (ScriptArgs): TERM, then KILL after
+// 5 seconds (sessionScript, mode kill). A docker exec client that is
+// killed leaves what it started running in the container: this is what
+// stops an interrupted script.
+func KillScriptArgs(container, run string) []string {
+	return []string{"exec", container, "sh", "-c", sessionScript, scriptKiller, "kill", run, "0", "0", ScriptVar}
 }
 
 // Runner runs the docker CLI with args and returns its trimmed stdout; a
@@ -420,6 +539,12 @@ func IsNoSuch(err error) bool { return noSuch(err) }
 // container of the task exists (any old one was removed): what it prepares
 // for the container cannot be touched by the task meanwhile. Its error stops
 // the creation.
+//
+// The container returned has a usable $HOME (makeHome): made when the
+// container is created, and checked once per atl process when it is
+// reused, since it may predate makeHome or its creator may have died first.
+// Not in a container kept although it predates a change: its mounts are
+// not the spec's.
 func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh func() error) (container string, stale bool, err error) {
 	create := func() (string, error) {
 		if fresh != nil {
@@ -432,18 +557,42 @@ func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh 
 			if !strings.Contains(err.Error(), "already in use") {
 				return "", err
 			}
-			// Lost a race with another atl creating it: take theirs, if it is atl's.
+			// Lost a race with another atl creating it: take theirs, if it
+			// is atl's, with its home made, in case that atl has not made it
+			// yet or died first; left alone if that fails (it is theirs).
 			c, err := Agent(ctx, run, spec.ID)
-			if err == nil && !c.Running {
-				_, err = run(ctx, "start", c.ID)
+			if err != nil {
+				return "", err
 			}
-			return c.ID, err
+			if !c.Running {
+				if _, err := run(ctx, "start", c.ID); err != nil {
+					return "", err
+				}
+			}
+			if err := spec.makeHomeOnce(ctx, run, c.ID); err != nil {
+				return "", err
+			}
+			return c.ID, nil
 		}
+		var id string
 		if lines := strings.Fields(out); len(lines) > 0 && fullID(lines[len(lines)-1]) {
-			return lines[len(lines)-1], nil // docker run -d prints the ID last
+			id = lines[len(lines)-1] // docker run -d prints the ID last
+		} else {
+			c, err := Agent(ctx, run, spec.ID)
+			if err != nil {
+				return "", err
+			}
+			id = c.ID
 		}
-		c, err := Agent(ctx, run, spec.ID)
-		return c.ID, err
+		if err := spec.makeHome(ctx, run, id); err != nil {
+			// Removed, so that the next try makes it again.
+			if _, rerr := run(ctx, "rm", "-f", id); rerr != nil && !noSuch(rerr) {
+				err = errors.Join(err, rerr)
+			}
+			return "", err
+		}
+		homesMade.Store(id, true)
+		return id, nil
 	}
 	c, err := Agent(ctx, run, spec.ID)
 	switch {
@@ -468,7 +617,89 @@ func Ensure(ctx context.Context, run Runner, spec Spec, busy func() bool, fresh 
 			return "", false, err
 		}
 	}
+	if err := spec.makeHomeOnce(ctx, run, c.ID); err != nil {
+		return "", false, err
+	}
 	return c.ID, false, nil
+}
+
+// homeScript makes $HOME a directory of the user $1 ("uid:gid"), and hands
+// that user the root-owned directories strictly between $HOME and the mount
+// points $2... below it (docker makes them, as root, to mount something
+// there). It runs as root in the container, and only ever changes the
+// container's own file system: nothing when a mount is $HOME or above it;
+// never a mount point, nor anything in a mount; never through a symlink
+// (it stops at one, and chown -h). It changes nothing that is right already.
+const homeScript = `set -f
+u=$1 uid=${1%%:*}
+shift
+owns() { set -- $(ls -dn -- "$1"); [ "$3" = "$uid" ]; }
+for o do
+	case $HOME in "$o" | "$o"/*) exit 0 ;; esac
+done
+if [ ! -e "$HOME" ] && [ ! -L "$HOME" ]; then
+	mkdir -p -- "$HOME" || exit
+fi
+if [ ! -L "$HOME" ] && ! owns "$HOME"; then
+	chown -h -- "$u" "$HOME" || exit
+fi
+for m do
+	case $m in "$HOME"/*) ;; *) continue ;; esac
+	d=$HOME rest=${m#"$HOME"/}
+	while :; do
+		case $rest in */*) ;; *) break ;; esac
+		d=$d/${rest%%/*} rest=${rest#*/}
+		if [ -L "$d" ] || [ ! -d "$d" ]; then break; fi
+		in=
+		for o do
+			case $d in "$o" | "$o"/*) in=1 ;; esac
+		done
+		if [ -n "$in" ]; then break; fi
+		if [ -O "$d" ] && ! owns "$d"; then
+			chown -h -- "$u" "$d" || exit
+		fi
+	done
+done
+`
+
+// makeHome makes the spec's $HOME, in container id, a directory the spec's
+// user owns, with the root-owned directories docker made below it for mount
+// points handed to that user too (homeScript). $HOME is the home dir of the
+// user running atl, which the image has only when built for that path:
+// atelier's images put the user's home in /home/<user>, so on a host where
+// it is elsewhere (/var/home/<user>, /Users/<user>) it would be missing, or
+// a root-owned directory docker made to mount something below it, and what
+// writes to ~/.cache, ~/.npm or ~/.config would fail. Without $HOME or a
+// user in the spec it does nothing.
+func (s Spec) makeHome(ctx context.Context, run Runner, id string) error {
+	home := s.Env["HOME"]
+	if home == "" || s.User == "" {
+		return nil
+	}
+	args := []string{"exec", "-u", "0", id, "sh", "-c", homeScript, "sh", s.User}
+	for _, m := range s.Mounts {
+		args = append(args, m.Dst)
+	}
+	if _, err := run(ctx, args...); err != nil {
+		return fmt.Errorf("make the home dir %s in the container: %w", home, err)
+	}
+	return nil
+}
+
+// homesMade holds the IDs of the containers whose home makeHome made in
+// this process, so that Ensure checks a container it reuses only once.
+var homesMade sync.Map
+
+// makeHomeOnce is makeHome, unless it already ran for container id.
+func (s Spec) makeHomeOnce(ctx context.Context, run Runner, id string) error {
+	if _, ok := homesMade.Load(id); ok {
+		return nil
+	}
+	if err := s.makeHome(ctx, run, id); err != nil {
+		return err
+	}
+	homesMade.Store(id, true)
+	return nil
 }
 
 // Cleanup removes the task container of sandbox id (only atl's own, see
@@ -523,14 +754,18 @@ func InstallBin(src, runDir string) error {
 	return nil
 }
 
+// linkSeq numbers linkAtl's temp links.
+var linkSeq atomic.Int64
+
 // linkAtl makes path a symlink to atl in its own directory, replacing
-// whatever is there atomically, unless it is one already.
+// whatever is there atomically, unless it is one already. Its temp link
+// is its own (by process and call): launches in one task may run at once.
 func linkAtl(path string) error {
 	if target, err := os.Readlink(path); err == nil && target == "atl" {
 		return nil
 	}
-	tmp := path + ".tmp"
-	os.Remove(tmp)
+	tmp := fmt.Sprintf("%s.%d.%d.tmp", path, os.Getpid(), linkSeq.Add(1))
+	os.Remove(tmp) // left by a crashed process that had this pid
 	if err := os.Symlink("atl", tmp); err != nil {
 		return err
 	}

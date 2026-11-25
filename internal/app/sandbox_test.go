@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -249,6 +250,38 @@ func TestSandboxLeavesAContainerNotItsOwn(t *testing.T) {
 	}
 }
 
+// TestCloseStopsTheGateFirst: closing a task stops its gate before it
+// lists the containers the task made. A container of the task that has the
+// gate's socket (mounted as its Docker socket) could otherwise create
+// another one after the list, which would outlive the task, its worktrees'
+// removal included, with them mounted.
+func TestCloseStopsTheGateFirst(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	task := e.task(t, "boxed", model.StatusActive, true)
+	runDir := e.app.Paths.RunDir(task.Slug)
+	if err := sandbox.MakeRunDir(runDir); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("unix", sandbox.SocketPath(runDir)) // the gate
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	listed, aliveThen := false, false
+	fd.onPs = func() {
+		if !listed {
+			listed, aliveThen = true, sandbox.Alive(runDir)
+		}
+	}
+	if _, err := e.app.Done(ctx, "boxed", true); err != nil {
+		t.Fatal(err)
+	}
+	if !listed || aliveThen {
+		t.Errorf("the task's containers listed: %v, with its gate still up: %v", listed, aliveThen)
+	}
+}
+
 // fakeDocker records docker CLI calls. No container exists until one is
 // "run"; then inspect reports it running with the spec label it was given.
 type fakeDocker struct {
@@ -261,6 +294,8 @@ type fakeDocker struct {
 	down    bool            // the daemon cannot be reached
 	ps      string          // what the activity probe prints (sandbox.ActivityArgs)
 	onRm    func()          // called on docker rm
+	onPs    func()          // called on docker ps
+	onExec  func([]string)  // called on docker exec, with its arguments
 }
 
 // fakeContainerID is the full ID of fakeDocker's container.
@@ -310,12 +345,19 @@ func (f *fakeDocker) run(_ context.Context, args ...string) (string, error) {
 			}
 		}
 		return fakeContainerID, nil
+	case "ps":
+		if f.onPs != nil {
+			f.onPs()
+		}
 	case "rm":
 		f.label = ""
 		if f.onRm != nil {
 			f.onRm()
 		}
 	case "exec":
+		if f.onExec != nil {
+			f.onExec(args)
+		}
 		if args[len(args)-1] == "atl-activity" {
 			return f.ps, nil
 		}
@@ -908,6 +950,20 @@ func TestSandboxTaskImage(t *testing.T) {
 	if n := len(fd.find("run")); n != 1 {
 		t.Errorf("docker run calls = %d, want 1 (docker may pull)", n)
 	}
+	// A project that does not load is said once, not again for the error.
+	broken := e.app.Paths.ProjectFile("broken")
+	if err := os.WriteFile(broken, []byte("image = \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task.Project = "broken"
+	e.app.Out.(*bytes.Buffer).Reset()
+	if _, err := e.app.ensureSandbox(ctx, task); err == nil || !strings.Contains(err.Error(), "task image mine:1 (from $ATL_SANDBOX_IMAGE)") {
+		t.Fatalf("ensureSandbox with a broken project: %v", err)
+	}
+	if n := strings.Count(e.app.Out.(*bytes.Buffer).String(), "using the default task image"); n != 1 {
+		t.Errorf("project warning said %d times:\n%s", n, e.app.Out.(*bytes.Buffer).String())
+	}
+	task.Project = ""
 
 	// Once it is there, the container starts.
 	fd.missing = nil
@@ -1298,5 +1354,140 @@ func TestInsideSandboxRefusesToLaunchAndRecover(t *testing.T) {
 	}
 	if got := e.session(t, s.ID).State; got == model.StateStopped {
 		t.Error("session marked stopped from inside a task container")
+	}
+}
+
+// TestSandboxProjectPath: in a sandboxed task the project's PATH and SHELL
+// are the container's: docker exec gets them by value, while the window
+// that runs docker exec where atl runs keeps atl's own (a container PATH
+// need not hold docker, tmux or sh there). Other project variables still
+// reach docker exec by name, from the window's environment.
+func TestSandboxProjectPath(t *testing.T) {
+	e, _ := sandboxEnv(t)
+	ctx := context.Background()
+	pf := e.app.Paths.ProjectFile("shop")
+	if err := os.MkdirAll(filepath.Dir(pf), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "[env]\nPATH = \"/opt/in-container/bin\"\nSHELL = \"/bin/in-container-sh\"\nFOO = \"bar\"\n"
+	if err := os.WriteFile(pf, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := &model.Task{Slug: "boxed", Title: "boxed", Status: model.StatusActive, Branch: "atl/boxed", Project: "shop"}
+	if err := e.app.Store.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(e.app.Paths.TaskDir("boxed"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := e.app.NewSession(ctx, "boxed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.argv(t, s.ID) // the stub claude ran: the window started docker exec
+	cmd := e.tmux(t, "display-message", "-p", "-t", s.TmuxTarget, "#{pane_start_command}")
+	for _, want := range []string{"-e PATH=/opt/in-container/bin ", "-e SHELL=/bin/in-container-sh ", "-e FOO "} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("window command lacks %q: %s", want, cmd)
+		}
+	}
+	if strings.HasPrefix(cmd, "env ") {
+		t.Errorf("window command runs with the project's PATH: %s", cmd)
+	}
+}
+
+// TestSandboxComposeProject: a sandboxed task's container and sessions get
+// COMPOSE_PROJECT_NAME set to the task's Docker namespace, over the
+// project's own value, which atl warns about once; with the sandbox off,
+// the project's value stands, and nothing is said.
+func TestSandboxComposeProject(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	ctx := context.Background()
+	pf := e.app.Paths.ProjectFile("shop")
+	if err := os.MkdirAll(filepath.Dir(pf), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pf, []byte("[env]\nCOMPOSE_PROJECT_NAME = \"shop\"\nFOO = \"bar\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := &model.Task{Slug: "boxed", Title: "boxed", Status: model.StatusActive, Branch: "atl/boxed", Project: "shop"}
+	if err := e.app.Store.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(e.app.Paths.TaskDir("boxed"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ns := sandbox.ComposeProject(sandbox.ID("boxed", e.app.Paths.TaskDir("boxed")))
+	var ids []int64
+	for range 2 {
+		s, err := e.app.NewSession(ctx, "boxed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.argv(t, s.ID) // the stub claude ran
+		ids = append(ids, s.ID)
+	}
+	if runs := fd.find("run"); len(runs) != 1 || !slices.Contains(runs[0], "COMPOSE_PROJECT_NAME="+ns) {
+		t.Errorf("docker run = %q, want --env COMPOSE_PROJECT_NAME=%s", runs, ns)
+	}
+	for _, id := range ids {
+		if env := "\n" + readFile(t, filepath.Join(e.out, "env-"+strconv.FormatInt(id, 10))); !strings.Contains(env, "\nCOMPOSE_PROJECT_NAME="+ns+"\n") ||
+			!strings.Contains(env, "\nFOO=bar\n") {
+			t.Errorf("session %d: claude's env:\n%s", id, env)
+		}
+	}
+	out := e.app.Out.(*bytes.Buffer).String()
+	if n := strings.Count(out, "warning: project shop sets COMPOSE_PROJECT_NAME=shop; sandboxed tasks use their own ("+ns+" for task boxed)"); n != 1 {
+		t.Errorf("%d warnings, want 1:\n%s", n, out)
+	}
+
+	// Sandbox off: the project's.
+	e.app.Sandbox = nil
+	e.app.Out.(*bytes.Buffer).Reset()
+	if env := e.app.launchEnv(task, &model.Session{ID: 9}); env["COMPOSE_PROJECT_NAME"] != "shop" {
+		t.Errorf("without the sandbox: COMPOSE_PROJECT_NAME=%q, want the project's", env["COMPOSE_PROJECT_NAME"])
+	}
+	task.Project = ""
+	if env := e.app.launchEnv(task, &model.Session{ID: 9}); env["COMPOSE_PROJECT_NAME"] != "" {
+		t.Errorf("without the sandbox or a project: COMPOSE_PROJECT_NAME=%q", env["COMPOSE_PROJECT_NAME"])
+	}
+	if out := e.app.Out.(*bytes.Buffer).String(); out != "" {
+		t.Errorf("output without the sandbox: %q", out)
+	}
+}
+
+// TestSandboxMakesHome: the task container's $HOME is the host user's home
+// dir, which an image built for /home/<user> lacks when the host keeps it
+// elsewhere (/var/home/<user>): the new container gets it, made as root and
+// handed to the user (with what docker made below it for mount points),
+// before the session starts.
+func TestSandboxMakesHome(t *testing.T) {
+	e, fd := sandboxEnv(t)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.task(t, "boxed", model.StatusActive, true)
+	if _, err := e.app.NewSession(context.Background(), "boxed"); err != nil {
+		t.Fatal(err)
+	}
+	var verbs []string
+	var root []string
+	ran := false
+	for _, c := range fd.changes() {
+		verbs = append(verbs, c[0])
+		switch {
+		case c[0] == "run":
+			ran = true
+			if !slices.Contains(c, "HOME="+home) {
+				t.Errorf("docker run without HOME=%s: %q", home, c)
+			}
+		case c[0] == "exec" && c[1] == "-u" && ran && root == nil:
+			root = c
+		}
+	}
+	owner := strconv.Itoa(os.Getuid()) + ":" + strconv.Itoa(os.Getgid())
+	if len(root) < 4 || !slices.Equal(root[:4], []string{"exec", "-u", "0", fakeContainerID}) || len(root) < 9 || root[8] != owner || !slices.Contains(root, e.app.Paths.TaskDir("boxed")) {
+		t.Fatalf("home made with %q (calls %q); want, after docker run, as root in the new container, for %s, with the mount points", root, verbs, owner)
 	}
 }

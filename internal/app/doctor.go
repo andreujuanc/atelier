@@ -194,7 +194,7 @@ func (a *App) checkClaudeToken() Check {
 		}
 		return pass(name, detail)
 	}
-	age := a.now().Sub(auth.storedAt)
+	age := max(a.now().Sub(auth.storedAt), 0) // not negative if the clock was set back
 	days := int(age / (24 * time.Hour))
 	on := auth.storedAt.Local().Format(time.DateOnly)
 	switch {
@@ -225,10 +225,16 @@ func (a *App) checkRepoConfigs(ctx context.Context) []Check {
 	for _, r := range repos {
 		dir := a.Paths.RepoPath(r)
 		var origin *gitx.Origin
-		if o, ok, err := a.loadPin(r); err == nil && ok {
+		if o, ok, err := a.loadPin(r); err != nil {
+			// Every fetch and push of the repo fails on it.
+			checks = append(checks, warn("repo "+r, err.Error()))
+		} else if ok {
 			origin = &o
-		} else if o, ok, err := gitx.CurrentOrigin(ctx, dir); err == nil && ok {
-			origin = &o
+		}
+		if origin == nil {
+			if o, ok, err := gitx.CurrentOrigin(ctx, dir); err == nil && ok {
+				origin = &o
+			}
 		}
 		dirs := []string{dir}
 		if wts, err := gitx.Worktrees(ctx, dir); err == nil {
@@ -350,14 +356,18 @@ func (a *App) checkTasksDir() Check {
 
 func (a *App) checkReposDir() Check {
 	const name = "repos dir"
+	def := "~/repos"
+	if a.Paths.Workspace != "" {
+		def = filepath.Join(a.Paths.Workspace, "repos")
+	}
 	fi, err := os.Stat(a.Paths.Repos)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		return warn(name, a.Paths.Repos+" does not exist; clone repos there or set $ATL_REPOS (default ~/repos)")
+		return warn(name, a.Paths.Repos+" does not exist; clone repos there or set $ATL_REPOS (default "+def+")")
 	case err != nil:
 		return warn(name, err.Error())
 	case !fi.IsDir():
-		return warn(name, a.Paths.Repos+" is not a directory; set $ATL_REPOS (default ~/repos)")
+		return warn(name, a.Paths.Repos+" is not a directory; set $ATL_REPOS (default "+def+")")
 	}
 	return pass(name, a.Paths.Repos)
 }

@@ -74,20 +74,20 @@ func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID
 // package sandbox) what that changes: a repo with its own container setup
 // is built and tested in it, through the gate (whose refusals it lists).
 const sandboxNote = "Sandbox: you run in the task's own container. " +
-	"Build, test and run a repo in its own container setup, if any (`.devcontainer`, compose, " +
-	"or per its docs/CLAUDE.md), via `docker`/`docker compose`. " +
-	"If none, work here, installing what is missing (system packages: " +
-	"`docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`); installs are lost when this container " +
-	"is replaced: tell the user what the task keeps needing, for the project's image. " +
-	"Docker gate: bind mounts only from the task dir; no privileged or host modes; classic builder only " +
-	"(DOCKER_BUILDKIT=0 is set); you see only this task's containers, networks, volumes; " +
-	"services answer by compose service name. " +
-	"If a setup needs something refused (a host file mount, privileged, BuildKit-only syntax), don't edit " +
-	"the repo: override it with a file in the task dir (compose: an extra `-f` file) and tell the user " +
-	"what you overrode. " +
-	"What this session starts here ends with it (background dev servers too); what should outlive it " +
-	"belongs in a Docker service. " +
-	"No git credentials here (`git push`, `gh` fail): push with `atl push`, fetch with `atl fetch`."
+	"Build, test, run a repo in its own container setup, if any (`.devcontainer`, compose, " +
+	"or per its docs/CLAUDE.md). " +
+	"Else work here, installing what's missing (system packages: " +
+	"`docker exec -u 0 $ATL_CONTAINER apt-get install -y <pkg>`); installs are lost with this container: " +
+	"tell the user what the image lacks. " +
+	"Docker gate: bind mounts only from the task dir; network/volume names, build tags start with $COMPOSE_PROJECT_NAME " +
+	"(per task; a 2nd compose project: `-p $COMPOSE_PROJECT_NAME-<repo>`); no privileged or host modes; " +
+	"classic builder only (DOCKER_BUILDKIT=0); pull build bases first (allowed registries); " +
+	"you see only this task's containers, networks, volumes; services answer by service name. " +
+	"If a setup needs something refused (host file mount, privileged, BuildKit), don't edit " +
+	"the repo: override it in a task-dir file (compose: an extra `-f`) and tell the user. " +
+	"What this session starts ends with it (dev servers too); what should outlive it " +
+	"goes in a Docker service. " +
+	"No git credentials here (`git push`, `gh` fail): use `atl push`, `atl fetch`."
 
 // renderContext renders the SessionStart task context: plain markdown of
 // at most contextMaxLen bytes. envText (the raw ATL_CONTEXT value) is
@@ -239,19 +239,27 @@ func notesTail(text string, room int, slug string) string {
 // dropped or become spaces (as in envBlock), and surrounding blank lines
 // and trailing spaces are trimmed.
 func notesBlock(s string) string {
+	s = strings.TrimRight(keepLines(s), " \n")
+	return strings.TrimLeft(s, "\n")
+}
+
+// keepLines turns \r\n and \r into \n and every other control or format
+// character into a space (see unprintable).
+func keepLines(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
-	s = strings.Map(func(r rune) rune {
-		if r == '\n' {
-			return r
-		}
-		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+	return strings.Map(func(r rune) rune {
+		if r != '\n' && unprintable(r) {
 			return ' '
 		}
 		return r
 	}, s)
-	s = strings.TrimRight(s, " \n")
-	return strings.TrimLeft(s, "\n")
+}
+
+// unprintable reports whether r is a control or format character (newline,
+// tab, escape, bidi override, ...) or invalid UTF-8.
+func unprintable(r rune) bool {
+	return r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
 }
 
 // oneLine sanitises s for a single line: control and format characters
@@ -259,7 +267,7 @@ func notesBlock(s string) string {
 // whitespace collapse to one space.
 func oneLine(s string) string {
 	s = strings.Map(func(r rune) rune {
-		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+		if unprintable(r) {
 			return ' '
 		}
 		return r
@@ -307,18 +315,7 @@ func envBlock(s string) string {
 // and format characters into spaces (as in oneLine) and trims surrounding
 // whitespace.
 func sanitiseEnv(s string) string {
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	s = strings.ReplaceAll(s, "\r", "\n")
-	s = strings.Map(func(r rune) rune {
-		if r == '\n' {
-			return r
-		}
-		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			return ' '
-		}
-		return r
-	}, s)
-	return strings.TrimSpace(s)
+	return strings.TrimSpace(keepLines(s))
 }
 
 // truncateBytes cuts s to at most n bytes on a rune boundary.

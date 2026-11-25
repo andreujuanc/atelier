@@ -41,7 +41,7 @@ Every hook runs `atl hook <event>`, which reads the hook JSON from stdin (sessio
 - UserPromptSubmit → running
 - Notification → waiting (needs my input)
 - Stop → idle (turn finished)
-- SessionEnd → ended
+- SessionEnd → ended, for a live session of the Claude atl last launched for it (`ATL_LAUNCH`); a session atl stopped or ended itself, or launched again since, keeps its state (its old Claude, killed, ending late)
 - PreToolUse on Edit|Write|MultiEdit|NotebookEdit → block (exit code 2 + message) if the target path is inside any ro repo path. This enforces read-only.
 `atl hook` must be fast (<50ms), never block on errors except the ro guard, and log failures to $XDG_STATE_HOME/atelier/hook.log.
 

@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"unicode/utf8"
 
 	"github.com/andreujuanc/atelier/internal/gen"
 	"github.com/andreujuanc/atelier/internal/gitx"
@@ -126,12 +128,11 @@ func (a *App) mergeRepos(o NewTaskOpts) ([]model.TaskRepo, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, r := range pr.Repos {
-			if o.ExactRepos {
-				break
-			}
-			if err := add(r.Name, r.Mode); err != nil {
-				return nil, err
+		if !o.ExactRepos {
+			for _, r := range pr.Repos {
+				if err := add(r.Name, r.Mode); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -205,8 +206,10 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 	if title == "" {
 		return nil, errors.New("title is required")
 	}
-	// The same cap as a rename, so `atl rename`/TUI `t` can always resave it.
-	if err := model.CheckTitleLen(title); err != nil {
+	// Then the checks of a rename (other control characters, UTF-8, the
+	// length cap), so `atl rename`/TUI `t` can always resave it.
+	title, err := model.NormalizeTitle(title)
+	if err != nil {
 		return nil, err
 	}
 	o.Project = strings.TrimSpace(o.Project)
@@ -247,7 +250,7 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 	t := &model.Task{
 		Slug:        model.Slugify(title),
 		Title:       title,
-		Description: strings.TrimSpace(o.Description),
+		Description: strings.TrimSpace(model.SanitizeNotes(o.Description)), // as notes: keeps newlines and tabs
 		Status:      status,
 		Project:     o.Project,
 		Base:        base,
@@ -261,8 +264,8 @@ func (a *App) NewTask(ctx context.Context, o NewTaskOpts) (*model.Task, error) {
 		a.warnf("%s", w)
 	}
 	avoid := store.Avoid{SlugTaken: a.slugTaken(ctx, repos)}
-	for _, o := range others.Tasks {
-		avoid.PortOffsets = append(avoid.PortOffsets, o.PortOffset)
+	for _, ot := range others.Tasks {
+		avoid.PortOffsets = append(avoid.PortOffsets, ot.PortOffset)
 	}
 	if err := a.Store.CreateTaskAutoPort(ctx, t, avoid); err != nil {
 		return nil, err
@@ -411,30 +414,11 @@ func (a *App) buildTaskDir(ctx context.Context, t *model.Task, plan []rwCheckout
 		}
 		name := c.Repo.Name
 		wt := a.Paths.WorktreePath(t.Slug, name)
-		repo := a.Paths.RepoPath(name)
-		_, berr := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
-		branchExisted := berr == nil
-		var err error
-		if c.Existing {
-			err = a.addBranchWorktree(ctx, name, repo, wt, t.Branch)
-		} else {
-			err = a.addWorktree(ctx, name, repo, wt, t.Branch, c.Start)
-		}
+		createdBranch, err := a.addTaskWorktree(ctx, name, wt, t.Branch, c.Start, c.Existing)
 		if err != nil {
-			// git may have created the branch (and worktree) before failing,
-			// e.g. when the checkout fails: undo only what this call
-			// verifiably created. "already exists" means git refused up
-			// front and whatever is there belongs to someone else.
-			if !strings.Contains(err.Error(), "already exists") {
-				_, werr := os.Lstat(wt)
-				_, nberr := gitx.RevParse(context.WithoutCancel(ctx), repo, "refs/heads/"+t.Branch)
-				createdWT, createdBr := werr == nil, !branchExisted && nberr == nil
-				// A missing worktree is only pruned.
-				a.undoWorktree(ctx, name, wt, t.Branch, createdWT || !branchExisted, createdBr)
-			}
 			return nil, fmt.Errorf("repo %s: %w", name, err)
 		}
-		created = append(created, made{name, wt, !branchExisted})
+		created = append(created, made{name, wt, createdBranch})
 	}
 	if err := gen.WriteClaudeMD(dir, *t, a.repoInfos(t)); err != nil {
 		return nil, err
@@ -460,33 +444,50 @@ func (a *App) scriptEnv(t *model.Task, r model.TaskRepo) project.ScriptEnv {
 }
 
 // runScript runs one setup/teardown script for rw repo r, streaming its
-// output to Out as "<kind> <repo>: <line>".
-func (a *App) runScript(ctx context.Context, pr *project.Project, kind, script string, t *model.Task, r model.TaskRepo) error {
+// output to Out as "<kind> <repo>: <line>": in the task's container if
+// container is its ID (see scriptContainer, runInContainer), else (the
+// sandbox is off) here, with atl's environment (project.EnvFor).
+func (a *App) runScript(ctx context.Context, pr *project.Project, kind, script string, t *model.Task, r model.TaskRepo, container string) error {
 	se := a.scriptEnv(t, r)
 	if _, err := a.checkWorktree(ctx, t, r); err != nil {
 		return err
 	}
 	fmt.Fprintf(a.out(), "%s %s: $ %s\n", kind, r.Name, strings.TrimSpace(script))
 	pw := &prefixWriter{w: a.out(), prefix: kind + " " + r.Name + ": "}
-	err := project.RunScript(ctx, script, se.Worktree, pr.EnvFor(se), pw)
+	var err error
+	if container == "" {
+		err = project.RunScript(ctx, script, se.Worktree, pr.EnvFor(se), pw)
+	} else {
+		vars := pr.ScriptVars(se)
+		// docker exec -e would override the container's own value.
+		a.composeEnv(t, vars)
+		err = a.runInContainer(ctx, t, container, se.Worktree, vars, script, pw)
+	}
 	pw.Flush()
 	return err
 }
 
 // runSetup runs the project's setup script in each rw worktree (only those
-// for which only returns true, if only is not nil). A failure in one repo
-// is a warning; the remaining repos still run. The returned error is only
-// for a project that cannot be loaded.
+// for which only returns true, if only is not nil), in the task's container
+// (scriptContainer: started, or created, before the first). A failure in
+// one repo, the container's included, is a warning; the remaining repos
+// still run. The returned error is only for a project that cannot be
+// loaded.
 func (a *App) runSetup(ctx context.Context, t *model.Task, only func(model.TaskRepo) bool) error {
 	pr, err := a.taskProject(t)
 	if err != nil || pr == nil || strings.TrimSpace(pr.Setup) == "" {
 		return err
 	}
+	container := sync.OnceValues(func() (string, error) { return a.scriptContainer(ctx, t) })
 	for _, r := range t.Repos {
 		if r.Mode != model.ModeRW || (only != nil && !only(r)) {
 			continue
 		}
-		if err := a.runScript(ctx, pr, "setup", pr.Setup, t, r); err != nil {
+		c, err := container()
+		if err == nil {
+			err = a.runScript(ctx, pr, "setup", pr.Setup, t, r, c)
+		}
+		if err != nil {
 			a.warnf("setup failed in %s: %v", r.Name, err)
 		}
 	}
@@ -494,10 +495,13 @@ func (a *App) runSetup(ctx context.Context, t *model.Task, only func(model.TaskR
 }
 
 // runTeardown runs the project's teardown script in each rw worktree that
-// still exists. Without force the first failure is returned (and the
-// remaining repos are not torn down); with force failures are warnings. A
-// project that can no longer be loaded is a warning, never an error, so it
-// cannot block closing the task.
+// still exists, in the task's container (scriptContainer: started, or
+// created, before the first; the gate still runs, removeSandbox comes
+// after). Without force the first failure is returned (and the remaining
+// repos are not torn down), a container that cannot be started included;
+// with force failures are warnings, and without a container nothing runs.
+// A project that can no longer be loaded is a warning, never an error, so
+// it cannot block closing the task.
 func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error {
 	pr, err := a.taskProject(t)
 	if err != nil {
@@ -507,6 +511,7 @@ func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error 
 	if pr == nil || strings.TrimSpace(pr.Teardown) == "" {
 		return nil
 	}
+	container := sync.OnceValues(func() (string, error) { return a.scriptContainer(ctx, t) })
 	for _, r := range t.Repos {
 		if r.Mode != model.ModeRW {
 			continue
@@ -514,7 +519,15 @@ func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error 
 		if _, err := os.Lstat(a.Paths.WorktreePath(t.Slug, r.Name)); errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if err := a.runScript(ctx, pr, "teardown", pr.Teardown, t, r); err != nil { // checks the worktree
+		c, err := container()
+		if err != nil {
+			if !force {
+				return err
+			}
+			a.warnf("teardown not run: %v", err)
+			return nil
+		}
+		if err := a.runScript(ctx, pr, "teardown", pr.Teardown, t, r, c); err != nil { // checks the worktree
 			if !force {
 				return fmt.Errorf("repo %s: %w", r.Name, err)
 			}
@@ -526,7 +539,8 @@ func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error 
 
 // prefixWriter writes each line to w with prefix; Flush emits a trailing
 // partial line. '\r' ends a line too, so progress output (docker, npm)
-// streams; empty segments (e.g. from "\r\n") are skipped.
+// streams; empty segments (e.g. from "\r\n") are skipped. A line longer
+// than maxPartialLine goes out in pieces of that size.
 type prefixWriter struct {
 	w      io.Writer
 	prefix string
@@ -537,11 +551,24 @@ func (p *prefixWriter) Write(b []byte) (int, error) {
 	p.buf = append(p.buf, b...)
 	for {
 		i := bytes.IndexAny(p.buf, "\r\n")
-		if i < 0 {
-			break
+		var line []byte
+		switch {
+		case i >= 0:
+			line, p.buf = p.buf[:i], p.buf[i+1:]
+		case len(p.buf) > maxPartialLine:
+			// Cut before a UTF-8 character, not inside one (if there is
+			// one within its length; otherwise it is not UTF-8 anyway).
+			cut := maxPartialLine
+			for k := cut; k > maxPartialLine-utf8.UTFMax; k-- {
+				if utf8.RuneStart(p.buf[k]) {
+					cut = k
+					break
+				}
+			}
+			line, p.buf = p.buf[:cut], p.buf[cut:]
+		default:
+			return len(b), nil
 		}
-		line := p.buf[:i]
-		p.buf = p.buf[i+1:]
 		if len(line) == 0 {
 			continue
 		}
@@ -550,8 +577,11 @@ func (p *prefixWriter) Write(b []byte) (int, error) {
 			return len(b), nil
 		}
 	}
-	return len(b), nil
 }
+
+// maxPartialLine bounds what prefixWriter keeps of a line not ended yet:
+// a longer one is written out in pieces of this size.
+const maxPartialLine = 64 << 10
 
 // Flush writes any buffered partial line.
 func (p *prefixWriter) Flush() {
@@ -568,13 +598,17 @@ func (a *App) List(ctx context.Context, statuses ...model.Status) ([]TaskView, e
 	if err != nil {
 		return nil, err
 	}
+	ids := make([]int64, len(tasks))
+	for i, t := range tasks {
+		ids[i] = t.ID
+	}
+	sessions, err := a.Store.ListSessionsByTask(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]TaskView, 0, len(tasks))
 	for _, t := range tasks {
-		sessions, err := a.Store.ListSessions(ctx, t.ID)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, TaskView{Task: t, Sessions: sessions})
+		out = append(out, TaskView{Task: t, Sessions: sessions[t.ID]})
 	}
 	return out, nil
 }
@@ -614,7 +648,9 @@ func (a *App) Get(ctx context.Context, ref string) (*TaskView, error) {
 // SetStatus changes a task's status. Between open statuses, between closed
 // ones (done ↔ cancelled) and from open to closed it changes nothing else
 // (closing with cleanup is Done/Cancel). From closed to open it reopens the
-// task (see reopen).
+// task (see reopen). It decides under the per-task lock, as done, cancel
+// and reopen hold it: an open status set while done runs would otherwise
+// mark the task it just closed open, without its worktrees.
 func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error {
 	if !st.Valid() {
 		return fmt.Errorf("invalid status %q", st)
@@ -623,15 +659,31 @@ func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error 
 	if err != nil {
 		return err
 	}
+	unlock, err := a.lockTask(ctx, t.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
+		return err
+	}
+	if t.Status.Open() && !st.Open() {
+		// Closing it: no session is launched into it (see lockLaunches).
+		unlockLaunches, err := a.lockLaunches(ctx, t.ID)
+		if err != nil {
+			return err
+		}
+		defer unlockLaunches()
+	}
 	if t.Status.Open() || !st.Open() {
 		return a.Store.SetTaskStatus(ctx, t.ID, st)
 	}
-	return a.reopen(ctx, t.ID, st)
+	return a.reopen(ctx, t, st)
 }
 
-// reopen brings closed task id back to the state a new task has, and then
-// sets its status to the open status to; under the per-task lock, like
-// finish. For each rw repo it makes the worktree on the task branch
+// reopen brings closed task t back to the state a new task has, and then
+// sets its status to the open status to; the caller holds the per-task
+// lock (SetStatus). For each rw repo it makes the worktree on the task branch
 // (buildTaskDir): on the local branch if the canonical clone still has it
 // (done/cancel keep a branch with unpushed commits); else, after a fetch,
 // on a new one from origin/<branch> if origin has it; else on a new one
@@ -643,21 +695,9 @@ func (a *App) SetStatus(ctx context.Context, ref string, st model.Status) error 
 // project's setup in each new worktree (a failure is a warning). If a step
 // fails, what this call made is undone, the task stays closed and the error
 // says what failed.
-func (a *App) reopen(ctx context.Context, id int64, to model.Status) error {
+func (a *App) reopen(ctx context.Context, t *model.Task, to model.Status) error {
 	if err := outsideSandbox("reopen a task"); err != nil {
 		return err
-	}
-	unlock, err := a.lockTask(ctx, id)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	t, err := a.Store.GetTask(ctx, id)
-	if err != nil {
-		return err
-	}
-	if t.Status.Open() { // reopened meanwhile
-		return a.Store.SetTaskStatus(ctx, t.ID, to)
 	}
 	fail := func(err error) error {
 		return fmt.Errorf("reopen task %s: %w (it stays %s)", t.Slug, err, t.Status)
@@ -678,6 +718,22 @@ func (a *App) reopen(ctx context.Context, id int64, to model.Status) error {
 	// a container left from before would have the old task dir mounted.
 	if a.Sandbox != nil || fileExists(a.Paths.RunDir(t.Slug)) {
 		a.removeSandbox(ctx, t)
+	}
+	// A worktree removed by hand (the task closed with `atl status`, say)
+	// is still registered in git, which refuses to add it again until it
+	// is pruned. Only a path still missing is pruned, and only now that
+	// nothing of the task runs to put something there.
+	for _, c := range plan {
+		if c.Keep {
+			continue
+		}
+		wt := a.Paths.WorktreePath(t.Slug, c.Repo.Name)
+		if _, err := os.Lstat(wt); !errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err := gitx.RemoveWorktree(ctx, a.Paths.RepoPath(c.Repo.Name), wt, false); err != nil {
+			return fail(fmt.Errorf("repo %s: prune worktrees: %w", c.Repo.Name, err))
+		}
 	}
 	undo, err := a.buildTaskDir(ctx, t, plan, true)
 	if err != nil {
@@ -842,8 +898,10 @@ func (a *App) Cancel(ctx context.Context, ref string, force bool) (*model.Task, 
 
 // finish closes an open task: refuses if a rw worktree's HEAD has commits
 // no branch, remote-tracking ref or tag reaches (even with force) or has
-// uncommitted changes (unless force), kills its tmux session, ends its sessions, runs
-// teardown, removes its worktrees and generated files, deletes each task
+// uncommitted changes (unless force), kills its tmux session, ends its
+// sessions (if the close then fails, those it ended that have a Claude id are
+// left stopped, resumable), runs teardown, removes its worktrees and
+// generated files, deletes each task
 // branch that has no unpushed commits (see cleanupBranch), removes the task
 // dir if it is then empty and sets the status. Worktrees
 // whose dir was deleted by hand are skipped by the dirty check but still
@@ -862,6 +920,12 @@ func (a *App) finish(ctx context.Context, ref string, force bool, to model.Statu
 		return nil, err
 	}
 	defer unlock()
+	// And no session is launched into it from here on (see lockLaunches).
+	unlockLaunches, err := a.lockLaunches(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockLaunches()
 	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
 		return nil, err
 	}
@@ -879,11 +943,90 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 	if !t.Status.Open() {
 		return fmt.Errorf("task %s is already %s", t.Slug, t.Status)
 	}
-	type wt struct {
-		name, repo, path string
-		missing          bool
+	wts, err := a.closeWorktrees(ctx, t, force)
+	if err != nil {
+		return err
 	}
-	var wts []wt
+	if err := a.Tmux.KillSession(ctx, tmux.SessionName(t.Slug)); err != nil && !errors.Is(err, exec.ErrNotFound) {
+		if !force {
+			return fmt.Errorf("task %s: kill tmux session: %w", t.Slug, err)
+		}
+		a.warnf("kill tmux session %s: %v", tmux.SessionName(t.Slug), err)
+	}
+	sessions, err := a.Store.ListSessions(ctx, t.ID)
+	if err != nil {
+		return err
+	}
+	// The sessions this close ends. Should it fail, the task stays open:
+	// those with a conversation to resume are set back to stopped (their
+	// windows are gone), so atl resume / atl open relaunch them.
+	var ended []model.Session
+	closed := false
+	defer func() {
+		if closed {
+			return
+		}
+		for _, s := range ended {
+			if s.ClaudeSessionID == "" {
+				continue
+			}
+			if _, err := a.Store.SetStateIf(context.WithoutCancel(ctx), s.ID, model.StateEnded, model.StateStopped, a.now()); err != nil {
+				a.warnf("session %s: %v", sessionName(s), err)
+			}
+		}
+	}()
+	for _, s := range sessions {
+		if s.State == model.StateEnded {
+			continue
+		}
+		if err := a.Store.SetSessionState(ctx, s.ID, model.StateEnded, a.now()); err != nil {
+			return err
+		}
+		ended = append(ended, s)
+	}
+	if err := a.runTeardown(ctx, t, force); err != nil {
+		if !force {
+			// The task stays open, and so does its container: what the
+			// sessions just ended (their windows are gone) left running in
+			// it goes now. Otherwise removeSandbox takes it with the
+			// container.
+			for _, s := range ended {
+				a.killSessionProcs(ctx, t, s.ID)
+			}
+			return fmt.Errorf("task %s: teardown: %w (use --force to continue anyway)", t.Slug, err)
+		}
+		a.warnf("teardown for task %s: %v", t.Slug, err)
+	}
+	// Before the worktrees go: the task's containers may hold them mounted.
+	a.removeSandbox(ctx, t)
+	removed, err := a.removeWorktrees(ctx, t, wts, force)
+	if err != nil {
+		return err
+	}
+	for _, w := range removed {
+		a.cleanupBranch(ctx, w.name, w.repo, t.Branch)
+	}
+	a.removeTaskDir(t.Slug)
+	if err := a.Store.SetTaskStatus(ctx, t.ID, to); err != nil {
+		return err
+	}
+	closed = true
+	return nil
+}
+
+// closeWorktree is an rw worktree of a task being closed.
+type closeWorktree struct {
+	name, repo, path string
+	missing          bool // its dir was deleted by hand: only pruned
+}
+
+// closeWorktrees returns the rw worktrees closing task t removes, after
+// the checks that must pass before anything of the task is torn down: no
+// commits that only HEAD reaches (even with force) and, unless force, no
+// uncommitted changes. A repo whose path is no longer a worktree of its
+// clone is an error, or with force a warning and left out.
+func (a *App) closeWorktrees(ctx context.Context, t *model.Task, force bool) ([]closeWorktree, error) {
+	var wts []closeWorktree
 	for _, r := range t.Repos {
 		if r.Mode != model.ModeRW {
 			continue
@@ -895,12 +1038,12 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		missing := errors.Is(cerr, os.ErrNotExist)
 		if cerr != nil && !missing {
 			if !force {
-				return fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, r.Name, cerr)
+				return nil, fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, r.Name, cerr)
 			}
 			a.warnf("repo %s: %v; left alone", r.Name, cerr)
 			continue
 		}
-		wts = append(wts, wt{r.Name, a.Paths.RepoPath(r.Name), p, missing})
+		wts = append(wts, closeWorktree{r.Name, a.Paths.RepoPath(r.Name), p, missing})
 	}
 	// Commits only HEAD reaches (detached HEAD, stopped rebase) would be
 	// lost with the worktree; --force never discards commits.
@@ -912,7 +1055,7 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		n, err := gitx.OrphanCommits(ctx, w.path)
 		if err != nil {
 			if !force {
-				return fmt.Errorf("task %s: repo %s: %w (use --force to remove anyway)", t.Slug, w.name, err)
+				return nil, fmt.Errorf("task %s: repo %s: %w (use --force to remove anyway)", t.Slug, w.name, err)
 			}
 			a.warnf("repo %s: %v", w.name, err)
 			continue
@@ -922,7 +1065,7 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 		}
 	}
 	if len(orphans) > 0 {
-		return fmt.Errorf("task %s: %s (detached HEAD or rebase in progress); put them on a branch first",
+		return nil, fmt.Errorf("task %s: %s (detached HEAD or rebase in progress); put them on a branch first",
 			t.Slug, strings.Join(orphans, "; "))
 	}
 	if !force {
@@ -933,60 +1076,31 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 			}
 			d, err := gitx.IsDirty(ctx, w.path)
 			if err != nil {
-				return fmt.Errorf("task %s: repo %s: %w (use --force to remove anyway)", t.Slug, w.name, err)
+				return nil, fmt.Errorf("task %s: repo %s: %w (use --force to remove anyway)", t.Slug, w.name, err)
 			}
 			if d {
 				dirty = append(dirty, w.name)
 			}
 		}
 		if len(dirty) > 0 {
-			return fmt.Errorf("task %s has uncommitted changes in %s; commit or stash them, or use --force to discard",
+			return nil, fmt.Errorf("task %s has uncommitted changes in %s; commit or stash them, or use --force to discard",
 				t.Slug, strings.Join(dirty, ", "))
 		}
 	}
+	return wts, nil
+}
 
-	if err := a.Tmux.KillSession(ctx, tmux.SessionName(t.Slug)); err != nil && !errors.Is(err, exec.ErrNotFound) {
-		if !force {
-			return fmt.Errorf("task %s: kill tmux session: %w", t.Slug, err)
-		}
-		a.warnf("kill tmux session %s: %v", tmux.SessionName(t.Slug), err)
-	}
-	sessions, err := a.Store.ListSessions(ctx, t.ID)
-	if err != nil {
-		return err
-	}
-	var ended []int64
-	for _, s := range sessions {
-		if s.State == model.StateEnded {
-			continue
-		}
-		if err := a.Store.SetSessionState(ctx, s.ID, model.StateEnded, a.now()); err != nil {
-			return err
-		}
-		ended = append(ended, s.ID)
-	}
-	if err := a.runTeardown(ctx, t, force); err != nil {
-		if !force {
-			// The task stays open, and so does its container: what the
-			// sessions just ended (their windows are gone) left running in
-			// it goes now. Otherwise removeSandbox takes it with the
-			// container.
-			for _, id := range ended {
-				a.killSessionProcs(ctx, t, id)
-			}
-			return fmt.Errorf("task %s: teardown: %w (use --force to continue anyway)", t.Slug, err)
-		}
-		a.warnf("teardown for task %s: %v", t.Slug, err)
-	}
-	// Before the worktrees go: the task's containers may hold them mounted.
-	a.removeSandbox(ctx, t)
-	var removed []wt
+// removeWorktrees removes the worktrees wts of task t, once nothing of the
+// task runs any more, and returns those it removed. Without force the first
+// failure is returned; with force failures are warnings.
+func (a *App) removeWorktrees(ctx context.Context, t *model.Task, wts []closeWorktree, force bool) ([]closeWorktree, error) {
+	var removed []closeWorktree
 	for _, w := range wts {
 		// Again, now that nothing of the task runs any more: what it left
 		// there last is what git would remove.
 		if err := gitx.CheckWorktree(ctx, w.path, w.repo); err != nil && !errors.Is(err, os.ErrNotExist) {
 			if !force {
-				return fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, w.name, err)
+				return nil, fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, w.name, err)
 			}
 			a.warnf("repo %s: %v; left alone", w.name, err)
 			continue
@@ -995,20 +1109,23 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 			if !force {
 				// It was clean before teardown, so teardown left changes.
 				if d, derr := gitx.IsDirty(ctx, w.path); derr == nil && d {
-					return fmt.Errorf("task %s: repo %s: worktree has changes after teardown (%w); re-run with --force to discard them",
+					return nil, fmt.Errorf("task %s: repo %s: worktree has changes after teardown (%w); re-run with --force to discard them",
 						t.Slug, w.name, err)
 				}
-				return fmt.Errorf("task %s: repo %s: %w", t.Slug, w.name, err)
+				return nil, fmt.Errorf("task %s: repo %s: %w", t.Slug, w.name, err)
 			}
 			a.warnf("remove worktree %s: %v", w.path, err)
 			continue
 		}
 		removed = append(removed, w)
 	}
-	for _, w := range removed {
-		a.cleanupBranch(ctx, w.name, w.repo, t.Branch)
-	}
-	dir := a.Paths.TaskDir(t.Slug)
+	return removed, nil
+}
+
+// removeTaskDir removes task slug's generated files, then its task dir if
+// that is empty; failures are warnings.
+func (a *App) removeTaskDir(slug string) {
+	dir := a.Paths.TaskDir(slug)
 	if err := os.Remove(filepath.Join(dir, "CLAUDE.md")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		a.warnf("%v", err)
 	}
@@ -1022,7 +1139,6 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 			a.warnf("left %s: %v", dir, err)
 		}
 	}
-	return a.Store.SetTaskStatus(ctx, t.ID, to)
 }
 
 // beforeBranchDelete, if set (tests only), runs in cleanupBranch between the

@@ -36,6 +36,7 @@ var envKeys = map[string]string{
 	"ATL_SANDBOX_IMAGE":   "sandbox.image",
 	sandbox.MountsVar:     "sandbox.mounts",
 	"ATL_SANDBOX_CONTEXT": "sandbox.context",
+	sandbox.RegistriesVar: "sandbox.registries",
 }
 
 // secretRE matches the names of variables that hold secrets, which are

@@ -55,6 +55,10 @@ func TestSessionBackground(t *testing.T) {
 			return err
 		},
 		"SetClaudeSession": func() error { return s.SetClaudeSession(ctx, sess.ID, "cid", at) },
+		"EndLive": func() error {
+			_, err := s.EndLive(ctx, sess.ID, -1, at)
+			return err
+		},
 		"UpdateSession": func() error {
 			g := get()
 			g.State = model.StateWaiting

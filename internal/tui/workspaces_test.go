@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image/color"
 	"strings"
 	"testing"
 
@@ -503,5 +504,46 @@ func TestSwitchWorkspaceKey(t *testing.T) {
 	key(m, "w")
 	if m.switching || m.filter != "w" {
 		t.Fatalf("w in the filter: switching %v filter %q", m.switching, m.filter)
+	}
+}
+
+// TestWorkspacePickerNarrow: too narrow for the box, the list takes the
+// whole width (the selected row highlighted across it).
+func TestWorkspacePickerNarrow(t *testing.T) {
+	f := &fakeWorkspaces{rows: sampleWorkspaces()}
+	m := newWSTest(t, f, "")
+	for _, size := range [][2]int{{22, 20}, {100, 6}} {
+		m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		if m.boxed() {
+			t.Fatalf("%v: boxed", size)
+		}
+		found := false
+		for _, l := range strings.Split(m.View().Content, "\n") {
+			if strings.Contains(ansi.Strip(l), "alpha") {
+				found = true
+				if w := ansi.StringWidth(l); w != size[0] {
+					t.Errorf("%v: selected row %d cells wide: %q", size, w, ansi.Strip(l))
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%v: no alpha row:\n%s", size, wsView(m))
+		}
+	}
+}
+
+// TestWorkspacePickerTheme: the selector's colours follow the terminal's
+// background as the task list's do (its inputs too).
+func TestWorkspacePickerTheme(t *testing.T) {
+	t.Cleanup(func() { applyTheme(true) })
+	m := newWSTest(t, &fakeWorkspaces{rows: sampleWorkspaces()}, "")
+	dark := m.nameInput.Styles().Focused.Prompt.GetForeground()
+	m.Update(tea.BackgroundColorMsg{Color: color.White})
+	if isDark || m.nameInput.Styles().Focused.Prompt.GetForeground() == dark {
+		t.Fatal("a light background kept the dark colours")
+	}
+	m.Update(tea.BackgroundColorMsg{Color: color.Black})
+	if !isDark || m.nameInput.Styles().Focused.Prompt.GetForeground() != dark {
+		t.Fatal("a dark background did not bring the dark colours back")
 	}
 }

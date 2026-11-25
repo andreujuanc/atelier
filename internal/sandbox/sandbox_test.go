@@ -4,25 +4,49 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"text/template"
 	"time"
 )
 
+// Sessions of the session scripts' tests ("7", "17", "8" in their
+// comments). The scripts find a session's processes in all of /proc, so
+// another run of these tests at the same time (another checkout's go test
+// on the same machine) must not share them: they carry this process's PID.
+// s17 ends with s7's digits, which the scripts must not take for s7.
+var (
+	s7  = int64(os.Getpid())*10 + 7
+	s17 = s7 + pow10(len(str(s7)))
+	s8  = s7 + 1
+)
+
+func str(session int64) string { return strconv.FormatInt(session, 10) }
+
+func pow10(n int) int64 {
+	p := int64(1)
+	for range n {
+		p *= 10
+	}
+	return p
+}
+
 // TestKillSessionArgs: the script docker exec runs in the container ends
 // every process whose environment has ATL_SESSION=<the session>, children
 // included, and nothing else (not session 17 for session 7). It is run
 // here with sh, as docker exec would run it in the container.
 func TestKillSessionArgs(t *testing.T) {
-	args := KillSessionArgs(oldID, 7)
-	if !slices.Equal(args[:4], []string{"exec", oldID, "sh", "-c"}) || args[len(args)-1] != "7" {
+	args := KillSessionArgs(oldID, s7)
+	if !slices.Equal(args[:4], []string{"exec", oldID, "sh", "-c"}) || args[len(args)-1] != str(s7) {
 		t.Fatalf("args = %q", args)
 	}
 	start := func(session string) *exec.Cmd {
@@ -35,8 +59,7 @@ func TestKillSessionArgs(t *testing.T) {
 		t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
 		return cmd
 	}
-	mine, other := start("7"), start("17")
-	time.Sleep(200 * time.Millisecond)
+	mine, other := start(str(s7)), start(str(s17))
 	count := func(session string) int {
 		n := 0
 		dirs, _ := filepath.Glob("/proc/[0-9]*")
@@ -49,7 +72,9 @@ func TestKillSessionArgs(t *testing.T) {
 		}
 		return n
 	}
-	if n := count("7"); n < 3 {
+	// Each session's sh starts its two sleeps in its own time.
+	until(func() bool { return count(str(s7)) >= 3 && count(str(s17)) >= 3 })
+	if n := count(str(s7)); n < 3 {
 		t.Fatalf("session 7 has %d processes, want its sh and two sleeps", n)
 	}
 	out, err := exec.Command("sh", append([]string{"-c", args[4]}, args[5:]...)...).CombinedOutput()
@@ -59,12 +84,20 @@ func TestKillSessionArgs(t *testing.T) {
 	if err := mine.Wait(); err == nil {
 		t.Error("session 7's process exited normally, want killed")
 	}
-	time.Sleep(100 * time.Millisecond)
-	if n := count("7"); n != 0 {
+	until(func() bool { return count(str(s7)) == 0 }) // the kill reaches them in their own time
+	if n := count(str(s7)); n != 0 {
 		t.Errorf("%d processes of session 7 left", n)
 	}
-	if n := count("17"); n < 3 || other.ProcessState != nil {
+	if n := count(str(s17)); n < 3 || other.ProcessState != nil {
 		t.Errorf("session 17 lost processes: %d left", n)
+	}
+}
+
+// until waits, up to 10 seconds, for cond: what other processes do (start
+// children, die of a signal) takes its own time on a loaded machine.
+func until(cond func() bool) {
+	for deadline := time.Now().Add(10 * time.Second); !cond() && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -83,8 +116,8 @@ func aliveProc(pid int) bool {
 // are never touched; a root that outlives the wait (a /clear) means the
 // session goes on.
 func TestEndSessionCmd(t *testing.T) {
-	cmd := EndSessionCmd(7)
-	if !slices.Equal(cmd[:2], []string{"sh", "-c"}) || !slices.Equal(cmd[3:], []string{"atl-end-session", "end", "7"}) {
+	cmd := EndSessionCmd(s7)
+	if !slices.Equal(cmd[:2], []string{"sh", "-c"}) || !slices.Equal(cmd[3:], []string{"atl-end-session", "end", str(s7)}) {
 		t.Fatalf("cmd = %q", cmd[3:])
 	}
 	env := func(session string) []string { return append(os.Environ(), "ATL_SESSION="+session) }
@@ -118,15 +151,25 @@ func TestEndSessionCmd(t *testing.T) {
 		}
 		return c
 	}
-	claude7, left7 := root("7"), leftover("7")
-	claude17, left17 := root("17"), leftover("17")
-	claude8, left8 := root("8"), leftover("8")
-	time.Sleep(200 * time.Millisecond)
+	claude7, left7 := root(str(s7)), leftover(str(s7))
+	claude17, left17 := root(str(s17)), leftover(str(s17))
+	claude8, left8 := root(str(s8)), leftover(str(s8))
+	// Each of them runs, with its session in its environment, for the scripts to find.
+	until(func() bool {
+		for pid, session := range map[int]int64{claude7.Process.Pid: s7, left7: s7, claude17.Process.Pid: s17, left17: s17,
+			claude8.Process.Pid: s8, left8: s8} {
+			env, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "environ"))
+			if err != nil || !aliveProc(pid) || !slices.Contains(strings.Split(string(env), "\x00"), "ATL_SESSION="+str(session)) {
+				return false
+			}
+		}
+		return true
+	})
 
 	// Session 8 had a /clear: its Claude outlives the wait.
-	clear8 := end("8", 2)
+	clear8 := end(str(s8), 2)
 	// Session 7 ends: nothing goes while its Claude still runs.
-	end7 := end("7", 30)
+	end7 := end(str(s7), 30)
 	time.Sleep(1500 * time.Millisecond)
 	if !aliveProc(left7) || claude7.ProcessState != nil {
 		t.Fatal("session 7 was touched while its Claude ran")
@@ -143,7 +186,7 @@ func TestEndSessionCmd(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the end script did not finish after Claude exited")
 	}
-	time.Sleep(100 * time.Millisecond)
+	until(func() bool { return !aliveProc(left7) }) // the kill reaches it in its own time
 	if aliveProc(left7) {
 		t.Error("session 7's background process outlived its Claude")
 	}
@@ -260,6 +303,78 @@ func TestIDDiffersPerWorkspace(t *testing.T) {
 	for _, slug := range []string{"fix-login", "x", "a.b_c-1"} {
 		if name := ContainerName(ID(slug, "/ws/tasks/"+slug)); !ReservedName(name) || !ReservedName("/"+strings.ToUpper(name)) {
 			t.Errorf("%s is not reserved", name)
+		}
+	}
+}
+
+// TestComposeProject: a task's namespace is atl_ and the 6 hex digits of
+// its ID; no name is in two tasks' namespaces (a namespace is never a
+// prefix of another's), every name in one is in the pattern the gate keeps
+// container names of (Namespaced), and neither a namespace's names nor the
+// pattern meet atl's task container names (ReservedName, atl-...).
+func TestComposeProject(t *testing.T) {
+	if got := ComposeProject("fix-login-4a2f21"); got != "atl_4a2f21" {
+		t.Errorf("ComposeProject = %q", got)
+	}
+	// An ID that ID did not make still gets atl_ and 6 hex digits.
+	for _, id := range []string{"plain", "x-ABCDEF", "x-abc12", "", "x-"} {
+		if ns := ComposeProject(id); !regexp.MustCompile(`^atl_[0-9a-f]{6}$`).MatchString(ns) {
+			t.Errorf("ComposeProject(%q) = %q", id, ns)
+		}
+	}
+	var spaces []string
+	for i := range 300 {
+		slug := fmt.Sprintf("t%d", i%7) // equal slugs in other dirs
+		id := ID(slug, fmt.Sprintf("/ws%d/tasks/%s", i, slug))
+		ns := ComposeProject(id)
+		if ns != "atl_"+id[len(id)-6:] || len(ns) != len("atl_")+6 {
+			t.Fatalf("ComposeProject(%q) = %q", id, ns)
+		}
+		if slices.Contains(spaces, ns) {
+			continue // the same hash for two dirs: one namespace
+		}
+		spaces = append(spaces, ns)
+		for _, name := range []string{ns, ns + "_default", ns + "-web-1", "/" + ns + "-db-1", strings.ToUpper(ns) + "_X"} {
+			if !Namespaced(name) {
+				t.Errorf("%q is not in the namespace pattern", name)
+			}
+		}
+		if Namespaced(ContainerName(id)) || ReservedName(ns+"-db-1") || ReservedName(ns+"-x-"+id[len(id)-6:]) {
+			t.Errorf("%s and %s overlap atl's container names", ns, ContainerName(id))
+		}
+	}
+	for _, a := range spaces {
+		for _, b := range spaces {
+			if a == b {
+				continue
+			}
+			for _, name := range []string{b, b + "_data", b + "-web_default", b + "x"} {
+				if InNamespace(a, name) {
+					t.Errorf("%q is in %s and %s", name, a, b)
+				}
+			}
+			if strings.HasPrefix(b, a) {
+				t.Errorf("%s is a prefix of %s", a, b)
+			}
+		}
+	}
+	ns := "atl_4a2f21"
+	for name, want := range map[string]bool{
+		ns: true, ns + "_data": true, ns + "-api_default": true, ns + "-": true,
+		ns + "x": false, "atl_4a2f211": false, "ATL_4A2F21_data": false, "Atl_4a2f21": false,
+		"/" + ns: false, " " + ns: false, "shop_data": false, "atl-4a2f21_data": false, "": false,
+	} {
+		if InNamespace(ns, name) != want {
+			t.Errorf("InNamespace(%s, %q) = %v", ns, name, !want)
+		}
+	}
+	for name, want := range map[string]bool{
+		"atl_4a2f21": true, "atl_ffffff-x": true, "//ATL_ABCDEF_x": true, "Atl_0a1B2c": true,
+		"atl_4a2f211": false, "atl_4a2f2": false, "atl_xyz123-db": false, "atl-4a2f21": false,
+		"x-atl_4a2f21": false, "db": false, "testcontainers-ryuk-1": false,
+	} {
+		if Namespaced(name) != want {
+			t.Errorf("Namespaced(%q) = %v", name, !want)
 		}
 	}
 }
@@ -445,23 +560,16 @@ func (s *script) answer(prefix, out string, err error) {
 	}{out, err}
 }
 
-func (s *script) verbs() string {
-	var v []string
-	for _, c := range s.calls {
-		first, _, _ := strings.Cut(c, " ")
-		v = append(v, first)
-	}
-	return strings.Join(v, " ")
-}
-
 // agentDaemon is a Runner for Ensure: a daemon with at most the one
 // container named atl-<id>.
 type agentDaemon struct {
-	t      *testing.T
-	c      *container // nil: none
-	calls  []string
-	runErr error      // what docker run fails with
-	winner *container // the container another atl made when run fails with a name conflict
+	t       *testing.T
+	c       *container // nil: none
+	calls   []string
+	runErr  error      // what docker run fails with
+	winner  *container // the container another atl made when run fails with a name conflict
+	rootErr error      // what docker exec fails with
+	execs   [][]string // the docker exec calls
 }
 
 const (
@@ -500,6 +608,9 @@ func (d *agentDaemon) run(_ context.Context, args ...string) (string, error) {
 		if d.c != nil && args[len(args)-1] == d.c.Id {
 			d.c.State.Running = true
 		}
+	case "exec":
+		d.execs = append(d.execs, args)
+		return "", d.rootErr
 	}
 	return "", nil
 }
@@ -582,6 +693,168 @@ func TestEnsure(t *testing.T) {
 	if _, _, err := Ensure(ctx, d.run, spec, idle, func() error { return errors.New("no") }); err == nil || d.verbs() != "inspect" {
 		t.Errorf("failed fresh: %q, %v", d.verbs(), err)
 	}
+}
+
+// TestEnsureMakesHome: $HOME is the home dir of the user running atl,
+// which the image has only when built for that path (atelier's images put
+// it in /home/<user>; a host may have it in /var/home/<user>). Ensure runs
+// homeScript as root in the container it returns, with the user and the
+// mount points: in a new one (removed if that fails, so that the next try
+// makes it again); in the winner's of a name race (kept if that fails, it is
+// theirs); and in one it reuses, once per process (it may predate makeHome,
+// or its creator may have died first), kept if that fails and checked again
+// next time. Not in one kept although it predates a change.
+func TestEnsureMakesHome(t *testing.T) {
+	spec := testSpec()
+	spec.Env["HOME"] = "/var/home/u"
+	spec.Mounts = append(spec.Mounts, Mount{Src: "/var/home/u/ws/t", Dst: "/var/home/u/ws/t"})
+	ctx := context.Background()
+	idle := func() bool { return false }
+	busy := func() bool { return true }
+	failed := errors.New("docker exec: chown: not permitted")
+	conflict := errors.New(`docker run: Conflict. The container name "/atl-t-abc123" is already in use`)
+	wantExec := func(name string, d *agentDaemon, id string) {
+		t.Helper()
+		want := []string{"exec", "-u", "0", id, "sh", "-c", homeScript, "sh", "1000:1000", "/tasks/t", RunMount, "/var/home/u/ws/t"}
+		if len(d.execs) != 1 || !slices.Equal(d.execs[0], want) {
+			t.Errorf("%s: docker exec %q, want once %q", name, d.execs, want)
+		}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		d       *agentDaemon
+		busy    func() bool
+		want    string // the calls
+		exec    string // the container the home is made in; "" none
+		wantErr bool
+		kept    bool // the container is there afterwards
+	}{
+		{"new", &agentDaemon{}, idle, "inspect run exec", newID, false, true},
+		{"new, home not made", &agentDaemon{rootErr: failed}, idle, "inspect run exec rm", newID, true, false},
+		{"name race", &agentDaemon{runErr: conflict, winner: atlsContainer(spec, true, spec.Hash())}, idle,
+			"inspect run inspect exec", oldID, false, true},
+		{"name race, home not made", &agentDaemon{runErr: conflict, winner: atlsContainer(spec, false, spec.Hash()), rootErr: failed}, idle,
+			"inspect run inspect start exec", oldID, true, true},
+		{"reused, running", &agentDaemon{c: atlsContainer(spec, true, spec.Hash())}, busy, "inspect exec", oldID, false, true},
+		{"reused, stopped", &agentDaemon{c: atlsContainer(spec, false, spec.Hash())}, idle, "inspect start exec", oldID, false, true},
+		{"reused, home not made", &agentDaemon{c: atlsContainer(spec, true, spec.Hash()), rootErr: failed}, idle,
+			"inspect exec", oldID, true, true},
+		{"kept, predates a change", &agentDaemon{c: atlsContainer(spec, true, "old")}, busy, "inspect", "", false, true},
+	} {
+		homesMade.Clear()
+		d := tc.d
+		d.t = t
+		id, _, err := Ensure(ctx, d.run, spec, tc.busy, nil)
+		if (err != nil) != tc.wantErr || d.verbs() != tc.want || (d.c != nil) != tc.kept {
+			t.Errorf("%s: calls %q, err %v, kept %v; want %q, an error %v, kept %v", tc.name, d.verbs(), err, d.c != nil, tc.want, tc.wantErr, tc.kept)
+		}
+		if tc.wantErr && (id != "" || !strings.Contains(err.Error(), "/var/home/u")) {
+			t.Errorf("%s: %.4s…, %v; want no container, and an error that names the home", tc.name, id, err)
+		}
+		if tc.exec != "" {
+			wantExec(tc.name, d, tc.exec)
+		} else if len(d.execs) != 0 {
+			t.Errorf("%s: docker exec %q", tc.name, d.execs)
+		}
+		// Once made, not again in this process; if not, again (in a new
+		// container if it was removed).
+		d.calls, d.execs, d.rootErr = nil, nil, nil
+		if _, _, err := Ensure(ctx, d.run, spec, tc.busy, nil); err != nil {
+			t.Errorf("%s, again: %v", tc.name, err)
+		}
+		if again := len(d.execs) != 0; again != tc.wantErr {
+			t.Errorf("%s, again: docker exec %q", tc.name, d.execs)
+		}
+	}
+
+	// Without $HOME in the spec, nothing to make.
+	homesMade.Clear()
+	d := &agentDaemon{t: t}
+	if _, _, err := Ensure(ctx, d.run, testSpec(), idle, nil); err != nil || d.verbs() != "inspect run" {
+		t.Errorf("no $HOME: %q, %v", d.verbs(), err)
+	}
+}
+
+// TestHomeScript runs homeScript with a real sh, in a temp dir that stands
+// for the container's file system, chown stubbed (it logs what it is
+// given): as root in a container, -O is true of root-owned files; here,
+// of the test user's, which the stand-in user 4242 is not.
+func TestHomeScript(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	log := filepath.Join(root, "chown.log")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := "#!/bin/sh\necho \"$*\" >> '" + log + "'\n"
+	if err := os.WriteFile(filepath.Join(bin, "chown"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "var", "home", "u")
+	in := func(p string) string { return filepath.Join(home, p) }
+	script := func(user string, mounts ...string) []string {
+		t.Helper()
+		os.Remove(log)
+		cmd := exec.Command("sh", append([]string{"-c", homeScript, "sh", user}, mounts...)...)
+		cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+bin+":"+os.Getenv("PATH"))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("homeScript: %v: %s", err, out)
+		}
+		b, _ := os.ReadFile(log)
+		var got []string
+		for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+			if l != "" && !slices.Contains(got, l) {
+				got = append(got, l)
+			}
+		}
+		slices.Sort(got)
+		return got
+	}
+	chowned := func(paths ...string) []string {
+		var out []string
+		for _, p := range paths {
+			out = append(out, "-h -- 4242:4242 "+p)
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	// A mount at or above $HOME: its files are the host's; nothing done.
+	if got := script("4242:4242", filepath.Join(root, "var")); len(got) != 0 || fileExists(home) {
+		t.Errorf("mount above $HOME: %q, home made %v", got, fileExists(home))
+	}
+	// A missing $HOME is made, and handed to the user.
+	if got, want := script("4242:4242", "/tasks/t"), chowned(home); !slices.Equal(got, want) || !fileExists(home) {
+		t.Errorf("missing $HOME: %q, made %v; want %q", got, fileExists(home), want)
+	}
+
+	// What docker makes for mounts below $HOME: the directories between are
+	// handed to the user, not the mount points, nor what lies in a mount,
+	// nor anything through a symlink.
+	elsewhere := filepath.Join(root, "elsewhere")
+	for _, d := range []string{in("ws/tasks/t"), in("ws/repos/api/.git"), in("m/sub/inner"), filepath.Join(elsewhere, "x", "y"), filepath.Join(root, "other", "z")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(elsewhere, in("link")); err != nil {
+		t.Fatal(err)
+	}
+	mounts := []string{in("ws/tasks/t"), in("ws/repos/api/.git"), in("m"), in("m/sub/inner"), in("link/x/y"), filepath.Join(root, "other", "z"), RunMount}
+	want := chowned(home, in("ws"), in("ws/tasks"), in("ws/repos"), in("ws/repos/api"))
+	if got := script("4242:4242", mounts...); !slices.Equal(got, want) {
+		t.Errorf("chowned:\n got %q\nwant %q", got, want)
+	}
+	// What is the user's already is left alone.
+	if got := script(fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), mounts...); len(got) != 0 {
+		t.Errorf("the user's already: chowned %q", got)
+	}
+}
+
+func fileExists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
 }
 
 // container is a fake daemon's only container, for Runners that answer
@@ -773,6 +1046,39 @@ func TestInstallBin(t *testing.T) {
 	links()
 	if entries, _ := os.ReadDir(filepath.Join(run, "bin")); len(entries) != 3 {
 		t.Errorf("bin has %d entries, want atl and its two links", len(entries))
+	}
+}
+
+// Launches in one task, from several atl processes, install the binary at
+// once: each gets the copy and its links, and no temp file is left.
+func TestInstallBinConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "atl")
+	if err := os.WriteFile(src, []byte("v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 50; round++ {
+		run := filepath.Join(dir, fmt.Sprintf("run-%d", round))
+		var wg sync.WaitGroup
+		errs := make(chan error, 8)
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := InstallBin(src, run); err != nil {
+					errs <- err
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		entries, _ := os.ReadDir(filepath.Join(run, "bin"))
+		if len(entries) != 3 {
+			t.Fatalf("round %d: bin has %v, want atl and its two links", round, entries)
+		}
 	}
 }
 

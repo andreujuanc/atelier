@@ -25,11 +25,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
+	"github.com/andreujuanc/atelier/internal/workspace"
 )
 
 // Input is the JSON Claude Code passes to a hook on stdin (fields used by atelier).
@@ -66,8 +68,8 @@ type db struct {
 	// place a transcript path from the task may point into (see
 	// transcriptIn), since atl reads that file later where it runs.
 	claudeDir string
-	// ended, if set, is told each session a SessionEnd set ended (see
-	// TaskServer.OnSessionEnd).
+	// ended, if set, is told each session a SessionEnd is for, whether it
+	// set it ended or not (see TaskServer.OnSessionEnd).
 	ended func(session int64)
 	// roMounts are, with scope, the host paths the task has read-only
 	// ($ATL_SANDBOX_MOUNTS): its session context names them.
@@ -140,7 +142,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, env func(stri
 		}
 	}()
 
-	p, err := config.Resolve()
+	p, err := workspace.Paths()
 	if err != nil {
 		logError(p, stderr, event, "", err)
 		if event == EventAssistantGuard {
@@ -186,13 +188,35 @@ func (d db) serve(event string, data []byte, readErr error, landings []candidate
 		if event == EventPreToolUse {
 			return d.guardPartial(stderr, env, event, data, false, landings)
 		}
-		return 0
+		if !typeErrorOnly(err, data) {
+			return 0
+		}
+		// The rest of the input decoded: a field of an unexpected type
+		// (left empty) must not cost the session its state change.
 	}
 	if !knownEvent(event) {
 		return 0
 	}
 	in.landings = landings
 	return d.handleMain(stdout, stderr, env, event, in)
+}
+
+// typeErrorOnly reports whether err, from json.Unmarshal of data into an
+// Input, only says that some field had an unexpected type (json.Unmarshal
+// then decodes the others), data is a JSON object, and its session_id, if
+// any, is a string: the session can still be told apart.
+func typeErrorOnly(err error, data []byte) bool {
+	var te *json.UnmarshalTypeError
+	if !errors.As(err, &te) {
+		return false
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) != nil || obj == nil {
+		return false
+	}
+	var sid string
+	raw, ok := obj["session_id"]
+	return !ok || json.Unmarshal(raw, &sid) == nil
 }
 
 // handleMain opens the store (unless d has one) and runs Handle, mapping its
@@ -260,26 +284,35 @@ func refuseOversized(stderr io.Writer, tool string) int {
 
 // partialInput recovers session_id, cwd, tool_name and tool_input's
 // file_path/notebook_path from a possibly truncated or malformed hook JSON
-// object by decoding it token by token and stopping at the first error.
+// object by decoding it token by token and stopping at the first syntax
+// error (a value of the wrong type is ignored, as json.Unmarshal does).
 // Other values (e.g. a huge "content" string) are skipped without being
 // kept. As with json.Unmarshal, a duplicate key's last value wins (as far
 // as the input could be read). ok reports whether a target path was found.
 func partialInput(data []byte) (in Input, ok bool) {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	str := func(dst *string) error {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return err
+		}
+		_ = json.Unmarshal(raw, dst) // not a string: left as it was
+		return nil
+	}
 	var targets map[string]string
 	_ = walkObject(dec, func(key string) error {
 		switch key {
 		case "session_id":
-			return dec.Decode(&in.SessionID)
+			return str(&in.SessionID)
 		case "cwd":
-			return dec.Decode(&in.Cwd)
+			return str(&in.Cwd)
 		case "tool_name":
-			return dec.Decode(&in.ToolName)
+			return str(&in.ToolName)
 		case "hook_event_name":
-			return dec.Decode(&in.HookEventName)
+			return str(&in.HookEventName)
 		case "tool_input":
 			targets = map[string]string{} // a later tool_input replaces an earlier one
-			return walkObject(dec, func(key string) error {
+			err := walkObject(dec, func(key string) error {
 				if key != "file_path" && key != "notebook_path" {
 					return skipValue(dec)
 				}
@@ -294,6 +327,10 @@ func partialInput(data []byte) (in Input, ok bool) {
 				}
 				return nil
 			})
+			if errors.Is(err, errNotObject) {
+				return nil // a value of the wrong type: no targets, as json.Unmarshal leaves it
+			}
+			return err
 		}
 		return skipValue(dec)
 	})
@@ -304,15 +341,23 @@ func partialInput(data []byte) (in Input, ok bool) {
 	return in, true
 }
 
+// errNotObject is walkObject's error for a value that is not an object,
+// which it has consumed.
+var errNotObject = errors.New("not a JSON object")
+
 // walkObject reads a JSON object from dec, calling field for each key with
-// the decoder positioned at its value (field must consume the value).
+// the decoder positioned at its value (field must consume the value). Any
+// other value is consumed and errNotObject returned.
 func walkObject(dec *json.Decoder, field func(key string) error) error {
 	tok, err := dec.Token()
 	if err != nil {
 		return err
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return errors.New("not a JSON object")
+		if err := skipRest(dec, tok); err != nil {
+			return err
+		}
+		return errNotObject
 	}
 	for dec.More() {
 		tok, err := dec.Token()
@@ -333,12 +378,18 @@ func walkObject(dec *json.Decoder, field func(key string) error) error {
 
 // skipValue consumes one JSON value from dec.
 func skipValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	return skipRest(dec, tok)
+}
+
+// skipRest consumes the rest of the JSON value whose first token, tok, was
+// read from dec.
+func skipRest(dec *json.Decoder, tok json.Token) error {
 	depth := 0
 	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return err
-		}
 		if d, ok := tok.(json.Delim); ok {
 			switch d {
 			case '{', '[':
@@ -349,6 +400,10 @@ func skipValue(dec *json.Decoder) error {
 		}
 		if depth == 0 {
 			return nil
+		}
+		var err error
+		if tok, err = dec.Token(); err != nil {
+			return err
 		}
 	}
 }
@@ -419,6 +474,11 @@ func (d db) handle(ctx context.Context, event string, in Input, env func(string)
 // task id (0 if the event matched no session or task).
 func (d db) transition(ctx context.Context, event string, in Input, env func(string) string, now time.Time) (int64, error) {
 	st := d.st
+	if !claudeIDOK(in.SessionID) {
+		logError(d.p, io.Discard, event, in.SessionID,
+			fmt.Errorf("claude session id ignored: %q has a control character or starts with \"-\"", in.SessionID))
+		in.SessionID = ""
+	}
 	if event == EventSessionStart && d.scope != 0 {
 		// A Claude session id is how the hooks and the status line of every
 		// task find a session row (GetSessionByClaudeID): a sandboxed task
@@ -452,13 +512,20 @@ func (d db) transition(ctx context.Context, event string, in Input, env func(str
 		return task.ID, st.CreateSession(ctx, &model.Session{TaskID: task.ID, ClaudeSessionID: in.SessionID,
 			State: model.StateIdle, CreatedAt: now, LastEventAt: now, TranscriptPath: in.TranscriptPath})
 	}
-	if err := transitionState(ctx, event, in, sess.ID, st, now); err != nil {
+	if err := transitionState(ctx, event, in, sess.ID, envLaunch(env, sess.ID), st, now); err != nil {
 		return sess.TaskID, err
 	}
 	if event == EventSessionEnd && d.ended != nil {
 		d.ended(sess.ID)
 	}
 	return sess.TaskID, recordTranscript(ctx, event, in, sess, st)
+}
+
+// claudeIDOK reports whether id can be stored as a Claude session id: it
+// has no control character (atl shows it) and does not start with "-"
+// (resuming runs `claude --resume <id>`, where it would be an option).
+func claudeIDOK(id string) bool {
+	return !strings.HasPrefix(id, "-") && strings.IndexFunc(id, unicode.IsControl) < 0
 }
 
 // recordTranscript stores the event's transcript path: SessionStart (any
@@ -488,6 +555,11 @@ func transcriptIn(dir, path string) error {
 	if dir == "" {
 		return errors.New("the task has no Claude config dir")
 	}
+	if path != filepath.Clean(path) {
+		// Its ".." are resolved below after the symlinks before them, and
+		// lexically where atl reads it: they may land in different places.
+		return fmt.Errorf("%q is not a clean path", path)
+	}
 	root, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return fmt.Errorf("the task's Claude config dir: %w", err)
@@ -502,8 +574,9 @@ func transcriptIn(dir, path string) error {
 	return nil
 }
 
-// transitionState applies event's state change to session id.
-func transitionState(ctx context.Context, event string, in Input, id int64, st *store.Store, now time.Time) error {
+// transitionState applies event's state change to session id; launch is
+// the session's launch the event's Claude was started at (envLaunch).
+func transitionState(ctx context.Context, event string, in Input, id, launch int64, st *store.Store, now time.Time) error {
 	switch event {
 	case EventSessionStart:
 		if in.Source == "compact" {
@@ -534,7 +607,13 @@ func transitionState(ctx context.Context, event string, in Input, id int64, st *
 	case EventStop:
 		return st.SetIdle(ctx, id, strings.Join(backgroundLines(in.BackgroundTasks), "\n"), now)
 	case EventSessionEnd:
-		return st.SetSessionState(ctx, id, model.StateEnded, now)
+		// Only a live session ends: one atl stopped or ended itself gets this
+		// from its Claude being killed, and stays as atl left it (resumable).
+		ok, err := st.EndLive(ctx, id, launch, now)
+		if err != nil || ok {
+			return err
+		}
+		return st.TouchSession(ctx, id, now)
 	}
 	return nil
 }
@@ -614,6 +693,20 @@ func idChangingSource(source string) bool {
 		return true
 	}
 	return false
+}
+
+// envLaunch returns $ATL_LAUNCH, the LaunchSeq of session id at which atl
+// started the hook's Claude, if atl started it for id (its $ATL_SESSION);
+// else -1 (unknown: a Claude started before atl passed it, or not by atl).
+func envLaunch(env func(string) string, id int64) int64 {
+	if s, err := strconv.ParseInt(env("ATL_SESSION"), 10, 64); err != nil || s != id {
+		return -1
+	}
+	n, err := strconv.ParseInt(env("ATL_LAUNCH"), 10, 64)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
 }
 
 // envSession returns the ATL_SESSION row if it is set, parses, exists and

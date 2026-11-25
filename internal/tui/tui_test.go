@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1677,6 +1678,89 @@ func TestShutdown(t *testing.T) {
 	}
 }
 
+// slowDirty is a backend whose DirtyTasks runs until its context ends.
+type slowDirty struct {
+	Backend
+	started chan struct{}
+}
+
+func (s slowDirty) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
+	close(s.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A plain quit never waits for a dirty check in flight (it only reads; up
+// to dirtyTimeout): shutdown cancels it.
+func TestShutdownDoesNotWaitForDirtyCheck(t *testing.T) {
+	tr := &tracker{}
+	ctx, cancel := context.WithCancel(context.Background())
+	sd := slowDirty{Backend: &fakeBackend{}, started: make(chan struct{})}
+	tb := &trackedBackend{Backend: sd, tr: tr}
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		tb.DirtyTasks(ctx)
+	}()
+	<-sd.started
+	returned := make(chan bool, 1)
+	go func() { returned <- shutdown(context.Background(), cancel, tr, false, time.Second) }()
+	select {
+	case ok := <-returned:
+		if !ok {
+			t.Fatal("shutdown reported unfinished calls")
+		}
+	case <-time.After(2 * time.Second):
+		cancel() // unblock the check
+		t.Fatal("quit waited for the dirty check")
+	}
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dirty check not cancelled")
+	}
+	if _, err := tb.DirtyTasks(context.Background()); !errors.Is(err, errStopped) {
+		t.Fatalf("dirty check after stop: %v", err)
+	}
+}
+
+// Every backend call that may run when the TUI stops (and write to App.Out)
+// goes through the tracker: once it is closed, none reaches the backend
+// (nil here, so an untracked call panics). TaskDir only builds a path.
+func TestTrackedBackendTracksEveryCall(t *testing.T) {
+	tr := &tracker{}
+	tr.close()
+	tb := reflect.ValueOf(&trackedBackend{tr: tr})
+	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	bt := reflect.TypeOf((*Backend)(nil)).Elem()
+	for i := 0; i < bt.NumMethod(); i++ {
+		name := bt.Method(i).Name
+		if name == "TaskDir" {
+			continue
+		}
+		fn := tb.MethodByName(name)
+		args := make([]reflect.Value, fn.Type().NumIn())
+		for j := range args {
+			if in := fn.Type().In(j); in == ctxType {
+				args[j] = reflect.ValueOf(context.Background())
+			} else {
+				args[j] = reflect.Zero(in)
+			}
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("%s is not tracked (reached the backend)", name)
+				}
+			}()
+			out := fn.Call(args)
+			if err, _ := out[len(out)-1].Interface().(error); !errors.Is(err, errStopped) {
+				t.Errorf("%s after close: %v", name, err)
+			}
+		}()
+	}
+}
+
 func TestOrderedSend(t *testing.T) {
 	var mu sync.Mutex
 	var got []string
@@ -1733,6 +1817,54 @@ func TestOrderedSend(t *testing.T) {
 		t.Fatalf("fallback %q", fallback.String())
 	}
 }
+
+// TestOrderedSendStopKeepsQueued: lines still queued when stop is called
+// are not delivered (the program is gone) but written to the fallback, in
+// order, before the lines sent after stop.
+func TestOrderedSendStopKeepsQueued(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	var delivered []string
+	var fallback bytes.Buffer
+	send, _, stop := orderedSend(func(s string) {
+		mu.Lock()
+		delivered = append(delivered, s)
+		mu.Unlock()
+		if s == "0" {
+			close(started)
+			<-release
+		}
+	}, writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return fallback.Write(p)
+	}))
+	for i := 0; i < 10; i++ {
+		send(fmt.Sprint(i))
+	}
+	<-started // "0" is being delivered, the others are queued
+	stop()
+	close(release)
+	send("late")
+	want := "1\n2\n3\n4\n5\n6\n7\n8\n9\nlate\n"
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got, gotDelivered := fallback.String(), slices.Clone(delivered)
+		mu.Unlock()
+		if got == want && reflect.DeepEqual(gotDelivered, []string{"0"}) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivered %q, fallback %q; want [0] and %q", gotDelivered, got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 func TestSanitize(t *testing.T) {
 	if got := clean("a\n\nb\x1b[31mc\t\r d\x00\x7f"); got != "a b [31mc d" {
@@ -1853,6 +1985,27 @@ func TestDetailStaleDropped(t *testing.T) {
 	m.Update(r1) // a late duplicate of the older reply
 	if m.detailApplied != applied {
 		t.Fatal("older reply applied after a newer one")
+	}
+}
+
+// A list in flight when an operation ends may have been read before the
+// operation's change: it is not shown, a fresh one is asked for instead. A
+// created task ends up selected (the stale list does not have it).
+func TestStaleListAfterOp(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	stale := m.listCmd()() // read before the task exists…
+	m.listing = true       // …and still in flight
+	created := tv(9, "fresh", model.StatusActive)
+	fb.tasks = append(fb.tasks, created)
+	_, cmd := m.Update(newTaskMsg{task: &created.Task})
+	drain(m, cmd)
+	_, cmd = m.Update(stale)
+	drain(m, cmd)
+	_, cmd = m.Update(listTickMsg{})
+	drain(m, cmd)
+	if s := m.selected(); s == nil || s.Task.Slug != "fresh" {
+		t.Fatalf("selected %v, want the created task", s)
 	}
 }
 
@@ -2072,6 +2225,35 @@ func TestPickerEscClearsFilter(t *testing.T) {
 	key(m, "esc")
 	if m.mode != modeNormal || m.picker != nil {
 		t.Fatalf("esc without filter: mode %d", m.mode)
+	}
+}
+
+// The picker shows the last known repos at once and the refreshed list when
+// it arrives: a cursor the user moved stays on the same repo, so space never
+// toggles a repo the user did not highlight.
+func TestPickerRefreshKeepsCursor(t *testing.T) {
+	p := newPicker("Pick", nil, nil)
+	p.available = []string{"api", "lib", "web"} // shown until the refresh
+	p.initCursor()
+	p.update(keyMsg("down"))
+	if p.current() != "lib" {
+		t.Fatalf("cursor on %q", p.current())
+	}
+	p.setAvailable([]string{"api", "docs", "lib", "web"}, nil)
+	if p.current() != "lib" {
+		t.Fatalf("after the refresh the cursor is on %q, want lib", p.current())
+	}
+	p.update(keyMsg(" "))
+	if got := p.selection(); len(got) != 1 || got[0].Name != "lib" {
+		t.Fatalf("space selected %v", got)
+	}
+	// Its repo gone from disk: the cursor stays at its row, clamped.
+	p.update(keyMsg(" "))
+	p.update(keyMsg(" ")) // deselected again
+	p.update(keyMsg("end"))
+	p.setAvailable([]string{"api", "docs"}, nil)
+	if p.current() != "docs" {
+		t.Fatalf("after its repo went the cursor is on %q, want docs", p.current())
 	}
 }
 
@@ -2754,6 +2936,30 @@ func TestSessionPickerStartsOnMostRecent(t *testing.T) {
 	}
 }
 
+// Fast j/k in the session picker may arrive as one event ("jj"): each
+// letter moves, as in the task list.
+func TestSessionPickerMultiRuneKeys(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks(), choices: map[string][]app.SessionChoice{"gamma": {
+		choice(7, model.StateIdle, true, "a", "", time.Minute),
+		choice(5, model.StateEnded, false, "b", "", time.Hour),
+		choice(4, model.StateEnded, false, "c", "", 2*time.Hour),
+	}}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+	runOpen(t, m, press(m, "enter"))
+	if m.mode != modeSessions || m.sessPick.cursor != 1 {
+		t.Fatalf("mode %v, picker %+v", m.mode, m.sessPick)
+	}
+	key(m, "jj")
+	if m.sessPick.cursor != 3 {
+		t.Fatalf("jj: cursor %d, want 3", m.sessPick.cursor)
+	}
+	key(m, "kkk")
+	if m.sessPick.cursor != 0 {
+		t.Fatalf("kkk: cursor %d, want 0", m.sessPick.cursor)
+	}
+}
+
 func TestOpenChoicesWhileBusyElsewhere(t *testing.T) {
 	fb := &fakeBackend{tasks: sampleTasks(), choices: map[string][]app.SessionChoice{
 		"gamma": {choice(7, model.StateIdle, true, "t", "", time.Minute)}}}
@@ -3250,5 +3456,64 @@ func TestAddRestartCheckInFlight(t *testing.T) {
 	key(m, "esc")
 	if m.mode != modeNormal {
 		t.Fatal("esc did not close the dialog after the refused add")
+	}
+}
+
+// TestExecDoneAndRecovered: the status line after a command run on the
+// terminal (its last stderr line on failure, "attached" after an open),
+// and after a recovery pass (an error shown once; stopped sessions
+// counted and the list reloaded). D runs atl diff on the selected task; a
+// status key for the status the task has does nothing.
+func TestExecDoneAndRecovered(t *testing.T) {
+	fb := &fakeBackend{tasks: sampleTasks()}
+	m, _ := newTest(t, fb)
+	var diffed []string
+	m.diffCmd = func(slug string) *exec.Cmd { diffed = append(diffed, slug); return exec.Command("true") }
+	if press(m, "D") == nil || !slices.Equal(diffed, []string{"beta"}) {
+		t.Fatalf("D: diffed %q", diffed)
+	}
+	key(m, "1") // beta is backlog already
+	if fb.count("SetStatus") != 0 {
+		t.Fatal("status key for the same status called SetStatus")
+	}
+
+	lists := fb.count("List")
+	drain(m, func() tea.Msg {
+		return execDoneMsg{op: "diff", slug: "beta", stderr: bytes.NewBufferString("warning: x\nfatal: boom\n\n"), err: errors.New("exit status 128")}
+	})
+	if m.status != "diff beta: fatal: boom" || !m.statusErr {
+		t.Fatalf("failed exec: %q %v", m.status, m.statusErr)
+	}
+	if fb.count("List") == lists {
+		t.Fatal("no reload after an exec")
+	}
+	drain(m, func() tea.Msg {
+		return execDoneMsg{op: "assistant", stderr: &bytes.Buffer{}, err: errors.New("exit status 1")}
+	})
+	if m.status != "assistant: exit status 1" || !m.statusErr {
+		t.Fatalf("failed exec without stderr: %q", m.status)
+	}
+	drain(m, func() tea.Msg { return execDoneMsg{op: "open", slug: "beta", stderr: &bytes.Buffer{}} })
+	if m.status != "attached beta" || m.statusErr {
+		t.Fatalf("open: %q %v", m.status, m.statusErr)
+	}
+
+	drain(m, func() tea.Msg { return recoverMsg{err: errors.New("tmux: no server")} })
+	if !strings.Contains(m.status, "tmux: no server") || !m.statusErr {
+		t.Fatalf("recover error: %q", m.status)
+	}
+	m.setStatus("")
+	drain(m, func() tea.Msg { return recoverMsg{err: errors.New("tmux: no server")} })
+	if m.status != "" {
+		t.Fatalf("the same recover error shown again: %q", m.status)
+	}
+	lists = fb.count("List")
+	drain(m, func() tea.Msg { return recoverMsg{n: 2} })
+	if !strings.Contains(m.status, "2 session(s) marked stopped") || fb.count("List") == lists {
+		t.Fatalf("recovered 2: %q, reloaded %v", m.status, fb.count("List") != lists)
+	}
+	drain(m, func() tea.Msg { return recoverMsg{err: errors.New("tmux: no server")} })
+	if !strings.Contains(m.status, "tmux: no server") {
+		t.Fatalf("a recover error after a success not shown: %q", m.status)
 	}
 }

@@ -106,7 +106,7 @@ func (e *notesEditor) dirty() bool {
 // while the task is busy (normalKey checks that).
 func (m *Model) openNotes(t *app.TaskView) tea.Cmd {
 	if m.quitRequested {
-		m.setStatus(m.quitText(len(m.busyOps())))
+		m.setStatus(m.quitText(m.opsRunning()))
 		return nil
 	}
 	id, slug, be, ctx := t.Task.ID, t.Task.Slug, m.be, m.ctx
@@ -448,29 +448,61 @@ func (m *Model) notesLines(t *app.TaskView, w, n int) []string {
 	if m.detail == nil || m.detail.Task.ID != t.Task.ID {
 		return append(out, dimStyle.Render("…"))
 	}
-	text := notesDisplay(m.detail.Notes)
-	if strings.TrimSpace(text) == "" {
+	lines := m.wrappedNotes(m.detail.Notes, w)
+	if len(lines) == 0 {
 		return append(out, trunc(dimStyle.Render("no notes — ")+keyStyle.Render("m")+dimStyle.Render(" to write"), w))
 	}
-	var lines []string
-	for _, l := range strings.Split(text, "\n") {
-		if l == "" {
-			lines = append(lines, "")
-			continue
-		}
-		st := noteStyle(l)
-		for _, wl := range strings.Split(ansi.Wrap(l, w, ""), "\n") {
-			lines = append(lines, st.Render(wl))
-		}
-	}
+	more := 0
 	if len(lines) > n {
-		more := len(lines) - (n - 1)
-		lines = append(lines[:n-1], dimStyle.Render(fmt.Sprintf("… %d more line(s) — m to edit and scroll", more)))
+		more = len(lines) - (n - 1)
+		lines = lines[:n-1]
 	}
 	for _, l := range lines {
-		out = append(out, trunc(l, w))
+		s := l.line
+		if s != "" {
+			s = noteStyle(l.src).Render(s)
+		}
+		out = append(out, trunc(s, w))
+	}
+	if more > 0 {
+		out = append(out, trunc(dimStyle.Render(fmt.Sprintf("… %d more line(s) — m to edit and scroll", more)), w))
 	}
 	return out
+}
+
+// wrappedNote is a line of the notes area: line, a part of the notes
+// line src wrapped to the area's width.
+type wrappedNote struct{ src, line string }
+
+// notesWrap caches wrappedNotes: the notes area is drawn on every frame.
+type notesWrap struct {
+	notes string
+	w     int
+	lines []wrappedNote
+	ok    bool
+}
+
+// wrappedNotes returns notes, made safe to render (notesDisplay) and
+// wrapped to width w, line by line; none for notes that are blank.
+func (m *Model) wrappedNotes(notes string, w int) []wrappedNote {
+	c := &m.notesWrap
+	if c.ok && c.w == w && c.notes == notes {
+		return c.lines
+	}
+	var lines []wrappedNote
+	if text := notesDisplay(notes); strings.TrimSpace(text) != "" {
+		for _, l := range strings.Split(text, "\n") {
+			if l == "" {
+				lines = append(lines, wrappedNote{})
+				continue
+			}
+			for _, wl := range strings.Split(ansi.Wrap(l, w, ""), "\n") {
+				lines = append(lines, wrappedNote{l, wl})
+			}
+		}
+	}
+	*c = notesWrap{notes: notes, w: w, lines: lines, ok: true}
+	return lines
 }
 
 // notesDisplay makes notes text safe to render: tabs become four spaces

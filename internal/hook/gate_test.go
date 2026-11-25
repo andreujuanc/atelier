@@ -236,8 +236,8 @@ func TestHookThroughGate(t *testing.T) {
 	}
 }
 
-// TestGateSessionEnd: the gate is told each session a SessionEnd records as
-// ended (it then ends what the session leaves running in the container),
+// TestGateSessionEnd: the gate is told each session a SessionEnd is for
+// (it then ends what the session leaves running in the container),
 // and nothing for other events or a SessionEnd that matches no session.
 func TestGateSessionEnd(t *testing.T) {
 	f := setup(t)
@@ -557,8 +557,6 @@ func TestLogErrorOneLine(t *testing.T) {
 	}
 }
 
-// TestGateLatency: a hook round trip through the gate (client and gate in
-// one process here) stays in the low milliseconds.
 // TestGateTranscriptPath: the gate records a transcript path only inside
 // the task's own Claude config dir, symlinks resolved; any other is
 // ignored (the event still counts) and logged.
@@ -580,6 +578,28 @@ func TestGateTranscriptPath(t *testing.T) {
 	if err := os.Symlink(filepath.Join(f.root, ".claude", ".credentials.json"), filepath.Join(project, "creds.jsonl")); err != nil {
 		t.Fatal(err)
 	}
+	// A path whose ".." stay in the dir as the gate resolves it (after a
+	// symlink to a deep dir) but leave it as written: atl, reading it
+	// later, cleans it to the user's dir.
+	up, err := filepath.Rel(filepath.Join(own, "projects"), f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ups := strings.Count(up, "..") + 1
+	deep := project
+	for i := range ups {
+		deep = filepath.Join(deep, "d"+itoa(int64(i)))
+	}
+	if err := os.MkdirAll(deep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(deep, filepath.Join(own, "projects", "up")); err != nil {
+		t.Fatal(err)
+	}
+	dotdot := filepath.Join(own, "projects", "up") + strings.Repeat("/..", ups) + "/.claude/projects/k/b.jsonl"
+	if filepath.Clean(dotdot) != filepath.Join(userDir, "b.jsonl") {
+		t.Fatalf("test setup: %s cleans to %s", dotdot, filepath.Clean(dotdot))
+	}
 	for _, c := range []struct {
 		name, path string
 		ok         bool
@@ -592,6 +612,8 @@ func TestGateTranscriptPath(t *testing.T) {
 		{"a symlinked dir out of it", filepath.Join(own, "projects", "out", "d.jsonl"), false},
 		{"a symlink out of it", filepath.Join(project, "creds.jsonl"), false},
 		{"relative", "projects/k/e.jsonl", false},
+		{"dot-dot after a symlink, out of it as written", dotdot, false},
+		{"own, not clean", project + "/./f.jsonl", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s := f.session(t, model.StateIdle, "")
@@ -611,6 +633,43 @@ func TestGateTranscriptPath(t *testing.T) {
 	}
 }
 
+// TestGateClaudeID: a Claude session id that cannot be one (control
+// characters, or a leading "-": resuming runs `claude --resume <id>`,
+// where it would be an option) is not recorded; the event still counts,
+// and the id is logged as ignored.
+func TestGateClaudeID(t *testing.T) {
+	f := setup(t)
+	sock := gated(t, f)
+	start := func(cid string) *model.Session {
+		t.Helper()
+		s := f.session(t, model.StateEnded, "old")
+		in := hookInput(Input{SessionID: cid, Cwd: f.p.TaskDir("fix"), Source: "clear"})
+		if r := hookVia(t, f, sock, EventSessionStart, in, map[string]string{"ATL_SESSION": itoa(s.ID)}); r.code != 0 {
+			t.Fatalf("result %+v", r)
+		}
+		got := f.get(t, s.ID)
+		if got.State != model.StateIdle {
+			t.Fatalf("event not applied: row %+v", got)
+		}
+		return got
+	}
+	for _, cid := range []string{"--dangerously-skip-permissions", "-x", "a\x1b]0;pwned\x07b", "a\nb", "a\u009bb"} {
+		t.Run(strconv.Quote(cid), func(t *testing.T) {
+			if got := start(cid); got.ClaudeSessionID != "old" {
+				t.Errorf("claude id recorded: %q", got.ClaudeSessionID)
+			}
+			if !strings.Contains(readLog(t, f.p), "claude session id ignored") {
+				t.Errorf("not logged:\n%s", readLog(t, f.p))
+			}
+		})
+	}
+	if got := start("1f0c3a52-7d4e-4b8a-9c1e-2f3a4b5c6d7e"); got.ClaudeSessionID != "1f0c3a52-7d4e-4b8a-9c1e-2f3a4b5c6d7e" {
+		t.Errorf("a valid claude id not recorded: %q", got.ClaudeSessionID)
+	}
+}
+
+// TestGateLatency: a hook round trip through the gate (client and gate in
+// one process here) stays in the low milliseconds.
 func TestGateLatency(t *testing.T) {
 	if raceEnabled {
 		t.Skip("race-instrumented code is too slow to measure")
@@ -641,3 +700,82 @@ func TestGateLatency(t *testing.T) {
 		}
 	}
 }
+
+// TestTaskServerEdges: a task server opens only for a task that still has
+// its id and slug, and notices when the task goes; a note needs text and
+// is the user's unless it says otherwise; an unknown op is refused.
+func TestTaskServerEdges(t *testing.T) {
+	ctx := context.Background()
+	f := setup(t)
+	if _, err := OpenTaskServer(f.p, f.task.ID, "other"); err == nil || !strings.Contains(err.Error(), "is not other") {
+		t.Fatalf("open with another task's slug: %v", err)
+	}
+	if _, err := OpenTaskServer(f.p, 9999, "fix"); err == nil {
+		t.Fatal("open for a missing task: no error")
+	}
+	ts, err := OpenTaskServer(f.p, f.task.ID, "fix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+	do := func(req sandbox.ControlRequest, body string) (int, string, string) {
+		var out, errb bytes.Buffer
+		code := ts.Do(req, []byte(body), &out, &errb)
+		return code, out.String(), errb.String()
+	}
+	if code, _, errs := do(sandbox.ControlRequest{Op: "frobnicate"}, ""); code != 1 || !strings.Contains(errs, `unknown operation "frobnicate"`) {
+		t.Errorf("unknown op: %d %q", code, errs)
+	}
+	if code, _, errs := do(sandbox.ControlRequest{Op: sandbox.OpNote}, " \n\x01\t"); code != 1 || !strings.Contains(errs, "note is empty") {
+		t.Errorf("empty note: %d %q", code, errs)
+	}
+	if code, out, _ := do(sandbox.ControlRequest{Op: sandbox.OpNote}, "plain"); code != 0 || out != "note added\n" {
+		t.Errorf("note without author: %d %q", code, out)
+	}
+	if notes, err := f.st.GetNotes(ctx, f.task.ID); err != nil || !strings.HasSuffix(notes, "[user] plain") {
+		t.Errorf("notes %q, %v", notes, err)
+	}
+	if code, _, errs := do(sandbox.ControlRequest{Op: sandbox.OpHook, Event: EventAssistantGuard}, "{}"); code != 2 || errs == "" {
+		t.Errorf("assistant guard for a task container: %d %q", code, errs)
+	}
+	if gone, err := ts.Gone(ctx); err != nil || gone {
+		t.Fatalf("Gone = %v, %v", gone, err)
+	}
+	if err := f.st.DeleteTask(ctx, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := ts.Gone(ctx); err != nil || !gone {
+		t.Fatalf("Gone after delete = %v, %v", gone, err)
+	}
+}
+
+// TestViaGateLongRequestLine: when JSON escaping makes the request line too
+// long, PreToolUse goes to the gate without the container's landings and
+// ATL_CONTEXT, and the gate still guards the targets itself; the
+// assistant's guard, which may not go without them, refuses.
+func TestViaGateLongRequestLine(t *testing.T) {
+	f := setup(t)
+	sock := gated(t, f)
+	odd := strings.Repeat("\x01", 16000) // \u0001 on the line: six bytes each
+	target := filepath.Join(f.p.RepoPath("docs"), odd)
+	in := hookInput(Input{SessionID: "s", Cwd: f.p.TaskDir("fix"), ToolName: "Write", ToolInput: json.RawMessage(`{"file_path":` + strconvQuote(target) + `}`)})
+	if l := containerLandings([]byte(in)); len(l) == 0 {
+		t.Fatal("no landings: the test does not make a long line")
+	}
+	r := hookVia(t, f, sock, EventPreToolUse, in, map[string]string{envContextVar: strings.Repeat("\x01", 8000), "ATL_LAUNCH": strings.Repeat("\x01", 8000)})
+	if r.code != 2 || !strings.Contains(r.stderr, "inside read-only repo docs") {
+		t.Fatalf("long PreToolUse into ro: %+v", r)
+	}
+	rw := hookInput(Input{SessionID: "s", Cwd: f.p.TaskDir("fix"), ToolName: "Write",
+		ToolInput: json.RawMessage(`{"file_path":` + strconvQuote(filepath.Join(f.p.WorktreePath("fix", "api"), odd)) + `}`)})
+	if r := hookVia(t, f, sock, EventPreToolUse, rw, nil); r.code != 0 || r.stderr != "" {
+		t.Fatalf("long PreToolUse into rw: %+v", r)
+	}
+	var out, errb bytes.Buffer
+	code := run([]string{EventAssistantGuard}, strings.NewReader(in), &out, &errb, inContainer(sock, nil))
+	if code != 2 || !strings.Contains(errb.String(), "too long to check") {
+		t.Fatalf("long assistant guard: %d %q", code, errb.String())
+	}
+}
+
+func strconvQuote(s string) string { b, _ := json.Marshal(s); return string(b) }

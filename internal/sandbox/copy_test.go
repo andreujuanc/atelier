@@ -161,6 +161,10 @@ func TestCopyMain(t *testing.T) {
 		// Over the cap: nothing reaches the gate.
 		{"wl-copy", nil, strings.NewReader(big + "y"), 1, nil},
 		{"wl-copy", []string{big + "y"}, noRead{t}, 1, nil},
+		// --trim-newline: the cap holds for the text without its final
+		// newline, never for one cut short at a newline.
+		{"wl-copy", []string{"-n"}, strings.NewReader(big + "\n"), 0, []string{big}},
+		{"wl-copy", []string{"-n"}, strings.NewReader(big + "\nmore"), 1, nil},
 		{"wl-copy", []string{"--type", "text/plain"}, noRead{t}, 2, nil},
 		// Reading is refused, whatever it asks for: it reads nothing (and
 		// CopyMain has no standard output to write to).

@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,9 +11,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -29,13 +32,20 @@ type daemon struct {
 	requests []string          // "METHOD path?query"
 	bodies   map[string]string // last body per "METHOD path"
 	objects  []*object
-	execIn   []string // IDs of the containers execs were created in
+	execIn   []string        // IDs of the containers execs were created in
+	execs    int             // execs created: the next one is new<execs+1>
+	execGone map[string]bool // execs the daemon has forgotten: their inspect is a 404
 	// onInspect, if set, runs before an inspect of an object is answered.
 	onInspect func(kind, ref string)
 	// volumesMissing are the volumes a container create named by name that
 	// did not exist when the create reached the daemon (which would create
 	// them itself, without the task's label).
 	volumesMissing []string
+	// attached are the daemon's ends of attach streams, in the order they
+	// came: a quiet container, until the test writes to one or closes it.
+	attached []net.Conn
+	// onBuild are the ONBUILD triggers of images, by ID.
+	onBuild map[string][]string
 }
 
 type object struct {
@@ -57,7 +67,7 @@ const (
 
 func newDaemon(t *testing.T) (*daemon, string) {
 	t.Helper()
-	d := &daemon{bodies: map[string]string{}, objects: []*object{
+	d := &daemon{bodies: map[string]string{}, execGone: map[string]bool{}, objects: []*object{
 		{"containers", mineID, "mine", map[string]string{LabelTask: testID}},
 		{"containers", agentID, "agent", map[string]string{LabelAgent: testID}},
 		{"containers", otherID, "other", map[string]string{LabelTask: "someone-else"}},
@@ -80,7 +90,14 @@ func newDaemon(t *testing.T) (*daemon, string) {
 	}
 	srv := &http.Server{Handler: d}
 	go srv.Serve(l)
-	t.Cleanup(func() { srv.Close() })
+	t.Cleanup(func() {
+		srv.Close()
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for _, conn := range d.attached {
+			conn.Close()
+		}
+	})
 	return d, sock
 }
 
@@ -100,7 +117,7 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p := versionPrefix.ReplaceAllString(r.URL.Path, ""); r.Method == "GET" && strings.HasPrefix(p, "/images/") && strings.HasSuffix(p, "/json") {
 		// An image inspect: by name as dockerd reads it.
 		if o := d.findImage(strings.TrimSuffix(strings.TrimPrefix(p, "/images/"), "/json")); o != nil {
-			json.NewEncoder(w).Encode(map[string]any{"Id": o.id, "Config": map[string]any{"Labels": o.labels}})
+			json.NewEncoder(w).Encode(map[string]any{"Id": o.id, "Config": map[string]any{"Labels": o.labels, "OnBuild": d.triggers(o.id)}})
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `{"message":"no such image"}`)
@@ -157,9 +174,33 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "POST" && len(parts) == 3 && parts[2] == "exec" && obj != nil:
 		d.mu.Lock()
 		d.execIn = append(d.execIn, obj.id)
+		d.execs++
+		id := fmt.Sprintf("new%d", d.execs)
 		d.mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
-		io.WriteString(w, `{"Id":"new1"}`)
+		fmt.Fprintf(w, `{"Id":%q}`, id)
+	case r.Method == "GET" && len(parts) == 3 && parts[0] == "exec" && parts[2] == "json":
+		d.mu.Lock()
+		gone := d.execGone[parts[1]]
+		d.mu.Unlock()
+		if gone {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"message":"no such exec"}`)
+			return
+		}
+		io.WriteString(w, `{}`)
+	case r.Method == "POST" && len(parts) == 3 && parts[2] == "attach" && obj != nil:
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		d.mu.Lock()
+		d.attached = append(d.attached, conn)
+		d.mu.Unlock()
+		io.WriteString(conn, "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\n"+
+			"Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+	case r.Method == "GET" && len(parts) == 1 && parts[0] == "version":
+		io.WriteString(w, `{"Os":"linux","Arch":"amd64"}`)
 	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/create"):
 		w.WriteHeader(http.StatusCreated)
 		io.WriteString(w, `{"Id":"new1"}`)
@@ -293,6 +334,7 @@ func newGateWith(t *testing.T, setup func(*Gate)) *gateClient {
 	// The task's own container is the daemon's "agent" (atl names it
 	// atl-<id>, see ContainerName).
 	g := &Gate{ID: testID, Root: root, SocketHost: "/host/run/docker.sock", Agent: "agent", Upstream: upstream}
+	g.HostRoutes = func() ([]netip.Prefix, error) { return nil, nil } // not the routes of the machine the tests run on
 	if setup != nil {
 		setup(g)
 	}
@@ -334,6 +376,15 @@ func TestGateRefusesHostReachingContainers(t *testing.T) {
 	}
 	for name, body := range map[string]string{
 		"host root bind":       `{"HostConfig":{"Binds":["/:/host"]}}`,
+		"bind of four parts":   `{"HostConfig":{"Binds":["` + c.root + `:/x:ro:extra"]}}`,
+		"bind not a string":    `{"HostConfig":{"Binds":[{"Source":"/"}]}}`,
+		"bind option":          `{"HostConfig":{"Binds":["` + c.root + `:/x:ro,rbind"]}}`,
+		"mount not an object":  `{"HostConfig":{"Mounts":["/:/host"]}}`,
+		"mount type npipe":     `{"HostConfig":{"Mounts":[{"Type":"npipe","Source":"/","Target":"/h"}]}}`,
+		"mount without type":   `{"HostConfig":{"Mounts":[{"Source":"/","Target":"/h"}]}}`,
+		"relative mount":       `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"rootlink","Target":"/h"}]}}`,
+		"volume of a host dir": `{"HostConfig":{"Mounts":[{"Type":"volume","Source":"/etc","Target":"/h"}]}}`,
+		"volumes from nothing": `{"HostConfig":{"VolumesFrom":[7]}}`,
 		"bind outside":         `{"HostConfig":{"Binds":["` + outside + `:/x:ro"]}}`,
 		"bind via dotdot":      `{"HostConfig":{"Binds":["` + c.root + `/../x:/x"]}}`,
 		"bind via symlink":     `{"HostConfig":{"Binds":["` + c.root + `/rootlink/etc:/x"]}}`,
@@ -354,6 +405,11 @@ func TestGateRefusesHostReachingContainers(t *testing.T) {
 		"unmasked paths":       `{"HostConfig":{"MaskedPaths":[]}}`,
 		"runtime":              `{"HostConfig":{"Runtime":"other"}}`,
 		"sysctls":              `{"HostConfig":{"Sysctls":{"kernel.x":"1"}}}`,
+		"empty sysctl":         `{"HostConfig":{"Sysctls":{"net.ipv4.ip_unprivileged_port_start":""}}}`,
+		"shim group":           `{"HostConfig":{"Annotations":{"io.containerd.runc.v2.group":""}}}`,
+		"empty storage opt":    `{"HostConfig":{"StorageOpt":{"size":""}}}`,
+		"empty volume opt":     `{"HostConfig":{"Mounts":[{"Type":"volume","Source":"myvol","Target":"/e","VolumeOptions":{"DriverConfig":{"Options":{"type":""}}}}]}}`,
+		"top-level sysctl":     `{"Image":"x","Sysctls":{"net.ipv4.ip_unprivileged_port_start":""}}`,
 		"unknown setting":      `{"HostConfig":{"FutureHostThing":"x"}}`,
 		"another's network":    `{"HostConfig":{"NetworkMode":"hostnet"}}`,
 		"another's endpoint":   `{"NetworkingConfig":{"EndpointsConfig":{"hostnet":{}}}}`,
@@ -365,6 +421,29 @@ func TestGateRefusesHostReachingContainers(t *testing.T) {
 			`"NetworkingConfig":{"EndpointsConfig":{"hostnet":{"NetworkID":"` + mynetID + `"}}}}`,
 		"syslog log driver": `{"HostConfig":{"LogConfig":{"Type":"syslog","Config":{"syslog-address":"tcp://127.0.0.1:22"}}}}`,
 		"gelf log driver":   `{"HostConfig":{"LogConfig":{"Type":"gelf","Config":{"gelf-address":"udp://127.0.0.1:1"}}}}`,
+		// Docker 24 and older read HostConfig settings at the top level
+		// (all of them without a HostConfig, some besides one).
+		"top-level privileged": `{"Image":"x","Privileged":true}`,
+		"top-level bind":       `{"Image":"x","Binds":["/:/host"]}`,
+		"top-level unmasked":   `{"Image":"x","maskedpaths":[]}`,
+		"top-level driver":     `{"Image":"x","HostConfig":{},"VolumeDriver":"evil"}`,
+		// A checked setting of another type than the gate reads is refused,
+		// not passed on unread.
+		"host config list":  `{"Image":"x","HostConfig":[{"Privileged":true}]}`,
+		"networking string": `{"Image":"x","NetworkingConfig":"hostnet"}`,
+		"binds string":      `{"HostConfig":{"Binds":"/:/host"}}`,
+		"mounts object":     `{"HostConfig":{"Mounts":{"Type":"bind","Source":"/","Target":"/h"}}}`,
+		"mount source list": `{"HostConfig":{"Mounts":[{"Type":"volume","Source":["hostvol"],"Target":"/h"}]}}`,
+		"bind opts string":  `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + c.root + `","Target":"/h","BindOptions":"rshared"}]}}`,
+		"propagation list":  `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + c.root + `","Target":"/h","BindOptions":{"Propagation":["shared"]}}]}}`,
+		"volume opts list":  `{"HostConfig":{"Mounts":[{"Type":"volume","Source":"myvol","Target":"/h","VolumeOptions":[{"DriverConfig":{"Name":"x"}}]}]}}`,
+		"volumes from str":  `{"HostConfig":{"VolumesFrom":"other"}}`,
+		"volumes from num":  `{"HostConfig":{"VolumesFrom":[5]}}`,
+		"log config string": `{"HostConfig":{"LogConfig":"syslog"}}`,
+		"log type list":     `{"HostConfig":{"LogConfig":{"Type":["syslog"]}}}`,
+		"ipc mode list":     `{"HostConfig":{"IpcMode":["host"]}}`,
+		"cgroupns list":     `{"HostConfig":{"CgroupnsMode":["host"]}}`,
+		"network mode list": `{"HostConfig":{"NetworkMode":["host"]}}`,
 	} {
 		status, out := c.do("POST", "/v1.45/containers/create", body)
 		if status != http.StatusForbidden || !strings.Contains(out, "atelier gate:") {
@@ -441,10 +520,10 @@ func TestGateForwardsTaskContainers(t *testing.T) {
 	}
 
 	// A volume named in a mount that does not exist yet is created with the label.
-	if status, out := c.do("POST", "/containers/create", `{"HostConfig":{"Binds":["fresh:/data"]}}`); status != http.StatusCreated {
+	if status, out := c.do("POST", "/containers/create", `{"HostConfig":{"Binds":["atl_abc123_fresh:/data"]}}`); status != http.StatusCreated {
 		t.Fatalf("create with a new volume: %d %s", status, out)
 	}
-	if b := c.d.body("POST /volumes/create"); !strings.Contains(b, `"atelier.task":"`+testID+`"`) || !strings.Contains(b, `"fresh"`) {
+	if b := c.d.body("POST /volumes/create"); !strings.Contains(b, `"atelier.task":"`+testID+`"`) || !strings.Contains(b, `"atl_abc123_fresh"`) {
 		t.Errorf("volume create body = %s", b)
 	}
 }
@@ -530,6 +609,105 @@ func TestGateOwnership(t *testing.T) {
 	if b := c.d.body("POST /v1.45/networks/" + mynetID + "/connect"); !strings.Contains(b, `"NetworkID":"`+mynetID+`"`) ||
 		!strings.Contains(b, `"Container":"`+agentID+`"`) {
 		t.Errorf("connect body = %s", b)
+	}
+}
+
+// TestGateForgetsGoneExecs: the daemon forgets an exec some minutes after
+// it ended (or with its container), and so does the gate, once it has seen
+// enough new ones: a task that runs docker exec in a loop does not grow it
+// without bound. The execs the daemon still knows stay the task's.
+func TestGateForgetsGoneExecs(t *testing.T) {
+	c := newGate(t)
+	create := func() string {
+		t.Helper()
+		status, out := c.do("POST", "/containers/mine/exec", `{"Cmd":["true"]}`)
+		var created struct{ Id string }
+		if status != http.StatusCreated || json.Unmarshal([]byte(out), &created) != nil {
+			t.Fatalf("exec create: %d %s", status, out)
+		}
+		return created.Id
+	}
+	gone, kept := create(), create()
+	c.d.mu.Lock()
+	c.d.execGone[gone] = true
+	c.d.mu.Unlock()
+	for range execsPruneMin {
+		create()
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if status, _ := c.do("GET", "/exec/"+gone+"/json", ""); status == http.StatusForbidden {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the gate still holds an exec the daemon has forgotten")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status, out := c.do("GET", "/exec/"+kept+"/json", ""); status != http.StatusOK {
+		t.Errorf("an exec the daemon still knows: %d %s", status, out)
+	}
+}
+
+// TestGateAttachEndsWithTheClient: an attach stream lasts as long as its
+// client. One that only stops sending (docker run without -i) still gets
+// what the container prints; one that hangs up ends the stream, even of a
+// container that prints nothing, instead of holding the gate's handler and
+// the daemon's attach until the container writes or exits.
+func TestGateAttachEndsWithTheClient(t *testing.T) {
+	d, upstream := newDaemon(t)
+	g := &Gate{ID: testID, Root: t.TempDir(), Upstream: upstream}
+	ended := make(chan struct{}, 2)
+	sock := filepath.Join(t.TempDir(), "gate.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.ServeHTTP(w, r)
+		ended <- struct{}{}
+	})}
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+	attach := func() (client *net.UnixConn, in *bufio.Reader, container net.Conn) {
+		t.Helper()
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		io.WriteString(conn, "POST /v1.45/containers/mine/attach?stream=1&stdout=1 HTTP/1.1\r\nHost: d\r\n"+
+			"Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+		in = bufio.NewReader(conn)
+		resp, err := http.ReadResponse(in, nil)
+		if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("attach: %v %v", resp, err)
+		}
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return conn.(*net.UnixConn), in, d.attached[len(d.attached)-1]
+	}
+
+	client, in, container := attach()
+	client.CloseWrite()
+	time.Sleep(3 * hangupCheck)
+	io.WriteString(container, "late\n")
+	if line, err := in.ReadString('\n'); line != "late\n" {
+		t.Errorf("after the client stopped sending, it got %q, %v; want the container's output", line, err)
+	}
+	container.Close()
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream did not end with the container's")
+	}
+
+	client, _, _ = attach()
+	client.Close()
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream of a quiet container outlived its client")
 	}
 }
 
@@ -707,6 +885,211 @@ func TestGateReservesTaskContainerNames(t *testing.T) {
 	}
 }
 
+// TestGateNamespace: a new network or volume (created, or named in a mount
+// and made by the gate) must have a name in the task's namespace,
+// atl_abc123 for testID, compared exactly as dockerd does; an anonymous
+// volume needs none, and a volume the task has, of any name, stays its to
+// mount. A compose project label on a container, network or volume must be
+// in it too (or empty); the key is compose's exactly, as dockerd keeps
+// labels. Container names are free but for the pattern of any task's
+// namespace, which must be this task's, in any case and with any slash.
+func TestGateNamespace(t *testing.T) {
+	c := newGate(t)
+	ns := ComposeProject(testID)
+	if ns != "atl_abc123" {
+		t.Fatalf("namespace %q", ns)
+	}
+	c.d.mu.Lock()
+	c.d.objects = append(c.d.objects,
+		&object{"volumes", "shop_data", "shop_data", map[string]string{LabelTask: testID}},                 // made before the namespace
+		&object{"volumes", "atl_def456_data", "atl_def456_data", map[string]string{LabelTask: "t-def456"}}) // another task's
+	c.d.mu.Unlock()
+	reached := func(prefix string) int {
+		c.d.mu.Lock()
+		defer c.d.mu.Unlock()
+		n := 0
+		for _, r := range c.d.requests {
+			if strings.HasPrefix(r, prefix) {
+				n++
+			}
+		}
+		return n
+	}
+	in := []string{ns, ns + "_default", ns + "-api_default", ns + "_db-data"}
+	out := []string{"default", "shop_default", "data", "ATL_ABC123_default", "Atl_abc123", "atl_abc1234_x", "atl_abc123x",
+		"atl_def456_default", "atl-abc123_x", "/" + ns + "_x", " " + ns, "x" + ns}
+	for _, kind := range []string{"networks", "volumes"} {
+		for _, name := range in {
+			if status, body := c.do("POST", "/v1.45/"+kind+"/create", `{"Name":"`+name+`"}`); status != http.StatusCreated {
+				t.Errorf("%s create %q: status %d (%s)", kind, name, status, body)
+			}
+		}
+		before := reached("POST /v1.45/" + kind + "/create")
+		for _, name := range out {
+			status, body := c.do("POST", "/v1.45/"+kind+"/create", `{"Name":"`+name+`"}`)
+			if status != http.StatusForbidden || !strings.Contains(body, "start with atl_abc123_ or atl_abc123-") {
+				t.Errorf("%s create %q: status %d (%s), want a refusal that names the namespace", kind, name, status, body)
+			}
+		}
+		for _, body := range []string{`{}`, `{"Name":5}`, `{"name":"shop_data"}`, `{"Name":"` + ns + `","nAme":"shop_data"}`} {
+			status, _ := c.do("POST", "/v1.45/"+kind+"/create", body)
+			if anonymous := kind == "volumes" && body == `{}`; anonymous != (status == http.StatusCreated) {
+				t.Errorf("%s create %s: status %d", kind, body, status)
+			}
+		}
+		if n := reached("POST /v1.45/" + kind + "/create"); n != before+map[string]int{"networks": 0, "volumes": 1}[kind] {
+			t.Errorf("%d refused %s creates reached the daemon", n-before, kind)
+		}
+	}
+	if status, body := c.do("POST", "/networks/create", `{"Name":"default"}`); !strings.Contains(body, "name it atl_abc123_default, or use -p atl_abc123-") {
+		t.Errorf("refusal %d %s does not say what to do", status, body)
+	}
+	// A network may also be named a canonical lower-case UUID, as
+	// testcontainers names its networks; nothing else outside the
+	// namespace, and no volume. Its compose project label is checked all
+	// the same.
+	uuid := "0b1f6a2e-3c4d-4e5f-8a9b-0c1d2e3f4a5b"
+	if status, body := c.do("POST", "/networks/create", `{"Name":"`+uuid+`","Labels":{"org.testcontainers":"true"}}`); status != http.StatusCreated {
+		t.Errorf("network named %s: status %d (%s)", uuid, status, body)
+	}
+	if b := c.d.body("POST /networks/create"); !strings.Contains(b, `"Name":"`+uuid+`"`) || !strings.Contains(b, `"`+LabelTask+`":"`+testID+`"`) {
+		t.Errorf("network create reached the daemon as %s", b)
+	}
+	before := reached("POST /networks/create")
+	for _, name := range []string{strings.ToUpper(uuid), "{" + uuid + "}", uuid + "-x", uuid + "_default", "x" + uuid, " " + uuid,
+		"0b1f6a2e3c4d4e5f8a9b0c1d2e3f4a5b", "0b1f6a2e-3c4d-4e5f-8a9b-0c1d2e3f4a5", "0b1f6a2e-3c4d-4e5f-8a9b-0c1d2e3f4a5g"} {
+		if status, body := c.do("POST", "/networks/create", `{"Name":"`+name+`"}`); status != http.StatusForbidden {
+			t.Errorf("network named %q: status %d (%s), want a refusal", name, status, body)
+		}
+	}
+	if status, body := c.do("POST", "/networks/create", `{"Name":"`+uuid+`","Labels":{"com.docker.compose.project":"shop"}}`); status != http.StatusForbidden {
+		t.Errorf("UUID network with a host project label: status %d (%s), want a refusal", status, body)
+	}
+	if reached("POST /networks/create") != before {
+		t.Error("a refused network create reached the daemon")
+	}
+	if status, body := c.do("POST", "/volumes/create", `{"Name":"`+uuid+`"}`); status != http.StatusForbidden {
+		t.Errorf("volume named %s: status %d (%s), want a refusal", uuid, status, body)
+	}
+
+	// Volumes named in mounts: a new one only in the namespace; one the
+	// task has, by any name.
+	for _, hc := range []string{
+		`{"Binds":["` + ns + `_cache:/c"]}`,
+		`{"Mounts":[{"Type":"volume","Source":"` + ns + `_m","Target":"/m"}]}`,
+		`{"Binds":["shop_data:/d","myvol:/e"]}`,
+		`{"Mounts":[{"Type":"volume","Source":"shop_data","Target":"/d"},{"Type":"volume","Target":"/anon"}]}`,
+	} {
+		if status, body := c.do("POST", "/containers/create", `{"Image":"x","HostConfig":`+hc+`}`); status != http.StatusCreated {
+			t.Errorf("create with %s: status %d (%s)", hc, status, body)
+		}
+	}
+	if status, body := c.do("GET", "/volumes/shop_data", ""); status != http.StatusOK {
+		t.Errorf("inspect the task's volume of an old name: %d %s", status, body)
+	}
+	before, made := reached("POST /containers/create"), reached("POST /volumes/create")
+	for _, hc := range []string{
+		`{"Binds":["data:/d"]}`,
+		`{"Binds":["ATL_ABC123_data:/d"]}`,
+		`{"Binds":["atl_def456_x:/d"]}`,
+		`{"Binds":["atl_def456_data:/d"]}`, // there, another task's
+		`{"Mounts":[{"Type":"volume","Source":"data","Target":"/d"}]}`,
+		`{"Binds":["` + ns + `_ok:/a","data:/d"]}`,
+	} {
+		if status, body := c.do("POST", "/containers/create", `{"Image":"x","HostConfig":`+hc+`}`); status != http.StatusForbidden {
+			t.Errorf("create with %s: status %d (%s), want a refusal", hc, status, body)
+		}
+	}
+	if reached("POST /containers/create") != before {
+		t.Error("a refused container create reached the daemon")
+	}
+	if n := reached("POST /volumes/create") - made; n != 1 { // atl_abc123_ok only
+		t.Errorf("%d volumes made for refused creates, want 1", n)
+	}
+
+	// The compose project label.
+	label := func(v string) string { return `{"Labels":{"com.docker.compose.project":` + v + `}}` }
+	for _, uri := range []string{"/containers/create", "/volumes/create", "/networks/create"} {
+		named := func(body string) string {
+			if uri == "/networks/create" {
+				return strings.Replace(body, "{", `{"Name":"`+ns+`_n",`, 1)
+			}
+			return body
+		}
+		for _, v := range []string{`"` + ns + `"`, `"` + ns + `-api"`, `"` + ns + `_x"`, `""`} {
+			if status, body := c.do("POST", uri, named(label(v))); status != http.StatusCreated {
+				t.Errorf("%s with project %s: status %d (%s)", uri, v, status, body)
+			}
+		}
+		for _, body := range []string{
+			label(`"shop"`), label(`"atl_def456"`), label(`"ATL_ABC123"`), label(`"atl_abc1234"`), label(`5`), label(`null`),
+			// A key given twice: the gate forwards the one it checked,
+			// as dockerd would read it (the last).
+			`{"Labels":{"com.docker.compose.project":"` + ns + `","com.docker.compose.project":"shop"}}`,
+			// Labels in another spelling of the field.
+			`{"labels":{"com.docker.compose.project":"shop"}}`,
+			`{"Labels":{},"LABELS":{"com.docker.compose.project":"shop"}}`,
+		} {
+			if status, out := c.do("POST", uri, named(body)); status != http.StatusForbidden || !strings.Contains(out, "atelier gate:") {
+				t.Errorf("%s %s: status %d (%s), want a refusal", uri, body, status, out)
+			}
+		}
+		body := `{"Labels":{"com.docker.compose.project":"shop","com.docker.compose.project":"` + ns + `"}}`
+		if status, out := c.do("POST", uri, named(body)); status != http.StatusCreated {
+			t.Errorf("%s %s: status %d (%s)", uri, body, status, out)
+		}
+		if b := c.d.body("POST " + uri); strings.Contains(b, "shop") || !strings.Contains(b, `"com.docker.compose.project":"`+ns+`"`) {
+			t.Errorf("%s reached the daemon as %s", uri, b)
+		}
+		// Other spellings of the key are other labels: compose reads none.
+		body = `{"Labels":{"COM.DOCKER.COMPOSE.PROJECT":"shop","com.docker.compose.project.working_dir":"/x"}}`
+		if status, out := c.do("POST", uri, named(body)); status != http.StatusCreated {
+			t.Errorf("%s %s: status %d (%s)", uri, body, status, out)
+		}
+	}
+	// A container takes the labels of its image that its own do not set:
+	// the gate sets compose's, empty (no project), unless the task did.
+	if b := c.d.body("POST /containers/create"); !strings.Contains(b, `"com.docker.compose.project":""`) || !strings.Contains(b, `"COM.DOCKER.COMPOSE.PROJECT":"shop"`) {
+		t.Errorf("create reached the daemon as %s", b)
+	}
+	if status, _ := c.do("POST", "/containers/create", label(`"`+ns+`-api"`)); status != http.StatusCreated ||
+		!strings.Contains(c.d.body("POST /containers/create"), `"com.docker.compose.project":"`+ns+`-api"`) {
+		t.Errorf("the task's own project label was not kept: %s", c.d.body("POST /containers/create"))
+	}
+	if b := c.d.body("POST /volumes/create"); strings.Contains(b, `"com.docker.compose.project":""`) {
+		t.Errorf("a volume got an empty project label: %s", b)
+	}
+
+	// Container names: free, but for the pattern of a namespace, which
+	// must be this task's.
+	for _, name := range []string{"atl_def456-db-1", "/atl_def456-db-1", "//atl_def456-db-1", "ATL_DEF456-db-1", "atl_def456",
+		"atl_def456_x", "Atl_Abc123-db-1", "ATL_ABC123", "//" + ns + "-db-1"} {
+		q := "?name=" + url.QueryEscape(name)
+		if status, out := c.do("POST", "/v1.45/containers/create"+q, `{"Image":"x"}`); status != http.StatusForbidden {
+			t.Errorf("create named %q: status %d (%s), want a refusal", name, status, out)
+		}
+		if status, out := c.do("POST", "/v1.45/containers/mine/rename"+q, ""); status != http.StatusForbidden {
+			t.Errorf("rename to %q: status %d (%s), want a refusal", name, status, out)
+		}
+	}
+	if status, out := c.do("POST", "/v1.45/containers/mine/rename?name=db&name=atl_def456-db-1", ""); status != http.StatusForbidden {
+		t.Errorf("rename with a second name: status %d (%s)", status, out)
+	}
+	if reached("POST /v1.45/containers/create") != 0 || reached("POST /v1.45/containers/"+mineID+"/rename") != 0 {
+		t.Error("a refused create or rename reached the daemon")
+	}
+	for _, name := range []string{ns + "-db-1", "/" + ns + "-db-1", ns, ns + "_x", "db", "shop-db-1", "testcontainers-ryuk-0b1f",
+		"atl_abc1234-x", "atl_xyz123-db", "my-atl_def456-x"} {
+		q := "?name=" + url.QueryEscape(name)
+		if status, out := c.do("POST", "/v1.45/containers/create"+q, `{"Image":"x"}`); status != http.StatusCreated {
+			t.Errorf("create named %q: status %d (%s)", name, status, out)
+		}
+		if status, out := c.do("POST", "/v1.45/containers/"+mineID+"/rename"+q, ""); status >= 400 {
+			t.Errorf("rename to %q: status %d (%s)", name, status, out)
+		}
+	}
+}
+
 // TestGateOwnContainerByLabelsOnly: a container is the task's own one only
 // if it has atelier.agent=<id> and no atelier.task label. A task cannot set
 // atelier.agent on a container through its gate, but a container takes the
@@ -773,6 +1156,37 @@ func TestGateListsOnlyTheTask(t *testing.T) {
 	}
 }
 
+// TestGateNullJSON: JSON null where the gate expects an object (filters,
+// build labels, a request body) is read as an empty one, as dockerd reads
+// it, and still gets the task's label.
+func TestGateNullJSON(t *testing.T) {
+	c := newGate(t)
+	own := LabelTask + "=" + testID
+	for _, tc := range []struct{ method, uri, body, saw, want string }{
+		{"GET", "/containers/json?filters=null", "", "GET /containers/json", `"label":{"` + own + `":true}`},
+		{"POST", "/build?labels=null", "", "POST /build", `"` + LabelTask + `":"` + testID + `"`},
+	} {
+		if status, out := c.do(tc.method, tc.uri, tc.body); status >= 400 {
+			t.Errorf("%s %s: status %d (%s), want it forwarded", tc.method, tc.uri, status, out)
+		}
+		if got := c.d.saw(tc.saw); !strings.Contains(got, tc.want) {
+			t.Errorf("%s %s reached the daemon as %q, want %s", tc.method, tc.uri, got, tc.want)
+		}
+	}
+	for _, uri := range []string{"/containers/create", "/volumes/create"} {
+		if status, out := c.do("POST", uri, "null"); status != http.StatusCreated {
+			t.Errorf("POST %s null: status %d (%s), want it forwarded", uri, status, out)
+		}
+		if b := c.d.body("POST " + uri); !strings.Contains(b, `"`+LabelTask+`":"`+testID+`"`) {
+			t.Errorf("POST %s null reached the daemon as %s, want the task's label", uri, b)
+		}
+	}
+	// A network needs a name, in the task's namespace.
+	if status, out := c.do("POST", "/networks/create", "null"); status != http.StatusForbidden || !strings.Contains(out, "atl_abc123") {
+		t.Errorf("POST /networks/create null: status %d (%s), want a refusal that names the namespace", status, out)
+	}
+}
+
 func TestGateRefusesEverythingElse(t *testing.T) {
 	c := newGate(t)
 	for _, tc := range []struct{ method, uri, body string }{
@@ -787,16 +1201,28 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"POST", "/session", ""},
 		{"POST", "/build?version=2", ""},
 		{"POST", "/build?networkmode=host", ""},
+		{"POST", "/build?cgroupparent=" + url.QueryEscape("/system.slice"), ""},
 		{"POST", "/build?remote=" + url.QueryEscape("git@github.com:org/private.git"), ""},
 		{"POST", "/build?remote=" + url.QueryEscape("https://example.com/context.tar"), ""},
 		{"POST", "/containers/mine/update", "{}"},
 		{"GET", "/containers/mine/export", ""},
 		{"GET", "/containers/mine%2Fx/json", ""},
-		{"POST", "/volumes/create", `{"Name":"evil","DriverOpts":{"type":"none","o":"bind","device":"/"}}`},
-		{"POST", "/volumes/create", `{"Name":"evil","Driver":"nfs"}`},
-		{"POST", "/networks/create", `{"Name":"n","Driver":"host"}`},
-		{"POST", "/networks/create", `{"Name":"n","Options":{"com.docker.network.bridge.name":"docker0"}}`},
-		{"POST", "/networks/create", `{"Name":"n","ConfigFrom":{"Network":"hostnet"}}`},
+		{"POST", "/volumes/create", `{"Name":"atl_abc123_evil","DriverOpts":{"type":"none","o":"bind","device":"/"}}`},
+		{"POST", "/volumes/create", `{"Name":"atl_abc123_evil","Driver":"nfs"}`},
+		{"POST", "/networks/create", `{"Name":"atl_abc123_n","Driver":"host"}`},
+		{"POST", "/networks/create", `{"Name":"atl_abc123_n","Options":{"com.docker.network.bridge.name":"docker0"}}`},
+		{"POST", "/networks/create", `{"Name":"atl_abc123_n","ConfigFrom":{"Network":"hostnet"}}`},
+		{"POST", "/networks/create", `{"Name":"atl_abc123_n","Options":{"com.docker.network.bridge.name":""}}`},
+		{"POST", "/volumes/create", `{"Name":"atl_abc123_evil","DriverOpts":{"type":""}}`},
+		{"POST", "/volumes/create", `{"Name":"atl_abc123_evil","Driver":["nfs"]}`},
+		{"POST", "/networks/create", `{"Name":"atl_abc123_n","Driver":["host"]}`},
+		{"POST", "/networks/create", `{"Name":"atl_abc123_n","Scope":["swarm"]}`},
+		// API versions before 1.24 (Docker 24 and older) apply a
+		// HostConfig sent with a start.
+		{"POST", "/v1.23/containers/mine/start", `{"Privileged":true,"Binds":["/:/host"]}`},
+		// Docker 17.09 and older (experimental) restore a checkpoint from
+		// any host directory.
+		{"POST", "/containers/mine/start?checkpoint=c1&checkpoint-dir=" + url.QueryEscape(c.root+"/cp"), ""},
 	} {
 		before := len(c.d.requests)
 		if status, out := c.do(tc.method, tc.uri, tc.body); status != http.StatusForbidden {
@@ -815,8 +1241,21 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 		{"GET", "/images/localstack/localstack:4/json", ""},
 		{"POST", "/images/create?fromImage=postgres&tag=17", ""},
 		{"POST", "/build?networkmode=default", ""},
-		{"POST", "/volumes/create", `{"Name":"data"}`},
-		{"POST", "/networks/create", `{"Name":"n","Driver":"bridge","IPAM":{"Config":[{"Subnet":"10.1.0.0/24"}]}}`},
+		{"POST", "/volumes/create", `{"Name":"atl_abc123_data"}`},
+		{"POST", "/volumes/create", `{"Name":"atl_abc123_data","DriverOpts":{}}`},
+		{"POST", "/networks/create", `{"Name":"atl_abc123_n","Options":{},"ConfigFrom":null,"Driver":null,"Scope":null}`},
+		{"POST", "/volumes/create", `{"Name":"atl_abc123_data","Driver":null}`},
+		{"POST", "/containers/create", `{"Image":"x","HostConfig":null,"NetworkingConfig":null}`},
+		{"POST", "/containers/create", `{"Image":"x","HostConfig":{"Binds":null,"Mounts":[{"Type":"tmpfs","Target":"/t","Source":null,"BindOptions":null,"VolumeOptions":null}],` +
+			`"VolumesFrom":null,"LogConfig":{"Type":null,"Config":null},"IpcMode":null,"CgroupnsMode":null,"NetworkMode":null}}`},
+		{"POST", "/containers/mine/start", ""},
+		{"POST", "/containers/mine/start", "{}"},
+		{"POST", "/containers/create", `{"Hostname":"h","Domainname":"d","User":"1000","AttachStdin":false,"AttachStdout":true,` +
+			`"AttachStderr":true,"ExposedPorts":{"5432/tcp":{}},"Tty":true,"OpenStdin":true,"StdinOnce":false,"Env":["A=1"],` +
+			`"Cmd":["x"],"Healthcheck":{"Test":["NONE"]},"ArgsEscaped":false,"Image":"postgres","Volumes":{"/d":{}},` +
+			`"WorkingDir":"/","Entrypoint":["sh"],"NetworkDisabled":false,"MacAddress":"","OnBuild":null,"Labels":{},` +
+			`"StopSignal":"SIGINT","StopTimeout":5,"Shell":["sh"],"HostConfig":{"Sysctls":{},"Annotations":null},"NetworkingConfig":{}}`},
+		{"POST", "/networks/create", `{"Name":"atl_abc123_n","Driver":"bridge","IPAM":{"Config":[{"Subnet":"10.1.0.0/24"}]}}`},
 	} {
 		if status, out := c.do(tc.method, tc.uri, tc.body); status >= 400 {
 			t.Errorf("%s %s: status %d (%s), want it forwarded", tc.method, tc.uri, status, out)
@@ -831,13 +1270,60 @@ func TestGateRefusesEverythingElse(t *testing.T) {
 	}
 }
 
+// TestGateKeysInAnyCase: dockerd decodes a request body with encoding/json,
+// which takes a key for a field in any case, Unicode folding included
+// ("hoſtconfig" is HostConfig), and lets a later spelling add to or
+// override what an earlier one set. A key the gate reads, in another
+// spelling, would reach the daemon unchecked: it is refused. Keys of
+// maps (labels, tmpfs paths) are not field names and stay as they are.
+func TestGateKeysInAnyCase(t *testing.T) {
+	c := newGate(t)
+	for _, tc := range []struct{ uri, body string }{
+		{"/containers/create", `{"Image":"x","hostconfig":{"Privileged":true}}`},
+		{"/containers/create", `{"Image":"x","HostConfig":{},"hoſtconfig":{"Binds":["/:/host"]}}`},
+		{"/containers/create", `{"HostConfig":{"maskedpaths":[]}}`},
+		{"/containers/create", `{"HostConfig":{"LogConfig":{"type":"syslog"}}}`},
+		{"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"volume","type":"bind","source":"/","Target":"/h"}]}}`},
+		{"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"bind","Source":"` + c.root + `","Target":"/h","BindOptions":{"propagation":"shared"}}]}}`},
+		{"/containers/create", `{"HostConfig":{"Mounts":[{"Type":"volume","Source":"myvol","Target":"/h","VolumeOptions":{"driverconfig":{"Name":"x"}}}]}}`},
+		{"/containers/create", `{"Labels":{},"labels":null}`},
+		{"/containers/create", `{"networkingconfig":{"EndpointsConfig":{"hostnet":{}}}}`},
+		{"/containers/create", `{"NetworkingConfig":{"endpointsconfig":{"hostnet":{}}}}`},
+		{"/containers/create", `{"NetworkingConfig":{"EndpointsConfig":{"mynet":{"networkid":"` + hostnetID + `"}}}}`},
+		{"/containers/mine/exec", `{"Cmd":["id"],"privileged":true}`},
+		{"/volumes/create", `{"Name":"atl_abc123_evil","driveropts":{"type":"none","o":"bind","device":"/"}}`},
+		{"/networks/create", `{"Name":"atl_abc123_n","labels":null}`},
+		{"/networks/mynet/connect", `{"Container":"mine","container":"other"}`},
+		{"/networks/mynet/connect", `{"Container":"mine","endpointconfig":{"NetworkID":"` + hostnetID + `"}}`},
+		{"/networks/mynet/connect", `{"Container":"mine","EndpointConfig":{"networkid":"` + hostnetID + `"}}`},
+	} {
+		c.d.mu.Lock()
+		before := len(c.d.requests)
+		c.d.mu.Unlock()
+		if status, out := c.do("POST", tc.uri, tc.body); status != http.StatusForbidden || !strings.Contains(out, "atelier gate:") {
+			t.Errorf("POST %s %s: status %d (%s), want a refusal", tc.uri, tc.body, status, out)
+		}
+		c.d.mu.Lock()
+		for _, r := range c.d.requests[before:] {
+			if !strings.HasPrefix(r, "GET ") {
+				t.Errorf("POST %s %s: %s reached the daemon", tc.uri, tc.body, r)
+			}
+		}
+		c.d.mu.Unlock()
+	}
+	body := `{"Labels":{"labels":"1","Type":"x"},"HostConfig":{"Tmpfs":{"/hostconfig":""}},"Volumes":{"/source":{}}}`
+	if status, out := c.do("POST", "/containers/create", body); status != http.StatusCreated {
+		t.Errorf("create with such map keys: status %d (%s), want it forwarded", status, out)
+	}
+}
+
 // TestGateImageNames: a build or a pull may not create or move a tag that
 // atl runs its own containers from (the default task image, the box image,
 // the workspace's and the projects' images, in any spelling dockerd reads
-// as the same); a build may not name a tag that points to an image no task
-// built (the user's, a pulled one), but may build over one a task built,
-// while a pull may re-pull any (it brings only what the registry has under
-// that name); a pull by digest moves no tag; a build may not pull (--pull,
+// as the same); a build may only name tags in the task's namespace (see
+// TestGateBuildTagNamespace), while a pull may re-pull any (it brings only
+// what the registry has under that name); a pull by digest moves no tag; a
+// build may not pull (--pull,
 // --platform: the builder would store FROM images under their names); and
 // every image a task builds carries its label. The other endpoints that
 // name images (tag, import, load, commit) stay refused.
@@ -852,7 +1338,7 @@ func TestGateImageNames(t *testing.T) {
 		"/build?t=library/atelier-task",
 		"/build?t=atelier",
 		"/build?t=GHCR.IO/you/alpha-dev:2",
-		"/build?t=localstack/localstack:4", // pulled by someone
+		"/build?t=localstack/localstack:4", // pulled by someone, outside the namespace
 		"/build?t=Bad/Name",
 		"/build?pull=1",
 		"/build?t=new-tool&pull=true",
@@ -883,10 +1369,10 @@ func TestGateImageNames(t *testing.T) {
 		}
 	}
 	for _, uri := range []string{
-		"/build?t=new-tool",
-		"/build?t=my-tool:dev&t=new-tool:2",
-		"/build?t=other-tool", // another task built it
-		"/build?t=new-tool&pull=0&platform=",
+		"/build?t=atl_abc123-new-tool",
+		"/build?t=atl_abc123-my-tool:dev&t=atl_abc123/new-tool:2",
+		"/build?t=atl_abc123",
+		"/build?t=atl_abc123_tool&pull=0&platform=",
 		"/build",
 		"/images/create?fromImage=postgres&tag=17",
 		"/images/create?fromImage=atelier-task@sha256:" + strings.Repeat("a", 64),
@@ -901,21 +1387,20 @@ func TestGateImageNames(t *testing.T) {
 			t.Errorf("POST %s: status %d (%s), want it forwarded", uri, status, out)
 		}
 	}
-	if _, out := c.do("POST", "/build?t=localstack/localstack:4", ""); !strings.Contains(out, "build under another tag") ||
-		!strings.Contains(out, "docker rmi localstack/localstack:4") {
-		t.Errorf("refusal of a pulled image's tag: %s", out)
+	if _, out := c.do("POST", "/build?t=localstack/localstack:4", ""); !strings.Contains(out, "-t atl_abc123-") {
+		t.Errorf("refusal of a tag outside the namespace: %s", out)
 	}
 	if got := c.d.saw("POST /build?"); !strings.Contains(got, `"atelier.task":"`+testID+`"`) {
 		t.Errorf("build not labelled: %s", got)
 	}
-	if status, _ := c.do("POST", "/build?t=x&labels="+url.QueryEscape(`{"atelier.agent":"`+testID+`","a":"b"}`), ""); status >= 400 {
+	if status, _ := c.do("POST", "/build?t=atl_abc123-x&labels="+url.QueryEscape(`{"atelier.agent":"`+testID+`","a":"b"}`), ""); status >= 400 {
 		t.Errorf("build with labels: %d", status)
 	} else if got := c.d.saw("POST /build?"); strings.Contains(got, "atelier.agent") || !strings.Contains(got, `"a":"b"`) {
 		t.Errorf("build labels: %s", got)
 	}
 	// What atl uses cannot be read: refused.
 	c.g.Reserved = func() ([]string, error) { return nil, errors.New("projects unreadable") }
-	if status, out := c.do("POST", "/build?t=new-tool", ""); status != http.StatusForbidden {
+	if status, out := c.do("POST", "/build?t=atl_abc123-new-tool", ""); status != http.StatusForbidden {
 		t.Errorf("unreadable reserved names: %d %s", status, out)
 	}
 }
@@ -1101,5 +1586,131 @@ func TestServeOneGatePerRunDir(t *testing.T) {
 		if _, err := os.Stat(sock); !os.IsNotExist(err) {
 			t.Errorf("socket %s left behind: %v", sock, err)
 		}
+	}
+}
+
+// TestGatePatternsCompile: the gate's route patterns and refTag compile
+// on first use (sync.OnceValue), not at start; a bad one would panic on a
+// task's first request instead. All are compiled here.
+func TestGatePatternsCompile(t *testing.T) {
+	compile := func(name string, re func() *regexp.Regexp) {
+		t.Helper()
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("%s: %v", name, r)
+			}
+		}()
+		re()
+	}
+	for i, rt := range gateRoutes {
+		compile(fmt.Sprintf("gateRoutes[%d] (%s)", i, rt.methods), rt.re)
+	}
+	compile("refTag", refTag)
+}
+
+// TestGateNetworkAddresses: a network's bridge is an interface of the host,
+// and its subnet a route there. A subnet of public addresses (a resolver's,
+// half the internet's) or one that overlaps a route the host has (its LAN,
+// a VPN: a more specific one wins) would send the host's own traffic, and
+// every container's, into a container of the task. A network's subnets
+// must be private and new to the host.
+func TestGateNetworkAddresses(t *testing.T) {
+	c := newGateWith(t, func(g *Gate) {
+		g.HostRoutes = func() ([]netip.Prefix, error) {
+			return []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("192.168.1.0/24"),
+				netip.MustParsePrefix("::/0"), netip.MustParsePrefix("fd7a:115c:a1e0::/48")}, nil
+		}
+	})
+	network := func(ipam string) string { return `{"Name":"atl_abc123_n","Driver":"bridge","IPAM":` + ipam + `}` }
+	for _, ipam := range []string{
+		`{"Config":[{"Subnet":"8.8.8.0/24"}]}`,
+		`{"Config":[{"Subnet":"0.0.0.0/1"}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24"},{"Subnet":"1.1.1.0/24"}]}`,
+		`{"Config":[{"Subnet":"192.168.1.0/25"}]}`, // the host's LAN, its gateway
+		`{"Config":[{"Subnet":"192.168.0.0/16"}]}`,
+		`{"Config":[{"Subnet":"2000::/3"}]}`,
+		`{"Config":[{"Subnet":"::ffff:8.8.8.0/120"}]}`,
+		`{"Config":[{"Subnet":"fd7a:115c:a1e0:ab12::/64"}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","Gateway":"8.8.8.8"}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","IPRange":"8.8.8.0/24"}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","AuxiliaryAddresses":{"dns":"8.8.8.8"}}]}`,
+		`{"Config":[{"Gateway":"8.8.8.8"}]}`,
+		`{"Config":[{"Subnet":"not a subnet"}]}`,
+		`{"Config":[{"Subnet":["8.8.8.0/24"]}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","subnet":"8.8.8.0/24"}]}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","Other":"x"}]}`,
+		`{"Config":{"Subnet":"8.8.8.0/24"}}`,
+		`{"Driver":"remote-ipam","Config":[]}`,
+		`{"Options":{"x":"y"}}`,
+		`{"config":[{"Subnet":"8.8.8.0/24"}]}`,
+		`"8.8.8.0/24"`,
+	} {
+		if status, out := c.do("POST", "/networks/create", network(ipam)); status != http.StatusForbidden {
+			t.Errorf("IPAM %s: status %d (%s), want 403", ipam, status, out)
+		}
+	}
+	for _, ipam := range []string{
+		`null`,
+		`{}`,
+		`{"Driver":"default","Config":[],"Options":{}}`,
+		`{"Config":[{"Subnet":"10.1.0.0/24","IPRange":"10.1.0.128/25","Gateway":"10.1.0.1","AuxiliaryAddresses":{"a":"10.1.0.2"}}]}`,
+		`{"Config":[{"Subnet":"172.28.0.0/16"},{"Subnet":"fd12:3456:789a::/64","Gateway":"fd12:3456:789a::1"}]}`,
+		`{"Config":[{"Subnet":"192.168.2.0/24"}]}`,
+	} {
+		if status, out := c.do("POST", "/networks/create", network(ipam)); status >= 400 {
+			t.Errorf("IPAM %s: status %d (%s), want it forwarded", ipam, status, out)
+		}
+	}
+	// A VPN that sends everything through it with two /1 routes (OpenVPN's
+	// def1) has, in effect, default routes: they take nothing more than
+	// the default route does.
+	c = newGateWith(t, func(g *Gate) {
+		g.HostRoutes = func() ([]netip.Prefix, error) {
+			return []netip.Prefix{netip.MustParsePrefix("0.0.0.0/1"), netip.MustParsePrefix("128.0.0.0/1"),
+				netip.MustParsePrefix("::/1"), netip.MustParsePrefix("8000::/1"), netip.MustParsePrefix("10.8.0.0/24")}, nil
+		}
+	})
+	for _, ipam := range []string{`{"Config":[{"Subnet":"10.1.0.0/24"}]}`, `{"Config":[{"Subnet":"fd12:3456:789a::/64"}]}`} {
+		if status, out := c.do("POST", "/networks/create", network(ipam)); status >= 400 {
+			t.Errorf("IPAM %s with a def1 VPN: status %d (%s), want it forwarded", ipam, status, out)
+		}
+	}
+	if status, _ := c.do("POST", "/networks/create", network(`{"Config":[{"Subnet":"10.8.0.0/25"}]}`)); status != http.StatusForbidden {
+		t.Errorf("the VPN's own subnet: status %d, want 403", status)
+	}
+	// Without the host's routes, no subnet is taken.
+	c = newGateWith(t, func(g *Gate) {
+		g.HostRoutes = func() ([]netip.Prefix, error) { return nil, errors.New("no /proc") }
+	})
+	if status, _ := c.do("POST", "/networks/create", network(`{"Config":[{"Subnet":"10.1.0.0/24"}]}`)); status != http.StatusForbidden {
+		t.Errorf("subnet without the host's routes: status %d, want 403", status)
+	}
+	if status, out := c.do("POST", "/networks/create", network(`{}`)); status >= 400 {
+		t.Errorf("no subnet without the host's routes: status %d (%s)", status, out)
+	}
+}
+
+func TestParseRoutes(t *testing.T) {
+	// The kernel prints each address as a number in the host's byte order.
+	hex := func(a string) string {
+		b := netip.MustParseAddr(a).As4()
+		return fmt.Sprintf("%08X", binary.NativeEndian.Uint32(b[:]))
+	}
+	v4 := "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" +
+		"eth0\t00000000\t" + hex("192.168.1.1") + "\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" +
+		"eth0\t" + hex("192.168.1.0") + "\t00000000\t0001\t0\t0\t100\t" + hex("255.255.255.0") + "\t0\t0\t0\n" +
+		"docker0\t" + hex("172.17.0.0") + "\t00000000\t0001\t0\t0\t0\t" + hex("255.255.0.0") + "\t0\t0\t0\n"
+	v6 := "fd7a115ca1e000000000000000000000 30 00000000000000000000000000000000 00 00000000000000000000000000000000 00000400 00000001 00000000 00000001 tailscale0\n" +
+		"00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003 eth0\n"
+	got, err := parseRoutes(v4, v6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"0.0.0.0/0", "192.168.1.0/24", "172.17.0.0/16", "fd7a:115c:a1e0::/48", "::/0"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("routes = %v, want %v", got, want)
+	}
+	if _, err := parseRoutes("Iface\tDestination\nbad", ""); err == nil {
+		t.Error("an unreadable route table parsed")
 	}
 }

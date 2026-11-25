@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,6 +22,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Labels the gate puts on Docker objects. Their value is the sandbox ID.
@@ -61,11 +66,23 @@ type Gate struct {
 	// every project's. A task may not create or move these tags (see
 	// checkTag); an error refuses every request that would.
 	Reserved func() ([]string, error)
+	// Registries returns the registries a task may pull from (docker
+	// pull, a build's FROM and COPY --from), besides DefaultRegistries
+	// (see checkRegistry); an error refuses every pull.
+	Registries func() ([]string, error)
+	// HostRoutes returns the routes of the host the daemon runs on, which a
+	// network's subnet may not overlap (see checkIPAM); nil: hostRoutes,
+	// read where the gate runs.
+	HostRoutes func() ([]netip.Prefix, error)
 
 	once   sync.Once
 	client *http.Client
 	proxy  *httputil.ReverseProxy
-	execs  sync.Map // exec IDs created through this gate
+
+	execMu  sync.Mutex
+	execs   map[string]bool // exec IDs created through this gate (see addExec)
+	execsAt int             // size of execs at which addExec prunes it next
+	pruning bool            // a pruneExecs runs
 
 	// volumes orders the task's requests that name volumes. A volume is
 	// the one object the gate forwards by name (its name is its ID), and
@@ -87,12 +104,12 @@ type gateHandler func(g *Gate, w http.ResponseWriter, r *http.Request, m []strin
 
 type gateRoute struct {
 	methods string
-	re      *regexp.Regexp
+	re      func() *regexp.Regexp // compiled on first use: not in every atl process (hooks)
 	h       gateHandler
 }
 
 func route(methods, pattern string, h gateHandler) gateRoute {
-	return gateRoute{methods, regexp.MustCompile("^" + pattern + "$"), h}
+	return gateRoute{methods, sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile("^" + pattern + "$") }), h}
 }
 
 // gateRoutes is everything a task may call, matched without the /v1.xx prefix.
@@ -112,12 +129,12 @@ var gateRoutes = []gateRoute{
 	route("GET", `/exec/([^/]+)/json`, gateExec),
 
 	// Images are shared between tasks: reading is fine, removing is not; a
-	// pull or a build may only name a tag that is neither atl's nor
-	// another's (checkTag). Tagging, importing, loading and committing are
+	// pull may not name a tag of atl's (checkTag), a build only one in the
+	// task's namespace (checkBuildTag). Tagging, importing, loading and committing are
 	// not in this table: refused.
 	route("GET", `/images/json`, gatePass),
 	route("GET", `/images/(.+)/(json|history)`, gatePass),
-	route("GET", `/distribution/(.+)/json`, gatePass),
+	route("GET", `/distribution/(.+)/json`, gateDistribution),
 	route("POST", `/images/create`, gateImagePull),
 	route("POST", `/build`, gateBuild),
 
@@ -182,7 +199,7 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if method != r.Method {
 				continue
 			}
-			if m := rt.re.FindStringSubmatch(path); m != nil {
+			if m := rt.re().FindStringSubmatch(path); m != nil {
 				rt.h(g, w, r, m)
 				return
 			}
@@ -208,12 +225,82 @@ func formBody(r *http.Request) bool {
 // checkName refuses a container name in the query (all of them, should it
 // be given twice) that is in the pattern of atl's own task containers
 // (ReservedName): another task's session would run in a container the task
-// made, and get its Claude token there.
-func checkName(r *http.Request) error {
+// made, and get its Claude token there. A name in the pattern of a task's
+// namespace (Namespaced) must be in this task's: compose names a project's
+// containers <project>-<service>-<n>, and another task's compose would
+// find its names taken. Other names are free.
+func (g *Gate) checkName(r *http.Request) error {
 	for _, name := range r.URL.Query()["name"] {
 		if ReservedName(name) {
 			return fmt.Errorf("container names like %s are reserved for atl's task containers", name)
 		}
+		// dockerd strips one leading slash (and refuses a second).
+		if ns := g.namespace(); Namespaced(name) && !InNamespace(ns, strings.TrimPrefix(name, "/")) {
+			return fmt.Errorf("container name %s is in another task's compose namespace: a name that starts with atl_<6 hex digits> "+
+				"must start with %s (this task's compose project; COMPOSE_PROJECT_NAME is set)", name, ns)
+		}
+	}
+	return nil
+}
+
+// namespace is the task's Docker name namespace (see ComposeProject).
+func (g *Gate) namespace() string { return ComposeProject(g.ID) }
+
+// checkNewName refuses a name for a new network or volume (what) that is
+// not in the task's namespace (see InNamespace): tasks' names would collide,
+// and a compose project on the host would adopt a network or volume of the
+// name it looks for, made (and filled, or joined) by the task.
+func (g *Gate) checkNewName(what, name string) error {
+	ns := g.namespace()
+	if InNamespace(ns, name) {
+		return nil
+	}
+	instead := ns + "_<name>"
+	if name != "" {
+		instead = ns + "_" + name
+	}
+	return fmt.Errorf("%s name %q: new network and volume names must be %s or start with %s_ or %s- "+
+		"(this task's compose project; COMPOSE_PROJECT_NAME is set): name it %s, or use -p %s-<name> for another compose project",
+		what, name, ns, ns, ns, instead, ns)
+}
+
+// randomName matches a canonical lower-case UUID, which a network may also
+// be named, outside the namespace: testcontainers names its networks so
+// (Java's Network.newNetwork(), testcontainers-go's network.New, Node,
+// Python). No task can guess another's to take it first, and compose names
+// none so (<project>_<network>).
+var randomName = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+})
+
+// composeProject is the label by which compose finds the containers,
+// networks and volumes of a project.
+const composeProject = "com.docker.compose.project"
+
+// checkProjectLabel refuses labels (a create's Labels) whose compose
+// project is not in the task's namespace: a compose project on the host
+// would take the object for its own. The key is read exactly, as dockerd
+// stores labels and compose filters them (another spelling is another
+// label, which compose does not read; the gate forwards the map it read,
+// so a key given twice is the one it checked). An empty value is no
+// project.
+func (g *Gate) checkProjectLabel(labels any) error {
+	m, err := as[map[string]any]("Labels", labels)
+	if err != nil {
+		return err
+	}
+	v, ok := m[composeProject]
+	if !ok {
+		return nil
+	}
+	project, isString := v.(string)
+	if !isString {
+		return fmt.Errorf("label %s has the wrong type", composeProject)
+	}
+	if ns := g.namespace(); project != "" && !InNamespace(ns, project) {
+		return fmt.Errorf("label %s=%s: the compose project must be %s or start with %s_ or %s- "+
+			"(this task's; COMPOSE_PROJECT_NAME is set): use -p %s-<name> for another compose project",
+			composeProject, project, ns, ns, ns, ns)
 	}
 	return nil
 }
@@ -330,13 +417,61 @@ func (g *Gate) stream(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(conn, "HTTP/1.1 %s\r\n", resp.Status)
 	resp.Header.Write(conn)
 	io.WriteString(conn, "\r\n")
+	done := make(chan struct{})
+	defer close(done)
 	go func() { // client to daemon; when the client is done sending, say so and keep reading
 		io.Copy(back, client)
 		if c, ok := back.(*net.UnixConn); ok {
 			c.CloseWrite()
 		}
+		// ...until it hangs up: a quiet container would otherwise hold
+		// the stream until it next prints or exits.
+		if awaitHangup(conn, done) {
+			back.Close()
+		}
 	}()
 	io.Copy(conn, fromBack)
+}
+
+// hangupCheck is how often awaitHangup looks.
+const hangupCheck = 500 * time.Millisecond
+
+// awaitHangup waits until conn, a client that has stopped sending, hangs
+// up altogether, and reports whether it did; false once done is closed. A
+// unix socket tells that apart from a client that only shut its sending
+// side and still reads (docker run without -i): POLLHUP. Other conns are
+// not watched.
+func awaitHangup(conn net.Conn, done <-chan struct{}) bool {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return false
+	}
+	rc, err := uc.SyscallConn()
+	if err != nil {
+		return false
+	}
+	tick := time.NewTicker(hangupCheck)
+	defer tick.Stop()
+	for {
+		hup := false
+		err := rc.Control(func(fd uintptr) {
+			fds := []unix.PollFd{{Fd: int32(fd)}}
+			if n, _ := unix.Poll(fds, 0); n > 0 {
+				hup = fds[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0
+			}
+		})
+		switch {
+		case err != nil:
+			return false
+		case hup:
+			return true
+		}
+		select {
+		case <-done:
+			return false
+		case <-tick.C:
+		}
+	}
 }
 
 func decodeBody(r *http.Request) (map[string]any, error) {
@@ -346,7 +481,28 @@ func decodeBody(r *http.Request) (map[string]any, error) {
 	if err := dec.Decode(&body); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("unreadable request body: %v", err)
 	}
+	if body == nil { // "null"
+		body = map[string]any{}
+	}
 	return body, nil
+}
+
+// fieldKeys refuses an object of a request body that has a key dockerd
+// would take for one of fields, the names the gate reads it by, without
+// being spelled exactly so. dockerd decodes request bodies with
+// encoding/json, which matches a key to a field in any case, Unicode case
+// folding included ("hoſtconfig" is HostConfig), and lets a later spelling
+// add to or override what an earlier one set; the gate, reading a map,
+// sees only the exact name. Docker's clients send the exact names.
+func fieldKeys(obj map[string]any, fields ...string) error {
+	for k := range obj {
+		for _, f := range fields {
+			if k != f && strings.EqualFold(k, f) {
+				return fmt.Errorf("setting %q is not accepted: spell it %s", k, f)
+			}
+		}
+	}
+	return nil
 }
 
 var errNotFound = errors.New("not found")
@@ -457,6 +613,9 @@ func gateList(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 			g.deny(w, r, http.StatusBadRequest, "unreadable filters")
 			return
 		}
+		if filters == nil { // "null"
+			filters = map[string]any{}
+		}
 	}
 	own := LabelTask + "=" + g.ID
 	switch v := filters["label"].(type) {
@@ -492,8 +651,20 @@ func gateContainer(g *Gate, w http.ResponseWriter, r *http.Request, m []string) 
 		g.deny(w, r, http.StatusForbidden, "this is the task's own container: it cannot be stopped, removed or renamed from inside")
 		return
 	}
+	if action == "start" && (r.ContentLength > 7 || r.ContentLength == -1) {
+		// What dockerd reads as a HostConfig: Docker 24 and older apply
+		// it for API versions before 1.24; later ones refuse it.
+		g.deny(w, r, http.StatusForbidden, "a container start takes no settings; they go in the create")
+		return
+	}
+	if action == "start" && slices.ContainsFunc(r.URL.Query()["checkpoint-dir"], func(s string) bool { return s != "" }) {
+		// Docker 17.09 and older (experimental) restore the container
+		// from a checkpoint in this host directory; later ones refuse it.
+		g.deny(w, r, http.StatusForbidden, "a checkpoint directory is not allowed")
+		return
+	}
 	if action == "rename" {
-		if err := checkName(r); err != nil {
+		if err := g.checkName(r); err != nil {
 			g.deny(w, r, http.StatusForbidden, err.Error())
 			return
 		}
@@ -554,7 +725,7 @@ func gateVolume(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
 }
 
 func gateExec(g *Gate, w http.ResponseWriter, r *http.Request, m []string) {
-	if _, ok := g.execs.Load(m[1]); !ok {
+	if !g.ownExec(m[1]) {
 		g.deny(w, r, http.StatusForbidden, "this exec was not started by this task")
 		return
 	}
@@ -575,6 +746,10 @@ func gateExecCreate(g *Gate, w http.ResponseWriter, r *http.Request, m []string)
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := fieldKeys(body, "Privileged"); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	if !isZero(body["Privileged"]) {
 		g.deny(w, r, http.StatusForbidden, "privileged exec is not allowed")
 		return
@@ -588,9 +763,59 @@ func gateExecCreate(g *Gate, w http.ResponseWriter, r *http.Request, m []string)
 	if status, out := g.relay(w, r, body); status == http.StatusCreated {
 		var created struct{ Id string }
 		if json.Unmarshal(out, &created) == nil && created.Id != "" {
-			g.execs.Store(created.Id, true)
+			g.addExec(created.Id)
 		}
 	}
+}
+
+// execsPruneMin is the least number of exec IDs the gate holds before it
+// looks for the ones the daemon has forgotten.
+const execsPruneMin = 256
+
+// ownExec reports whether exec id was created through this gate.
+func (g *Gate) ownExec(id string) bool {
+	g.execMu.Lock()
+	defer g.execMu.Unlock()
+	return g.execs[id]
+}
+
+// addExec records an exec created through this gate. The daemon forgets an
+// exec some minutes after it ended, or with its container; so that a long
+// task's execs do not pile up here, each time execs has doubled since it
+// was last pruned (and holds execsPruneMin), pruneExecs drops in the
+// background those the daemon no longer knows.
+func (g *Gate) addExec(id string) {
+	g.execMu.Lock()
+	defer g.execMu.Unlock()
+	if g.execs == nil {
+		g.execs = map[string]bool{}
+	}
+	g.execs[id] = true
+	if g.pruning || len(g.execs) < max(g.execsAt, execsPruneMin) {
+		return
+	}
+	g.pruning = true
+	go g.pruneExecs(slices.Collect(maps.Keys(g.execs)))
+}
+
+// pruneExecs drops those of ids whose inspect the daemon answers with a
+// 404: an exec it has forgotten, or one whose container is gone. Neither
+// comes back (IDs are not reused), so the gate refuses only what the
+// daemon would refuse anyway.
+func (g *Gate) pruneExecs(ids []string) {
+	var gone []string
+	for _, id := range ids {
+		if status, _, err := g.call("GET", "/exec/"+url.PathEscape(id)+"/json", nil); err == nil && status == http.StatusNotFound {
+			gone = append(gone, id)
+		}
+	}
+	g.execMu.Lock()
+	defer g.execMu.Unlock()
+	for _, id := range gone {
+		delete(g.execs, id)
+	}
+	g.execsAt = 2 * len(g.execs)
+	g.pruning = false
 }
 
 func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
@@ -619,8 +844,52 @@ func gateBuild(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
 			g.deny(w, r, http.StatusForbidden, err.Error())
 			return
 		}
-		g.forward(w, r, nil)
+		g.forwardBuild(w, r)
 	}
+}
+
+// forwardBuild forwards a build once its context, which it reads into a
+// file of its own, passes checkBuildContext and its base images pass
+// pinBaseImages: the daemon gets those very bytes, or the context with the
+// Dockerfile naming its base images by ID.
+func (g *Gate) forwardBuild(w http.ResponseWriter, r *http.Request) {
+	spool, err := os.CreateTemp("", "atl-build-context-")
+	if err != nil {
+		g.deny(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	os.Remove(spool.Name()) // the open file is all that is needed
+	defer spool.Close()
+	df, err := checkBuildContext(r, spool)
+	if err == nil {
+		var pinned *os.File
+		if pinned, err = g.pinBaseImages(r, spool, df); pinned != nil {
+			defer pinned.Close()
+			spool = pinned
+		}
+	}
+	if err != nil {
+		status := http.StatusBadRequest
+		var refusal *buildRefusal
+		if errors.As(err, &refusal) {
+			status = http.StatusForbidden
+		}
+		g.deny(w, r, status, err.Error())
+		return
+	}
+	size, err := spool.Seek(0, io.SeekCurrent)
+	if err == nil {
+		_, err = spool.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		g.deny(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	r.Body = io.NopCloser(spool)
+	r.ContentLength = size
+	r.TransferEncoding = nil
+	r.Header.Set("Content-Length", strconv.FormatInt(size, 10))
+	g.forward(w, r, nil)
 }
 
 func (g *Gate) label(body map[string]any) {
@@ -639,9 +908,24 @@ func gateVolumeCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []strin
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := fieldKeys(body, "Name", "Driver", "DriverOpts", "ClusterVolumeSpec", "Labels"); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	// The local driver's options can bind any host path (type=none,o=bind,device=/).
-	if d, _ := body["Driver"].(string); !oneOf(d, "", "local") || !isZero(body["DriverOpts"]) || !isZero(body["ClusterVolumeSpec"]) {
+	if d, err := as[string]("Driver", body["Driver"]); err != nil || !oneOf(d, "", "local") || !isZero(body["DriverOpts"]) || !isZero(body["ClusterVolumeSpec"]) {
 		g.deny(w, r, http.StatusForbidden, "volume drivers and driver options are not allowed")
+		return
+	}
+	name, err := as[string]("Name", body["Name"])
+	if err == nil && name != "" { // no name: the daemon makes one up (an anonymous volume)
+		err = g.checkNewName("volume", name)
+	}
+	if err == nil {
+		err = g.checkProjectLabel(body["Labels"])
+	}
+	if err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
 		return
 	}
 	g.label(body)
@@ -659,16 +943,34 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := fieldKeys(body, slices.Collect(maps.Keys(networkKeys))...); err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	for k, v := range body {
 		if !networkKeys[k] && !isZero(v) {
 			g.deny(w, r, http.StatusForbidden, "network setting "+k+" is not allowed")
 			return
 		}
 	}
-	driver, _ := body["Driver"].(string)
-	scope, _ := body["Scope"].(string)
-	if !oneOf(driver, "", "bridge") || !oneOf(scope, "", "local") {
+	driver, derr := as[string]("Driver", body["Driver"])
+	scope, serr := as[string]("Scope", body["Scope"])
+	if derr != nil || serr != nil || !oneOf(driver, "", "bridge") || !oneOf(scope, "", "local") {
 		g.deny(w, r, http.StatusForbidden, "only local bridge networks are allowed")
+		return
+	}
+	name, err := as[string]("Name", body["Name"])
+	if err == nil && !randomName().MatchString(name) {
+		err = g.checkNewName("network", name)
+	}
+	if err == nil {
+		err = g.checkProjectLabel(body["Labels"])
+	}
+	if err == nil {
+		err = g.checkIPAM(body["IPAM"])
+	}
+	if err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
 		return
 	}
 	g.label(body)
@@ -687,9 +989,9 @@ func gateNetworkCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []stri
 // EndSession starts, detached in the task's own container (by the ID its
 // labels were checked on), EndSessionCmd for session: once the session's
 // Claude has exited, what it left running there is ended; while it runs,
-// nothing. The gate calls it when a SessionEnd hook of the task recorded
-// the session as ended. The exec runs as the container's user and is not
-// the task's (it is not in g.execs).
+// nothing. The gate calls it for each SessionEnd hook of the task for
+// the session (see hook.TaskServer.OnSessionEnd). The exec runs as the
+// container's user and is not the task's (it is not in g.execs).
 func (g *Gate) EndSession(session int64) error {
 	g.init()
 	agent := g.agentID()
@@ -746,6 +1048,14 @@ func gateNetworkConnect(g *Gate, w http.ResponseWriter, r *http.Request, m []str
 		g.deny(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	err = fieldKeys(body, "Container", "EndpointConfig")
+	if ep, ok := body["EndpointConfig"].(map[string]any); ok && err == nil {
+		err = fieldKeys(ep, "NetworkID")
+	}
+	if err != nil {
+		g.deny(w, r, http.StatusForbidden, err.Error())
+		return
+	}
 	nid, ok := g.checkOwned(w, r, "networks", m[1])
 	if !ok {
 		return
@@ -776,7 +1086,7 @@ func gateNetworkConnect(g *Gate, w http.ResponseWriter, r *http.Request, m []str
 // the daemon has created the container, no volume delete of the task's
 // runs (see Gate.volumes); the body is read before that.
 func gateContainerCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []string) {
-	if err := checkName(r); err != nil {
+	if err := g.checkName(r); err != nil {
 		g.deny(w, r, http.StatusForbidden, err.Error())
 		return
 	}
@@ -792,11 +1102,18 @@ func gateContainerCreate(g *Gate, w http.ResponseWriter, r *http.Request, _ []st
 		return
 	}
 	g.label(body)
+	// A container takes the labels of its image that its own do not set,
+	// and the task can build or pull an image with any compose project
+	// label; an empty one is no project. (The image a name stands for may
+	// change until the daemon reads it: so always.)
+	if labels := body["Labels"].(map[string]any); labels[composeProject] == nil {
+		labels[composeProject] = ""
+	}
 	g.forward(w, r, body)
 }
 
 // HostConfig settings that are harmless whatever their value. Every other
-// setting must be unset (zero) or pass its own check in checkCreate, so a
+// setting must be unset (zero) or pass its own check in checkHostConfig, so a
 // setting this list does not know is refused.
 var hostAllowed = map[string]bool{
 	"PortBindings": true, "PublishAllPorts": true, "RestartPolicy": true, "AutoRemove": true,
@@ -807,8 +1124,59 @@ var hostAllowed = map[string]bool{
 	"ExtraHosts": true, "Dns": true, "DnsOptions": true, "DnsSearch": true, "CapDrop": true,
 }
 
+// createFields are the top-level fields of a container create: the
+// container's Config (MacAddress: up to API 1.43), HostConfig and
+// NetworkingConfig. Any other is refused unless unset (see checkCreate).
+var createFields = []string{
+	"Hostname", "Domainname", "User", "AttachStdin", "AttachStdout", "AttachStderr", "ExposedPorts", "Tty",
+	"OpenStdin", "StdinOnce", "Env", "Cmd", "Healthcheck", "ArgsEscaped", "Image", "Volumes", "WorkingDir",
+	"Entrypoint", "NetworkDisabled", "MacAddress", "OnBuild", "Labels", "StopSignal", "StopTimeout", "Shell",
+	"HostConfig", "NetworkingConfig",
+}
+
+// hostChecked are the HostConfig settings checkHostConfig checks by value.
+var hostChecked = []string{"Binds", "Mounts", "NetworkMode", "VolumesFrom", "LogConfig", "IpcMode", "CgroupnsMode", "MaskedPaths", "ReadonlyPaths"}
+
+// checkCreate checks a container create's body, changing in it what the
+// gate forwards otherwise (see checkHostConfig and checkNetworking).
 func (g *Gate) checkCreate(body map[string]any) error {
-	hc, _ := body["HostConfig"].(map[string]any)
+	if err := fieldKeys(body, "HostConfig", "NetworkingConfig", "Labels"); err != nil {
+		return err
+	}
+	if err := g.checkProjectLabel(body["Labels"]); err != nil {
+		return err
+	}
+	// Docker 24 and older also read HostConfig settings at the top level:
+	// all of them when there is no HostConfig, a few besides one.
+	for k, v := range body {
+		known := slices.ContainsFunc(createFields, func(f string) bool { return strings.EqualFold(k, f) })
+		paths := strings.EqualFold(k, "MaskedPaths") || strings.EqualFold(k, "ReadonlyPaths")
+		if !known && (!isZero(v) || paths && v != nil) {
+			return fmt.Errorf("container setting %s is not allowed here (host settings go in HostConfig)", k)
+		}
+	}
+	hc, err := as[map[string]any]("HostConfig", body["HostConfig"])
+	if err != nil {
+		return err
+	}
+	if err := g.checkHostConfig(hc); err != nil {
+		return err
+	}
+	nc, err := as[map[string]any]("NetworkingConfig", body["NetworkingConfig"])
+	if err != nil {
+		return err
+	}
+	return g.checkNetworking(nc)
+}
+
+// checkHostConfig checks a container create's HostConfig: each setting is
+// harmless (hostAllowed), passes its own check here or is unset. What the
+// gate forwards otherwise (a mount made read-only, objects by full ID) is
+// changed in hc.
+func (g *Gate) checkHostConfig(hc map[string]any) error {
+	if err := fieldKeys(hc, append(slices.Collect(maps.Keys(hostAllowed)), hostChecked...)...); err != nil {
+		return err
+	}
 	for k, v := range hc {
 		var err error
 		switch k {
@@ -817,12 +1185,19 @@ func (g *Gate) checkCreate(body map[string]any) error {
 		case "Mounts":
 			err = g.mounts(v)
 		case "NetworkMode":
-			s, _ := v.(string)
-			hc[k], err = g.network(s)
+			var s string
+			if s, err = as[string](k, v); err == nil {
+				hc[k], err = g.network(s)
+			}
 		case "VolumesFrom":
-			list, _ := v.([]any)
+			var list []any
+			list, err = as[[]any](k, v)
 			for i, c := range list {
-				name, _ := c.(string)
+				name, ok := c.(string)
+				if !ok {
+					err = fmt.Errorf("setting %s has the wrong type", k)
+					break
+				}
 				ref, mode, hasMode := strings.Cut(name, ":")
 				id, e := g.owned("containers", ref)
 				if e != nil {
@@ -835,16 +1210,25 @@ func (g *Gate) checkCreate(body map[string]any) error {
 				list[i] = id
 			}
 		case "LogConfig":
-			lc, _ := v.(map[string]any)
-			if t, _ := lc["Type"].(string); !oneOf(t, "", "json-file", "local", "none") {
+			var lc map[string]any
+			if lc, err = as[map[string]any](k, v); err != nil {
+				break
+			}
+			if err = fieldKeys(lc, "Type"); err != nil {
+				break
+			}
+			var t string
+			if t, err = as[string]("LogConfig.Type", lc["Type"]); err == nil && !oneOf(t, "", "json-file", "local", "none") {
 				err = fmt.Errorf("log driver %s is not allowed (json-file, local and none are)", t)
 			}
 		case "IpcMode":
-			if s, _ := v.(string); !oneOf(s, "", "private", "shareable", "none") {
+			var s string
+			if s, err = as[string](k, v); err == nil && !oneOf(s, "", "private", "shareable", "none") {
 				err = fmt.Errorf("IPC mode %s is not allowed", s)
 			}
 		case "CgroupnsMode":
-			if s, _ := v.(string); !oneOf(s, "", "private") {
+			var s string
+			if s, err = as[string](k, v); err == nil && !oneOf(s, "", "private") {
 				err = fmt.Errorf("cgroup namespace mode %s is not allowed", s)
 			}
 		case "MaskedPaths", "ReadonlyPaths":
@@ -860,7 +1244,16 @@ func (g *Gate) checkCreate(body map[string]any) error {
 			return err
 		}
 	}
-	nc, _ := body["NetworkingConfig"].(map[string]any)
+	return nil
+}
+
+// checkNetworking checks a container create's NetworkingConfig: each
+// network its endpoints name must be one the container may join (see
+// network), and is rewritten to its full ID.
+func (g *Gate) checkNetworking(nc map[string]any) error {
+	if err := fieldKeys(nc, "EndpointsConfig"); err != nil {
+		return err
+	}
 	endpoints, _ := nc["EndpointsConfig"].(map[string]any)
 	if nc != nil && endpoints == nil && !isZero(nc["EndpointsConfig"]) {
 		return errors.New("unreadable endpoint settings")
@@ -870,6 +1263,9 @@ func (g *Gate) checkCreate(body map[string]any) error {
 		ep, ok := v.(map[string]any)
 		if !ok && v != nil {
 			return errors.New("unreadable endpoint settings")
+		}
+		if err := fieldKeys(ep, "NetworkID"); err != nil {
+			return err
 		}
 		id, err := g.network(name)
 		if err != nil {
@@ -923,7 +1319,10 @@ func (g *Gate) network(mode string) (string, error) {
 }
 
 func (g *Gate) binds(v any) error {
-	list, _ := v.([]any)
+	list, err := as[[]any]("Binds", v)
+	if err != nil {
+		return err
+	}
 	for i, item := range list {
 		spec, _ := item.(string)
 		parts := strings.Split(spec, ":")
@@ -976,16 +1375,44 @@ func (g *Gate) readOnlyBind(src string, opts []string) []string {
 }
 
 func (g *Gate) mounts(v any) error {
-	list, _ := v.([]any)
+	list, err := as[[]any]("Mounts", v)
+	if err != nil {
+		return err
+	}
 	for _, item := range list {
-		m, _ := item.(map[string]any)
-		src, _ := m["Source"].(string)
+		m, ok := item.(map[string]any)
+		if !ok {
+			return errors.New("setting Mounts has the wrong type")
+		}
+		if err := fieldKeys(m, "Type", "Source", "ReadOnly", "BindOptions", "VolumeOptions"); err != nil {
+			return err
+		}
+		bindOpts, err := as[map[string]any]("Mounts.BindOptions", m["BindOptions"])
+		if err != nil {
+			return err
+		}
+		if err := fieldKeys(bindOpts, "Propagation", "ReadOnlyNonRecursive"); err != nil {
+			return err
+		}
+		volumeOpts, err := as[map[string]any]("Mounts.VolumeOptions", m["VolumeOptions"])
+		if err != nil {
+			return err
+		}
+		if err := fieldKeys(volumeOpts, "DriverConfig"); err != nil {
+			return err
+		}
+		src, err := as[string]("Mounts.Source", m["Source"])
+		if err != nil {
+			return err
+		}
 		switch m["Type"] {
 		case "bind":
-			if opts, _ := m["BindOptions"].(map[string]any); opts != nil {
-				if p, _ := opts["Propagation"].(string); !oneOf(p, "", "private", "rprivate") {
-					return fmt.Errorf("mount propagation %s is not allowed", p)
-				}
+			p, err := as[string]("Mounts.BindOptions.Propagation", bindOpts["Propagation"])
+			if err != nil {
+				return err
+			}
+			if !oneOf(p, "", "private", "rprivate") {
+				return fmt.Errorf("mount propagation %s is not allowed", p)
 			}
 			if !strings.HasPrefix(src, "/") {
 				return fmt.Errorf("unreadable mount source %q", src)
@@ -999,7 +1426,7 @@ func (g *Gate) mounts(v any) error {
 				g.readOnlyMount(real, m)
 			}
 		case "volume":
-			if opts, _ := m["VolumeOptions"].(map[string]any); opts != nil && !isZero(opts["DriverConfig"]) {
+			if !isZero(volumeOpts["DriverConfig"]) {
 				return errors.New("volume drivers and driver options are not allowed")
 			}
 			if src != "" {
@@ -1033,7 +1460,8 @@ func (g *Gate) readOnlyMount(src string, m map[string]any) {
 }
 
 // source checks the left side of a mount and returns what to mount instead:
-// a volume of this task, the gate's own socket in place of the Docker socket
+// a volume of this task (made, labelled, if none has the name and the name
+// is in the task's namespace), the gate's own socket in place of the Docker socket
 // (so nested Docker clients stay gated), or a path inside the task directory
 // with its symlinks resolved. A path that resolves to one of ROMounts, or
 // into one, is allowed too, if it exists (the daemon would create a missing
@@ -1043,6 +1471,12 @@ func (g *Gate) source(src string) (path string, ro bool, err error) {
 		// By name, as the daemon looks it up: exactly, no prefix.
 		_, err := g.owned("volumes", src)
 		if err == errNotFound { // created on the fly by the daemon otherwise, without the label
+			// A new name only in the task's namespace (see
+			// gateVolumeCreate); a volume of the task's of any name, as
+			// above, stays its to mount.
+			if err := g.checkNewName("volume", src); err != nil {
+				return "", false, err
+			}
 			status, out, cerr := g.call("POST", "/volumes/create", map[string]any{"Name": src, "Labels": map[string]string{LabelTask: g.ID}})
 			if cerr != nil || status != http.StatusCreated {
 				return "", false, fmt.Errorf("cannot create volume %s: %v %s", src, cerr, out)
@@ -1102,8 +1536,28 @@ func oneOf(s string, options ...string) bool {
 	return false
 }
 
+// as returns v, the value of the setting name the gate checks, as the type
+// the gate reads it as; the zero value if it is unset (null or absent). A
+// value of another type would pass the check unread: dockerd would refuse
+// it, but the gate does not count on that.
+func as[T any](name string, v any) (T, error) {
+	var t T
+	if v == nil {
+		return t, nil
+	}
+	t, ok := v.(T)
+	if !ok {
+		return t, fmt.Errorf("setting %s has the wrong type", name)
+	}
+	return t, nil
+}
+
 // isZero reports whether a decoded JSON value is unset: null, false, 0, "",
-// or a list or object holding nothing but such values.
+// or an empty list or object. An object with a key is set, whatever its
+// value: the settings that are maps (sysctls, annotations, driver options)
+// act on a key with an empty value too (it overrides the daemon's default
+// sysctl; containerd's shim groups containers by an annotation whatever its
+// value).
 func isZero(v any) bool {
 	switch v := v.(type) {
 	case nil:
@@ -1118,12 +1572,7 @@ func isZero(v any) bool {
 	case []any:
 		return len(v) == 0
 	case map[string]any:
-		for _, item := range v {
-			if !isZero(item) {
-				return false
-			}
-		}
-		return true
+		return len(v) == 0
 	}
 	return false
 }

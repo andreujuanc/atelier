@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/sandbox"
@@ -367,4 +368,118 @@ func TestReopenSandboxed(t *testing.T) {
 	if n := len(fd.find("run")); n != runs+1 {
 		t.Fatalf("docker run calls %d, want a new container (%d)", n, runs+1)
 	}
+}
+
+// A task closed with `atl status` keeps its worktree, registered in git;
+// removed by hand afterwards, the reopen still makes it again (git would
+// refuse a path it still has registered, "missing but already registered").
+func TestReopenWorktreeRemovedByHand(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "by hand", Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := e.commitIn(t, task.Slug, "api", "work")
+	if err := e.app.SetStatus(ctx, task.Slug, model.StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(e.app.Paths.TaskDir(task.Slug)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.app.SetStatus(ctx, task.Slug, model.StatusActive); err != nil {
+		t.Fatal(err)
+	}
+	reopened(t, e, task.Slug, model.StatusActive, head)
+}
+
+// SetStatus decides under the per-task lock: a change made while done (or
+// another operation) holds it waits, and then sees the task as that left
+// it. Here the task was closed meanwhile, so active reopens it rather than
+// marking a task without its worktrees active.
+func TestSetStatusWaitsForLock(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "racing", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := e.commitIn(t, task.Slug, "api", "work")
+	unlock, err := e.app.lockTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- e.app.SetStatus(ctx, task.Slug, model.StatusReview) }()
+	select {
+	case err := <-done:
+		unlock()
+		t.Fatalf("SetStatus did not wait for the lock: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// What Done does under the lock.
+	if err := e.app.finishTask(ctx, task, false, model.StatusDone); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	reopened(t, e, task.Slug, model.StatusReview, head)
+}
+
+// A reopen is refused, and the task stays closed with nothing changed,
+// when what is at a worktree's path is not a worktree of the repo's clone,
+// or when a repo's canonical clone is gone.
+func TestReopenRefusals(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.addRepo(t, "docs", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "refused",
+		Repos: []RepoArg{{"api", model.ModeRW}, {"docs", model.ModeRO}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.app.SetStatus(ctx, task.Slug, model.StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	if err := os.RemoveAll(wt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(wt, "mine"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stays := func(what string) {
+		t.Helper()
+		got, err := e.app.Store.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != model.StatusDone {
+			t.Fatalf("%s: status %s", what, got.Status)
+		}
+		if !exists(filepath.Join(wt, "mine")) {
+			t.Fatalf("%s: the directory at the worktree path was touched", what)
+		}
+	}
+	err = e.app.SetStatus(ctx, task.Slug, model.StatusActive)
+	if err == nil || !strings.Contains(err.Error(), "repo api:") || !strings.Contains(err.Error(), "remove it first") ||
+		!strings.Contains(err.Error(), "it stays done") {
+		t.Fatalf("reopen over a plain directory: %v", err)
+	}
+	stays("plain directory")
+
+	if err := os.Rename(e.canonical("docs"), e.canonical("docs")+".away"); err != nil {
+		t.Fatal(err)
+	}
+	err = e.app.SetStatus(ctx, task.Slug, model.StatusActive)
+	if err == nil || !strings.Contains(err.Error(), "repo docs") || !strings.Contains(err.Error(), "it stays done") {
+		t.Fatalf("reopen without the docs clone: %v", err)
+	}
+	stays("missing clone")
 }

@@ -167,6 +167,10 @@ func (d *Dir) OpenFile(rel string) (*os.File, error) {
 	}
 	defer d.closeParent(fd)
 	f, err := unix.Openat(fd, base, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENXIO) {
+		// What open(2) says of a unix socket (or a device with no driver).
+		err = ErrNotRegular
+	}
 	if err != nil {
 		return nil, pathErr("open", d.join(rel), err)
 	}
@@ -270,6 +274,64 @@ func (d *Dir) MkdirAll(rel string, perm os.FileMode) error {
 	return nil
 }
 
+// Mkdir creates the directory rel, mode perm (before the umask); one that
+// exists already (anything at rel) is an error, fs.ErrExist.
+func (d *Dir) Mkdir(rel string, perm os.FileMode) error {
+	fd, base, err := d.parent("mkdir", rel)
+	if err != nil {
+		return err
+	}
+	defer d.closeParent(fd)
+	if err := unix.Mkdirat(fd, base, uint32(perm.Perm())); err != nil {
+		return pathErr("mkdir", d.join(rel), err)
+	}
+	return nil
+}
+
+// CreateExcl creates rel, a new regular file (fs.ErrExist if anything is
+// there, a symlink included), holding data, mode perm, synced: a lock file.
+func (d *Dir) CreateExcl(rel string, data []byte, perm os.FileMode) error {
+	fd, base, err := d.parent("create", rel)
+	if err != nil {
+		return err
+	}
+	defer d.closeParent(fd)
+	f, err := unix.Openat(fd, base, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(perm.Perm()))
+	if err != nil {
+		return pathErr("create", d.join(rel), err)
+	}
+	file := os.NewFile(uintptr(f), d.join(rel))
+	_, werr := file.Write(data)
+	if werr == nil {
+		werr = file.Sync()
+	}
+	if cerr := file.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		unix.Unlinkat(fd, base, 0)
+		return pathErr("create", d.join(rel), werr)
+	}
+	return nil
+}
+
+// Rename renames rel to the name to in the same directory, replacing
+// what is there (a symlink itself, never what it points to).
+func (d *Dir) Rename(rel, to string) error {
+	if strings.Contains(to, "/") || to == "" || to == "." || to == ".." {
+		return &fs.PathError{Op: "rename", Path: d.join(rel), Err: errors.New("not a name in the same directory")}
+	}
+	fd, base, err := d.parent("rename", rel)
+	if err != nil {
+		return err
+	}
+	defer d.closeParent(fd)
+	if err := unix.Renameat(fd, base, fd, to); err != nil {
+		return pathErr("rename", d.join(rel), err)
+	}
+	return nil
+}
+
 // Remove removes the file, symlink or empty directory rel, without
 // following a symlink.
 func (d *Dir) Remove(rel string) error {
@@ -286,6 +348,80 @@ func (d *Dir) Remove(rel string) error {
 	}
 	if err != nil {
 		return pathErr("remove", d.join(rel), err)
+	}
+	return nil
+}
+
+// ReadDirNames returns the names of the entries of the directory rel (".":
+// d itself), in no particular order.
+func (d *Dir) ReadDirNames(rel string) ([]string, error) {
+	fd, base := d.fd, "."
+	if rel != "." {
+		var err error
+		if fd, base, err = d.parent("readdir", rel); err != nil {
+			return nil, err
+		}
+	}
+	defer d.closeParent(fd)
+	dir, err := unix.Openat(fd, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, pathErr("readdir", d.join(rel), err)
+	}
+	f := os.NewFile(uintptr(dir), d.join(rel))
+	defer f.Close()
+	return f.Readdirnames(-1)
+}
+
+// RemoveAll removes rel and, if it is a directory, everything in it. It
+// follows no symlink: one met is removed itself, and a directory swapped
+// for one while it is emptied is left (an error), never walked through,
+// since each directory is walked by the descriptor it was opened at.
+func (d *Dir) RemoveAll(rel string) error {
+	fd, base, err := d.parent("removeall", rel)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer d.closeParent(fd)
+	if err := removeAllAt(fd, base); err != nil {
+		return pathErr("removeall", d.join(rel), err)
+	}
+	return nil
+}
+
+// removeAllAt removes name, in the directory open at parent, and what is
+// in it.
+func removeAllAt(parent int, name string) error {
+	err := unix.Unlinkat(parent, name, 0)
+	if err == nil || errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if !errors.Is(err, unix.EISDIR) && !errors.Is(err, unix.EPERM) {
+		return err
+	}
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	dir := os.NewFile(uintptr(fd), name)
+	defer dir.Close()
+	// All names first: deleting while reading could skip some.
+	names, err := dir.Readdirnames(-1)
+	for _, n := range names {
+		if rerr := removeAllAt(fd, n); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(parent, name, unix.AT_REMOVEDIR); err != nil && !errors.Is(err, unix.ENOENT) {
+		return err
 	}
 	return nil
 }

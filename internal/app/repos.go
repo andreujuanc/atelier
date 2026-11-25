@@ -69,28 +69,58 @@ func (a *App) AvailableRepos(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// addRepoLockWait is how long lockTask waits for another operation on the
-// same task (AddRepo, done/cancel, a CLAUDE.md rewrite) to finish.
-const addRepoLockWait = 30 * time.Second
+// taskLockWait is how long lockTask waits for another operation on the
+// same task (AddRepo, done/cancel, a CLAUDE.md rewrite) to finish, and
+// lockLaunches for the task's launches.
+const taskLockWait = 30 * time.Second
 
 // lockTask takes an exclusive flock on <StateDir>/locks/task-<id>.lock,
-// waiting up to addRepoLockWait (or until ctx ends). The returned func
+// waiting up to taskLockWait (or until ctx ends). The returned func
 // releases it.
 func (a *App) lockTask(ctx context.Context, id int64) (func(), error) {
-	dir := filepath.Join(a.Paths.StateDir, "locks")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create lock dir: %w", err)
+	path, err := a.lockPath(fmt.Sprintf("task-%d.lock", id))
+	if err != nil {
+		return nil, err
 	}
-	path := filepath.Join(dir, fmt.Sprintf("task-%d.lock", id))
-	return lockFile(ctx, path, addRepoLockWait, "another operation on this task is in progress")
+	return lockFile(ctx, path, syscall.LOCK_EX, taskLockWait, "another operation on this task is in progress")
 }
 
-// lockFile takes an exclusive flock on path (created if missing), waiting
-// up to wait (or until ctx ends); busy describes the holder in the timeout
-// error. The returned func releases it. It follows no symlink at path and
-// takes only a regular file (never a pipe or device: it does not wait to
-// open one).
-func lockFile(ctx context.Context, path string, wait time.Duration, busy string) (func(), error) {
+// lockLaunches takes task id's launch lock exclusive: it waits for the
+// launches under way, up to taskLockWait (or until ctx ends), and keeps new
+// ones out until the returned func releases it. The launch lock
+// (<StateDir>/locks/task-<id>.launch.lock) is apart from the task's lock
+// (lockTask): each launch holds it shared (lockLaunch); closing the task
+// and adding repos to it hold it exclusive (after lockTask). So no session
+// is launched into a task being closed or with repos it would not see,
+// and a slow launch (a docker run, an image pull) holds up only those.
+func (a *App) lockLaunches(ctx context.Context, id int64) (func(), error) {
+	return a.launchLock(ctx, id, syscall.LOCK_EX)
+}
+
+// launchLock takes task id's launch lock (see lockLaunches) of kind how.
+func (a *App) launchLock(ctx context.Context, id int64, how int) (func(), error) {
+	path, err := a.lockPath(fmt.Sprintf("task-%d.launch.lock", id))
+	if err != nil {
+		return nil, err
+	}
+	return lockFile(ctx, path, how, taskLockWait, "the task is being closed, or a session is being started in it")
+}
+
+// lockPath is the path of lock file name in <StateDir>/locks, made if missing.
+func (a *App) lockPath(name string) (string, error) {
+	dir := filepath.Join(a.Paths.StateDir, "locks")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create lock dir: %w", err)
+	}
+	return filepath.Join(dir, name), nil
+}
+
+// lockFile takes a flock of kind how (syscall.LOCK_EX or LOCK_SH) on path
+// (created if missing), waiting up to wait (or until ctx ends); busy
+// describes the holder in the timeout error. The returned func releases
+// it. It follows no symlink at path and takes only a regular file (never a
+// pipe or device: it does not wait to open one).
+func lockFile(ctx context.Context, path string, how int, wait time.Duration, busy string) (func(), error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock: %w", err)
@@ -102,7 +132,7 @@ func lockFile(ctx context.Context, path string, wait time.Duration, busy string)
 	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
 		if err == nil {
 			return func() {
 				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
@@ -156,6 +186,13 @@ func (a *App) AddRepo(ctx context.Context, ref string, r RepoArg, noFetch bool) 
 		return nil, err
 	}
 	defer unlock()
+	// A launch under way has read the task's repos: it ends first, and
+	// none starts until the repo is in (see lockLaunches).
+	unlockLaunches, err := a.lockLaunches(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockLaunches()
 	return a.addRepoLocked(ctx, t.ID, name, mode, noFetch)
 }
 
@@ -169,6 +206,9 @@ func (a *App) addRepoLocked(ctx context.Context, id int64, name string, mode mod
 	}
 	if !t.Status.Open() {
 		return nil, fmt.Errorf("task %s is %s; repos can only be added to open tasks", t.Slug, t.Status)
+	}
+	if err := a.undoKilledAdd(ctx, t, name, mode); err != nil {
+		return nil, err
 	}
 	upgrade, err := a.checkAdd(ctx, t, name, mode)
 	if err != nil {
@@ -195,30 +235,18 @@ func (a *App) addRepoLocked(ctx context.Context, id int64, name string, mode mod
 		if tr.BaseBranch, tr.BaseCommit, err = resolveBase(ctx, name, repo, t.Base); err != nil {
 			return nil, err
 		}
+		if err := checkBranchFree(ctx, name, repo, t.Branch); err != nil {
+			return nil, err
+		}
 		if _, err := os.Lstat(wt); err == nil {
 			return nil, fmt.Errorf("repo %s: %s already exists; remove it first", name, wt)
 		}
 		if err := os.MkdirAll(a.Paths.TaskDir(t.Slug), 0o755); err != nil {
 			return nil, fmt.Errorf("create task dir: %w", err)
 		}
-		_, berr := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
-		branchExisted := berr == nil
-		if err := a.addWorktree(ctx, name, repo, wt, t.Branch, tr.BaseCommit); err != nil {
-			// git may have created the branch (and worktree) before
-			// failing, e.g. when the checkout fails: undo only what this
-			// call verifiably created. "already exists" means git refused
-			// up front and whatever is there belongs to someone else.
-			if !strings.Contains(err.Error(), "already exists") {
-				_, werr := os.Lstat(wt)
-				_, nberr := gitx.RevParse(context.WithoutCancel(ctx), repo, "refs/heads/"+t.Branch)
-				createdWT, createdBr := werr == nil, !branchExisted && nberr == nil
-				if createdWT || createdBr {
-					a.undoWorktree(ctx, name, wt, t.Branch, createdWT, createdBr)
-				}
-			}
+		if createdBranch, err = a.addTaskWorktree(ctx, name, wt, t.Branch, tr.BaseCommit, false); err != nil {
 			return nil, fmt.Errorf("repo %s: %w", name, err)
 		}
-		createdBranch = !branchExisted
 		if afterWorktreeAdd != nil {
 			afterWorktreeAdd(wt)
 		}
@@ -283,6 +311,40 @@ func (a *App) addRepoLocked(ctx context.Context, id int64, name string, mode mod
 // worktree's creation and the repo's insert.
 var afterWorktreeAdd func(wt string)
 
+// addTaskWorktree adds worktree wt of rw repo name on the task branch:
+// the existing local branch (existing) or a new one at start. It reports
+// whether it created the branch. On failure it undoes only what it
+// verifiably created: git may create the branch (and worktree) before
+// failing, e.g. when the checkout fails; "already exists" means git
+// refused up front and whatever is there belongs to someone else. If it
+// cannot tell whether the branch exists beforehand, it adds nothing: a
+// branch that is there would otherwise be deleted as its own.
+func (a *App) addTaskWorktree(ctx context.Context, name, wt, branch, start string, existing bool) (createdBranch bool, err error) {
+	repo := a.Paths.RepoPath(name)
+	branchExisted, err := gitx.RefExists(ctx, repo, "refs/heads/"+branch)
+	if err != nil {
+		return false, err
+	}
+	if existing {
+		err = a.addBranchWorktree(ctx, name, repo, wt, branch)
+	} else {
+		err = a.addWorktree(ctx, name, repo, wt, branch, start)
+	}
+	if err == nil {
+		return !branchExisted, nil
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		_, werr := os.Lstat(wt)
+		createdBr := false
+		if !branchExisted {
+			createdBr, _ = gitx.RefExists(context.WithoutCancel(ctx), repo, "refs/heads/"+branch)
+		}
+		// A missing worktree is only pruned.
+		a.undoWorktree(ctx, name, wt, branch, werr == nil || !branchExisted, createdBr)
+	}
+	return false, err
+}
+
 // undoWorktree removes (if removeWT) worktree wt of repo name and, if
 // deleteBranch and the branch exists, deletes it; failures are warnings.
 func (a *App) undoWorktree(ctx context.Context, name, wt, branch string, removeWT, deleteBranch bool) {
@@ -301,6 +363,24 @@ func (a *App) undoWorktree(ctx context.Context, name, wt, branch string, removeW
 			a.warnf("rollback: delete branch %s in %s: %v", branch, name, derr)
 		}
 	}
+}
+
+// checkBranchFree refuses to create the task branch in rw repo name (clone
+// at repo) when the clone has it, or a branch below it, locally or under
+// origin/ (as of the last fetch): like a new task's slug (see slugTaken),
+// atl never takes over a branch it did not create.
+func checkBranchFree(ctx context.Context, name, repo, branch string) error {
+	for _, ref := range []string{"refs/heads/" + branch, "refs/remotes/origin/" + branch} {
+		ok, err := gitx.RefOrBelowExists(ctx, repo, ref)
+		if err != nil {
+			return fmt.Errorf("repo %s: %w", name, err)
+		}
+		if ok {
+			return fmt.Errorf("repo %s: %s (or a branch below it) already exists in its clone; atl does not take over a branch it did not create",
+				name, strings.TrimPrefix(strings.TrimPrefix(ref, "refs/heads/"), "refs/remotes/"))
+		}
+	}
+	return nil
 }
 
 // checkAdd checks that repo name can be added to t in mode: not in the task
@@ -325,4 +405,48 @@ func (a *App) checkAdd(ctx context.Context, t *model.Task, name string, mode mod
 		}
 	}
 	return upgrade, nil
+}
+
+// undoKilledAdd removes what an add of rw repo name to t left when its atl
+// was killed after it made the worktree and before it recorded the repo
+// (which is otherwise refused forever: the path and the task branch are
+// taken), as that add would have undone it on a failure: a worktree at the
+// repo's path in the task dir, of the repo's clone, on the task branch,
+// clean and with no commit that another branch or remote-tracking ref lacks.
+// Anything else there is left alone (checkAdd refuses it). It is called
+// under the task's lock, before checkAdd.
+func (a *App) undoKilledAdd(ctx context.Context, t *model.Task, name string, mode model.Mode) error {
+	if mode != model.ModeRW {
+		return nil
+	}
+	for _, r := range t.Repos {
+		if r.Name == name && r.Mode == model.ModeRW {
+			return nil
+		}
+	}
+	repo, wt := a.Paths.RepoPath(name), a.Paths.WorktreePath(t.Slug, name)
+	if _, err := os.Lstat(wt); err != nil || gitx.CheckWorktree(ctx, wt, repo) != nil {
+		return nil
+	}
+	if b, err := gitx.CurrentBranch(ctx, wt); err != nil || b != t.Branch {
+		return nil
+	}
+	tip, err := gitx.RevParse(ctx, repo, "refs/heads/"+t.Branch)
+	if err != nil {
+		return nil
+	}
+	if n, err := gitx.UniqueCommitsAt(ctx, repo, t.Branch, tip); err != nil || n > 0 {
+		return nil
+	}
+	if dirty, err := gitx.IsDirty(ctx, wt); err != nil || dirty {
+		return nil
+	}
+	fmt.Fprintf(a.out(), "repo %s: removing %s and branch %s, left by an add that did not finish\n", name, wt, t.Branch)
+	if err := gitx.RemoveWorktree(ctx, repo, wt, false); err != nil {
+		return fmt.Errorf("repo %s: remove the worktree an unfinished add left: %w", name, err)
+	}
+	if err := gitx.DeleteBranchIfAt(ctx, repo, t.Branch, tip); err != nil {
+		return fmt.Errorf("repo %s: delete the branch an unfinished add left: %w", name, err)
+	}
+	return nil
 }

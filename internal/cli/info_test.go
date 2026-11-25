@@ -102,7 +102,7 @@ func TestShowNotesTranscript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess := &model.Session{TaskID: task.ID, State: model.StateIdle, Name: "claude-1", ClaudeSessionID: "cid", TranscriptPath: transcript}
+	sess := &model.Session{TaskID: task.ID, State: model.StateIdle, ClaudeSessionID: "cid", TranscriptPath: transcript}
 	if err := st.CreateSession(context.Background(), sess); err != nil {
 		t.Fatal(err)
 	}
@@ -389,6 +389,12 @@ func TestWrapLine(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("wrap = %q", got)
 	}
+	// Wide (CJK) characters take two columns: wrapped by display width.
+	got = wrapLine("漢字 "+strings.Repeat("字", 25)+" 漢", 20)
+	want = []string{"漢字", strings.Repeat("字", 10), strings.Repeat("字", 10), "字字字字字 漢"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("wide wrap = %q", got)
+	}
 }
 
 func TestPushedText(t *testing.T) {
@@ -482,5 +488,34 @@ func TestForAssistant(t *testing.T) {
 		!strings.Contains(s, "the user's plan\n") || !strings.Contains(s, "the assistant's text\n") ||
 		strings.Index(s, "the user's plan") > strings.Index(s, "the assistant's text") {
 		t.Errorf("history:\n%s", s)
+	}
+}
+
+// TestShowSanitizesSessionFields: a session's Claude id and transcript path
+// come from hook input, which a sandboxed task's container sends (through
+// its gate); `atl show` must not print their control characters.
+func TestShowSanitizesSessionFields(t *testing.T) {
+	setup(t)
+	if code, _, errs := atl(t, "new", "Fix", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	st, err := store.Open(testDB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := st.GetTaskBySlug(context.Background(), "fix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := &model.Session{TaskID: task.ID, State: model.StateIdle, Name: "claude-1",
+		ClaudeSessionID: "cid\x1b]0;pwned\x07", TranscriptPath: "/tmp/t\x1b[2J.jsonl"}
+	if err := st.CreateSession(context.Background(), sess); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	code, out, errs := atl(t, "show", "fix")
+	if code != 0 || strings.ContainsAny(out, "\x1b\x07") ||
+		!strings.Contains(out, "claude id   cid]0;pwned\n") || !strings.Contains(out, "transcript  /tmp/t[2J.jsonl\n") {
+		t.Fatalf("show: %d %q %s", code, out, errs)
 	}
 }

@@ -168,7 +168,7 @@ func TestWorkspaces(t *testing.T) {
 func wsEnv(t *testing.T) (string, string) {
 	root := setup(t)
 	for _, k := range []string{"ATL_WORKSPACE", "ATL_WORKSPACE_VARS", "ATL_TMUX_SOCKET", "ATL_REPOS", "ATL_TASKS",
-		"ATL_SANDBOX_IMAGE", "ATL_SANDBOX_MOUNTS", "ATL_SANDBOX_CONTEXT", "ATL_CONTEXT"} {
+		"ATL_SANDBOX_IMAGE", "ATL_SANDBOX_MOUNTS", "ATL_SANDBOX_CONTEXT", "ATL_SANDBOX_REGISTRIES", "ATL_CONTEXT"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("TMUX_TMPDIR", filepath.Join(root, "t"))
@@ -350,7 +350,7 @@ func TestWorkspaceAdoptTmux(t *testing.T) {
 	host := mkdb("host")
 	code, out, errs = atl(t, "workspace", "new", "host")
 	if code != exitErr || out != "" || !strings.Contains(errs, "atl workspace new host --repos DIR [--mount PATH]...") ||
-		!strings.Contains(errs, "Moving from a devcontainer box") {
+		!strings.Contains(errs, `"Moving from a devcontainer box" in atelier's docs/workspaces.md`) {
 		t.Errorf("new host, no repos: %d %q %q", code, out, errs)
 	}
 	for _, p := range []string{"atelier.toml", "repos"} {

@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -529,7 +528,8 @@ func TestRenderSandboxContext(t *testing.T) {
 	now := time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC)
 
 	got := renderSandboxContext(task, "", p, "", true, nil, now)
-	if !strings.Contains(got, "\nATL_PORT_OFFSET=300\n\n"+sandboxNote+"\n") || !strings.Contains(got, "run a repo in its own container setup, if any (`.devcontainer`") {
+	if !strings.Contains(got, "\nATL_PORT_OFFSET=300\n\n"+sandboxNote+"\n") || !strings.Contains(got, "run a repo in its own container setup, if any (`.devcontainer`") ||
+		!strings.Contains(got, "network/volume names, build tags start with $COMPOSE_PROJECT_NAME") || !strings.Contains(got, "`-p $COMPOSE_PROJECT_NAME-<repo>`") {
 		t.Errorf("sandbox note missing or misplaced:\n%s", got)
 	}
 	if plain := renderSandboxContext(task, "", p, "", false, []string{"/x"}, now); strings.Contains(plain, "Sandbox:") || strings.Contains(plain, mountsHead) {
@@ -639,21 +639,13 @@ func TestSessionStartContextLatency(t *testing.T) {
 	ctxTask(t, f, 20)
 	f.st.Close()
 	in := `{"session_id":"c-lat","cwd":"` + f.p.TaskDir("ctx") + `","hook_event_name":"SessionStart","source":"startup"}`
-	runMain(t, "SessionStart", in) // warm the page cache
-	var walls []time.Duration
-	for i := 0; i < 7; i++ {
+	checkLatency(t, "SessionStart+context hook", func() time.Duration {
 		exit, out, errOut, wall := runMain(t, "SessionStart", in)
 		if exit != 0 || errOut != "" || !strings.Contains(sessionStartContext(t, out), "note 20") {
 			t.Fatalf("exit=%d stdout=%q stderr=%q", exit, out, errOut)
 		}
-		walls = append(walls, wall)
-	}
-	sort.Slice(walls, func(i, j int) bool { return walls[i] < walls[j] })
-	median := walls[len(walls)/2]
-	t.Logf("SessionStart+context hook wall time (re-exec of test binary): min %v, median %v, max %v", walls[0], median, walls[len(walls)-1])
-	if median > 200*time.Millisecond {
-		t.Errorf("median hook latency %v exceeds 200ms", median)
-	}
+		return wall
+	})
 	if log := readLog(t, f.p); log != "" {
 		t.Errorf("unexpected errors logged: %s", log)
 	}

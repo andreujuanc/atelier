@@ -207,15 +207,34 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Err }
 
-func (c *Client) args(args ...string) []string {
-	var pre []string
+// args is tmux's command line for one tmux command.
+func (c *Client) args(args ...string) []string { return c.cmdline(args) }
+
+// cmdline is tmux's command line for the tmux commands cmds, run in one
+// invocation. tmux splits its command line into commands at every argument
+// that ends in ";" (the ";" dropped), and takes a final "\;" for ";": so
+// the commands are separated by ";" here, and an argument that ends in ";"
+// gets a "\" before that ";", which makes it reach its command as it is.
+func (c *Client) cmdline(cmds ...[]string) []string {
+	var out []string
 	if c.config != "" {
-		pre = append(pre, "-f", c.config)
+		out = append(out, "-f", c.config)
 	}
 	if c.Socket != "" {
-		pre = append(pre, "-L", c.Socket)
+		out = append(out, "-L", c.Socket)
 	}
-	return append(pre, args...)
+	for i, cmd := range cmds {
+		if i > 0 {
+			out = append(out, ";")
+		}
+		for _, a := range cmd {
+			if s, ok := strings.CutSuffix(a, ";"); ok {
+				a = s + `\;`
+			}
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // run executes tmux and returns trimmed stdout.
@@ -225,8 +244,16 @@ func (c *Client) run(ctx context.Context, args ...string) (string, error) {
 
 // runIn is run with stdin as tmux's standard input.
 func (c *Client) runIn(ctx context.Context, stdin string, args ...string) (string, error) {
+	out, err := c.runCmds(ctx, stdin, args)
+	return strings.TrimSpace(out), err
+}
+
+// runCmds runs the tmux commands cmds in one tmux invocation (see cmdline),
+// with stdin as its standard input, and returns its stdout as it is. An
+// *Error's Args are the commands' arguments, separated by ";".
+func (c *Client) runCmds(ctx context.Context, stdin string, cmds ...[]string) (string, error) {
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "tmux", c.args(args...)...)
+	cmd := exec.CommandContext(ctx, "tmux", c.cmdline(cmds...)...)
 	cmd.Env = c.serverEnv()
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -239,15 +266,22 @@ func (c *Client) runIn(ctx context.Context, stdin string, args ...string) (strin
 		if cerr := ctx.Err(); cerr != nil {
 			err = cerr
 		}
-		return strings.TrimSpace(stdout.String()), &Error{Args: args, Stderr: strings.TrimSpace(stderr.String()), Err: err}
+		var args []string
+		for i, a := range cmds {
+			if i > 0 {
+				args = append(args, ";")
+			}
+			args = append(args, a...)
+		}
+		return stdout.String(), &Error{Args: args, Stderr: strings.TrimSpace(stderr.String()), Err: err}
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	return stdout.String(), nil
 }
 
 // sessionVars are what a tmux server started from inside a session (a
 // Claude window, a task container's gate) must not take into its global
 // environment, which every window it opens later inherits.
-var sessionVars = []string{"CLAUDECODE", "ATL_SESSION", "ATL_CONTROL_SOCK", "ATL_TASK", "ATL_TASK_DIR", "ATL_PORT_OFFSET"}
+var sessionVars = []string{"CLAUDECODE", "ATL_SESSION", "ATL_LAUNCH", "ATL_CONTROL_SOCK", "ATL_TASK", "ATL_TASK_DIR", "ATL_PORT_OFFSET"}
 
 // serverEnv is the environment of the tmux commands c runs (a command that
 // starts the server gives it this one): atl's, without sessionVars, and,
@@ -347,17 +381,23 @@ func globalEnvScript(env map[string]string) (string, error) {
 	return script.String(), nil
 }
 
-// redact removes env's values from a tmux error.
+// redact removes env's values from a tmux error, the longest first: a value
+// that is part of another must not leave the rest of that one behind.
 func redact(err error, env map[string]string) error {
 	var te *Error
 	if !errors.As(err, &te) {
 		return err
 	}
-	msg := te.Stderr
+	vals := make([]string, 0, len(env))
 	for _, v := range env {
 		if v != "" {
-			msg = strings.ReplaceAll(msg, v, "…")
+			vals = append(vals, v)
 		}
+	}
+	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
+	msg := te.Stderr
+	for _, v := range vals {
+		msg = strings.ReplaceAll(msg, v, "…")
 	}
 	return &Error{Args: te.Args, Stderr: msg, Err: te.Err}
 }
@@ -392,23 +432,25 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	if err != nil {
 		return "", err
 	}
-	build := func(exists bool) []string {
+	argv, err := withPaneEnv(spec.Env, spec.Argv)
+	if err != nil {
+		return "", err
+	}
+	// tmux expands formats (#{...}, #(command)) in a new session's name and
+	// a new window's name and directory: "##" there is a "#".
+	noFormat := func(s string) string { return strings.ReplaceAll(s, "#", "##") }
+	build := func(exists bool) [][]string {
 		var args []string
-		if script != "" {
-			// One invocation: if it starts the server, the variables are
-			// set in it before the window is created.
-			args = []string{"source-file", "-", ";"}
-		}
 		if exists {
-			args = append(args, "new-window", "-t", "="+spec.Session+":")
+			args = []string{"new-window", "-t", "=" + spec.Session + ":"}
 		} else {
-			args = append(args, "new-session", "-d", "-s", spec.Session)
+			args = []string{"new-session", "-d", "-s", noFormat(spec.Session)}
 		}
 		if spec.Name != "" {
-			args = append(args, "-n", spec.Name)
+			args = append(args, "-n", noFormat(spec.Name))
 		}
 		if spec.Dir != "" {
-			args = append(args, "-c", spec.Dir)
+			args = append(args, "-c", noFormat(spec.Dir))
 		}
 		keys := make([]string, 0, len(spec.Env))
 		for k := range spec.Env {
@@ -419,7 +461,13 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 			args = append(args, "-e", k+"="+spec.Env[k])
 		}
 		args = append(args, "-P", "-F", "#{window_id}", "--")
-		return append(args, commandArgs(spec.Argv)...)
+		args = append(args, commandArgs(argv)...)
+		if script != "" {
+			// One invocation: if it starts the server, the variables are
+			// set in it before the window is created.
+			return [][]string{{"source-file", "-"}, args}
+		}
+		return [][]string{args}
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -429,18 +477,18 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 	defer cancel()
 
 	exists := c.HasSession(ctx, spec.Session)
-	out, err := c.runIn(ctx, script, build(exists)...)
+	out, err := c.runCmds(ctx, script, build(exists)...)
 	if serverExited(err) {
 		// Reached a server on its way out (just killed, or its last
 		// session just closed), which ran nothing: once more, with the
 		// server that is there now, or a new one.
 		exists = c.HasSession(ctx, spec.Session)
-		out, err = c.runIn(ctx, script, build(exists)...)
+		out, err = c.runCmds(ctx, script, build(exists)...)
 	}
 	var te *Error
-	if !exists && err != nil && out == "" && errors.As(err, &te) && strings.Contains(te.Stderr, "duplicate session") {
+	if !exists && err != nil && strings.TrimSpace(out) == "" && errors.As(err, &te) && strings.Contains(te.Stderr, "duplicate session") {
 		// Lost a race with another atl creating the same session.
-		out, err = c.runIn(ctx, script, build(true)...)
+		out, err = c.runCmds(ctx, script, build(true)...)
 	}
 	if err != nil {
 		return "", fmt.Errorf("tmux: launch window in session %s: %w", spec.Session, redact(err, spec.GlobalEnv))
@@ -462,6 +510,30 @@ func (c *Client) NewWindow(ctx context.Context, spec WindowSpec) (string, error)
 		return id, fmt.Errorf("tmux: tag window %s in session %s: %w", id, spec.Session, err)
 	}
 	return id, nil
+}
+
+// PaneVars are the variables tmux sets in a new pane after its -e ones:
+// PATH (the client's, or the session's) and SHELL (default-shell).
+var PaneVars = []string{"PATH", "SHELL"}
+
+// withPaneEnv returns argv run by env(1) with env's PaneVars, which -e
+// cannot set; argv unchanged if env has none of them. env then looks argv[0]
+// up on that PATH.
+func withPaneEnv(env map[string]string, argv []string) ([]string, error) {
+	var set []string
+	for _, k := range PaneVars {
+		if v, ok := env[k]; ok {
+			set = append(set, k+"="+v)
+		}
+	}
+	if len(set) == 0 {
+		return argv, nil
+	}
+	if strings.Contains(argv[0], "=") {
+		// env would take it for a variable.
+		return nil, fmt.Errorf("tmux: new window: command %q contains '='", argv[0])
+	}
+	return append(append([]string{"env"}, set...), argv...), nil
 }
 
 // commandArgs adapts argv for tmux: with several arguments tmux executes them
@@ -595,15 +667,12 @@ func (c *Client) CapturePane(ctx context.Context, window string) (text string, w
 	if err != nil {
 		return "", 0, fmt.Errorf("tmux: capture pane of window %s: %w", window, err)
 	}
-	width, _ = strconv.Atoi(strings.TrimSpace(w))
-	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "tmux", c.args("capture-pane", "-p", "-J", "-S", "-", "-E", "-", "-t", window)...)
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	cmd.WaitDelay = 2 * time.Second
-	if err := cmd.Run(); err != nil {
-		return "", 0, fmt.Errorf("tmux: capture pane of window %s: %s", window, strings.TrimSpace(stderr.String()))
+	width, _ = strconv.Atoi(w)
+	text, err = c.runCmds(ctx, "", []string{"capture-pane", "-p", "-J", "-S", "-", "-E", "-", "-t", window})
+	if err != nil {
+		return "", 0, fmt.Errorf("tmux: capture pane of window %s: %w", window, err)
 	}
-	return stdout.String(), width, nil
+	return text, width, nil
 }
 
 // SetBuffer puts text in a new automatic paste buffer, the one tmux's
@@ -690,20 +759,15 @@ func (c *Client) KillSession(ctx context.Context, name string) error {
 // ($TMUX names its socket), attach-session otherwise. From inside another
 // server (another workspace's, or the user's own tmux) that is a nested
 // client, so TMUX is removed from its environment (tmux refuses to nest
-// while it is set). Stdio is left for the caller to wire.
+// while it is set). attach-session starts the server if none runs, so it
+// runs with serverEnv (which drops TMUX there: that case has a socket
+// name). Stdio is left for the caller to wire.
 func (c *Client) AttachCmd(name string) *exec.Cmd {
-	if os.Getenv("TMUX") == "" {
-		return exec.Command("tmux", c.args("attach-session", "-t", "="+name)...)
-	}
-	if c.inside() {
+	if os.Getenv("TMUX") != "" && c.inside() {
 		return exec.Command("tmux", c.args("switch-client", "-t", "="+name)...)
 	}
 	cmd := exec.Command("tmux", c.args("attach-session", "-t", "="+name)...)
-	for _, kv := range os.Environ() {
-		if k, _, _ := strings.Cut(kv, "="); k != "TMUX" && k != "TMUX_PANE" {
-			cmd.Env = append(cmd.Env, kv)
-		}
-	}
+	cmd.Env = c.serverEnv()
 	return cmd
 }
 

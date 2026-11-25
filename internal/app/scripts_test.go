@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/andreujuanc/atelier/internal/model"
 )
@@ -191,6 +192,49 @@ func TestTeardownFailureAbortsUnlessForce(t *testing.T) {
 	}
 }
 
+// TestFailedCloseLeavesSessionsResumable: a close that fails after it
+// closed the task's sessions (teardown fails, or leaves changes the
+// worktree removal then refuses) leaves the task open with the sessions
+// that have a Claude id stopped, so `atl resume` relaunches them; one
+// without a Claude id (nothing to resume) and one ended before stay ended.
+func TestFailedCloseLeavesSessionsResumable(t *testing.T) {
+	for _, teardown := range []string{"exit 4", "echo x > teardown.log"} {
+		t.Run(teardown, func(t *testing.T) {
+			e := newTaskEnv(t)
+			ctx := context.Background()
+			e.addRepo(t, "api", "main")
+			e.writeProject(t, "shop", "teardown = '"+teardown+"'\n[[repos]]\nname = \"api\"\n")
+			task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "td fail", Project: "shop"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sessions := []*model.Session{
+				{TaskID: task.ID, State: model.StateIdle, ClaudeSessionID: "cid-idle"},
+				{TaskID: task.ID, State: model.StateStopped, ClaudeSessionID: "cid-stopped"},
+				{TaskID: task.ID, State: model.StateRunning},
+				{TaskID: task.ID, State: model.StateEnded, ClaudeSessionID: "cid-ended"},
+			}
+			for _, s := range sessions {
+				if err := e.app.Store.CreateSession(ctx, s); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := e.app.Done(ctx, task.Slug, false); err == nil {
+				t.Fatal("Done succeeded; want it to fail")
+			}
+			if st, _ := e.app.Store.GetTask(ctx, task.ID); st.Status != model.StatusActive {
+				t.Fatalf("status %s", st.Status)
+			}
+			want := []model.SessionState{model.StateStopped, model.StateStopped, model.StateEnded, model.StateEnded}
+			for i, s := range sessions {
+				if got, _ := e.app.Store.GetSession(ctx, s.ID); got.State != want[i] {
+					t.Errorf("session %d (%s): %s, want %s", s.ID, s.ClaudeSessionID, got.State, want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestTeardownProjectGone(t *testing.T) {
 	e := newTaskEnv(t)
 	ctx := context.Background()
@@ -213,10 +257,10 @@ func TestTeardownProjectGone(t *testing.T) {
 
 func TestLaunchEnvProject(t *testing.T) {
 	e := newTaskEnv(t)
-	e.writeProject(t, "shop", "[env]\nFOO = \"bar\"\nATL_PORT_OFFSET = \"9999\"\nATL_SESSION = \"x\"\n")
+	e.writeProject(t, "shop", "[env]\nFOO = \"bar\"\nATL_PORT_OFFSET = \"9999\"\nATL_SESSION = \"x\"\nATL_LAUNCH = \"99\"\n")
 	task := &model.Task{Slug: "s", Project: "shop", PortOffset: 300}
-	env := e.app.launchEnv(task, &model.Session{ID: 7})
-	want := map[string]string{"FOO": "bar", "ATL_PORT_OFFSET": "300", "ATL_SESSION": "7", "ATL_TASK": "s",
+	env := e.app.launchEnv(task, &model.Session{ID: 7, LaunchSeq: 2})
+	want := map[string]string{"FOO": "bar", "ATL_PORT_OFFSET": "300", "ATL_SESSION": "7", "ATL_LAUNCH": "2", "ATL_TASK": "s",
 		"ATL_TASK_DIR": e.app.Paths.TaskDir("s")}
 	if len(env) != len(want) {
 		t.Fatalf("env = %v", env)
@@ -228,7 +272,7 @@ func TestLaunchEnvProject(t *testing.T) {
 	}
 	// Project file gone (or no project): ATL_* only.
 	task.Project = "missing"
-	if env := e.app.launchEnv(task, &model.Session{ID: 7}); len(env) != 4 || env["ATL_PORT_OFFSET"] != "300" {
+	if env := e.app.launchEnv(task, &model.Session{ID: 7}); len(env) != 5 || env["ATL_PORT_OFFSET"] != "300" {
 		t.Fatalf("env = %v", env)
 	}
 	if !strings.Contains(e.outString(), `warning: project "missing" not found`) ||
@@ -274,5 +318,92 @@ func TestPrefixWriter(t *testing.T) {
 	want := "setup api: one\nsetup api: 10%\nsetup api: 20%\nsetup api: done\nsetup api: tail\n"
 	if buf.String() != want {
 		t.Fatalf("got %q\nwant %q", buf.String(), want)
+	}
+}
+
+// Output with no line break (binary junk, a progress bar drawn otherwise)
+// is not kept whole: past maxPartialLine bytes it goes out as a line.
+func TestPrefixWriterLongLine(t *testing.T) {
+	var buf bytes.Buffer
+	p := &prefixWriter{w: &buf, prefix: "setup api: "}
+	chunk := bytes.Repeat([]byte("x"), 4096)
+	total := 0
+	for total < 4*maxPartialLine {
+		p.Write(chunk)
+		total += len(chunk)
+		if len(p.buf) > maxPartialLine {
+			t.Fatalf("after %d bytes the writer holds %d", total, len(p.buf))
+		}
+	}
+	p.Flush()
+	if got := strings.Count(buf.String(), "x"); got != total {
+		t.Fatalf("wrote %d of %d bytes", got, total)
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n") {
+		if !strings.HasPrefix(line, "setup api: x") || len(line) > len("setup api: ")+maxPartialLine {
+			t.Fatalf("line of %d bytes: %.40q", len(line), line)
+		}
+	}
+}
+
+// A piece of a long line ends on a whole UTF-8 character, not inside one.
+func TestPrefixWriterLongLineRunes(t *testing.T) {
+	var buf bytes.Buffer
+	p := &prefixWriter{w: &buf, prefix: "setup api: "}
+	long := strings.Repeat("x", maxPartialLine-1) + "é" + strings.Repeat("€", maxPartialLine/3)
+	p.Write([]byte(long))
+	p.Flush()
+	var joined strings.Builder
+	for _, line := range strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n") {
+		if !utf8.ValidString(line) {
+			t.Fatalf("piece of %d bytes is not valid UTF-8, ending %q", len(line), line[len(line)-4:])
+		}
+		joined.WriteString(strings.TrimPrefix(line, "setup api: "))
+	}
+	if joined.String() != long {
+		t.Fatal("the pieces do not add up to the line")
+	}
+}
+
+// A teardown that puts something else at the worktree's path (here a
+// symlink to a copy of the worktree) makes the close refuse, before git
+// removes anything; with --force the close goes on and leaves it alone.
+func TestTeardownSwapsWorktree(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	e.writeProject(t, "shop", "teardown = 'cd .. && mv api api.moved && ln -s api.moved api'\n[[repos]]\nname = \"api\"\n")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "td swap", Project: "shop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	moved := wt + ".moved"
+	_, err = e.app.Done(ctx, task.Slug, false)
+	if err == nil || !strings.Contains(err.Error(), "repo api:") || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("err = %v", err)
+	}
+	if got, _ := e.app.Store.GetTask(ctx, task.ID); got.Status != model.StatusActive {
+		t.Fatalf("refused close: status %s", got.Status)
+	}
+	if !exists(filepath.Join(moved, "README")) {
+		t.Fatal("the worktree behind the symlink was removed")
+	}
+	// Put it back as it was, and let the teardown swap it again.
+	if err := os.Remove(wt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moved, wt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.app.Done(ctx, task.Slug, true)
+	if err != nil || got.Status != model.StatusDone {
+		t.Fatalf("forced close: %v", err)
+	}
+	if !strings.Contains(e.outString(), "warning: repo api:") || !strings.Contains(e.outString(), "left alone") {
+		t.Fatalf("output:\n%s", e.outString())
+	}
+	if !exists(filepath.Join(moved, "README")) {
+		t.Fatal("forced close removed the worktree behind the symlink")
 	}
 }

@@ -3,6 +3,7 @@ package nofollow
 import (
 	"errors"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -141,5 +142,100 @@ func TestOpenRefusesASymlink(t *testing.T) {
 	_, root, _, _ := setup(t)
 	if _, err := Open(filepath.Join(root, "dirlink")); !errors.Is(err, ErrSymlink) {
 		t.Errorf("Open(dirlink) = %v, want ErrSymlink", err)
+	}
+}
+
+// A unix socket, which open(2) refuses with ENXIO, is ErrNotRegular too.
+func TestOpenFileRefusesASocket(t *testing.T) {
+	d, root, _, _ := setup(t)
+	l, err := net.Listen("unix", filepath.Join(root, "sock"))
+	must(t, err)
+	defer l.Close()
+	if _, err := d.ReadFile("sock", 100); !errors.Is(err, ErrNotRegular) {
+		t.Errorf("ReadFile(sock) = %v, want ErrNotRegular", err)
+	}
+}
+
+// RemoveAll removes a tree with symlinks in it, not their targets; a
+// symlink on the way is an error; what is missing is no error.
+// ReadDirNames lists a directory, not one through a symlink.
+func TestRemoveAllDoesNotFollowSymlinks(t *testing.T) {
+	d, root, victim, victimDir := setup(t)
+	must(t, os.MkdirAll(filepath.Join(root, "tree", "a", "b"), 0o755))
+	must(t, os.WriteFile(filepath.Join(root, "tree", "a", "b", "f"), []byte("x"), 0o644))
+	must(t, os.Symlink(victimDir, filepath.Join(root, "tree", "a", "dirlink")))
+	must(t, os.Symlink(victim, filepath.Join(root, "tree", "link")))
+	names, err := d.ReadDirNames("tree")
+	if err != nil || len(names) != 2 {
+		t.Errorf("ReadDirNames(tree) = %q, %v; want a and link", names, err)
+	}
+	if _, err := d.ReadDirNames("dirlink"); !errors.Is(err, ErrSymlink) {
+		t.Errorf("ReadDirNames(dirlink) = %v, want ErrSymlink", err)
+	}
+	if err := d.RemoveAll("dirlink/f"); !errors.Is(err, ErrSymlink) {
+		t.Errorf("RemoveAll(dirlink/f) = %v, want ErrSymlink", err)
+	}
+	must(t, d.RemoveAll("tree"))
+	must(t, d.RemoveAll("tree"))
+	must(t, d.RemoveAll("link"))
+	if _, err := os.Lstat(filepath.Join(root, "tree")); !os.IsNotExist(err) {
+		t.Errorf("tree after RemoveAll: %v", err)
+	}
+	unchanged(t, victim, "the user's file\n")
+	unchanged(t, filepath.Join(victimDir, "f"), "the user's other file\n")
+}
+
+// Mkdir makes a new directory only: not over anything, not through a
+// symlink.
+func TestMkdir(t *testing.T) {
+	d, root, _, victimDir := setup(t)
+	must(t, d.Mkdir("new", 0o755))
+	if fi, err := os.Lstat(filepath.Join(root, "new")); err != nil || !fi.IsDir() {
+		t.Fatalf("new: %v, %v", fi, err)
+	}
+	for _, rel := range []string{"new", "sub", "link", "dirlink"} {
+		if err := d.Mkdir(rel, 0o755); !errors.Is(err, fs.ErrExist) {
+			t.Errorf("Mkdir(%s) = %v, want ErrExist", rel, err)
+		}
+	}
+	if err := d.Mkdir("dirlink/x", 0o755); !errors.Is(err, ErrSymlink) {
+		t.Errorf("Mkdir(dirlink/x) = %v, want ErrSymlink", err)
+	}
+	if _, err := os.Stat(filepath.Join(victimDir, "x")); err == nil {
+		t.Error("a directory was made through the symlink")
+	}
+}
+
+// TestCreateExclAndRename: a lock file is made only where nothing is, a
+// symlink included, never through one; a rename replaces a symlink itself.
+func TestCreateExclAndRename(t *testing.T) {
+	d, root, victim, victimDir := setup(t)
+	if err := d.CreateExcl("sub/f.lock", []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CreateExcl("sub/f.lock", nil, 0o644); !errors.Is(err, fs.ErrExist) {
+		t.Errorf("second CreateExcl: %v, want ErrExist", err)
+	}
+	if err := d.CreateExcl("link", nil, 0o644); !errors.Is(err, fs.ErrExist) {
+		t.Errorf("CreateExcl on a symlink: %v, want ErrExist", err)
+	}
+	if err := d.CreateExcl("dirlink/new", nil, 0o644); !errors.Is(err, ErrSymlink) {
+		t.Errorf("CreateExcl under a symlink: %v, want ErrSymlink", err)
+	}
+	if _, err := os.Stat(filepath.Join(victimDir, "new")); !os.IsNotExist(err) {
+		t.Errorf("a file was made in the symlinked dir: %v", err)
+	}
+	must(t, os.Symlink(victim, filepath.Join(root, "sub", "g")))
+	if err := d.Rename("sub/f.lock", "g"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(root, "sub", "g")); string(data) != "new\n" {
+		t.Errorf("sub/g = %q", data)
+	}
+	if data, _ := os.ReadFile(victim); string(data) != "the user's file\n" {
+		t.Errorf("victim = %q", data)
+	}
+	if err := d.Rename("sub/g", "../x"); err == nil {
+		t.Error("rename out of the directory: no error")
 	}
 }

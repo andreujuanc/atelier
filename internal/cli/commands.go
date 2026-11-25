@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -273,6 +274,13 @@ type jsonTask struct {
 
 func rfc3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
+// printJSON prints v on stdout as indented JSON (the --json outputs).
+func (c *cli) printJSON(v any) error {
+	enc := json.NewEncoder(c.stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
 func toJSON(ap *app.App, v app.TaskView) jsonTask {
 	t := v.Task
 	jt := jsonTask{
@@ -354,16 +362,14 @@ func (c *cli) lsCmd() *cobra.Command {
 				for _, v := range views {
 					out = append(out, toJSON(ap, v))
 				}
-				enc := json.NewEncoder(c.stdout)
-				enc.SetIndent("", "  ")
-				return enc.Encode(out)
+				return c.printJSON(out)
 			}
 			tw := tabwriter.NewWriter(c.stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(tw, "ID\tSLUG\tSTATUS\tPROJECT\tSESSIONS\tTITLE")
 			for _, v := range views {
 				t := v.Task
 				fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", t.ID, t.Slug, t.Status, orDash(t.Project),
-					sessionsSummary(v.Sessions), t.Title)
+					sessionsSummary(v.Sessions), sanitize(t.Title))
 			}
 			return tw.Flush()
 		},
@@ -410,11 +416,7 @@ func (c *cli) openCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			attach.Stdin, attach.Stdout, attach.Stderr = os.Stdin, c.stdout, c.stderr
-			if err := attach.Run(); err != nil {
-				return fmt.Errorf("attach: %w", err)
-			}
-			return nil
+			return c.attach(attach)
 		},
 	}
 	cmd.Flags().Int64Var(&sessionID, "session", 0, "open this session (id from atl show): attach to it if live, else resume it")
@@ -445,13 +447,24 @@ func (c *cli) assistantCmd() *cobra.Command {
 			if hint != "" {
 				fmt.Fprintln(c.stderr, hint)
 			}
-			attach.Stdin, attach.Stdout, attach.Stderr = os.Stdin, c.stdout, c.stderr
-			if err := attach.Run(); err != nil {
-				return fmt.Errorf("attach: %w", err)
-			}
-			return nil
+			return c.attach(attach)
 		},
 	}
+}
+
+// attach runs a tmux attach command on the terminal.
+func (c *cli) attach(attach *exec.Cmd) error {
+	if err := c.runOnTerminal(attach); err != nil {
+		return fmt.Errorf("attach: %w", err)
+	}
+	return nil
+}
+
+// runOnTerminal runs cmd with the terminal's stdin and atl's stdout and
+// stderr.
+func (c *cli) runOnTerminal(cmd *exec.Cmd) error {
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, c.stdout, c.stderr
+	return cmd.Run()
 }
 
 func (c *cli) sessionCmd() *cobra.Command {
@@ -647,9 +660,9 @@ func (c *cli) prCmd() *cobra.Command {
 
 func (c *cli) finishCmd(verb string) *cobra.Command {
 	var force bool
-	short := "Finish a task: kill tmux, remove worktrees (branches kept), status done"
+	short := "Finish a task: kill tmux, remove worktrees and the branches with nothing unpushed, status done"
 	if verb == "cancel" {
-		short = "Cancel a task: kill tmux, remove worktrees (branches kept), status cancelled"
+		short = "Cancel a task: kill tmux, remove worktrees and the branches with nothing unpushed, status cancelled"
 	}
 	cmd := &cobra.Command{
 		Use:   verb + " <task> [--force]",
@@ -664,6 +677,14 @@ func (c *cli) finishCmd(verb string) *cobra.Command {
 			if verb == "cancel" {
 				finish = ap.Cancel
 			}
+			// Closing kills the task's tmux session: run from a window
+			// of it, this process gets its SIGHUP and would die with the
+			// task half closed (worktrees left, status still open).
+			// Caught, not ignored: an ignored signal stays ignored in
+			// what atl starts (teardown and its background processes).
+			hup := make(chan os.Signal, 1)
+			signal.Notify(hup, syscall.SIGHUP)
+			defer signal.Stop(hup)
 			t, err := finish(cmd.Context(), a[0], force)
 			if err != nil {
 				return err
@@ -689,7 +710,9 @@ func (c *cli) doctorCmd() *cobra.Command {
 			failed := false
 			tw := tabwriter.NewWriter(c.stdout, 0, 0, 2, ' ', 0)
 			for _, ch := range ap.Doctor(cmd.Context()) {
-				fmt.Fprintf(tw, "%s\t%s\t%s\n", ch.Level(), ch.Name, ch.Detail)
+				// What a check found may come from a task (a repo's config, the
+				// worktrees git lists for it).
+				fmt.Fprintf(tw, "%s\t%s\t%s\n", ch.Level(), sanitize(ch.Name), sanitize(ch.Detail))
 				failed = failed || !ch.OK
 			}
 			if err := tw.Flush(); err != nil {
@@ -765,76 +788,84 @@ func (c *cli) gateCmd() *cobra.Command {
 					return fmt.Errorf("--ro-mount: %w", err)
 				}
 			}
-			dir := p.TaskDir(slug)
-			root, err := filepath.EvalSymlinks(dir)
-			if err != nil {
-				return fmt.Errorf("task dir: %w", err)
-			}
-			runDir := p.RunDir(slug)
-			id := sandbox.ID(slug, dir)
-			bin, err := gateBin()
-			if err != nil {
-				return err
-			}
-			// The task by database id, checked against the slug once: a
-			// request never names a task.
-			ts, err := hook.OpenTaskServer(p, taskID, slug)
-			if err != nil {
-				return err
-			}
-			defer ts.Close()
-			g := &sandbox.Gate{
-				ID:         id,
-				Root:       root,
-				SocketHost: sandbox.SocketPath(runDir),
-				Agent:      sandbox.ContainerName(id),
-				Upstream:   sandbox.UpstreamSocket(),
-				Log:        sandbox.NewLogger(),
-				Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
-				Ident:      sandbox.Ident(taskID, bin, roMounts),
-				ROMounts:   roMounts,
-				Reserved:   reservedImages(p, os.Getenv("ATL_SANDBOX_IMAGE"), os.Getenv("ATL_BOX_IMAGE")),
-			}
-			ts.SetROMounts(roMounts)
-			// A session ended (Claude exits): what it left running in the
-			// container goes once Claude is gone.
-			ts.OnSessionEnd(func(session int64) {
-				go func() {
-					if err := g.EndSession(session); err != nil {
-						g.Log.Printf("note  end what session %d left running: %v", session, err)
-					}
-				}()
-			})
-			ctx, cancel := context.WithCancel(cmd.Context())
-			defer cancel()
-			go func() { // a gate outliving its task stops
-				tick := time.NewTicker(10 * time.Second)
-				defer tick.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-tick.C:
-						if gone, _ := ts.Gone(ctx); gone {
-							g.Log.Printf("task %d (%s) is gone; stopping", taskID, slug)
-							cancel()
-							return
-						}
-					}
-				}
-			}()
-			ctl := &sandbox.Control{Slug: slug, TaskID: taskID, Atl: bin, Task: ts, Log: g.Log}
-			// The copy relay (wl-copy in the container): to the terminal
-			// attached to this task's tmux session, on atl's tmux server.
-			tc, session := tmux.New(), tmux.SessionName(slug)
-			ctl.Copy = func(ctx context.Context, text []byte) error { return tc.Copy(ctx, session, text) }
-			return sandbox.Serve(ctx, g, ctl, runDir)
+			return c.taskGate(cmd.Context(), p, slug, taskID, roMounts)
 		},
 	}
 	cmd.Flags().Int64Var(&taskID, "task-id", 0, "the task's database id (must still have this slug)")
 	cmd.Flags().StringArrayVar(&roMounts, "ro-mount", nil, "a host path of $"+sandbox.MountsVar+" (resolved) the task may bind-mount, read-only only")
 	cmd.Flags().BoolVar(&assistant, "assistant", false, "serve the assistant's container of the workspace instead of a task's")
 	return cmd
+}
+
+// taskGate is `atl gate <slug> --task-id ID`: the gate of task slug, whose
+// database id is taskID, with the read-only mount sources roMounts (both
+// checked by the caller). It stops once the task is gone.
+func (c *cli) taskGate(ctx context.Context, p config.Paths, slug string, taskID int64, roMounts []string) error {
+	dir := p.TaskDir(slug)
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return fmt.Errorf("task dir: %w", err)
+	}
+	runDir := p.RunDir(slug)
+	id := sandbox.ID(slug, dir)
+	bin, err := atlBin()
+	if err != nil {
+		return err
+	}
+	// The task by database id, checked against the slug once: a
+	// request never names a task.
+	ts, err := hook.OpenTaskServer(p, taskID, slug)
+	if err != nil {
+		return err
+	}
+	defer ts.Close()
+	g := &sandbox.Gate{
+		ID:         id,
+		Root:       root,
+		SocketHost: sandbox.SocketPath(runDir),
+		Agent:      sandbox.ContainerName(id),
+		Upstream:   sandbox.UpstreamSocket(),
+		Log:        sandbox.NewLogger(),
+		Verbose:    os.Getenv("ATL_GATE_DEBUG") != "",
+		Ident:      sandbox.Ident(taskID, bin, roMounts),
+		ROMounts:   roMounts,
+		Reserved:   reservedImages(p, os.Getenv("ATL_SANDBOX_IMAGE"), os.Getenv("ATL_BOX_IMAGE")),
+		Registries: registries(p, workspace.UserEnv(sandbox.RegistriesVar)),
+	}
+	ts.SetROMounts(roMounts)
+	// A session ended (Claude exits): what it left running in the
+	// container goes once Claude is gone.
+	ts.OnSessionEnd(func(session int64) {
+		go func() {
+			if err := g.EndSession(session); err != nil {
+				g.Log.Printf("note  end what session %d left running: %v", session, err)
+			}
+		}()
+	})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { // a gate outliving its task stops
+		tick := time.NewTicker(10 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if gone, _ := ts.Gone(ctx); gone {
+					g.Log.Printf("task %d (%s) is gone; stopping", taskID, slug)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	ctl := &sandbox.Control{Slug: slug, TaskID: taskID, Atl: bin, Task: ts, Log: g.Log}
+	// The copy relay (wl-copy in the container): to the terminal
+	// attached to this task's tmux session, on atl's tmux server.
+	tc, session := tmux.New(), tmux.SessionName(slug)
+	ctl.Copy = func(ctx context.Context, text []byte) error { return tc.Copy(ctx, session, text) }
+	return sandbox.Serve(ctx, g, ctl, runDir)
 }
 
 // reservedImages is a task gate's sandbox.Gate.Reserved: the image names
@@ -871,9 +902,32 @@ func reservedImages(p config.Paths, startImages ...string) func() ([]string, err
 	}
 }
 
-// gateBin is the atl binary a gate runs push, fetch and the assistant's
-// commands with: $ATL_BIN, else the running one.
-func gateBin() (string, error) {
+// registries is a task gate's sandbox.Gate.Registries: the registries
+// tasks may pull from besides the default ones. userEnv, the user's own
+// $ATL_SANDBOX_REGISTRIES when the gate started (a variable set wins over
+// atelier.toml), else the workspace's sandbox.registries, read again on
+// each call: an entry the user adds or removes applies at once. A file
+// that cannot be read, or a bad entry, is an error: the gate then refuses
+// every pull.
+func registries(p config.Paths, userEnv string) func() ([]string, error) {
+	return func() ([]string, error) {
+		if userEnv != "" {
+			return sandbox.ParseRegistries(userEnv)
+		}
+		if p.Workspace == "" {
+			return nil, nil
+		}
+		c, err := workspace.ReadConfig(p.Workspace)
+		if err != nil || c.Sandbox == nil {
+			return nil, err
+		}
+		return c.Sandbox.Registries, nil
+	}
+}
+
+// atlBin is the atl binary a gate runs push, fetch and the assistant's
+// commands with, and the one atl re-executes: $ATL_BIN, else the running one.
+func atlBin() (string, error) {
 	if bin := os.Getenv("ATL_BIN"); bin != "" {
 		return bin, nil
 	}
@@ -901,7 +955,7 @@ func (c *cli) assistantGate(ctx context.Context, p config.Paths) error {
 	if err != nil {
 		return fmt.Errorf("assistant dir: %w", err)
 	}
-	bin, err := gateBin()
+	bin, err := atlBin()
 	if err != nil {
 		return err
 	}

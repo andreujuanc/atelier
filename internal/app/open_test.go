@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/model"
 )
 
@@ -116,6 +118,45 @@ func TestReadTranscriptInfo(t *testing.T) {
 
 	if _, err := readTranscriptInfoAt(filepath.Join(dir, "missing.jsonl")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("missing transcript: %v", err)
+	}
+}
+
+// shrunkFile is a transcript that was cut short after it was stat'ed:
+// Stat still reports size, but only what the Reader holds is there.
+type shrunkFile struct {
+	*bytes.Reader
+	size int64
+}
+
+func (f shrunkFile) Stat() (fs.FileInfo, error) { return shrunkInfo(f.size), nil }
+
+type shrunkInfo int64
+
+func (s shrunkInfo) Name() string       { return "shrunk.jsonl" }
+func (s shrunkInfo) Size() int64        { return int64(s) }
+func (s shrunkInfo) Mode() fs.FileMode  { return 0o644 }
+func (s shrunkInfo) ModTime() time.Time { return time.Time{} }
+func (s shrunkInfo) IsDir() bool        { return false }
+func (s shrunkInfo) Sys() any           { return nil }
+
+// A large transcript cut short between its stat and the read of its tail
+// still gives its last line, even one not ended by a newline yet: only
+// the bytes read are scanned, not the rest of the buffer.
+func TestReadTranscriptInfoShrunk(t *testing.T) {
+	filler := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + strings.Repeat("x", 1000) + `"}]}}` + "\n"
+	var b strings.Builder
+	b.WriteString(`{"type":"user","message":{"role":"user","content":"first"}}` + "\n")
+	for b.Len() < 3*transcriptWindow {
+		b.WriteString(filler)
+	}
+	b.WriteString(`{"type":"user","message":{"role":"user","content":"last"}}`) // no newline yet
+	data := []byte(b.String())
+	info, err := readTranscriptInfo(shrunkFile{bytes.NewReader(data), int64(len(data)) + 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (transcriptInfo{FirstPrompt: "first", LastPrompt: "last"}); info != want {
+		t.Fatalf("info = %+v, want %+v", info, want)
 	}
 }
 
@@ -322,7 +363,7 @@ func TestOpenSessionResumesEnded(t *testing.T) {
 	if !reflect.DeepEqual(cmd.Args, wantArgs) {
 		t.Errorf("attach cmd = %v", cmd.Args)
 	}
-	want := []string{"--resume", "cid-e", "--add-dir", e.app.Paths.RepoPath("docs")}
+	want := []string{"--resume=cid-e", "--add-dir", e.app.Paths.RepoPath("docs")}
 	if argv := e.argv(t, ended.ID); !reflect.DeepEqual(argv, want) {
 		t.Errorf("argv = %q, want %q", argv, want)
 	}
@@ -580,6 +621,22 @@ func TestOpenLiveWindowOfPastRow(t *testing.T) {
 	if got := e.session(t, s.ID); got.State != model.StateIdle || got.TmuxTarget != win {
 		t.Errorf("after Resume: %+v, want idle in %s", got, win)
 	}
+	// That Claude, adopted rather than launched again, still ends the
+	// session when it exits: the launch it was started at stays current.
+	launch := ""
+	for _, kv := range strings.Split(readFile(t, filepath.Join(e.out, "env-"+tag)), "\n") {
+		if v, ok := strings.CutPrefix(kv, "ATL_LAUNCH="); ok {
+			launch = v
+		}
+	}
+	env := map[string]string{"ATL_SESSION": tag, "ATL_TASK": "t", "ATL_LAUNCH": launch}
+	in := hook.Input{SessionID: "cid-1", Cwd: e.app.Paths.TaskDir("t")}
+	if _, _, err := hook.Handle(ctx, hook.EventSessionEnd, in, func(k string) string { return env[k] }, e.app.Store, e.app.Paths, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.session(t, s.ID).State; got != model.StateEnded {
+		t.Errorf("the adopted Claude's SessionEnd (ATL_LAUNCH=%q) left the session %s", launch, got)
+	}
 }
 
 // TestOpenResumableOnlyFromTaskDir: past sessions are offered (and resumed
@@ -633,7 +690,7 @@ func TestOpenResumableOnlyFromTaskDir(t *testing.T) {
 	if _, err := e.app.OpenSession(ctx, "t", launched.ID); err != nil {
 		t.Fatal(err)
 	}
-	if argv := e.argv(t, launched.ID); len(argv) < 2 || argv[0] != "--resume" || argv[1] != "cid-l" {
+	if argv := e.argv(t, launched.ID); len(argv) < 1 || argv[0] != "--resume=cid-l" {
 		t.Errorf("argv = %q", argv)
 	}
 }

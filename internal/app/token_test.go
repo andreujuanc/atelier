@@ -292,7 +292,7 @@ func TestDoctorClaudeToken(t *testing.T) {
 		{0, "ok", "0 days old"},
 		{100 * 24 * time.Hour, "ok", "100 days old"},
 		{334 * 24 * time.Hour, "ok", "334 days old"},
-		{335 * 24 * time.Hour, "warn", "expires by 2027-01-10"},
+		{335 * 24 * time.Hour, "warn", "expires by " + t0.Add(tokenLifetime).Local().Format(time.DateOnly)}, // a local date
 		{364 * 24 * time.Hour, "warn", "364 days old"},
 		{365 * 24 * time.Hour, "FAIL", "has expired"},
 	} {
@@ -316,6 +316,42 @@ func TestDoctorClaudeToken(t *testing.T) {
 	if c.Level() != "ok" || !strings.Contains(c.Detail, "from the environment: $CLAUDE_CODE_OAUTH_TOKEN") ||
 		!strings.Contains(c.Detail, "not used") || strings.Contains(c.Detail, testToken) {
 		t.Errorf("env: %s %q", c.Level(), c.Detail)
+	}
+}
+
+// TestTokenDates: doctor and a session's launch give the day a token was
+// stored as the same, local, date; a token stored "later" than now (the
+// clock was set back) is not given a negative age.
+func TestTokenDates(t *testing.T) {
+	e := newEnv(t)
+	a := e.app
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	local := time.Local
+	t.Cleanup(func() { time.Local = local })
+	time.Local = time.FixedZone("east", 5*3600)
+	t0 := time.Date(2026, 1, 10, 23, 30, 0, 0, time.UTC) // Jan 11 at 04:30 local
+	now := t0
+	a.Now = func() time.Time { return now }
+	if err := a.StoreToken(storedTestToken); err != nil {
+		t.Fatal(err)
+	}
+
+	now = t0.Add(-3 * 24 * time.Hour)
+	if c := a.checkClaudeToken(); c.Level() != "ok" || !strings.Contains(c.Detail, " 0 days old") {
+		t.Errorf("future-dated token: %s %q", c.Level(), c.Detail)
+	}
+
+	now = t0.Add(400 * 24 * time.Hour)
+	if c := a.checkClaudeToken(); !strings.Contains(c.Detail, "on 2026-01-11 ") {
+		t.Errorf("doctor: %q", c.Detail)
+	}
+	a.Out.(*bytes.Buffer).Reset()
+	if _, err := a.sandboxAuth(); err != nil {
+		t.Fatal(err)
+	}
+	if out := a.Out.(*bytes.Buffer).String(); !strings.Contains(out, "stored on 2026-01-11 ") {
+		t.Errorf("launch warning: %q", out)
 	}
 }
 
@@ -536,5 +572,18 @@ func TestSetupTokenCustomImageNotPulled(t *testing.T) {
 	}
 	if e.app.Tmux.HasSession(context.Background(), TokenSession) {
 		t.Error("token window started")
+	}
+}
+
+// TestTokenRECompiles: tokenRE compiles on first use (sync.OnceValue), not
+// at start; a bad pattern would panic when a token is first read instead.
+func TestTokenRECompiles(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("tokenRE: %v", r)
+		}
+	}()
+	if !tokenRE().MatchString(storedTestToken) {
+		t.Error("tokenRE does not match a token of the shape claude setup-token prints")
 	}
 }

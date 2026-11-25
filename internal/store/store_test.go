@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/andreujuanc/atelier/internal/model"
+	"modernc.org/libc"
 )
 
 func openTest(t *testing.T) (*Store, string) {
@@ -417,6 +420,14 @@ func TestSessions(t *testing.T) {
 	if err != nil || len(list) != 2 || list[0].ID != s2.ID || list[1].ID != s1.ID {
 		t.Errorf("ListSessions = %+v, %v", list, err)
 	}
+	third := mkTask(t, s, "t3", model.StatusActive, 200)
+	byTask, err := s.ListSessionsByTask(ctx, []int64{task.ID, third.ID})
+	if err != nil || len(byTask) != 1 || !reflect.DeepEqual(byTask[task.ID], list) {
+		t.Errorf("ListSessionsByTask(t1, t3) = %+v, %v; want t1: %+v", byTask, err, list)
+	}
+	if byTask, err := s.ListSessionsByTask(ctx, nil); err != nil || len(byTask) != 0 {
+		t.Errorf("ListSessionsByTask(none) = %+v, %v", byTask, err)
+	}
 
 	// Validation.
 	if err := s.CreateSession(ctx, &model.Session{TaskID: task.ID, State: "dead"}); err == nil {
@@ -653,7 +664,7 @@ func TestSessionTransitions(t *testing.T) {
 		t.Errorf("second ClaimFrom(ended) = %v, %v", ok, err)
 	}
 
-	// SetSessionLaunch: only target and name.
+	// SetSessionLaunch: only target and name, and a new launch.
 	ss := mk(model.StateRunning)
 	before := get(ss.ID)
 	if err := s.SetSessionLaunch(ctx, ss.ID, "@42", "claude-x"); err != nil {
@@ -661,7 +672,7 @@ func TestSessionTransitions(t *testing.T) {
 	}
 	g := get(ss.ID)
 	want := *before
-	want.TmuxTarget, want.Name = "@42", "claude-x"
+	want.TmuxTarget, want.Name, want.LaunchSeq = "@42", "claude-x", before.LaunchSeq+1
 	if *g != want {
 		t.Errorf("after SetSessionLaunch: %+v, want %+v", g, want)
 	}
@@ -805,26 +816,32 @@ func TestOpenCurrentSchemaNoWriteLock(t *testing.T) {
 	}
 }
 
+// TestOpenConcurrentFreshDB: concurrent first opens of a fresh database (a
+// hook and the TUI on first run, several hooks at once) all succeed: none
+// gets SQLITE_BUSY from the switch to WAL mode instead of waiting.
 func TestOpenConcurrentFreshDB(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "fresh.db")
-	var wg sync.WaitGroup
-	errs := make(chan error, 8)
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s, err := Open(path)
-			if err != nil {
-				errs <- err
-				return
-			}
-			s.Close()
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
+	dir := t.TempDir()
+	for round := 0; round < 20; round++ {
+		path := filepath.Join(dir, fmt.Sprintf("fresh%d.db", round))
+		var wg sync.WaitGroup
+		errs := make(chan error, 16)
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s, err := Open(path)
+				if err != nil {
+					errs <- err
+					return
+				}
+				s.Close()
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Error(err)
+		}
 	}
 }
 
@@ -839,5 +856,363 @@ func TestOpenNewerSchema(t *testing.T) {
 			s2.Close()
 		}
 		t.Errorf("Open newer schema: err = %v", err)
+	}
+}
+
+// TestListTasksConsistentRepos checks that ListTasks reads a task and its
+// repos from one snapshot: a task whose status changes while it is listed
+// still comes with its repos.
+func TestListTasksConsistentRepos(t *testing.T) {
+	s, path := openTest(t)
+	ctx := context.Background()
+	for i := 0; i < 20; i++ {
+		mkTask(t, s, fmt.Sprintf("t%d", i), model.StatusActive, 0, model.TaskRepo{Name: "r", Mode: model.ModeRW})
+	}
+	w, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			st := model.StatusActive
+			if i%2 == 0 {
+				st = model.StatusDone
+			}
+			if err := w.SetTaskStatus(ctx, int64(i%20+1), st); err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	for i := 0; i < 300; i++ {
+		ts, err := s.ListTasks(ctx, model.StatusActive)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range ts {
+			if len(task.Repos) != 1 {
+				t.Fatalf("iteration %d: %s listed with repos %+v, want its one repo", i, task.Slug, task.Repos)
+			}
+		}
+	}
+}
+
+// TestOpenWaitsForWALSwitch: Open of a database not yet in WAL mode waits
+// for a lock another connection holds, as for any other statement, instead
+// of failing at once with SQLITE_BUSY when it switches the file to WAL.
+func TestOpenWaitsForWALSwitch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fresh.db")
+	// Rollback journal, like a fresh file; and a busy timeout, like every
+	// connection of atl: its COMMIT waits for the read lock that each of
+	// Open's tries of the switch takes.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ctx := context.Background()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE x (y)"); err != nil {
+		t.Fatal(err)
+	}
+	time.AfterFunc(300*time.Millisecond, func() { conn.ExecContext(ctx, "COMMIT") })
+	s, err := OpenWithTimeout(path, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+}
+
+// fileSize returns the size of the file at path, 0 if it does not exist.
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Size()
+}
+
+// TestCloseSkipsCheckpoint: the last connection to close (a hook while the
+// TUI is not running) leaves the committed writes in the WAL instead of
+// checkpointing them into the database file, and they stay visible.
+func TestCloseSkipsCheckpoint(t *testing.T) {
+	s, path := openTest(t)
+	mkTask(t, s, "in-wal", model.StatusActive, 0)
+	s.Close()
+	if fileSize(t, path+"-wal") == 0 {
+		t.Fatal("close checkpointed the WAL into the database file")
+	}
+	ctx := context.Background()
+	ro, err := OpenReadOnly(path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ro.GetTaskBySlug(ctx, "in-wal"); err != nil {
+		t.Errorf("read-only read: %v", err)
+	}
+	ro.Close()
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if _, err := s2.GetTaskBySlug(ctx, "in-wal"); err != nil {
+		t.Errorf("read after reopen: %v", err)
+	}
+}
+
+// TestWALBoundedAcrossOpens: although no connection checkpoints on close,
+// many open-write-close cycles with no other connection open (one hook
+// after another) keep the WAL bounded, and checkpoint it into the database
+// file. Also when the database path is a symlink, where SQLite keeps the
+// WAL next to the symlink's target.
+func TestWALBoundedAcrossOpens(t *testing.T) {
+	t.Run("plain", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "atelier.db")
+		walBoundedAcrossOpens(t, path, path)
+	})
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		real := filepath.Join(dir, "real", "atelier.db")
+		if err := os.MkdirAll(filepath.Dir(real), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(dir, "atelier.db")
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		walBoundedAcrossOpens(t, link, real)
+	})
+	t.Run("symlinked dir", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "real"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(dir, "real"), filepath.Join(dir, "data")); err != nil {
+			t.Fatal(err)
+		}
+		walBoundedAcrossOpens(t, filepath.Join(dir, "data", "atelier.db"), filepath.Join(dir, "real", "atelier.db"))
+	})
+}
+
+// walBoundedAcrossOpens runs open-write-close cycles on the database at
+// path, whose file (where SQLite keeps the WAL) is real.
+func walBoundedAcrossOpens(t *testing.T, path, real string) {
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	task := mkTask(t, s, "busy", model.StatusActive, 0)
+	s.Close()
+	const write = 32 << 10
+	var maxWAL int64
+	text := ""
+	for i := 0; i < 400; i++ { // ~13MB of notes, several times the bound
+		st, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text = fmt.Sprintf("%04d %s", i, strings.Repeat(string(rune('a'+i%26)), write))
+		if _, err := st.ReplaceNotes(ctx, task.ID, text); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		maxWAL = max(maxWAL, fileSize(t, real+"-wal"))
+	}
+	// One write past the bound is let in before Close truncates the WAL.
+	if limit := int64(walTruncateSize + 4*write); maxWAL > limit {
+		t.Errorf("WAL grew to %d bytes, want at most %d", maxWAL, limit)
+	}
+	if n := fileSize(t, real); n < write {
+		t.Errorf("database file is %d bytes: the WAL was never checkpointed into it", n)
+	}
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if got, err := st.GetNotes(ctx, task.ID); err != nil || got != text {
+		t.Errorf("notes after the cycles: %d bytes, %v; want the last write", len(got), err)
+	}
+}
+
+// benchHookCycle measures what one `atl hook` does with the database:
+// open, one small write, close; keepOpen: while another Store (the TUI)
+// has the database open.
+func benchHookCycle(b *testing.B, keepOpen bool) {
+	path := filepath.Join(b.TempDir(), "atelier.db")
+	s, err := Open(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx := context.Background()
+	task := &model.Task{Slug: "b", Title: "b", Status: model.StatusActive, Branch: "atl/b"}
+	if err := s.CreateTask(ctx, task); err != nil {
+		b.Fatal(err)
+	}
+	sess := &model.Session{TaskID: task.ID, State: model.StateRunning}
+	if err := s.CreateSession(ctx, sess); err != nil {
+		b.Fatal(err)
+	}
+	if keepOpen {
+		// s (the TUI) keeps the database open throughout
+		if err := s.db.PingContext(ctx); err != nil {
+			b.Fatal(err)
+		}
+		defer s.Close()
+	} else {
+		s.Close()
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		st, err := Open(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := st.TouchSession(ctx, sess.ID, time.Time{}); err != nil {
+			b.Fatal(err)
+		}
+		st.Close()
+	}
+}
+
+func BenchmarkHookCycleAlone(b *testing.B)   { benchHookCycle(b, false) }
+func BenchmarkHookCycleTUIOpen(b *testing.B) { benchHookCycle(b, true) }
+
+// TestCloseCheckpointBounded: Close's checkpoint of a grown WAL does not
+// wait out the store's busy timeout while another connection (the TUI)
+// holds a read transaction; the WAL is truncated by a later Close once the
+// reader is done.
+func TestCloseCheckpointBounded(t *testing.T) {
+	tui, path := openTest(t)
+	ctx := context.Background()
+	task := mkTask(t, tui, "busy", model.StatusActive, 0)
+	reader, err := tui.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, err := reader.ExecContext(ctx, "BEGIN DEFERRED"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ExecContext(ctx, "SELECT count(*) FROM tasks"); err != nil { // takes the snapshot
+		t.Fatal(err)
+	}
+	cycle := func(i int) time.Duration {
+		t.Helper()
+		st, err := OpenWithTimeout(path, 3*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ReplaceNotes(ctx, task.ID, fmt.Sprintf("%04d %s", i, strings.Repeat(string(rune('a'+i%26)), 32<<10))); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return time.Since(start)
+	}
+	var slowest time.Duration
+	for i := 0; i < 60; i++ { // well past walTruncateSize
+		slowest = max(slowest, cycle(i))
+	}
+	if n := fileSize(t, path+"-wal"); n <= walTruncateSize {
+		t.Fatalf("WAL is %d bytes; the test needs it past %d", n, walTruncateSize)
+	}
+	if slowest > 250*time.Millisecond {
+		t.Errorf("Close took %v while a reader held the WAL; want about %v at most", slowest, walCheckpointBusy)
+	}
+	if _, err := reader.ExecContext(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	cycle(60)
+	if n := fileSize(t, path+"-wal"); n != 0 {
+		t.Errorf("WAL is %d bytes after the reader finished; want it truncated", n)
+	}
+}
+
+// TestConnHandleGuard: the driver connection's unexported fields are read
+// only from the driver's own connection type with the expected layout.
+func TestConnHandleGuard(t *testing.T) {
+	s, _ := openTest(t)
+	c, err := s.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var real any
+	if err := c.Raw(func(dc any) error { real = dc; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if db, tls, ok := connHandle(real); !ok || db == 0 || tls == nil {
+		t.Fatalf("driver connection rejected: %#x, %p, %v", db, tls, ok)
+	}
+	if _, _, ok := connHandle(reflect.Zero(reflect.TypeOf(real)).Interface()); ok {
+		t.Error("nil driver connection accepted")
+	}
+
+	type conn struct {
+		db  uintptr
+		tls *libc.TLS
+	}
+	if !connLayout(reflect.TypeFor[conn]()) {
+		t.Error("expected layout rejected")
+	}
+	tls := libc.NewTLS()
+	defer tls.Close()
+	if _, _, ok := connHandle(&conn{db: 1, tls: tls}); ok {
+		t.Error("a type other than the driver's accepted")
+	}
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[struct {
+			db  int64
+			tls *libc.TLS
+		}](),
+		reflect.TypeFor[struct {
+			db  uintptr
+			tls uintptr
+		}](),
+		reflect.TypeFor[struct {
+			db  uintptr
+			tls *int
+		}](),
+		reflect.TypeFor[struct{ db uintptr }](),
+		reflect.TypeFor[struct{ conn }](),
+		reflect.TypeFor[*conn](),
+		reflect.TypeFor[uintptr](),
+	} {
+		if connLayout(typ) {
+			t.Errorf("layout %v accepted", typ)
+		}
 	}
 }

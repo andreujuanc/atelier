@@ -48,10 +48,10 @@ config dir, atelier's database, state dir (logs) or config dir (projects).
 
 ## Lifecycle
 
-- Created on the task's first session; reused by later ones (installed tools persist);
-  restarted after a reboot; removed by `atl done`/`atl cancel`.
-- Replaced when the task's repos, image or mounts change, at the next session start while no
-  other session runs in it. A running container cannot get a new mount, so adding a repo
+- Created on the task's first session, or for the project's setup; reused by later ones
+  (installed tools persist); restarted after a reboot; removed by `atl done`/`atl cancel`.
+- Replaced when the task's repos, image, mounts or environment change, at the next session
+  start (or project script) while no other session runs in it. A running container cannot get a new mount, so adding a repo
   (`atl add`, TUI `a`) to a task with live sessions restarts them: their windows close, the
   container is removed and the same conversations are resumed (`claude --resume`) in a new
   one that has the repo. While things run in the task (Claude mid-turn, background work an
@@ -72,6 +72,21 @@ config dir, atelier's database, state dir (logs) or config dir (projects).
 - atl only touches a container named like the task's if it carries atl's `atelier.agent`
   label and no `atelier.task` label. Anything else under that name makes the session start
   fail; remove or rename it yourself.
+
+## Project setup and teardown
+
+A project's `setup` and `teardown` run in the task's container (`docker exec`), as your user,
+in each rw worktree, with the project's `[env]` and the `ATL_*` variables, not atl's
+environment; `docker` in them goes through the gate. atl starts the container first if
+needed: for `setup` when the task is created or reopened or a repo is added (a container that
+cannot start is a warning, as a failed setup is), for `teardown` on `atl done`/`atl cancel`
+(one that cannot start fails the close; `--force` closes without the teardown). What a script
+leaves running ends when it exits, or when it is interrupted.
+
+At close atl removes the task's containers, networks and volumes: a teardown needs no
+`docker compose down -v`. Scripts that need host tools or credentials (a CLI only the host
+has, your SSH agent, git credentials) do not work with the sandbox on. With `ATL_SANDBOX=off`
+they run on the host, with atl's environment.
 
 ## Image and tools
 
@@ -112,11 +127,21 @@ The session's start context tells Claude all of this.
 | bind mounts only from the task dir, or read-only from `[sandbox] mounts` | no host access |
 | a mount of `/var/run/docker.sock` becomes the gate's socket | testcontainers/localstack stay under the same rules |
 | refused: privileged, host network/PID/IPC, added capabilities, devices, security options, other runtimes, volume driver options, log drivers other than `json-file`/`local`/`none`, unknown container settings | each is a way out of the container |
-| images: pull and build allowed, remove refused; build from a remote URL refused | images are shared; the daemon would fetch with host credentials |
-| a pull or build may not name a tag atl's own containers run from (`atelier-task`, `atelier`, the workspace's and every project's image, in any spelling); a build may not name a tag whose image has no `atelier.task` label (yours, or pulled: build under another tag), nor pull (`--pull`, `--platform`: pull the base image first); builds get the task's label; pulling all tags, tag, import, load, commit refused | a task could swap what later tasks, the assistant and `atl token` run |
+| images: pull and build allowed, remove refused; build from a remote URL refused; a pull (also `/distribution`) only from an [allowed registry](#registries-tasks-may-pull-from) | images are shared; the daemon fetches from the host's network, with host credentials |
+| a pull or build may not name a tag atl's own containers run from (`atelier-task`, `atelier`, the workspace's and every project's image, in any spelling); a build may only tag in the task's namespace (`atl_4a2f21`, `atl_4a2f21-api`, `atl_4a2f21_x`, `atl_4a2f21/x`, with any `:tag`; no registry, no digest: compose's `<project>-<service>` names are in it), nor pull (`--pull`, `--platform`: pull the base image first); builds get the task's label; pulling all tags, tag, import, load, commit refused | a task could swap what later tasks, the assistant and `atl token` run, or what a host-side `docker run` or compose project runs (`shop-api`, an unpulled `postgres:16`), or another task's images |
 | BuildKit refused (`DOCKER_BUILDKIT=0` is set) | the gate cannot inspect BuildKit sessions |
+| a build's Dockerfile may not have `ONBUILD`, nor `ADD` from a URL or with a variable in a source (use `COPY`, or download in a `RUN` step); it must be a regular file in the context, sent uncompressed or gzipped | the daemon fetches an `ADD` URL from the host's network (its loopback services, a cloud's metadata address) |
+| a build's base images (each `FROM` image, each `COPY --from` that is no earlier stage) must be here already (`docker pull` them first), from an allowed registry, without `ONBUILD` triggers; the daemon gets the Dockerfile naming each by its ID | the builder would pull a missing one from any registry; triggers run in the build, unchecked (an `ADD` URL in one is fetched from the host's network); a tag moved during the build changes nothing |
+| the gate reads `FROM` as the classic builder does: build args and the `ARG`s before the first `FROM`, as `$V`, `${V}`, `${V:-x}`, `${V-x}`, `${V:+x}`, `${V+x}` (any other form refused); `COPY --from` is not expanded; `FROM --platform` only empty (the builder then fails) or the daemon's own platform. Refused where it could read otherwise: a `FROM`/`COPY --from` on a line that continues another instruction or in a heredoc, past a heredoc it cannot delimit, an escape directive not on the first lines, an image name across lines | where the gate and the builder could differ on a stage name, the builder could pull |
 | the task's container is joined to every network the task creates; the task cannot stop, remove, or impersonate (`atl-<slug>-<hash>` names) it | services answer by compose service name |
+| new network and volume names (also a volume a mount names, if it does not exist yet) must be the task's namespace `atl_<6 hex>` or start with it and `_` or `-` (a network may also be a lower-case UUID, as testcontainers names them); so must a `com.docker.compose.project` label; a container name that starts with any `atl_<6 hex>` must be in the task's; a container without that label gets it empty | tasks' compose names do not collide; a task cannot squat another's names, nor plant a network or volume that a compose project on the host would adopt; an image's labels cannot put a container in a host project |
 | form-encoded request bodies refused | Docker would read values the gate did not check |
+
+The namespace is `atl_` and the hash in the task's container name. atl sets `COMPOSE_PROJECT_NAME` to
+it in the container and in sessions, over a project's `[env]` value (with a warning), so compose names
+everything in it (`atl_4a2f21-db-1`, `atl_4a2f21_default`). A second compose project in one task (two
+repos) needs `-p $COMPOSE_PROJECT_NAME-<repo>`. Volumes the task made before keep their names. A
+refusal names what to use instead.
 
 ## Host files for every task
 
@@ -140,6 +165,26 @@ directory, contains a comma or quote, is `/`, or overlaps what the sandbox keeps
 the workspace, its run dir, the repos dir, the tasks dir, your Claude config dir, your git
 config (`GIT_CONFIG_GLOBAL`, `~/.gitconfig`, `~/.config/git`), the Docker socket, the SSH
 agent socket, `/proc`, `/sys`, `/dev`. `atl doctor` lists each path and why it is refused.
+
+## Registries tasks may pull from
+
+The daemon pulls from the host's network, not the task's: a registry on the host's loopback,
+the LAN or a cloud's metadata address is reached though the task's container cannot reach
+it, and so is wherever a registry's auth realm or redirects point. So a task may pull
+(`docker pull`, a build's base images) only from Docker Hub (`docker.io`, also as
+`index.docker.io` and `registry-1.docker.io`), `ghcr.io`, `quay.io`, `mcr.microsoft.com`,
+`gcr.io`, `registry.k8s.io` and `public.ecr.aws`, and those you add:
+
+```toml
+[sandbox]
+registries = ["localhost:5000", "*.pkg.dev"]
+```
+
+or `ATL_SANDBOX_REGISTRIES=localhost:5000,*.pkg.dev` (commas or blanks). An entry is a
+domain, with its port if the image names one (`localhost:5000` for kind or k3d), in any
+case; `*.pkg.dev` covers every domain under `pkg.dev`. The gate reads the setting at each
+pull (the variable as it was when the gate started). Every task can then have the daemon
+reach what you list, and follow its auth realm and redirects: list only registries you trust.
 
 ## atl inside the container
 
@@ -230,15 +275,15 @@ refuses, `atl push`/`atl fetch`) and names the mounted host paths. `context` /
   permission prompt runs in the assistant's container, so a hostile one skips it: the gate's
   allowlist is the only real limit ([assistant.md](assistant.md#permissions)).
 - Image names: rules are checked when the request arrives (a tag created while a build runs
-  is overwritten); tasks can build over each other's tags (and an image built `FROM` a
-  task's carries its label); a build pulls a missing `FROM` image under its own name (it
-  matters only for a reserved name not built yet).
+  is overwritten); an image built `FROM` a task's carries its label.
 - The assistant's container can read the token too; it has no repo, task dir or Docker.
 - A task can write (never read) your clipboard while your terminal is on its tmux session.
   Read what you paste into a shell.
 - No BuildKit.
 - Tasks can bind any free host port; no network egress policy.
-- Project setup and teardown scripts run on the host.
+- Container names outside the `atl_<6 hex>` pattern are free: a task can take the name a compose project
+  on the host would give a container (`shop-db-1`), so that project's `up` fails. Denial of service
+  only: compose finds its containers by label, not name.
 - No git credentials or `gh` in the task: use `atl push`/`atl fetch`; `atl pr` runs on the
   host.
 

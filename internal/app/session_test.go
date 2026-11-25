@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -120,6 +121,19 @@ func (e *env) startServer(t *testing.T, opts ...[2]string) {
 func (e *env) crash(t *testing.T) {
 	t.Helper()
 	e.tmux(t, "kill-server")
+	// kill-server returns before the old server is gone: a client that
+	// reaches it on its way out gets "server exited unexpectedly". Start the
+	// new one only once no server answers any more.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		out, err := exec.Command("tmux", "-L", e.sock, "-f", os.DevNull, "list-sessions").CombinedOutput()
+		if err != nil && !strings.Contains(string(out), "server exited unexpectedly") {
+			break // no server running (or no socket): gone
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tmux server still there after kill-server: %v: %s", err, out)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	e.startServer(t)
 }
 
@@ -199,8 +213,11 @@ func TestClaudeArgv(t *testing.T) {
 	}{
 		{nil, "", []string{"claude"}},
 		{[]string{"/r/a", "/r/b"}, "", []string{"claude", "--add-dir", "/r/a", "--add-dir", "/r/b"}},
-		{[]string{"/r/a"}, "cid", []string{"claude", "--resume", "cid", "--add-dir", "/r/a"}},
-		{nil, "cid", []string{"claude", "--resume", "cid"}},
+		{[]string{"/r/a"}, "cid", []string{"claude", "--resume=cid", "--add-dir", "/r/a"}},
+		{nil, "cid", []string{"claude", "--resume=cid"}},
+		// A stored id that looks like an option stays the value of --resume.
+		{nil, "--settings=x", []string{"claude", "--resume=--settings=x"}},
+		{[]string{"/r/a"}, "--dangerously-skip-permissions", []string{"claude", "--resume=--dangerously-skip-permissions", "--add-dir", "/r/a"}},
 	} {
 		if got := ClaudeArgv(c.ro, c.resume); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("ClaudeArgv(%v, %q) = %v, want %v", c.ro, c.resume, got, c.want)
@@ -247,6 +264,7 @@ func TestNewSession(t *testing.T) {
 	for _, want := range []string{
 		fmt.Sprintf("ATL_SESSION=%d\n", s.ID),
 		"ATL_TASK=fix-login\n",
+		"ATL_LAUNCH=0\n",
 		"ATL_PORT_OFFSET=100\n",
 		"ATL_TASK_DIR=" + e.app.Paths.TaskDir("fix-login") + "\n",
 	} {
@@ -472,9 +490,15 @@ func TestResume(t *testing.T) {
 	if tags[strconv.FormatInt(s1.ID, 10)] != got.TmuxTarget || len(tags) != 1 {
 		t.Errorf("tags = %v", tags)
 	}
-	want := []string{"--resume", "cid-1", "--add-dir", e.app.Paths.RepoPath("docs")}
+	want := []string{"--resume=cid-1", "--add-dir", e.app.Paths.RepoPath("docs")}
 	if argv := e.argv(t, s1.ID); !reflect.DeepEqual(argv, want) {
 		t.Errorf("resumed argv = %q, want %q", argv, want)
+	}
+	// Its Claude knows the launch it was started at: the claim's, one before
+	// the recorded window's (see hook.envLaunch).
+	if envb, _ := os.ReadFile(filepath.Join(e.out, fmt.Sprintf("env-%d", s1.ID))); !strings.Contains(string(envb),
+		fmt.Sprintf("ATL_LAUNCH=%d\n", e.session(t, s1.ID).LaunchSeq-1)) {
+		t.Errorf("resumed claude env lacks ATL_LAUNCH=%d", e.session(t, s1.ID).LaunchSeq-1)
 	}
 	if st := e.session(t, s2.ID).State; st != model.StateEnded {
 		t.Errorf("stopped session without claude id: %s, want ended", st)
@@ -542,7 +566,7 @@ func TestOpen(t *testing.T) {
 	if len(all) != 1 || all[0].State != model.StateIdle {
 		t.Fatalf("sessions after resuming Open = %+v", all)
 	}
-	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume", "cid-9"}) {
+	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume=cid-9"}) {
 		t.Errorf("argv = %q", argv)
 	}
 
@@ -630,7 +654,7 @@ func TestUserTmuxOptions(t *testing.T) {
 	if got.State != model.StateIdle || got.TmuxTarget == "" || got.TmuxTarget == s1.TmuxTarget || got.ClaudeSessionID != "cid-1" {
 		t.Fatalf("resumed session = %+v (old target %s)", got, s1.TmuxTarget)
 	}
-	if argv := e.argv(t, s1.ID); !reflect.DeepEqual(argv, []string{"--resume", "cid-1"}) {
+	if argv := e.argv(t, s1.ID); !reflect.DeepEqual(argv, []string{"--resume=cid-1"}) {
 		t.Errorf("resumed argv = %q", argv)
 	}
 	tags, err := e.app.Tmux.TaggedWindows(ctx)
@@ -678,7 +702,7 @@ func TestResumeOnlyWindowDead(t *testing.T) {
 	if n, err := e.app.Resume(ctx, "t"); err != nil || n != 1 {
 		t.Fatalf("Resume = %d, %v; want 1", n, err)
 	}
-	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume", "cid-1"}) {
+	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume=cid-1"}) {
 		t.Errorf("resumed argv = %q", argv)
 	}
 	got := e.session(t, s.ID)
@@ -720,7 +744,7 @@ func TestOpenDeadWindow(t *testing.T) {
 	if _, err := e.app.Open(ctx, "t"); err != nil {
 		t.Fatal(err)
 	}
-	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume", "cid-1"}) {
+	if argv := e.argv(t, s.ID); !reflect.DeepEqual(argv, []string{"--resume=cid-1"}) {
 		t.Errorf("argv after Open = %q, want a resume", argv)
 	}
 	got := e.session(t, s.ID)
@@ -898,5 +922,201 @@ func TestResumeLaunchFailure(t *testing.T) {
 	t.Setenv("PATH", strings.TrimPrefix(os.Getenv("PATH"), bin+string(os.PathListSeparator)))
 	if n, err := e.app.Resume(ctx, "t"); err != nil || n != 1 {
 		t.Fatalf("Resume = %d, %v", n, err)
+	}
+}
+
+// No session is launched into a task done or cancel is closing: a launch
+// waits for the task's launch lock, which they hold until the task is
+// closed, and then finds the task closed. Otherwise its window (and,
+// sandboxed, the task's container) would outlive the task.
+func TestLaunchWaitsForClose(t *testing.T) {
+	launches := map[string]func(e *env, ctx context.Context, task *model.Task) error{
+		"NewSession": func(e *env, ctx context.Context, task *model.Task) error {
+			_, err := e.app.NewSession(ctx, task.Slug)
+			return err
+		},
+		"Resume": func(e *env, ctx context.Context, task *model.Task) error {
+			_, err := e.app.Resume(ctx, task.Slug)
+			return err
+		},
+		"OpenSession": func(e *env, ctx context.Context, task *model.Task) error {
+			ss, err := e.app.Store.ListSessions(ctx, task.ID)
+			if err != nil {
+				return err
+			}
+			_, err = e.app.OpenSession(ctx, task.Slug, ss[0].ID)
+			return err
+		},
+	}
+	for name, launch := range launches {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			ctx := context.Background()
+			task := e.task(t, "t", model.StatusActive, true)
+			past := &model.Session{TaskID: task.ID, ClaudeSessionID: "cid", Name: "claude-1", State: model.StateStopped}
+			if err := e.app.Store.CreateSession(ctx, past); err != nil {
+				t.Fatal(err)
+			}
+			unlock, err := e.app.lockLaunches(ctx, task.ID) // as done holds it
+			if err != nil {
+				t.Fatal(err)
+			}
+			errc := make(chan error, 1)
+			go func() { errc <- launch(e, ctx, task) }()
+			select {
+			case err := <-errc:
+				unlock()
+				t.Fatalf("%s did not wait for the task's lock: %v", name, err)
+			case <-time.After(300 * time.Millisecond):
+			}
+			if err := e.app.Store.SetTaskStatus(ctx, task.ID, model.StatusDone); err != nil {
+				t.Fatal(err)
+			}
+			unlock()
+			if err := <-errc; err == nil || !strings.Contains(err.Error(), "is done") {
+				t.Fatalf("%s into a closed task: %v", name, err)
+			}
+			if e.app.Tmux.HasSession(ctx, "atl-t") {
+				t.Error("tmux session made for a closed task")
+			}
+			live, err := e.app.Store.ListSessionsByState(ctx, model.StateRunning, model.StateWaiting, model.StateIdle)
+			if err != nil || len(live) != 0 {
+				t.Fatalf("live sessions of a closed task: %+v, %v", live, err)
+			}
+		})
+	}
+}
+
+// waitedForLaunch reports whether err is the timeout of a wait for the
+// task's launch lock.
+func waitedForLaunch(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) &&
+		strings.Contains(err.Error(), "a session is being started in it") && strings.Contains(err.Error(), ".launch.lock")
+}
+
+// A launch held up in its sandbox (a slow docker run or image pull) does
+// not hold up the task's other operations: rename and a status change go
+// through at once. Only closing the task waits for it.
+func TestSlowLaunchBlocksOnlyClose(t *testing.T) {
+	e, _ := sandboxEnv(t)
+	ctx := context.Background()
+	task := e.task(t, "t", model.StatusActive, true)
+	entered, release := make(chan struct{}), make(chan struct{})
+	e.app.StartGate = func(string, string, int64, string, string, []string) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	errc := make(chan error, 1)
+	go func() {
+		_, err := e.app.NewSession(ctx, task.Slug)
+		errc <- err
+	}()
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+			<-errc
+		}
+	}()
+	<-entered
+
+	quick, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if _, err := e.app.Rename(quick, task.Slug, "renamed meanwhile"); err != nil {
+		t.Fatalf("rename during a launch: %v", err)
+	}
+	if out := e.app.Out.(*bytes.Buffer).String(); strings.Contains(out, "CLAUDE.md not updated") {
+		t.Fatalf("rename during a launch: %s", out)
+	}
+	if err := e.app.SetOpenStatus(quick, task.Slug, model.StatusReview); err != nil {
+		t.Fatalf("status during a launch: %v", err)
+	}
+	short, cancel2 := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel2()
+	if _, err := e.app.Done(short, task.Slug, true); !waitedForLaunch(err) {
+		t.Fatalf("done during a launch: %v", err)
+	}
+	short2, cancel3 := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel3()
+	if err := e.app.SetStatus(short2, task.Slug, model.StatusDone); !waitedForLaunch(err) {
+		t.Fatalf("status done during a launch: %v", err)
+	}
+
+	close(release)
+	released = true
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.app.Done(ctx, task.Slug, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Adding a repo waits for a launch under way: the launch has read the
+// task's repos, so a repo added under it would not be seen by its session
+// (no --add-dir, no mount) and no restart would be asked for.
+func TestAddRepoWaitsForLaunch(t *testing.T) {
+	adds := map[string]func(e *env, ctx context.Context) error{
+		"AddRepo": func(e *env, ctx context.Context) error {
+			_, err := e.app.AddRepo(ctx, "t", RepoArg{Name: "docs", Mode: model.ModeRO}, true)
+			return err
+		},
+		"AddRepos": func(e *env, ctx context.Context) error {
+			_, err := e.app.AddRepos(ctx, "t", []RepoArg{{Name: "docs", Mode: model.ModeRO}}, AddOpts{NoFetch: true})
+			return err
+		},
+	}
+	for name, add := range adds {
+		t.Run(name, func(t *testing.T) {
+			e, _ := sandboxEnv(t)
+			ctx := context.Background()
+			task := e.task(t, "t", model.StatusActive, true)
+			gitInit(t, e.app.Paths.RepoPath("docs"))
+			entered, release := make(chan struct{}), make(chan struct{})
+			e.app.StartGate = func(string, string, int64, string, string, []string) error {
+				select {
+				case <-entered:
+				default:
+					close(entered)
+					<-release
+				}
+				return nil
+			}
+			launched := make(chan struct{})
+			go func() {
+				_, err := e.app.NewSession(ctx, task.Slug)
+				if err != nil {
+					t.Error(err)
+				}
+				close(launched)
+			}()
+			<-entered
+			added := make(chan error, 1)
+			go func() { added <- add(e, ctx) }()
+			select {
+			case err := <-added:
+				close(release)
+				<-launched
+				t.Fatalf("%s did not wait for the launch: %v", name, err)
+			case <-time.After(300 * time.Millisecond):
+			}
+			close(release)
+			<-launched
+			err := <-added
+			if name == "AddRepo" {
+				if !errors.Is(err, ErrRestartNeeded) {
+					t.Fatalf("AddRepo after the launch: %v", err)
+				}
+				return
+			}
+			// AddRepos restarts the session that started meanwhile, or says it is busy.
+			if err != nil {
+				var busy *BusyError
+				if !errors.As(err, &busy) {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 }

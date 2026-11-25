@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,7 +80,11 @@ func (a *App) openTranscript(t *model.Task, path string) (*os.File, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("%q is not an absolute path; not read", path)
 	}
-	path = filepath.Clean(path)
+	if path != filepath.Clean(path) {
+		// Its ".." were checked after the symlinks before them: cleaned,
+		// they could lead out of the dir it was checked in.
+		return nil, fmt.Errorf("%q is not a clean path; not read", path)
+	}
 	for _, root := range []string{a.Paths.ClaudeDir(t.Slug), config.ClaudeConfigDir()} {
 		if root == "" {
 			continue
@@ -419,12 +424,19 @@ const (
 	maxPromptRunes = 200
 )
 
+// transcriptFile is what readTranscriptInfo reads: an *os.File.
+type transcriptFile interface {
+	io.Reader
+	io.ReaderAt
+	Stat() (fs.FileInfo, error)
+}
+
 // readTranscriptInfo reads a session's title and first/last user prompts
 // from its Claude Code transcript f (see transcriptInfo). Large files are
 // scanned only in their first and last transcriptWindow bytes (the first
 // prompt is at the head, the last prompt and the newest titles near the
 // tail), so a title or prompt in the middle of a huge file may be missed.
-func readTranscriptInfo(f *os.File) (transcriptInfo, error) {
+func readTranscriptInfo(f transcriptFile) (transcriptInfo, error) {
 	var info transcriptInfo
 	fi, err := f.Stat()
 	if err != nil {
@@ -446,9 +458,11 @@ func readTranscriptInfo(f *os.File) (transcriptInfo, error) {
 			head = head[:i+1] // drop the partial last line
 		}
 		tail := make([]byte, transcriptWindow)
-		if _, err := f.ReadAt(tail, size-transcriptWindow); err != nil && !errors.Is(err, io.EOF) {
+		n, err := f.ReadAt(tail, size-transcriptWindow) // short if the file shrank since
+		if err != nil && !errors.Is(err, io.EOF) {
 			return info, err
 		}
+		tail = tail[:n]
 		if i := bytes.IndexByte(tail, '\n'); i >= 0 {
 			tail = tail[i+1:] // drop the partial first line
 		}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"syscall"
 
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/sandbox"
@@ -14,11 +15,13 @@ import (
 )
 
 // ClaudeArgv returns the command line for a Claude window:
-// ["claude", ("--resume", id)?, "--add-dir", p...].
+// ["claude", ("--resume=" + id)?, "--add-dir", p...]. The id is joined to
+// --resume, whose value is optional: a separate one that starts with "-"
+// (the id comes from a hook, so from the task) would be a claude option.
 func ClaudeArgv(roPaths []string, resumeID string) []string {
 	argv := []string{"claude"}
 	if resumeID != "" {
-		argv = append(argv, "--resume", resumeID)
+		argv = append(argv, "--resume="+resumeID)
 	}
 	for _, p := range roPaths {
 		argv = append(argv, "--add-dir", p)
@@ -63,6 +66,33 @@ func (a *App) checkLaunchable(t *model.Task) (string, error) {
 	return dir, nil
 }
 
+// lockLaunch takes the task's launch lock shared for a launch in t (see
+// lockLaunches) and re-reads the task under it, returning it and its dir if
+// it is still launchable (checkLaunchable). Closing the task holds the lock
+// exclusive until the task is closed, so no session is launched into a
+// task being closed: its window and container would outlive the task. The
+// caller keeps the lock until its launch is recorded. AddRepos, which holds
+// it exclusive, launches without it.
+func (a *App) lockLaunch(ctx context.Context, t *model.Task) (*model.Task, string, func(), error) {
+	if _, err := a.checkLaunchable(t); err != nil {
+		return nil, "", nil, err
+	}
+	unlock, err := a.launchLock(ctx, t.ID, syscall.LOCK_SH)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
+		unlock()
+		return nil, "", nil, err
+	}
+	dir, err := a.checkLaunchable(t)
+	if err != nil {
+		unlock()
+		return nil, "", nil, err
+	}
+	return t, dir, unlock, nil
+}
+
 // launch refreshes the task dir and starts a Claude window for s in the
 // task's tmux session, returning the window id.
 func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, resumeID string) (string, error) {
@@ -92,6 +122,7 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 		// The window starts docker exec so that Claude has the window's
 		// size from its first frame on (sandbox.WindowArgv).
 		argv = sandbox.WindowArgv(attachFollows(ctx), a.sandboxArgv(container, dir, env, auth, argv))
+		env = sandboxWindowEnv(env)
 	}
 	return a.Tmux.NewWindow(ctx, tmux.WindowSpec{
 		Session:   tmux.SessionName(t.Slug),
@@ -107,9 +138,10 @@ func (a *App) launch(ctx context.Context, t *model.Task, s *model.Session, dir, 
 // NewSession creates a session row (state idle) for the task, launches a
 // Claude window for it in the task's tmux session and records the window.
 //
-// The row exists before its window and has an empty tmux target until the
-// launch is recorded; Recover never touches live rows without a target, so a
-// concurrent Recover cannot mark the session stopped mid-launch. The window is
+// The row exists (named after its window) before its window and has an
+// empty tmux target until the launch is recorded; Recover leaves such a row
+// alone while the task's launch lock is held, so a concurrent Recover cannot
+// mark the session stopped mid-launch. The window is
 // recorded with a targeted update (SetSessionLaunch) so that a claude session
 // id or state written meanwhile by a hook is never clobbered.
 func (a *App) NewSession(ctx context.Context, ref string) (*model.Session, error) {
@@ -117,16 +149,16 @@ func (a *App) NewSession(ctx context.Context, ref string) (*model.Session, error
 	if err != nil {
 		return nil, err
 	}
-	dir, err := a.checkLaunchable(t)
+	t, dir, unlock, err := a.lockLaunch(ctx, t)
 	if err != nil {
 		return nil, err
 	}
+	defer unlock()
 	now := a.now()
 	s := &model.Session{TaskID: t.ID, State: model.StateIdle, CreatedAt: now, LastEventAt: now}
-	if err := a.Store.CreateSession(ctx, s); err != nil {
+	if err := a.Store.CreateNamedSession(ctx, s, windowName); err != nil {
 		return nil, err
 	}
-	s.Name = windowName(s.ID)
 	win, err := a.launch(ctx, t, s, dir, "")
 	if err != nil {
 		if serr := a.Store.SetSessionState(context.WithoutCancel(ctx), s.ID, model.StateEnded, a.now()); serr != nil {
@@ -191,10 +223,11 @@ func (a *App) Resume(ctx context.Context, ref string) (int, error) {
 	if len(stopped) == 0 {
 		return 0, nil
 	}
-	dir, err := a.checkLaunchable(t)
+	t, dir, unlock, err := a.lockLaunch(ctx, t)
 	if err != nil {
 		return 0, err
 	}
+	defer unlock()
 	n := 0
 	var errs []error
 	for _, c := range stopped {
@@ -239,7 +272,7 @@ func (a *App) resumeClaimed(ctx context.Context, t *model.Task, id int64, dir st
 		tags, err = a.Tmux.TaggedWindows(bg)
 	}
 	if live, ok := tags[strconv.FormatInt(id, 10)]; ok && err == nil {
-		if err := a.Store.SetSessionLaunch(bg, id, live, s.Name); err != nil {
+		if err := a.Store.AdoptLaunch(bg, id, live, s.Name); err != nil {
 			return "", fmt.Errorf("record live window %s: %w", live, err)
 		}
 		return live, nil

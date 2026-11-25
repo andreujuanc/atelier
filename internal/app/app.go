@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/andreujuanc/atelier/internal/config"
@@ -50,6 +51,10 @@ type App struct {
 	// it and checks only the tools).
 	Workspace    *workspace.Applied
 	WorkspaceErr error
+
+	// composeWarned holds the projects whose COMPOSE_PROJECT_NAME a
+	// sandboxed launch overrode, and said so (see composeEnv).
+	composeWarned sync.Map
 }
 
 // New resolves paths from the environment, opens the store and returns an
@@ -155,8 +160,10 @@ func (a *App) prepareTaskDir(ctx context.Context, t *model.Task) error {
 
 // launchEnv is the environment passed to a Claude window: the project's env
 // (if the task has a project that still loads; otherwise a warning goes to
-// a.Out) overridden by ATL_TASK, ATL_SESSION, ATL_PORT_OFFSET and
-// ATL_TASK_DIR.
+// a.Out) overridden by ATL_TASK, ATL_SESSION, ATL_LAUNCH (s.LaunchSeq),
+// ATL_PORT_OFFSET and
+// ATL_TASK_DIR; with the sandbox on, also by COMPOSE_PROJECT_NAME (see
+// composeEnv).
 func (a *App) launchEnv(t *model.Task, s *model.Session) map[string]string {
 	env := map[string]string{}
 	pr, err := a.taskProject(t)
@@ -169,8 +176,12 @@ func (a *App) launchEnv(t *model.Task, s *model.Session) map[string]string {
 			env[k] = v
 		}
 	}
+	if a.Sandbox != nil {
+		a.composeEnv(t, env)
+	}
 	env["ATL_TASK"] = t.Slug
 	env["ATL_SESSION"] = strconv.FormatInt(s.ID, 10)
+	env["ATL_LAUNCH"] = strconv.FormatInt(s.LaunchSeq, 10)
 	env["ATL_PORT_OFFSET"] = strconv.Itoa(t.PortOffset)
 	env["ATL_TASK_DIR"] = a.Paths.TaskDir(t.Slug)
 	return env

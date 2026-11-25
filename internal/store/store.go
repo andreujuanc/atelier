@@ -12,7 +12,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // registers the "sqlite" driver
+	"modernc.org/sqlite" // also registers the "sqlite" driver
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 var (
@@ -25,6 +26,10 @@ var (
 // Store is a handle on the atelier database. It is safe for concurrent use.
 type Store struct {
 	db *sql.DB
+	// wal is the path of the database's -wal file (next to the database
+	// file a symlinked path resolves to), or "" for a read-only store (see
+	// Close).
+	wal string
 }
 
 // migrations are applied in order; the database's PRAGMA user_version
@@ -116,9 +121,14 @@ func Open(path string) (*Store, error) { return OpenWithTimeout(path, DefaultBus
 // with SQLITE_BUSY.
 //
 // Pragmas are passed as DSN "_pragma" parameters so the driver applies them
-// to every pooled connection. Transactions use BEGIN IMMEDIATE ("_txlock")
+// to every pooled connection, except journal_mode, which is persistent and
+// set once (see setWAL). Transactions use BEGIN IMMEDIATE ("_txlock")
 // so concurrent writers wait on busy_timeout instead of failing with
 // SQLITE_BUSY on a read→write lock upgrade.
+//
+// Its connections do not checkpoint the WAL when they close; Close
+// checkpoints it once it has grown past walTruncateSize instead (see
+// noCheckpointOnClose).
 func OpenWithTimeout(path string, busy time.Duration) (*Store, error) {
 	if busy < 0 {
 		busy = 0
@@ -134,20 +144,49 @@ func OpenWithTimeout(path string, busy time.Duration) (*Store, error) {
 	}
 	q := url.Values{}
 	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busy.Milliseconds()))
-	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "foreign_keys(ON)")
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Set("_txlock", "immediate")
-	db, err := sql.Open("sqlite", path+"?"+q.Encode())
-	if err != nil {
-		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	db := sql.OpenDB(noCkptConnector{dsn: path + "?" + q.Encode(), drv: &sqlite.Driver{}})
+	if err := setWAL(context.Background(), db, busy); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: open %s: set WAL mode: %w", path, err)
 	}
 	s := &Store{db: db}
 	if err := s.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate %s: %w", path, err)
 	}
+	// The database file as SQLite resolved it (following symlinks), next to
+	// which it keeps the WAL.
+	var file string
+	if err := db.QueryRowContext(context.Background(), "SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&file); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	}
+	s.wal = file + "-wal"
 	return s, nil
+}
+
+// setWAL puts the database in WAL mode, which is recorded in the file, so
+// once per Open is enough. On a database not yet in WAL mode (a fresh one)
+// the switch needs an exclusive lock, and while another connection opens
+// it too SQLite fails it with SQLITE_BUSY at once instead of waiting on
+// busy_timeout; setWAL retries it until busy has passed.
+func setWAL(ctx context.Context, db *sql.DB, busy time.Duration) error {
+	deadline := time.Now().Add(busy)
+	for {
+		_, err := db.ExecContext(ctx, "PRAGMA journal_mode = WAL")
+		var se *sqlite.Error
+		if err == nil || !errors.As(err, &se) || se.Code()&0xff != sqlite3.SQLITE_BUSY || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // ErrSchemaVersion is returned (wrapped) by OpenReadOnly when the
@@ -166,10 +205,10 @@ var ErrSchemaVersion = errors.New("database schema version mismatch")
 // The database file itself is never written. A read-only connection to a
 // WAL database does create empty -wal and -shm files next to it when they
 // are missing (SQLite needs the shared-memory index to read a WAL
-// database), and cannot remove them on close; the next read-write
-// connection cleans them up as usual. That is unavoidable without
+// database), and cannot remove them on close. That is unavoidable without
 // immutable=1 (unsafe while hooks write) or readonly_shm=1 (fails when no
-// -shm exists).
+// -shm exists), and harmless: read-write connections leave them in place
+// too (see noCheckpointOnClose).
 func OpenReadOnly(path string, busy time.Duration) (*Store, error) {
 	if busy < 0 {
 		busy = 0
@@ -208,8 +247,49 @@ func OpenReadOnly(path string, busy time.Duration) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// Close closes the database.
-func (s *Store) Close() error { return s.db.Close() }
+// walTruncateSize is the -wal file size past which a read-write Store's
+// Close checkpoints the WAL and truncates it.
+const walTruncateSize = 1 << 20
+
+// walCheckpointBusy bounds how long that checkpoint waits on another
+// connection's lock or read transaction, well within a hook's latency
+// budget.
+const walCheckpointBusy = 20 * time.Millisecond
+
+// Close closes the database. A read-write store first checkpoints the WAL
+// into the database file and truncates it, if it has grown past
+// walTruncateSize: its connections do not checkpoint on close (see
+// noCheckpointOnClose), and when no other connection has the database
+// open the next one to open it recovers the WAL by reading all of it and
+// forgets what was already checkpointed, so SQLite's automatic checkpoint
+// could never restart it and it would grow without bound. The checkpoint
+// waits at most walCheckpointBusy for other connections; one that cannot
+// finish (busy) is left to a later Close.
+func (s *Store) Close() error {
+	if s.wal != "" {
+		s.truncateWAL(context.Background())
+	}
+	return s.db.Close()
+}
+
+// truncateWAL checkpoints the WAL and truncates it if the -wal file is
+// larger than walTruncateSize, waiting at most walCheckpointBusy on locks.
+// It is best effort: on any failure the WAL is left as it is.
+func (s *Store) truncateWAL(ctx context.Context) {
+	if fi, err := os.Stat(s.wal); err != nil || fi.Size() <= walTruncateSize {
+		return
+	}
+	c, err := s.db.Conn(ctx)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	// busy_timeout is per connection, and Close closes this one right after.
+	if _, err := c.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", walCheckpointBusy.Milliseconds())); err != nil {
+		return
+	}
+	_, _ = c.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+}
 
 // migrate applies pending migrations. The common case (schema current) is
 // a plain read of user_version with no write transaction, so concurrent
@@ -281,7 +361,13 @@ func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
-func checkAffected(res sql.Result, what string, id int64) error {
+// execOne runs a statement on the row what id (an UPDATE or DELETE by id),
+// failing with ErrNotFound when it matches no row.
+func (s *Store) execOne(ctx context.Context, what string, id int64, query string, args ...any) error {
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
 	n, err := res.RowsAffected()
 	if err != nil {
 		return err

@@ -94,6 +94,13 @@ func (a *App) AddRepos(ctx context.Context, ref string, repos []RepoArg, o AddOp
 		return nil, err
 	}
 	defer unlock()
+	// A launch under way has read the task's repos: it ends first, and
+	// none starts until the repo is in (see lockLaunches).
+	unlockLaunches, err := a.lockLaunches(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockLaunches()
 	if t, err = a.Store.GetTask(ctx, t.ID); err != nil {
 		return nil, err
 	}
@@ -110,6 +117,9 @@ func (a *App) AddRepos(ctx context.Context, ref string, repos []RepoArg, o AddOp
 				return errors.New("given twice")
 			}
 			seen[w.name] = true
+			if err := a.undoKilledAdd(ctx, t, w.name, w.mode); err != nil {
+				return err
+			}
 			if _, err := a.checkAdd(ctx, t, w.name, w.mode); err != nil {
 				return err
 			}
@@ -121,6 +131,9 @@ func (a *App) AddRepos(ctx context.Context, ref string, repos []RepoArg, o AddOp
 			}
 			if w.mode == model.ModeRW {
 				if _, _, err := resolveBase(ctx, w.name, a.Paths.RepoPath(w.name), t.Base); err != nil {
+					return err
+				}
+				if err := checkBranchFree(ctx, w.name, a.Paths.RepoPath(w.name), t.Branch); err != nil {
 					return err
 				}
 			}

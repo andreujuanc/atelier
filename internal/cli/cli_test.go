@@ -17,6 +17,14 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	// The tests may run inside an atelier task (or its container), whose
+	// ATL_* variables change what atl does (e.g. it refuses most commands
+	// inside a task container): start from none; tests set what they need.
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "ATL_") {
+			os.Unsetenv(k)
+		}
+	}
 	dir, err := os.MkdirTemp("", "cli-test-git")
 	if err != nil {
 		panic(err)
@@ -225,6 +233,11 @@ func TestRootAndDoctor(t *testing.T) {
 	code, out, _ := atl(t)
 	if code != 0 || !strings.Contains(out, "Usage:") {
 		t.Fatalf("root: %d %s", code, out)
+	}
+	// done and cancel delete a task branch that has nothing unpushed
+	// (docs/tasks.md); the help must not say branches are kept.
+	if strings.Contains(out, "branches kept") || !strings.Contains(out, "remove worktrees and the branches with nothing unpushed") {
+		t.Errorf("root help on done/cancel branches:\n%s", out)
 	}
 	code, out, _ = atl(t, "doctor")
 	if !strings.Contains(out, "repos dir") || !strings.Contains(out, "database") {
@@ -488,5 +501,77 @@ func TestStartupRecover(t *testing.T) {
 	}
 	if got := tasks[0].Sessions[0].State; got != "stopped" {
 		t.Fatalf("session state after startup recover = %s, want stopped", got)
+	}
+}
+
+// TestLsSanitizesTitle: a task stored before `atl new` refused control
+// characters in titles may still have one (ESC included); `atl ls` must not
+// print them to the terminal, as `atl show` does not.
+func TestLsSanitizesTitle(t *testing.T) {
+	setup(t)
+	if code, _, errs := atl(t, "new", "red", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	st, err := store.Open(testDB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(context.Background(), &model.Task{Slug: "red-alert", Title: "Red \x1b[31malert\x07",
+		Status: model.StatusActive, Branch: "atl/red-alert", PortOffset: 100}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	code, out, errs := atl(t, "ls")
+	if code != 0 || strings.ContainsAny(out, "\x1b\x07") || !strings.Contains(out, "Red [31malert\n") {
+		t.Fatalf("ls: %d %q %s", code, out, errs)
+	}
+}
+
+// TestResumeAndDiff: atl resume prints how many sessions it resumed; atl
+// diff writes the diff of each rw repo straight to a stdout that is not a
+// terminal, without colour.
+func TestResumeAndDiff(t *testing.T) {
+	root := setup(t)
+	if code, _, errs := atl(t, "new", "Diffed", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	wt := filepath.Join(root, "tasks", "diffed", "api")
+	if err := os.WriteFile(filepath.Join(wt, "hello.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, wt, "add", "hello.txt")
+	git(t, wt, "commit", "-q", "-m", "hello")
+	code, out, errs := atl(t, "diff", "diffed")
+	if code != 0 || !strings.Contains(out, "+hello") || !strings.Contains(out, "hello.txt") || strings.Contains(out, "\x1b[") {
+		t.Fatalf("diff: %d %q %s", code, out, errs)
+	}
+	if code, _, errs := atl(t, "diff", "nope"); code != exitErr || !strings.Contains(errs, "nope") {
+		t.Fatalf("diff of a missing task: %d %s", code, errs)
+	}
+	if code, out, errs := atl(t, "resume", "diffed"); code != 0 || out != "0\n" {
+		t.Fatalf("resume with nothing stopped: %d %q %s", code, out, errs)
+	}
+	if code, _, errs := atl(t, "resume", "nope"); code != exitErr || !strings.Contains(errs, "nope") {
+		t.Fatalf("resume of a missing task: %d %s", code, errs)
+	}
+}
+
+// TestDoctorPrintsNoControlCharacters: atl doctor names what it finds in a
+// repo's config and the worktrees git lists for it, which a task can write
+// (a registration's path included): its rows reach the terminal without
+// control characters.
+func TestDoctorPrintsNoControlCharacters(t *testing.T) {
+	root := setup(t)
+	repo := filepath.Join(root, "repos", "api")
+	wt := filepath.Join(root, "tasks", "x\x1b]0;pwned\x07")
+	git(t, repo, "worktree", "add", "-q", "-b", "x", wt)
+	git(t, repo, "config", "extensions.worktreeConfig", "true")
+	git(t, wt, "config", "--worktree", "filter.x\x1b[2J.clean", "cat")
+	_, out, errs := atl(t, "doctor")
+	if !strings.Contains(out, "filter.x") {
+		t.Fatalf("doctor did not report the setting: %s %s", out, errs)
+	}
+	if strings.ContainsAny(out, "\x1b\x07") {
+		t.Errorf("doctor printed control characters: %q", out)
 	}
 }

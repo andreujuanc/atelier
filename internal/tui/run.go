@@ -1,13 +1,13 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -84,58 +84,90 @@ func RunContext(ctx context.Context, a *app.App) error {
 
 // orderedSend returns send, which hands lines to deliver one at a time and
 // in order from a single goroutine, flush, which returns once every line
-// sent before it has been delivered (or stop was called), and stop. After
-// stop, send writes lines to fallback instead and never blocks; deliver
-// must return once the consumer is gone (tea.Program.Send does after the
+// sent before it has been delivered (or stop was called), and stop. Lines
+// still queued when stop is called, and those sent after it, are written
+// to fallback instead, in order, and send then never blocks; deliver must
+// return once the consumer is gone (tea.Program.Send does after the
 // program stops).
 func orderedSend(deliver func(string), fallback io.Writer) (send func(string), flush func(), stop func()) {
 	type item struct {
 		line    string
 		barrier chan struct{} // non-nil: a flush marker, closed when reached
 	}
-	items := make(chan item, 64)
-	stopped := make(chan struct{})
+	const maxQueued = 64 // send waits while this many items are queued
+	var (
+		mu      sync.Mutex // guards queue and stopped; held while writing to fallback
+		changed = sync.NewCond(&mu)
+		queue   []item
+		stopped bool
+	)
+	// put queues it, unless stop was called; with mu held.
+	put := func(it item) bool {
+		for len(queue) >= maxQueued && !stopped {
+			changed.Wait()
+		}
+		if stopped {
+			return false
+		}
+		queue = append(queue, it)
+		changed.Broadcast()
+		return true
+	}
 	go func() {
 		for {
-			select {
-			case it := <-items:
-				if it.barrier != nil {
-					close(it.barrier)
-				} else {
-					deliver(it.line)
-				}
-			case <-stopped:
+			mu.Lock()
+			for len(queue) == 0 && !stopped {
+				changed.Wait()
+			}
+			if stopped {
+				mu.Unlock()
 				return
+			}
+			it := queue[0]
+			queue = queue[1:]
+			changed.Broadcast()
+			mu.Unlock()
+			if it.barrier != nil {
+				close(it.barrier)
+			} else {
+				deliver(it.line)
 			}
 		}
 	}()
 	send = func(s string) {
-		select {
-		case <-stopped:
-			fmt.Fprintln(fallback, s)
-			return
-		default:
-		}
-		select {
-		case items <- item{line: s}:
-		case <-stopped:
+		mu.Lock()
+		defer mu.Unlock()
+		if !put(item{line: s}) {
 			fmt.Fprintln(fallback, s)
 		}
 	}
 	flush = func() {
 		b := make(chan struct{})
-		select {
-		case items <- item{barrier: b}:
-		case <-stopped:
-			return
-		}
-		select {
-		case <-b:
-		case <-stopped:
+		mu.Lock()
+		queued := put(item{barrier: b})
+		mu.Unlock()
+		if queued {
+			<-b // closed when reached, or by stop
 		}
 	}
-	var once sync.Once
-	return send, flush, func() { once.Do(func() { close(stopped) }) }
+	stop = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if stopped {
+			return
+		}
+		stopped = true
+		for _, it := range queue {
+			if it.barrier != nil {
+				close(it.barrier)
+			} else {
+				fmt.Fprintln(fallback, it.line)
+			}
+		}
+		queue = nil
+		changed.Broadcast()
+	}
+	return send, flush, stop
 }
 
 // shutdown closes tr and waits for the tracked backend calls. Unless force,
@@ -186,6 +218,13 @@ func (t *tracker) begin() bool {
 }
 
 func (t *tracker) end() { t.wg.Done() }
+
+// stopped reports whether the tracker was closed.
+func (t *tracker) stopped() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
+}
 
 func (t *tracker) close() {
 	t.mu.Lock()
@@ -374,11 +413,11 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	w.buf = append(w.buf, p...)
 	for {
-		i := strings.IndexByte(string(w.buf), '\n')
+		i := bytes.IndexByte(w.buf, '\n')
 		if i < 0 {
 			break
 		}
-		line := strings.TrimSpace(string(w.buf[:i]))
+		line := string(bytes.TrimSpace(w.buf[:i]))
 		w.buf = w.buf[i+1:]
 		if line != "" {
 			w.send(line)
@@ -393,4 +432,22 @@ func (b *trackedBackend) AddCheck(ctx context.Context, ref string, repos []app.R
 	}
 	defer b.tr.end()
 	return b.Backend.AddCheck(ctx, ref, repos)
+}
+
+func (b *trackedBackend) Rename(ctx context.Context, ref, title string) (*model.Task, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.Rename(ctx, ref, title)
+}
+
+// DirtyTasks only reads (it never writes to App.Out) and may take up to
+// dirtyTimeout: it is refused once the TUI stopped but not waited for, so
+// a quit never hangs on it (shutdown cancels its context).
+func (b *trackedBackend) DirtyTasks(ctx context.Context) (map[int64]bool, error) {
+	if b.tr.stopped() {
+		return nil, errStopped
+	}
+	return b.Backend.DirtyTasks(ctx)
 }

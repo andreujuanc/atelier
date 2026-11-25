@@ -91,6 +91,21 @@ branch cleanup, push, fetch) defends in three ways:
 A refusal names the repo, setting and value, and is logged to `<workspace>/state/refused.log`.
 `atl doctor` lists, per repo, what it would refuse now. Fix: remove the setting and rerun.
 
+The same commands, and `atl show`'s last commit, are also refused while git would read another
+repository: `.git/objects/info/alternates` (a clone made with `--reference`: run
+`git repack -a -d` in it, then remove the file), a symlink in `.git/objects/`, or a `commondir`
+file in the clone's `.git`. `atl show` reads HEAD and its branch without following a symlink.
+
+Push and fetch run git in a git dir of atl's own (a copy of the repo's refs, its objects, your config
+as it applies to the repo) and then copy the refs that changed into the repo without following a
+symlink: no `FETCH_HEAD` or reflog is written in the repo. Each ref (and `.git/shallow`) is
+compared and swapped under git's lock files, as git updates one: it changes only if it still has
+the value it had when the push or fetch started. One that another push or fetch of the same clone
+changed meanwhile is left as it is: a fetch then runs once more from the refs as they are, and
+only if that one also finds a ref changed meanwhile does it fail naming it (the other refs are
+updated; run `atl fetch` again); `atl push`, whose push is done, prints a warning. A pruned ref
+also leaves `packed-refs`, so an older packed value does not come back.
+
 Worktree checks: before running git or a project script in a worktree, atl checks that it is
 a real directory (not a symlink) and a worktree of that repo's canonical clone. If not, the
 command fails for that repo; `atl done`/`cancel` refuse (with `--force`, close the task and
@@ -98,6 +113,6 @@ leave the path alone). Push, fetch and the PR remote check run in the canonical 
 
 Limits:
 
-- A task rewriting its config in a tight loop could slip a setting in between the check and
-  git's read.
+- A task rewriting its config (or git dir) in a tight loop could slip a setting in between the
+  check and git's read.
 - A partial clone (`clone --filter`) cannot be an rw repo: the checkout fails.

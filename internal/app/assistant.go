@@ -81,7 +81,7 @@ func (a *App) Assistant(ctx context.Context, taskRef string) (attach *exec.Cmd, 
 	if err := os.MkdirAll(a.Paths.StateDir, 0o755); err != nil {
 		return nil, "", fmt.Errorf("assistant: %w", err)
 	}
-	unlock, err := lockFile(ctx, a.assistantLock(), assistantLockWait,
+	unlock, err := lockFile(ctx, a.assistantLock(), syscall.LOCK_EX, assistantLockWait,
 		"another atl is launching the assistant")
 	if err != nil {
 		return nil, "", fmt.Errorf("assistant: %w", err)
@@ -231,17 +231,11 @@ func (a *App) ensureAssistantSandbox(ctx context.Context, busy bool) (string, er
 	if a.Paths.Workspace == "" {
 		return "", errors.New("the assistant's container needs a workspace")
 	}
-	if _, err := a.checkDocker(ctx); err != nil {
-		return "", err
-	}
-	if err := a.checkAtlBin(a.AtlBin); err != nil {
-		return "", err
-	}
-	if _, err := a.claudeAuth(); err != nil {
+	if err := a.checkSandboxNeeds(ctx); err != nil {
 		return "", err
 	}
 	runDir := a.Paths.AssistantRunDir()
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	if err := sandbox.MakeRunDir(runDir); err != nil {
 		return "", err
 	}
 	if err := sandbox.InstallBin(a.AtlBin, runDir); err != nil {

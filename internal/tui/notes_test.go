@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -661,5 +663,86 @@ func TestNotesTabs(t *testing.T) {
 	key(m, "ctrl+s")
 	if got := fb.notesText["gamma"]; got != "a    bc!" {
 		t.Fatalf("saved %q, want tabs as 4 spaces and U+FFFD dropped", got)
+	}
+}
+
+// BenchmarkNotesLines: the notes area of a task with notes at their size
+// limit, drawn as every frame does.
+func BenchmarkNotesLines(b *testing.B) {
+	m := New(context.Background(), &fakeBackend{tasks: sampleTasks()})
+	tv := sampleTasks()[0]
+	var notes strings.Builder
+	for i := 0; notes.Len() < model.MaxNotesLen-100; i++ {
+		fmt.Fprintf(&notes, "- [ ] item %d: %s\n", i, strings.Repeat("word ", i%30))
+	}
+	tv.Notes = notes.String()
+	m.detail = &tv
+	b.ReportAllocs()
+	for b.Loop() {
+		m.notesLines(&tv, 80, 12)
+	}
+}
+
+// TestWrappedNotesCache: the cached wrap follows the notes and the width.
+func TestWrappedNotesCache(t *testing.T) {
+	m := New(context.Background(), &fakeBackend{})
+	plain := func(notes string, w int) string {
+		var s []string
+		for _, l := range m.wrappedNotes(notes, w) {
+			s = append(s, l.line)
+		}
+		return strings.Join(s, "|")
+	}
+	for _, c := range []struct {
+		notes string
+		w     int
+		want  string
+	}{
+		{"aaa bbb\n\nccc", 20, "aaa bbb||ccc"},
+		{"aaa bbb\n\nccc", 4, "aaa|bbb||ccc"},
+		{"aaa bbb\n\nccc", 4, "aaa|bbb||ccc"},
+		{"aaa ddd", 4, "aaa|ddd"},
+		{" \n\t", 4, ""},
+		{"aaa ddd", 20, "aaa ddd"},
+	} {
+		if got := plain(c.notes, c.w); got != c.want {
+			t.Errorf("wrappedNotes(%q, %d) = %q, want %q", c.notes, c.w, got, c.want)
+		}
+	}
+}
+
+// TestNotesTooManyLines: notes with more lines than the editor takes are
+// not opened (atl notes --set is the way), nor reloaded into an open
+// editor, which keeps the user's text; a reload that fails keeps it too.
+func TestNotesTooManyLines(t *testing.T) {
+	long := strings.Repeat("x\n", maxEditLines)
+	fb := &fakeBackend{tasks: sampleTasks(), notesText: map[string]string{"gamma": long}}
+	m, _ := newTest(t, fb)
+	selectTask(t, m, "gamma")
+	key(m, "m")
+	if m.mode != modeNormal || m.notes != nil || !m.statusErr || !strings.Contains(m.status, "too many lines") ||
+		!strings.Contains(m.status, "atl notes gamma --set") || len(m.busy) != 0 {
+		t.Fatalf("open: mode %v status %q busy %v", m.mode, m.status, m.busy)
+	}
+
+	fb.notesText["gamma"] = "short"
+	key(m, "m")
+	if m.mode != modeNotes {
+		t.Fatalf("short notes not opened: mode %v status %q", m.mode, m.status)
+	}
+	typeText(m, "mine ")
+	edited := m.notes.ta.Value()
+	fb.notesText["gamma"] = long
+	key(m, "ctrl+r")
+	if m.mode != modeNotes || m.notes.ta.Value() != edited || !m.statusErr || !strings.Contains(m.status, "reload notes: too many lines") {
+		t.Fatalf("reload of long notes: mode %v value %q status %q", m.mode, m.notes.ta.Value(), m.status)
+	}
+	fb.notesErr = errors.New("boom")
+	key(m, "ctrl+r")
+	if m.mode != modeNotes || m.notes.ta.Value() != edited || !strings.Contains(m.status, "reload notes: boom") {
+		t.Fatalf("failed reload: mode %v value %q status %q", m.mode, m.notes.ta.Value(), m.status)
+	}
+	if m.notes.loading {
+		t.Fatal("still loading after the reload answered")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/andreujuanc/atelier/internal/model"
 )
@@ -90,6 +93,29 @@ func TestEnvFor(t *testing.T) {
 	pr.Env["ATL_SESSION"] = "7"
 	if _, ok := envMap(t, pr.EnvFor(se))["ATL_SESSION"]; ok {
 		t.Fatal("project ATL_SESSION must be dropped")
+	}
+}
+
+// TestScriptVars: what a script in the task container gets from atl is the
+// project's env and the ATL_* variables only: nothing of atl's own
+// environment, and no ATL_SESSION.
+func TestScriptVars(t *testing.T) {
+	t.Setenv("ATL_TEST_INHERITED", "inherited")
+	t.Setenv("ATL_SESSION", "42")
+	pr := &Project{Env: map[string]string{"FOO": "bar", "ATL_REPO": "project-repo", "ATL_SESSION": "7"}}
+	se := ScriptEnv{
+		Task:    model.Task{Slug: "fix-it", Branch: "atl/fix-it", PortOffset: 200},
+		TaskDir: "/tasks/fix-it", Repo: "api", Worktree: "/tasks/fix-it/api",
+	}
+	want := map[string]string{"FOO": "bar", "ATL_TASK": "fix-it", "ATL_TASK_DIR": "/tasks/fix-it", "ATL_REPO": "api",
+		"ATL_WORKTREE": "/tasks/fix-it/api", "ATL_BRANCH": "atl/fix-it", "ATL_PORT_OFFSET": "200"}
+	if got := pr.ScriptVars(se); !maps.Equal(got, want) {
+		t.Errorf("ScriptVars = %v, want %v", got, want)
+	}
+	var none *Project
+	delete(want, "FOO")
+	if got := none.ScriptVars(se); !maps.Equal(got, want) {
+		t.Errorf("nil project: ScriptVars = %v, want %v", got, want)
 	}
 }
 
@@ -196,5 +222,51 @@ func TestRunScriptCancelKillsGroup(t *testing.T) {
 			t.Fatalf("background sleep %d survived cancellation", pid)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A script that wants the terminal (ssh asking about a host key or for a
+// passphrase on /dev/tty) fails at once instead of being stopped
+// (SIGTTIN) for good in a background process group of atl's terminal,
+// which hung atl new until Ctrl-C. The test runs RunScript in a copy of
+// itself whose controlling terminal is a pty, as atl's is.
+func TestRunScriptNoTerminal(t *testing.T) {
+	if os.Getenv("ATL_TEST_TTY_HELPER") == "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		var out bytes.Buffer
+		err := RunScript(ctx, "read x < /dev/tty || exit 3; echo read $x", t.TempDir(), nil, &out)
+		fmt.Printf("result: %v | %s\n", err, strings.TrimSpace(out.String()))
+		return
+	}
+	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		t.Skipf("no pty: %v", err)
+	}
+	defer ptmx.Close()
+	if err := unix.IoctlSetPointerInt(int(ptmx.Fd()), unix.TIOCSPTLCK, 0); err != nil {
+		t.Skipf("unlockpt: %v", err)
+	}
+	n, err := unix.IoctlGetInt(int(ptmx.Fd()), unix.TIOCGPTN)
+	if err != nil {
+		t.Skipf("ptsname: %v", err)
+	}
+	pts, err := os.OpenFile("/dev/pts/"+strconv.Itoa(n), os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Skipf("open pts: %v", err)
+	}
+	defer pts.Close()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRunScriptNoTerminal$")
+	cmd.Env = append(os.Environ(), "ATL_TEST_TTY_HELPER=1")
+	cmd.Stdin = pts
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0} // the pts, as its stdin
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("helper: %v\n%s", err, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "result: script failed") || strings.Contains(got, "interrupted") {
+		t.Fatalf("a script reading /dev/tty: %s", got)
 	}
 }

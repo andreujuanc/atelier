@@ -9,15 +9,17 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
 // settingKeys are atelier.toml's keys, in the order of the design's table.
-var settingKeys = []string{"repos", "git_config", "context", "tmux_socket", "sandbox.image", "sandbox.mounts", "sandbox.context"}
+var settingKeys = []string{"repos", "git_config", "context", "tmux_socket", "sandbox.image", "sandbox.mounts", "sandbox.context", "sandbox.registries"}
 
 // getKey returns setting key of c; sandbox.mounts joined with ':' (a
 // mount never contains one).
@@ -41,12 +43,15 @@ func getKey(c *Config, key string) string {
 		return strings.Join(sb.Mounts, ":")
 	case "sandbox.context":
 		return sb.Context
+	case "sandbox.registries":
+		return strings.Join(sb.Registries, ",")
 	}
 	return ""
 }
 
 // setKey sets setting key of c to v; sandbox.mounts from a ':'-separated
-// list (empty parts dropped).
+// list (empty parts dropped), sandbox.registries from a list separated by
+// commas or blanks.
 func setKey(c *Config, key, v string) {
 	if c.Sandbox == nil {
 		c.Sandbox = &SandboxConfig{}
@@ -71,6 +76,8 @@ func setKey(c *Config, key, v string) {
 		}
 	case "sandbox.context":
 		c.Sandbox.Context = v
+	case "sandbox.registries":
+		c.Sandbox.Registries = strings.FieldsFunc(v, func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
 	}
 }
 
@@ -92,7 +99,7 @@ func fill(dst *Config, src Config, from map[string]string, source func(key strin
 
 // envFillKeys are the settings `atl workspace new` takes from the user's
 // environment.
-var envFillKeys = []string{"repos", "context", "sandbox.image", "sandbox.mounts", "sandbox.context"}
+var envFillKeys = []string{"repos", "context", "sandbox.image", "sandbox.mounts", "sandbox.context", "sandbox.registries"}
 
 // keyVar is the environment variable of a setting.
 func keyVar(key string) string {
@@ -265,6 +272,11 @@ func Prepare(root, name string, flags Config) (*Plan, error) {
 		}
 	}
 	if c.Sandbox != nil {
+		for _, r := range c.Sandbox.Registries {
+			if err := sandbox.CheckRegistry(r); err != nil {
+				return nil, fmt.Errorf("sandbox.registries (from %s): %v", from["sandbox.registries"], err)
+			}
+		}
 		for i, m := range c.Sandbox.Mounts {
 			if strings.Contains(m, ":") {
 				return nil, fmt.Errorf("mount %q: a path must not contain ':'", m)
@@ -359,19 +371,84 @@ func (p *Plan) Write() error {
 			return err
 		}
 	}
-	f, err := os.OpenFile(filepath.Join(p.Dir, File), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	final := filepath.Join(p.Dir, File)
+	exists := fmt.Errorf("workspace %s already exists (it has %s)", p.Dir, File)
+	if _, err := os.Lstat(final); err == nil {
+		return exists
+	}
+	// Written whole and synced under a temporary name first, then published
+	// under its own without replacing one there: atl killed (or the box
+	// losing power) on the way leaves no partial or empty atelier.toml,
+	// which would make a retry call the workspace existing, or load as the
+	// defaults.
+	tmp, err := os.CreateTemp(p.Dir, tmpPrefix+"*")
 	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("workspace %s already exists (it has %s)", p.Dir, File)
+		return err
+	}
+	defer os.Remove(tmp.Name()) // after the publish, only its temporary name
+	_, err = writeFile(tmp, buf.Bytes())
+	if err == nil {
+		err = tmp.Chmod(0o644)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := link(tmp.Name(), final); errors.Is(err, os.ErrExist) {
+		return exists
+	} else if err != nil {
+		// No hard links here: claim the name, then write it (a kill in
+		// between leaves it empty, as before).
+		if err := writeExcl(final, buf.Bytes()); errors.Is(err, os.ErrExist) {
+			return exists
+		} else if err != nil {
+			return err
 		}
-		return err
 	}
-	if _, err := f.Write(buf.Bytes()); err != nil {
-		f.Close()
-		return err
+	// Those a killed write left.
+	if old, err := filepath.Glob(filepath.Join(p.Dir, tmpPrefix+"*")); err == nil {
+		for _, f := range old {
+			os.Remove(f)
+		}
 	}
-	return f.Close()
+	return nil
 }
+
+// tmpPrefix starts the name of the temporary file Plan.Write writes
+// atelier.toml to.
+const tmpPrefix = "." + File + ".tmp"
+
+// writeExcl creates path, which must not exist, with data, synced; on a
+// failure after the create it removes it (it is ours: O_EXCL).
+func writeExcl(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = writeFile(f, data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(path)
+	}
+	return err
+}
+
+// writeFile writes atelier.toml's content; a var so tests can fail it.
+var writeFile = (*os.File).Write
+
+// link makes a hard link; a var so tests can fail it as a file system
+// without hard links does.
+var link = os.Link
 
 // HasDB reports whether dir has a database (data/atelier.db), as the
 // workspace of a devcontainer box does.
@@ -403,7 +480,7 @@ type AdoptDBError struct{ Name, Dir string }
 
 func (e *AdoptDBError) Error() string {
 	return fmt.Sprintf("%s has a database (a devcontainer box's workspace?) and no repos were found (no ATL_REPOS in %s): adopt it with %s, "+
-		"giving the box's repos and mounts (see \"Moving from a devcontainer box\" in atelier's README)", e.Dir, DevcontainerFile, adoptCommand(e.Dir))
+		"giving the box's repos and mounts (see \"Moving from a devcontainer box\" in atelier's docs/workspaces.md)", e.Dir, DevcontainerFile, adoptCommand(e.Dir))
 }
 
 // reposKnown reports whether adopting dir finds its repos without a flag:

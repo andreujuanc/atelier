@@ -122,10 +122,13 @@ type SandboxConfig struct {
 	Image   string   `toml:"image,omitempty"`
 	Mounts  []string `toml:"mounts,omitempty"`
 	Context string   `toml:"context,omitempty"`
+	// Registries are the registries tasks may pull from besides the
+	// default ones (sandbox.DefaultRegistries).
+	Registries []string `toml:"registries,omitempty"`
 }
 
 func (s *SandboxConfig) empty() bool {
-	return s == nil || (s.Image == "" && len(s.Mounts) == 0 && s.Context == "")
+	return s == nil || (s.Image == "" && len(s.Mounts) == 0 && s.Context == "" && len(s.Registries) == 0)
 }
 
 // ReadConfig reads dir/atelier.toml strictly: unknown keys are an error.
@@ -154,6 +157,11 @@ func ReadConfig(dir string) (Config, error) {
 		for _, m := range c.Sandbox.Mounts {
 			if m == "" || strings.Contains(m, ":") {
 				return c, fmt.Errorf("%s: sandbox.mounts: %q: empty or contains ':'", path, m)
+			}
+		}
+		for _, r := range c.Sandbox.Registries {
+			if err := sandbox.CheckRegistry(r); err != nil {
+				return c, fmt.Errorf("%s: sandbox.registries: %v", path, err)
 			}
 		}
 	}
@@ -194,7 +202,7 @@ type NotWorkspaceError struct{ Name, Dir string }
 func (e *NotWorkspaceError) Error() string {
 	if root, err := Root(); err == nil && HasDB(e.Dir) && !inBoxOf(root, e.Dir) && !reposKnown(e.Dir) {
 		return fmt.Sprintf("%s is not a workspace (no %s) and has a database (a devcontainer box's workspace?): adopt it with %s, "+
-			"giving the box's repos and mounts (see \"Moving from a devcontainer box\" in atelier's README)", e.Dir, File, adoptCommand(e.Dir))
+			"giving the box's repos and mounts (see \"Moving from a devcontainer box\" in atelier's docs/workspaces.md)", e.Dir, File, adoptCommand(e.Dir))
 	}
 	return fmt.Sprintf("%s is not a workspace (no %s): adopt it with %s", e.Dir, File, newCommand(e.Dir))
 }
@@ -269,6 +277,7 @@ func Load(dir string) (*Workspace, error) {
 	add("sandbox.image", "ATL_SANDBOX_IMAGE", sb.Image, FromFile)
 	add("sandbox.mounts", sandbox.MountsVar, strings.Join(sb.Mounts, ":"), FromFile)
 	add("sandbox.context", "ATL_SANDBOX_CONTEXT", sb.Context, FromFile)
+	add("sandbox.registries", sandbox.RegistriesVar, strings.Join(sb.Registries, ","), FromFile)
 	return ws, nil
 }
 
@@ -291,7 +300,8 @@ func defaultSocket(dir string) string {
 }
 
 // settingVars are the variables of the settings, in Settings order.
-var settingVars = []string{"ATL_REPOS", "GIT_CONFIG_GLOBAL", "ATL_CONTEXT", "ATL_TMUX_SOCKET", "ATL_SANDBOX_IMAGE", sandbox.MountsVar, "ATL_SANDBOX_CONTEXT"}
+var settingVars = []string{"ATL_REPOS", "GIT_CONFIG_GLOBAL", "ATL_CONTEXT", "ATL_TMUX_SOCKET", "ATL_SANDBOX_IMAGE", sandbox.MountsVar, "ATL_SANDBOX_CONTEXT",
+	sandbox.RegistriesVar}
 
 // WindowEnv is what atl gives every tmux window it creates (tmux -e), so
 // that the window has this process's workspace even on a tmux server

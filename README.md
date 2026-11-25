@@ -37,7 +37,8 @@ Run the steps below there (later: `git pull` there, then again).
 Without Go (the Dockerfile's `build` stage writes `/out/atl`):
 
 ```bash
-docker build --target build -t atl-build . \
+mkdir -p ~/.local/bin \
+  && docker build --target build -t atl-build . \
   && id=$(docker create atl-build) \
   && docker cp "$id:/out/atl" ~/.local/bin/atl \
   && docker rm "$id"
@@ -120,7 +121,7 @@ running, idle, stopped). Colours follow the terminal's light or dark background.
 | `q` | quit (waits for running operations; `ctrl+c` again forces) |
 
 Repo picker: type to filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter`
-confirms, `esc` cancels.
+confirms, `esc` clears the filter, else cancels.
 
 ## CLI
 
@@ -167,7 +168,8 @@ assistant's container forwards an allowlist ([docs/assistant.md](docs/assistant.
 ### `<workspace>/atelier.toml`
 
 Strict TOML: every key optional, unknown keys are an error. `~/` expands in `repos`,
-`git_config` and `mounts`; relative paths are relative to the workspace. No secrets here.
+`git_config` and `mounts`; relative `repos` and `git_config` paths are relative to the workspace
+(`mounts` must be absolute). No secrets here.
 
 | key | default | meaning |
 |---|---|---|
@@ -178,6 +180,7 @@ Strict TOML: every key optional, unknown keys are an error. `~/` expands in `rep
 | `[sandbox] image` | `"atelier-task"` | task container image (a project's `image` wins) |
 | `[sandbox] mounts` | none | host paths every task gets read-only ([docs/sandbox.md](docs/sandbox.md#host-files-for-every-task)) |
 | `[sandbox] context` | none | text added to sandboxed sessions' start context (max 1000 bytes) |
+| `[sandbox] registries` | none | registries tasks may pull from besides Docker Hub, ghcr.io, quay.io, mcr.microsoft.com, gcr.io, registry.k8s.io, public.ecr.aws (`"localhost:5000"`, `"*.pkg.dev"`; [docs/sandbox.md](docs/sandbox.md#registries-tasks-may-pull-from)) |
 
 ```toml
 repos = "~/src/work"
@@ -191,12 +194,12 @@ More: [docs/workspaces.md](docs/workspaces.md).
 ### Projects: `<workspace>/config/projects/<name>.toml`
 
 ```toml
-setup = "npm ci"                      # sh -c in each rw worktree after creation (on the host)
-teardown = "docker compose down -v"   # sh -c in each rw worktree before removal (on the host)
+setup = "npm ci"                      # sh -c in each rw worktree after creation, in the task's container
+# teardown = "..."                    # likewise, before removal; not needed for Docker (docs/sandbox.md)
 image = "shop-dev"                    # task container image, e.g. built FROM atelier-task
 
 [env]                                 # added to sessions and scripts
-COMPOSE_PROJECT_NAME = "shop"
+NODE_ENV = "development"
 
 [[repos]]
 name = "api"
@@ -223,12 +226,14 @@ A variable set in the environment wins over `atelier.toml`.
 | `ATL_SANDBOX_IMAGE` | `[sandbox] image` | task image (also read by `build-images`) |
 | `ATL_SANDBOX_MOUNTS` | `[sandbox] mounts` | `:`-separated absolute paths |
 | `ATL_SANDBOX_CONTEXT` | `[sandbox] context` | see `[sandbox] context` |
+| `ATL_SANDBOX_REGISTRIES` | `[sandbox] registries` | separated by commas or blanks |
 | `CLAUDE_CODE_OAUTH_TOKEN` | the token from `atl token` | token for sandboxed sessions and the assistant; wins over the stored one |
 | `ANTHROPIC_API_KEY` | none | API key instead of a token (also wins) |
 
 Sessions and project scripts get `ATL_TASK`, `ATL_TASK_DIR` and `ATL_PORT_OFFSET` (0, 100,
 200…, chosen to avoid other open tasks in every workspace: add it to every port you bind) plus the
-project's `env`. Scripts also get `ATL_REPO`, `ATL_WORKTREE` and `ATL_BRANCH`.
+project's `env`. Scripts also get `ATL_REPO`, `ATL_WORKTREE` and `ATL_BRANCH`. Sandboxed sessions get
+`COMPOSE_PROJECT_NAME` set to the task's Docker namespace, over the project's ([docs/sandbox.md](docs/sandbox.md#the-docker-gate)).
 
 ## Docs
 
