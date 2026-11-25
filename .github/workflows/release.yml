@@ -97,4 +97,22 @@ jobs:
           fi
           set -- --target "$GITHUB_SHA" --title "$TAG" --generate-notes --notes "$notes"
           if [ -n "$PREV" ]; then set -- "$@" --notes-start-tag "$PREV"; fi
-          gh release create "$TAG" dist/* "$@"
+
+          # A draft until every asset is up: no one sees a half-made release.
+          # A run that failed midway leaves its draft behind: start over
+          # (never touching a published release).
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "$TAG" --yes
+          fi
+          gh release create "$TAG" --draft "$@"
+          # An upload whose answer was lost succeeded anyway: retrying it
+          # must replace the asset (--clobber), not fail on its name.
+          for f in dist/*; do
+            n=0
+            until gh release upload "$TAG" "$f" --clobber; do
+              n=$((n + 1))
+              if [ "$n" -ge 3 ]; then echo "upload $f failed $n times"; exit 1; fi
+              sleep 10
+            done
+          done
+          gh release edit "$TAG" --draft=false --latest
