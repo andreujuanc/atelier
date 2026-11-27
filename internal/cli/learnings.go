@@ -19,9 +19,9 @@ import (
 
 // learningsCmd is `atl learnings`: review what atl learn proposes. Like
 // atl learn it runs only where atelier runs: not in a task container
-// (insideContainer) and not for the assistant (not in
-// sandbox.AssistantCommands; the commands that change a learning refuse
-// --for-assistant too).
+// (insideContainer). The assistant may only read them (its gate runs
+// learnings, ls and show: sandbox.AssistantCommands); the commands that
+// change a learning refuse --for-assistant too.
 func (c *cli) learningsCmd() *cobra.Command {
 	var all, asJSON bool
 	cmd := &cobra.Command{

@@ -49,7 +49,7 @@ func TestLearnings(t *testing.T) {
 	}, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetLearningStatus(ctx, 1, []string{"candidate"}, "proposed", false); err != nil {
+	if err := st.SetLearningStatus(ctx, 1, []string{"candidate"}, "proposed", false, func([]store.Learning, []store.LearningOccurrence) string { return "" }); err != nil {
 		t.Fatal(err)
 	}
 	st.Close()

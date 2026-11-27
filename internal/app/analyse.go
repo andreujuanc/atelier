@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/andreujuanc/atelier/internal/hook"
 	"github.com/andreujuanc/atelier/internal/learn"
 	"github.com/andreujuanc/atelier/internal/store"
 )
@@ -469,31 +470,65 @@ func scoreInput(o store.LearningOccurrence) learn.ScoreInput {
 
 // applyTransitions moves each learning to the status its score now says
 // (learn.Transition), only if its status is still the one scored (the
-// user may decide meanwhile), then deletes the candidates with no
-// occurrence left.
+// user may decide meanwhile), deletes the candidates with no occurrence
+// left, and rewrites the injection snapshot (scores change with every
+// run), all in one transaction (store.ApplyStatusChanges).
 func (a *App) applyTransitions(ctx context.Context) ([]LearningTransition, int, error) {
 	views, err := a.Learnings(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
 	cfg := a.LearnConfig()
-	var out []LearningTransition
+	var changes []store.StatusChange
+	texts := map[int64]string{}
 	for _, v := range views {
-		to := learn.Transition(v.Status, v.Score, cfg)
-		if to == v.Status {
-			continue
+		if to := learn.Transition(v.Status, v.Score, cfg); to != v.Status {
+			changes = append(changes, store.StatusChange{ID: v.ID, From: v.Status, To: to})
+			texts[v.ID] = v.Text
 		}
-		err := a.Store.SetLearningStatus(ctx, v.ID, []string{v.Status}, to, false)
-		if errors.Is(err, store.ErrLearningStatus) || errors.Is(err, store.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return out, 0, err
-		}
-		out = append(out, LearningTransition{ID: v.ID, Text: v.Text, From: v.Status, To: to})
 	}
-	n, err := a.Store.DeleteEmptyCandidates(ctx)
-	return out, n, err
+	made, n, err := a.Store.ApplyStatusChanges(ctx, changes, a.injection)
+	if err != nil {
+		return nil, 0, err
+	}
+	var out []LearningTransition
+	for _, c := range made {
+		out = append(out, LearningTransition{ID: c.ID, Text: texts[c.ID], From: c.From, To: c.To})
+	}
+	return out, n, nil
+}
+
+// injection renders the injection snapshot (store.InjectionRenderer): the
+// accepted learnings, an outdated one too (the user decides), scored at
+// now, highest first (the lower id first of equals), in the "User
+// preferences" section (hook.Preferences) within [learn] inject_budget.
+func (a *App) injection(accepted []store.Learning, occs []store.LearningOccurrence) string {
+	by := map[int64][]learn.ScoreInput{}
+	for _, o := range occs {
+		by[o.LearningID] = append(by[o.LearningID], scoreInput(o))
+	}
+	cfg, now := a.LearnConfig(), a.now()
+	type scored struct {
+		store.Learning
+		score float64
+	}
+	ls := make([]scored, 0, len(accepted))
+	for _, l := range accepted {
+		if l.Status == learn.StatusAccepted {
+			ls = append(ls, scored{l, learn.ScoreLearning(l.Status, l.DecidedAt, by[l.ID], now, cfg).Score})
+		}
+	}
+	sort.SliceStable(ls, func(i, j int) bool {
+		if ls[i].score != ls[j].score {
+			return ls[i].score > ls[j].score
+		}
+		return ls[i].ID < ls[j].ID
+	})
+	texts := make([]string, len(ls))
+	for i, l := range ls {
+		texts[i] = l.Text
+	}
+	return hook.Preferences(texts, cfg.InjectBudget)
 }
 
 // ErrLearnRunning is returned (wrapped) when a learning is to change while
@@ -528,9 +563,9 @@ func (a *App) changeLearning(ctx context.Context, what string, change func() err
 func (a *App) DecideLearning(ctx context.Context, id int64, accept bool) error {
 	return a.changeLearning(ctx, "decide on a learning", func() error {
 		if accept {
-			return a.Store.SetLearningStatus(ctx, id, []string{learn.StatusCandidate, learn.StatusProposed}, learn.StatusAccepted, true)
+			return a.Store.SetLearningStatus(ctx, id, []string{learn.StatusCandidate, learn.StatusProposed}, learn.StatusAccepted, true, a.injection)
 		}
-		return a.Store.SetLearningStatus(ctx, id, []string{learn.StatusCandidate, learn.StatusProposed, learn.StatusAccepted}, learn.StatusRejected, true)
+		return a.Store.SetLearningStatus(ctx, id, []string{learn.StatusCandidate, learn.StatusProposed, learn.StatusAccepted}, learn.StatusRejected, true, a.injection)
 	})
 }
 
@@ -543,7 +578,7 @@ func (a *App) EditLearning(ctx context.Context, id int64, text string) (string, 
 	if err != nil {
 		return "", err
 	}
-	return text, a.changeLearning(ctx, "edit a learning", func() error { return a.Store.SetLearningText(ctx, id, text) })
+	return text, a.changeLearning(ctx, "edit a learning", func() error { return a.Store.SetLearningText(ctx, id, text, a.injection) })
 }
 
 // DeleteLearning forgets learning id and its occurrences, and returns how
@@ -553,7 +588,7 @@ func (a *App) EditLearning(ctx context.Context, id int64, text string) (string, 
 // learn runs.
 func (a *App) DeleteLearning(ctx context.Context, id int64) (n int, err error) {
 	err = a.changeLearning(ctx, "delete a learning", func() error {
-		n, err = a.Store.DeleteLearning(ctx, id)
+		n, err = a.Store.DeleteLearning(ctx, id, a.injection)
 		return err
 	})
 	return n, err

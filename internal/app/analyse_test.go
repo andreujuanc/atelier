@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -424,4 +425,117 @@ func TestSampleQuotes(t *testing.T) {
 	if strings.Join(got[1], ",") != "a3,c,b old" || strings.Join(got[2], ",") != "x4,x3,x2" {
 		t.Errorf("quotes: %v", got)
 	}
+}
+
+// TestInjectionSnapshot: the injection snapshot holds the accepted
+// learnings only, an outdated one too, by score (the lower id first of
+// equals), within [learn] inject_budget; accept, reject, edit, rm and the
+// end of each atl learn run rewrite it.
+func TestInjectionSnapshot(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	a, b := e.learnTask(t, "a", ""), e.learnTask(t, "b", "")
+	now := time.Now()
+	n := 0
+	o := func(task int64, strength, polarity string, at time.Time) store.LearningOccurrence {
+		n++
+		return store.LearningOccurrence{Key: fmt.Sprint("k", n), ItemID: fmt.Sprint("i", n), TaskID: task, Session: int64(n), At: at,
+			Strength: strength, Polarity: polarity, Quote: "a quote of the user", Text: "x"}
+	}
+	r := learn.PolarityReinforce
+	high := "High, a text longer than the line that says how many more"
+	// 1 Low (1), 2 High (4), 3 Tied (1), 4 Proposed, 5 Rejected, 6 Candidate.
+	if _, err := e.app.Store.AssignOccurrences(ctx, []string{"Low", high, "Tied", "Proposed", "Rejected", "Candidate"}, []store.Assignment{
+		{Occ: o(a.ID, "normal", r, now), NewIndex: 0},
+		{Occ: o(a.ID, "strong", r, now), NewIndex: 1}, {Occ: o(b.ID, "strong", r, now), NewIndex: 1},
+		{Occ: o(b.ID, "normal", r, now), NewIndex: 2},
+		{Occ: o(a.ID, "strong", r, now), NewIndex: 3}, {Occ: o(b.ID, "strong", r, now), NewIndex: 3},
+		{Occ: o(a.ID, "strong", r, now), NewIndex: 4}, {Occ: o(b.ID, "strong", r, now), NewIndex: 4},
+		{Occ: o(a.ID, "mild", r, now), NewIndex: 5},
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	snap := func() string {
+		t.Helper()
+		s, err := e.app.Store.Injection(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	head := "User preferences (learned across tasks, approved by the user):\n"
+	want := func(step, w string) {
+		t.Helper()
+		if got := snap(); got != w {
+			t.Errorf("%s: %q, want %q", step, got, w)
+		}
+	}
+	// atl learn (nothing to read: no model call) proposes 4 and 5 (and 2).
+	if _, err := e.app.Learn(ctx, "", false); err != nil {
+		t.Fatal(err)
+	}
+	want("nothing accepted", "")
+	for _, id := range []int64{1, 3} {
+		if err := e.app.DecideLearning(ctx, id, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want("accept two of one score", head+"- Low\n- Tied")
+	if err := e.app.DecideLearning(ctx, 2, true); err != nil {
+		t.Fatal(err)
+	}
+	want("accept a higher one", head+"- "+high+"\n- Low\n- Tied")
+	if err := e.app.DecideLearning(ctx, 5, false); err != nil {
+		t.Fatal(err)
+	}
+	want("reject another", head+"- "+high+"\n- Low\n- Tied")
+	if _, err := e.app.EditLearning(ctx, 3, "Tied, reworded"); err != nil {
+		t.Fatal(err)
+	}
+	want("edit", head+"- "+high+"\n- Low\n- Tied, reworded")
+	if err := e.app.DecideLearning(ctx, 1, false); err != nil {
+		t.Fatal(err)
+	}
+	want("reject an accepted one", head+"- "+high+"\n- Tied, reworded")
+	if _, err := e.app.DeleteLearning(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+	want("rm", head+"- "+high)
+	if vs, _ := e.app.Learnings(ctx); len(vs) != 5 || vs[2].ID != 4 || vs[2].Status != learn.StatusProposed || vs[4].ID != 6 || vs[4].Status != learn.StatusCandidate {
+		t.Fatalf("learnings: %+v", vs)
+	}
+
+	// Contradicted since it was accepted, from two tasks: outdated, still
+	// in (the user decides). New occurrences change the order at the end
+	// of the next atl learn run, which also uses the budget it has then.
+	later := now.Add(time.Minute)
+	with2 := func(oc store.LearningOccurrence) store.LearningOccurrence { oc.LearningID = 2; return oc }
+	if _, err := e.app.Store.AssignOccurrences(ctx, []string{"Newer"}, []store.Assignment{{Occ: o(a.ID, "normal", r, later), NewIndex: 0}}, later); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.app.DecideLearning(ctx, 7, true); err != nil {
+		t.Fatal(err)
+	}
+	want("accept a low one", head+"- "+high+"\n- Newer")
+	if _, err := e.app.Store.AssignOccurrences(ctx, nil, []store.Assignment{
+		{Occ: with2(o(a.ID, "strong", learn.PolarityContradict, later))},
+		{Occ: with2(o(b.ID, "strong", learn.PolarityContradict, later))},
+	}, later); err != nil {
+		t.Fatal(err)
+	}
+	want("new occurrences alone", head+"- "+high+"\n- Newer")
+	if _, err := e.app.Learn(ctx, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if v, _, _ := e.app.Learning(ctx, 2); v.Status != learn.StatusAccepted || !v.Outdated || v.Score.Score >= 1 {
+		t.Fatalf("not outdated: %+v", v)
+	}
+	want("after atl learn", head+"- Newer\n- "+high)
+	cfg := learn.Defaults()
+	cfg.InjectBudget = len(head + "- Newer\n- … (1 more: atl learnings)")
+	e.learnConfig(cfg)
+	if _, err := e.app.Learn(ctx, "", false); err != nil {
+		t.Fatal(err)
+	}
+	want("a smaller budget", head+"- Newer\n- … (1 more: atl learnings)")
 }

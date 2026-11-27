@@ -211,12 +211,108 @@ func (s *Store) AssignOccurrences(ctx context.Context, texts []string, as []Assi
 	return created, tx.Commit()
 }
 
+// InjectionRenderer renders the injection snapshot (Injection): the "User
+// preferences" section of the start context, from the accepted learnings
+// (by id) and their occurrences (oldest first; TaskSlug not set), as the
+// change being made leaves them. "" is nothing to inject.
+type InjectionRenderer func(accepted []Learning, occs []LearningOccurrence) string
+
+// Injection returns the injection snapshot, as the last change of the
+// learnings rendered it; "" if there is none.
+func (s *Store) Injection(ctx context.Context) (string, error) {
+	var text string
+	err := s.db.QueryRowContext(ctx, `SELECT text FROM learn_injection WHERE id = 1`).Scan(&text)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return text, err
+}
+
+// writeInjection rewrites the injection snapshot in tx with render, from
+// the accepted learnings as tx sees them.
+func writeInjection(ctx context.Context, tx *sql.Tx, render InjectionRenderer) error {
+	if render == nil {
+		return errors.New("store: no injection renderer")
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT `+learningCols+` FROM learnings WHERE status = 'accepted' ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	var accepted []Learning
+	for rows.Next() {
+		l, err := scanLearning(rows)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		accepted = append(accepted, l)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var occs []LearningOccurrence
+	if len(accepted) > 0 {
+		rows, err := tx.QueryContext(ctx, `SELECT key, learning_id, task_id, item_id, session, at, strength, polarity, quote, text
+			FROM learning_occurrences WHERE learning_id IN (SELECT id FROM learnings WHERE status = 'accepted') ORDER BY at, key`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var o LearningOccurrence
+			var at int64
+			if err := rows.Scan(&o.Key, &o.LearningID, &o.TaskID, &o.ItemID, &o.Session, &at, &o.Strength, &o.Polarity, &o.Quote, &o.Text); err != nil {
+				rows.Close()
+				return err
+			}
+			o.At = msTime(at)
+			occs = append(occs, o)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO learn_injection (id, text, updated_at) VALUES (1, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at`, render(accepted, occs), toMS(now()))
+	return err
+}
+
 // SetLearningStatus moves learning id to status to, if its status is one
 // of from: ErrNotFound if there is no such learning, ErrLearningStatus
 // (with its status) if its status is not in from. decide sets its
 // decided_at (an accept or reject by the user); an automatic transition
-// leaves it.
-func (s *Store) SetLearningStatus(ctx context.Context, id int64, from []string, to string, decide bool) error {
+// (ApplyStatusChanges) leaves it. The injection snapshot is rewritten
+// with render in the same transaction.
+func (s *Store) SetLearningStatus(ctx context.Context, id int64, from []string, to string, decide bool, render InjectionRenderer) error {
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE (_txlock)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	ok, err := setStatus(ctx, tx, id, from, to, decide)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		l, err := scanLearning(tx.QueryRowContext(ctx, `SELECT `+learningCols+` FROM learnings WHERE id = ?`, id))
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("learning %d: %w", id, ErrNotFound)
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("learning %d is %s: %w", id, l.Status, ErrLearningStatus)
+	}
+	if err := writeInjection(ctx, tx, render); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// setStatus moves learning id to status to in tx if its status is one of
+// from, and reports whether it did.
+func setStatus(ctx context.Context, tx *sql.Tx, id int64, from []string, to string, decide bool) (bool, error) {
 	t := toMS(now())
 	q := `UPDATE learnings SET status = ?, updated_at = ?`
 	args := []any{to, t}
@@ -229,24 +325,63 @@ func (s *Store) SetLearningStatus(ctx context.Context, id int64, from []string, 
 	for _, f := range from {
 		args = append(args, f)
 	}
-	res, err := s.db.ExecContext(ctx, q, args...)
+	res, err := tx.ExecContext(ctx, q, args...)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if n, err := res.RowsAffected(); err != nil || n == 1 {
-		return err
-	}
-	l, err := s.GetLearning(ctx, id)
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// StatusChange is a learning's automatic status change, from From to To
+// (ApplyStatusChanges).
+type StatusChange struct {
+	ID       int64
+	From, To string
+}
+
+// ApplyStatusChanges makes, in one transaction, the changes whose learning
+// still has status From (another is left out: the user decided meanwhile,
+// or it is gone), deletes the candidates with no occurrence left (their
+// tasks were deleted) that the user did not edit, and rewrites the
+// injection snapshot with render. It returns the changes it made and how
+// many candidates it deleted.
+func (s *Store) ApplyStatusChanges(ctx context.Context, changes []StatusChange, render InjectionRenderer) ([]StatusChange, int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
-	return fmt.Errorf("learning %d is %s: %w", id, l.Status, ErrLearningStatus)
+	defer tx.Rollback()
+	var made []StatusChange
+	for _, c := range changes {
+		ok, err := setStatus(ctx, tx, c.ID, []string{c.From}, c.To, false)
+		if err != nil {
+			return nil, 0, err
+		}
+		if ok {
+			made = append(made, c)
+		}
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM learnings WHERE status = 'candidate' AND edited = 0
+		AND NOT EXISTS (SELECT 1 FROM learning_occurrences o WHERE o.learning_id = learnings.id)`)
+	if err != nil {
+		return nil, 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := writeInjection(ctx, tx, render); err != nil {
+		return nil, 0, err
+	}
+	return made, int(n), tx.Commit()
 }
 
 // SetLearningText rewords learning id (the user's: it is marked edited).
 // A text another learning has (by Unicode case folding) is
-// ErrLearningExists.
-func (s *Store) SetLearningText(ctx context.Context, id int64, text string) error {
+// ErrLearningExists. The injection snapshot is rewritten with render in
+// the same transaction.
+func (s *Store) SetLearningText(ctx context.Context, id int64, text string, render InjectionRenderer) error {
 	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE (_txlock)
 	if err != nil {
 		return err
@@ -268,12 +403,16 @@ func (s *Store) SetLearningText(ctx context.Context, id int64, text string) erro
 	} else if n != 1 {
 		return fmt.Errorf("learning %d: %w", id, ErrNotFound)
 	}
+	if err := writeInjection(ctx, tx, render); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
 // DeleteLearning deletes learning id and its occurrences, and returns how
-// many occurrences went with it.
-func (s *Store) DeleteLearning(ctx context.Context, id int64) (int, error) {
+// many occurrences went with it. The injection snapshot is rewritten with
+// render in the same transaction.
+func (s *Store) DeleteLearning(ctx context.Context, id int64, render InjectionRenderer) (int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -292,20 +431,10 @@ func (s *Store) DeleteLearning(ctx context.Context, id int64) (int, error) {
 	} else if d == 0 {
 		return 0, fmt.Errorf("learning %d: %w", id, ErrNotFound)
 	}
-	return n, tx.Commit()
-}
-
-// DeleteEmptyCandidates deletes the candidates with no occurrence left
-// (their tasks were deleted) that the user did not edit, and returns
-// how many.
-func (s *Store) DeleteEmptyCandidates(ctx context.Context) (int, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM learnings WHERE status = 'candidate' AND edited = 0
-		AND NOT EXISTS (SELECT 1 FROM learning_occurrences o WHERE o.learning_id = learnings.id)`)
-	if err != nil {
+	if err := writeInjection(ctx, tx, render); err != nil {
 		return 0, err
 	}
-	n, err := res.RowsAffected()
-	return int(n), err
+	return n, tx.Commit()
 }
 
 type idText struct {

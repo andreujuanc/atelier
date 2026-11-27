@@ -192,6 +192,15 @@ CREATE TABLE learning_skips (
   tries INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX learning_skips_task ON learning_skips(task_id);`,
+	// v11: the injection snapshot (one row): the "User preferences"
+	// section of the start context, rendered from the accepted learnings
+	// by every change of them (Store.Injection), so the hook only reads
+	// it. No row: nothing to inject.
+	`CREATE TABLE learn_injection (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  text TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);`,
 }
 
 // maxSessionTranscripts caps the session_transcripts rows of one session

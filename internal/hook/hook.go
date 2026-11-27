@@ -1,10 +1,12 @@
 // Package hook implements `atl hook <event>`: the Claude Code hook handler
 // that tracks session state in the database and enforces read-only repos.
 //
-// The hook never writes to stdout, with exactly one exception: a
+// The hook never writes to stdout, with exactly two exceptions: a
 // SessionStart inside a task prints one JSON object
 // {"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":...}}
-// carrying fresh task context (see context.go). Errors go to hook.log.
+// carrying fresh task context (see context.go), and the assistant's
+// AssistantStart (its SessionStart) prints one carrying the "User
+// preferences" section, if any (see assistant.go). Errors go to hook.log.
 //
 // This path must stay fast (<50ms): no cobra, one DB open, no tmux calls.
 // In a sandboxed task's container it opens nothing: the input goes to the
@@ -88,6 +90,9 @@ const (
 	// EventAssistantGuard is the atelier assistant's PreToolUse guard (see
 	// assistant.go); it never opens the database.
 	EventAssistantGuard = "AssistantGuard"
+	// EventAssistantStart is the atelier assistant's SessionStart (see
+	// assistant.go): it only reads the injection snapshot.
+	EventAssistantStart = "AssistantStart"
 )
 
 func knownEvent(e string) bool {
@@ -152,6 +157,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, env func(stri
 	}
 	if event == EventAssistantGuard {
 		return assistantGuardMain(p, stdin, stderr)
+	}
+	if event == EventAssistantStart {
+		return assistantStartMain(p, stdin, stdout, stderr)
 	}
 	if event == "" {
 		return db{p: p}.serve(event, nil, nil, nil, stdout, stderr, env)

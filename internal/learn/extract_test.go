@@ -291,7 +291,7 @@ func TestConfigDefaults(t *testing.T) {
 	}
 	if c.PromptCap != 2048 || c.ReplySnippet != 200 || c.TaskCap != 65536 || c.WeightStrong != 2 || c.WeightNormal != 1 ||
 		c.WeightMild != 0.5 || c.HalfLifeProposed != 45 || c.HalfLifeAccepted != 365 || c.ProposeScore != 3 || c.ProposeTasks != 2 ||
-		c.OutdatedScore != 2 || c.Budget != 800 || c.Parallelism != 3 || c.PrecleanModel != "haiku" || c.PrecleanEffort != "low" ||
+		c.OutdatedScore != 2 || c.InjectBudget != 800 || c.Parallelism != 3 || c.PrecleanModel != "haiku" || c.PrecleanEffort != "low" ||
 		c.AnalyseModel != "haiku" || c.AnalyseEffort != "medium" || c.MaxCallUSD != 0.25 || c.FadeRatio != 0.75 {
 		t.Errorf("defaults: %+v", c)
 	}
@@ -315,7 +315,8 @@ func TestConfigValidate(t *testing.T) {
 		{func(c *Config) { c.NotesCap, c.PromptCap, c.TaskCap = 4000, 2000, 5000 }, "learn.notes_cap + learn.prompt_cap"},
 		{func(c *Config) { c.ReplySnippet = -1 }, "learn.reply_snippet"},
 		{func(c *Config) { c.Parallelism = 0 }, "learn.parallelism"},
-		{func(c *Config) { c.Budget = -5 }, "learn.budget"},
+		{func(c *Config) { c.InjectBudget = -5 }, "learn.inject_budget"},
+		{func(c *Config) { c.InjectBudget = MaxInjectBudget + 1 }, "learn.inject_budget"},
 		{func(c *Config) { c.HalfLifeProposed = 0 }, "learn.half_life_proposed"},
 		{func(c *Config) { c.ProposeTasks = 0 }, "learn.propose_tasks"},
 		{func(c *Config) { c.WeightMild = 0 }, "learn.weight_mild"},
@@ -338,7 +339,7 @@ func TestConfigValidate(t *testing.T) {
 		}
 	}
 	cfg := Defaults()
-	cfg.AnalyseModel, cfg.AnalyseEffort, cfg.ReplySnippet, cfg.Budget = "sonnet[1m]", "high", 0, 0
+	cfg.AnalyseModel, cfg.AnalyseEffort, cfg.ReplySnippet, cfg.InjectBudget = "sonnet[1m]", "high", 0, 0
 	if err := cfg.Validate(); err != nil {
 		t.Error(err)
 	}

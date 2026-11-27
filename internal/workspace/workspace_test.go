@@ -218,14 +218,14 @@ func TestLoadStrict(t *testing.T) {
 		"[sandbox]\nmounts = [\"/a:/b\"]": "contains ':'",
 		"[sandbox]\nregistries = [\"127.0.0.1:5000/x\"]": "sandbox.registries",
 		`repos = 3`: "parse",
-		"[learn]\nprompt_cap = 2048\nbudgets = 1":      "unknown keys: learn.budgets",
-		"[learn]\nparallelism = 0":                     "learn.parallelism: 0",
-		"[learn]\nnotes_cap = 100000":                  "learn.notes_cap + learn.prompt_cap: 100000 + 2048: more than learn.task_cap",
-		"[learn]\nweight_mild = 5":                     "strong >= normal >= mild",
-		"[learn]\npreclean_effort = \"extreme\"":       "learn.preclean_effort",
-		"[learn]\nhalf_life_proposed = \"45d\"":        "parse",
-		"learn = 3":                                    "parse",
-		"[learn]\nanalyse_model = \"-x\"\nbudget = -1": "learn.budget: -1",
+		"[learn]\nprompt_cap = 2048\nbudgets = 1":             "unknown keys: learn.budgets",
+		"[learn]\nparallelism = 0":                            "learn.parallelism: 0",
+		"[learn]\nnotes_cap = 100000":                         "learn.notes_cap + learn.prompt_cap: 100000 + 2048: more than learn.task_cap",
+		"[learn]\nweight_mild = 5":                            "strong >= normal >= mild",
+		"[learn]\npreclean_effort = \"extreme\"":              "learn.preclean_effort",
+		"[learn]\nhalf_life_proposed = \"45d\"":               "parse",
+		"learn = 3":                                           "parse",
+		"[learn]\nanalyse_model = \"-x\"\ninject_budget = -1": "learn.inject_budget: -1",
 	} {
 		dir := mk(t, root, "w", content)
 		if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), want) {

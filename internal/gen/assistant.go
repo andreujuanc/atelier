@@ -12,6 +12,11 @@ import (
 // assistant from editing files outside its own directory.
 const AssistantGuardEvent = "AssistantGuard"
 
+// AssistantStartEvent is the `atl hook` event that gives the atelier
+// assistant its start context (SessionStart): the "User preferences"
+// section, the accepted learnings.
+const AssistantStartEvent = "AssistantStart"
+
 // assistantAllow, assistantAsk and assistantDeny are the permission rules
 // atelier owns in the assistant's settings: read-only commands run without
 // asking, every command that changes state asks first, and common
@@ -25,11 +30,15 @@ const AssistantGuardEvent = "AssistantGuard"
 // (quoting, `--set=true`, extra spaces, flag order all change the
 // string), so all of `atl notes` asks and the notes are read with
 // `atl show <task> --notes` (or --json) under the `atl show` allow rule.
-// Ask rules win over allow rules, also over a user's global ones.
+// Ask rules win over allow rules, also over a user's global ones. The
+// changes of `atl learnings` (accept, reject, edit, rm) are denied: deciding
+// on learnings is the user's (its gate refuses them too).
 var (
 	assistantAllow = []string{
 		"Bash(atl ls *)", "Bash(atl show *)", "Bash(atl transcript *)",
-		"Bash(atl repos)", "Bash(atl help *)", "Read", "Grep", "Glob",
+		"Bash(atl repos)", "Bash(atl help *)", "Bash(atl learnings)", "Bash(atl learnings ls)", "Bash(atl learnings ls *)",
+		"Bash(atl learnings show *)",
+		"Read", "Grep", "Glob",
 	}
 	assistantAsk = []string{
 		"Bash(atl new *)", "Bash(atl add *)", "Bash(atl status *)", "Bash(atl session *)",
@@ -42,6 +51,7 @@ var (
 		"Bash(git restore *)", "Bash(git clean *)", "Bash(git am *)", "Bash(git apply *)",
 		"Bash(git cherry-pick *)", "Bash(git branch -D *)", "Bash(git branch -d *)",
 		"Bash(sed -i *)", "Bash(rm *)", "Bash(mv *)", "Bash(cp *)", "Bash(tee *)",
+		"Bash(atl learnings accept *)", "Bash(atl learnings reject *)", "Bash(atl learnings edit *)", "Bash(atl learnings rm *)",
 	}
 	// retiredAssistantRules lists allow/ask rules earlier atelier versions
 	// wrote that are no longer wanted; they are removed on rewrite. Earlier
@@ -170,6 +180,7 @@ func writeAssistantSettings(d *nofollow.Dir, atlBin string) error {
 	if hooks == nil {
 		hooks = map[string]any{}
 	}
+	setAtelierHook(hooks, "SessionStart", "", AssistantStartEvent, atlBin)
 	setAtelierHook(hooks, "PreToolUse", "Edit|Write|MultiEdit|NotebookEdit", AssistantGuardEvent, atlBin)
 	root["hooks"] = hooks
 	return saveSettings(d, root)
@@ -247,6 +258,7 @@ func AssistantClaudeMD(inContainer bool) string {
 		"  `--clear` forms write), so prefer `atl show <task> --notes`.",
 		"- `atl repos` — git repos available in $ATL_REPOS.",
 		"- `atl diff <task>` — git diff of each rw repo against its base commit (read-only, may ask permission).",
+		"- `atl learnings [ls] [--all] [--json]`, `atl learnings show <id> [--json]` — preferences atl learned from the user across tasks (the accepted ones are in your start context); only the user decides on them.",
 		"- `atl help`, `atl help <command>` — usage.",
 		"",
 		"Changes state (ALWAYS confirm first):",

@@ -39,8 +39,10 @@ type Config struct {
 	// net score below 0).
 	OutdatedScore float64 `toml:"outdated_score"`
 
-	Budget      int `toml:"budget"`      // bytes of the "User preferences" start context section
-	Parallelism int `toml:"parallelism"` // pre-clean runs at a time
+	// InjectBudget is the bytes of the "User preferences" start context
+	// section (the injection snapshot: its header and lines); 0: none.
+	InjectBudget int `toml:"inject_budget"`
+	Parallelism  int `toml:"parallelism"` // pre-clean runs at a time
 
 	PrecleanModel  string `toml:"preclean_model"`
 	PrecleanEffort string `toml:"preclean_effort"`
@@ -70,8 +72,8 @@ func Defaults() Config {
 		FadeRatio:     0.75,
 		OutdatedScore: 2,
 
-		Budget:      800,
-		Parallelism: 3,
+		InjectBudget: 800,
+		Parallelism:  3,
 
 		PrecleanModel:  "haiku",
 		PrecleanEffort: "low",
@@ -80,6 +82,11 @@ func Defaults() Config {
 		AnalyseEffort:  "medium",
 	}
 }
+
+// MaxInjectBudget bounds Config.InjectBudget: the start context's "User
+// preferences" section adds at most this much (and its blank lines) to
+// the rest of it.
+const MaxInjectBudget = 4000
 
 // Efforts are the reasoning efforts a model run may be given.
 var Efforts = []string{"low", "medium", "high", "xhigh", "max"}
@@ -100,7 +107,7 @@ func (c Config) Validate() error {
 		{"half_life_proposed", c.HalfLifeProposed, 1, 36500},
 		{"half_life_accepted", c.HalfLifeAccepted, 1, 36500},
 		{"propose_tasks", c.ProposeTasks, 1, 1000},
-		{"budget", c.Budget, 0, 10000},
+		{"inject_budget", c.InjectBudget, 0, MaxInjectBudget},
 		{"parallelism", c.Parallelism, 1, 16},
 	}
 	for _, f := range ints {

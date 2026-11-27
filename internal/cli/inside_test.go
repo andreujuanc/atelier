@@ -275,6 +275,22 @@ func TestResolveAtl(t *testing.T) {
 		{[]string{"--help=true", "--help=false", "open", "alpha"}, "atl open", false, false},
 		{[]string{"--help", "--help=false", "gate", "--assistant"}, "atl gate", false, false},
 		{[]string{"--help", "x", "--help", "--help=false", "repos", "pin", "api"}, "atl repos pin", false, false},
+		// Learnings: read only.
+		{[]string{"learnings"}, "atl learnings", false, true},
+		{[]string{"learnings", "--all", "--json"}, "atl learnings", false, true},
+		{[]string{"learnings", "ls", "--json"}, "atl learnings ls", false, true},
+		{[]string{"learnings", "--json", "ls"}, "atl learnings ls", false, true},
+		{[]string{"learnings", "show", "3", "--json"}, "atl learnings show", false, true},
+		{[]string{"learnings", "accept", "1"}, "atl learnings accept", false, false},
+		{[]string{"learnings", "reject", "1"}, "atl learnings reject", false, false},
+		{[]string{"learnings", "edit", "1"}, "atl learnings edit", false, false},
+		{[]string{"learnings", "rm", "1"}, "atl learnings rm", false, false},
+		{[]string{"learnings", "--json", "accept", "1"}, "atl learnings accept", false, false},
+		{[]string{"learnings", "--all=true", "reject", "1"}, "atl learnings reject", false, false},
+		{[]string{"learnings", "accept", "--help=false", "1"}, "atl learnings accept", false, false},
+		{[]string{"learnings", "", "accept", "1"}, "atl learnings accept", false, false},
+		{[]string{"--help", "--help=false", "learnings", "rm", "1"}, "atl learnings rm", false, false},
+		{[]string{"--help", "--help=false", "learnings", "ls"}, "atl learnings ls", false, false},
 	} {
 		path, stdin, err := resolveAtl(append(append([]string{}, ws...), c.args...))
 		if err != nil || path != c.path || stdin != c.stdin {
@@ -287,5 +303,17 @@ func TestResolveAtl(t *testing.T) {
 	}
 	if _, _, err := resolveAtl(append(append([]string{}, ws...), "nosuch")); err == nil {
 		t.Error("an unknown command resolved")
+	}
+	// As the gate runs it: --for-assistant right after the command.
+	for args, want := range map[string]string{
+		"learnings --for-assistant":                 "atl learnings",
+		"learnings --for-assistant ls --all":        "atl learnings ls",
+		"learnings --for-assistant show 3":          "atl learnings show",
+		"learnings --for-assistant --json accept 1": "atl learnings accept",
+	} {
+		path, _, err := resolveAtl(append(append([]string{}, ws...), strings.Fields(args)...))
+		if err != nil || path != want || sandbox.AssistantCommandPath(path) != !strings.HasSuffix(want, "accept") {
+			t.Errorf("%s: %q %v", args, path, err)
+		}
 	}
 }

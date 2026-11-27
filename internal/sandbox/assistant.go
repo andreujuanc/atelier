@@ -39,9 +39,19 @@ func InAssistant() bool { return Inside() && os.Getenv(AssistantEnv) != "" }
 // AssistantCommands are the atl commands the assistant's gate runs for it,
 // in its workspace (see CheckAssistantArgs). Not done and cancel: they
 // remove a task's worktrees, which the user does from the TUI or a terminal.
+// Of learnings, only the read-only subcommands (assistantSubcommands).
 var AssistantCommands = []string{
 	"ls", "show", "transcript", "repos", "diff", "new", "add", "status", "session", "resume",
-	"pr", "note", "notes", "rename", "doctor", "help",
+	"pr", "note", "notes", "rename", "doctor", "help", "learnings",
+}
+
+// assistantSubcommands are, for a command of AssistantCommands that has
+// subcommands, the only ones the assistant's gate runs for it: none
+// other, by name (CheckAssistantArgs) or as cobra resolves the line
+// (AssistantCommandPath). learnings: read only (accept, reject, edit, rm
+// are the user's).
+var assistantSubcommands = map[string][]string{
+	"learnings": {"ls", "show"},
 }
 
 // ForAssistantFlag is the hidden global atl flag (--for-assistant) that the
@@ -84,7 +94,10 @@ var ErrAssistantOpen = errors.New("atl open attaches a terminal and does not run
 //     and atl note without --author assistant: the assistant writes no note
 //     that reads as the user's;
 //   - `repos pin` (any argument after repos): it accepts a changed origin
-//     URL, a decision for the user.
+//     URL, a decision for the user;
+//   - learnings with accept, reject, edit or rm among its arguments, or
+//     whose first argument that is no flag is not ls or show: deciding on
+//     learnings is the user's.
 //
 // Every argument is checked, also after "--" (a flag can take "--" as its
 // value, and then a -w after it would count): an argument that is text for
@@ -161,6 +174,25 @@ func CheckAssistantArgs(args []string) error {
 					"ask the user to run it in a terminal")
 			}
 		}
+	case sub == "learnings":
+		// Read only: no argument anywhere names a change (a flag can take
+		// the next argument as its value), and the first that is no flag,
+		// if any, is ls or show.
+		for _, a := range args[1:] {
+			if slices.Contains(learningChanges, a) {
+				return errors.New("atl learnings " + a + " changes a learning and does not run for the assistant (deciding on learnings is the user's): " +
+					"ask the user to run atl learnings " + a + " <id> in a terminal")
+			}
+		}
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			if !slices.Contains(assistantSubcommands[sub], a) {
+				return fmt.Errorf("atl learnings %q does not run for the assistant; it may run atl learnings [ls] [--all] [--json] and atl learnings show <id> [--json]", a)
+			}
+			break
+		}
 	}
 	for _, c := range AssistantCommands {
 		if sub == c {
@@ -176,15 +208,27 @@ var (
 		"ask the user to do it in the atl TUI or a terminal")
 )
 
+// learningChanges are the atl learnings subcommands that change a
+// learning: the assistant's gate refuses them in any spelling.
+var learningChanges = []string{"accept", "reject", "edit", "rm"}
+
 // AssistantCommandPath reports whether path, the CommandPath of the
 // command cobra resolves an atl command line to ("atl ls", "atl repos pin"),
-// is one the assistant's gate runs: "atl <c>" for c in AssistantCommands.
+// is one the assistant's gate runs: "atl <c>" for c in AssistantCommands,
+// or "atl <c> <s>" for s in assistantSubcommands[c] ("atl learnings ls").
 // The gate checks it as well as CheckAssistantArgs, on the command line it
 // runs, so that no spelling the string check misreads (a flag that takes the
 // next argument as its value, say) reaches another command.
 func AssistantCommandPath(path string) bool {
-	sub, ok := strings.CutPrefix(path, "atl ")
-	return ok && slices.Contains(AssistantCommands, sub)
+	rest, ok := strings.CutPrefix(path, "atl ")
+	if !ok {
+		return false
+	}
+	cmd, sub, nested := strings.Cut(rest, " ")
+	if !slices.Contains(AssistantCommands, cmd) {
+		return false
+	}
+	return !nested || slices.Contains(assistantSubcommands[cmd], sub)
 }
 
 // learnerSlug stands for a task slug in the learner's sandbox ID, as

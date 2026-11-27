@@ -284,11 +284,37 @@ As built (`atl learnings`, `internal/cli/learnings.go`):
 ### 5. Delivery
 
 A "User preferences" section in the SessionStart context (`internal/hook/context.go`),
-with its own budget (about 800 bytes) on top of the existing 2500 bytes. Accepted
-learnings go in by score, highest first; what does not fit is left out. The hook runs on
-startup, resume, `/clear` and compaction, so open tasks pick changes up at their next
-session event; no files are rewritten. The assistant gets the same section.
-`~/.claude` is never written.
+with its own budget (`inject_budget`, 800 bytes; at most 4000) on top of the existing
+2500 bytes, right after the task block (and the read-only mounts line), before the
+environment notes and the notes:
+
+```
+User preferences (learned across tasks, approved by the user):
+- Keep answers short
+- Ask before pushing
+- … (3 more: atl learnings)
+```
+
+As built:
+
+- The hook does not score anything: it reads a snapshot, the one row of
+  `learn_injection`, which atl rewrites in the same transaction as every change that
+  can alter it: the end of each `atl learn` run (scores and transitions) and every
+  `atl learnings accept`, `reject`, `edit`, `rm`.
+- The snapshot holds the accepted learnings only (an outdated one too: you decide),
+  by score at the time it was written, highest first (the lower id first of equal
+  scores), one `- <text>` line each, sanitised as the rest of the context. Whole lines
+  only, the head included in the budget: what does not fit is cut, from the first line
+  that does not fit, and a last line `- … (N more: atl learnings)`, also within the
+  budget, says how many. Empty (no section at all) when nothing is accepted.
+  The budget applies when the snapshot is written: a change of `inject_budget` takes
+  effect at the next `atl learn` or learnings decision (`accept`, `reject`, `edit`, `rm`).
+- Task sessions get it in their start context, sandboxed (through their gate) or not;
+  the assistant gets the section alone as its start context (its own SessionStart
+  hook, `atl hook AssistantStart`, through its gate when it runs in its container).
+
+The hook runs on startup, resume, `/clear` and compaction, so open tasks pick changes
+up at their next session event; no files are rewritten. `~/.claude` is never written.
 
 Optional, later: firmer wording for high scores ("Never …") than for low ones
 ("Prefer …").
@@ -388,6 +414,8 @@ learning_occurrences(key PRIMARY KEY, learning_id, task_id, item_id, session, at
 learning_skips(key PRIMARY KEY, task_id, analyse_version)               -- phase 3 (v10)
     left out by Analyse (tries: in how many runs); from 2 tries not sent again while
     analyse_version is current
+learn_injection(id = 1, text, updated_at)                                 -- phase 4 (v11)
+    the "User preferences" snapshot the hook reads (see 5. Delivery); no row: nothing
 learn_digests(task_id, input_hash, cache_key, occurrences_json, created_at, cost_usd)  -- phase 2 (v9)
 notes_line_authors(task_id, line_hash, copy, author, at)   -- phase 0
 session_transcripts(session_id, path, first_seen)          -- phase 1
@@ -407,8 +435,10 @@ Every TUI action also exists in the CLI.
 | `atl learnings rm <id>` | forget it and its occurrences |
 
 TUI: a key to run `atl learn`, and a review list (proposed first) with accept / edit /
-reject. The assistant may run `atl learnings ls` and `show` (allowed, read-only; not
-yet on its allowlist).
+reject. The assistant may run `atl learnings`, `atl learnings ls` and `atl learnings
+show` (with `--all`, `--json`): on its gate's allowlist and allowed in its permissions;
+its gate refuses `accept`, `reject`, `edit`, `rm` in any spelling, and its permissions
+deny them. Task containers run no `atl learnings` at all.
 
 ## Phases
 
@@ -430,7 +460,7 @@ yet on its allowlist).
 | propose | score ≥ 3 and ≥ 2 distinct tasks |
 | proposal fades | below 0.75 × the propose score (`fade_ratio`), or fewer tasks |
 | accepted → "possibly outdated" | contradictions since accepted, from ≥ 2 tasks, worth ≥ 2 (decayed) or more than the reinforcements |
-| injection budget | 800 bytes |
+| injection budget | 800 bytes (`inject_budget`, 0 to 4000) |
 | pre-clean parallelism | 3 |
 | call timeout | 5 minutes per pre-clean or Analyse call (not configurable) |
 | Analyse chunk | 200 new occurrences per call (not configurable) |

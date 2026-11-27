@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -68,22 +69,22 @@ func TestLearnings(t *testing.T) {
 	}
 
 	// Status: only from the allowed ones; decide sets decided_at.
-	if err := s.SetLearningStatus(ctx, short, []string{"candidate"}, "proposed", false); err != nil {
+	if err := s.SetLearningStatus(ctx, short, []string{"candidate"}, "proposed", false, joinTexts); err != nil {
 		t.Fatal(err)
 	}
 	if l, _ := s.GetLearning(ctx, short); l.Status != "proposed" || !l.DecidedAt.IsZero() {
 		t.Errorf("proposed: %+v", l)
 	}
-	if err := s.SetLearningStatus(ctx, short, []string{"candidate"}, "proposed", false); !errors.Is(err, ErrLearningStatus) || !strings.Contains(err.Error(), "is proposed") {
+	if err := s.SetLearningStatus(ctx, short, []string{"candidate"}, "proposed", false, joinTexts); !errors.Is(err, ErrLearningStatus) || !strings.Contains(err.Error(), "is proposed") {
 		t.Errorf("from the wrong status: %v", err)
 	}
-	if err := s.SetLearningStatus(ctx, short, []string{"proposed"}, "accepted", true); err != nil {
+	if err := s.SetLearningStatus(ctx, short, []string{"proposed"}, "accepted", true, joinTexts); err != nil {
 		t.Fatal(err)
 	}
 	if l, _ := s.GetLearning(ctx, short); l.Status != "accepted" || l.DecidedAt.IsZero() {
 		t.Errorf("accepted: %+v", l)
 	}
-	if err := s.SetLearningStatus(ctx, 999, []string{"proposed"}, "accepted", true); !errors.Is(err, ErrNotFound) {
+	if err := s.SetLearningStatus(ctx, 999, []string{"proposed"}, "accepted", true, joinTexts); !errors.Is(err, ErrNotFound) {
 		t.Errorf("no such learning: %v", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE learnings SET status = 'bogus' WHERE id = ?`, push); err == nil {
@@ -91,18 +92,18 @@ func TestLearnings(t *testing.T) {
 	}
 
 	// Text.
-	if err := s.SetLearningText(ctx, push, "Ask before you push"); err != nil {
+	if err := s.SetLearningText(ctx, push, "Ask before you push", joinTexts); err != nil {
 		t.Fatal(err)
 	}
 	if l, _ := s.GetLearning(ctx, push); l.Text != "Ask before you push" || !l.Edited {
 		t.Errorf("edited: %+v", l)
 	}
-	if err := s.SetLearningText(ctx, 999, "x"); !errors.Is(err, ErrNotFound) {
+	if err := s.SetLearningText(ctx, 999, "x", joinTexts); !errors.Is(err, ErrNotFound) {
 		t.Errorf("edit no learning: %v", err)
 	}
 
 	// A task's delete takes its occurrences; an empty unedited candidate
-	// goes with DeleteEmptyCandidates.
+	// goes with ApplyStatusChanges.
 	if _, err := s.AssignOccurrences(ctx, []string{"Only in b"}, []Assignment{{Occ: occ("k8", b.ID, 0)}}, at); err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +113,7 @@ func TestLearnings(t *testing.T) {
 	if o, _ := s.ListLearningOccurrences(ctx, 0); len(o) != 2 {
 		t.Errorf("after b's delete: %+v", o)
 	}
-	if n, err := s.DeleteEmptyCandidates(ctx); err != nil || n != 1 { // "Only in b"; push is edited
+	if _, n, err := s.ApplyStatusChanges(ctx, nil, joinTexts); err != nil || n != 1 { // "Only in b"; push is edited
 		t.Errorf("empty candidates: %d %v", n, err)
 	}
 	if _, err := s.GetLearning(ctx, push); err != nil {
@@ -120,7 +121,7 @@ func TestLearnings(t *testing.T) {
 	}
 
 	// Delete: the learning and its occurrences.
-	n, err := s.DeleteLearning(ctx, short)
+	n, err := s.DeleteLearning(ctx, short, joinTexts)
 	if err != nil || n != 2 {
 		t.Fatalf("delete: %d %v", n, err)
 	}
@@ -130,7 +131,7 @@ func TestLearnings(t *testing.T) {
 	if keys, _ := s.LearningOccurrenceKeys(ctx, []string{"k1", "k4"}); len(keys) != 0 {
 		t.Errorf("its occurrences stay: %v", keys)
 	}
-	if _, err := s.DeleteLearning(ctx, short); !errors.Is(err, ErrNotFound) {
+	if _, err := s.DeleteLearning(ctx, short, joinTexts); !errors.Is(err, ErrNotFound) {
 		t.Errorf("delete again: %v", err)
 	}
 }
@@ -156,10 +157,10 @@ func TestLearningTextsFold(t *testing.T) {
 	if occs, _ := s.ListLearningOccurrences(ctx, 1); len(occs) != 2 || occs[1].ItemID != "line:k3" {
 		t.Errorf("occurrences: %+v", occs)
 	}
-	if err := s.SetLearningText(ctx, 2, "écris SANS prose"); !errors.Is(err, ErrLearningExists) {
+	if err := s.SetLearningText(ctx, 2, "écris SANS prose", joinTexts); !errors.Is(err, ErrLearningExists) {
 		t.Errorf("edit to another's text: %v", err)
 	}
-	if err := s.SetLearningText(ctx, 1, "ÉCRIS sans prose"); err != nil {
+	if err := s.SetLearningText(ctx, 1, "ÉCRIS sans prose", joinTexts); err != nil {
 		t.Errorf("edit of its own case: %v", err)
 	}
 }
@@ -212,5 +213,107 @@ func TestLearningSkips(t *testing.T) {
 	}
 	if got, _ := s.LearningSkipKeys(ctx, []string{"k1"}, "v1"); len(got) != 0 {
 		t.Errorf("v1 after v2: %v", got)
+	}
+}
+
+// joinTexts is an InjectionRenderer for tests: the accepted texts, one
+// per line, each with its occurrence count.
+func joinTexts(accepted []Learning, occs []LearningOccurrence) string {
+	var b strings.Builder
+	for _, l := range accepted {
+		n := 0
+		for _, o := range occs {
+			if o.LearningID == l.ID {
+				n++
+			}
+		}
+		fmt.Fprintf(&b, "%s (%d)\n", l.Text, n)
+	}
+	return b.String()
+}
+
+// TestInjection: every change of a learning rewrites the injection
+// snapshot in its transaction, from the accepted learnings and their
+// occurrences only; a change that fails leaves it as it was.
+func TestInjection(t *testing.T) {
+	s, _ := openTest(t)
+	ctx := context.Background()
+	a := mkTask(t, s, "a", model.StatusActive, 0)
+	at := time.UnixMilli(1777629600000).UTC()
+	occ := func(key string) Assignment {
+		return Assignment{Occ: LearningOccurrence{Key: key, TaskID: a.ID, At: at, Strength: "normal", Polarity: "reinforce", Quote: "q", Text: "t"}, NewIndex: 0}
+	}
+	if got, err := s.Injection(ctx); got != "" || err != nil {
+		t.Fatalf("no snapshot yet: %q %v", got, err)
+	}
+	for i, text := range []string{"One", "Two", "Three"} {
+		if _, err := s.AssignOccurrences(ctx, []string{text}, []Assignment{occ(fmt.Sprint("k", i)), occ(fmt.Sprint("k", i, "b"))}, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := func(step, w string) {
+		t.Helper()
+		if got, err := s.Injection(ctx); got != w || err != nil {
+			t.Errorf("%s: %q %v, want %q", step, got, err, w)
+		}
+	}
+	var seen []string
+	spy := func(acc []Learning, occs []LearningOccurrence) string {
+		for _, l := range acc {
+			seen = append(seen, l.Status)
+		}
+		for _, o := range occs {
+			if o.LearningID != 1 && o.LearningID != 3 {
+				t.Errorf("an occurrence of learning %d", o.LearningID)
+			}
+		}
+		return joinTexts(acc, occs)
+	}
+	// Transitions: a proposed learning is not injected.
+	if made, _, err := s.ApplyStatusChanges(ctx, []StatusChange{{1, "candidate", "proposed"}, {2, "candidate", "proposed"}, {3, "proposed", "candidate"}}, joinTexts); err != nil || len(made) != 2 {
+		t.Fatalf("transitions: %v %v", made, err)
+	}
+	want("proposed", "")
+	if err := s.SetLearningStatus(ctx, 1, []string{"proposed"}, "accepted", true, joinTexts); err != nil {
+		t.Fatal(err)
+	}
+	want("accept", "One (2)\n")
+	if err := s.SetLearningStatus(ctx, 3, []string{"candidate"}, "accepted", true, spy); err != nil {
+		t.Fatal(err)
+	}
+	want("accept a candidate", "One (2)\nThree (2)\n")
+	if len(seen) != 2 || seen[0] != "accepted" || seen[1] != "accepted" {
+		t.Errorf("the renderer saw %v", seen)
+	}
+	if err := s.SetLearningText(ctx, 3, "Three, reworded", joinTexts); err != nil {
+		t.Fatal(err)
+	}
+	want("edit", "One (2)\nThree, reworded (2)\n")
+	if err := s.SetLearningStatus(ctx, 2, []string{"proposed"}, "rejected", true, joinTexts); err != nil {
+		t.Fatal(err)
+	}
+	want("reject another", "One (2)\nThree, reworded (2)\n")
+	if err := s.SetLearningStatus(ctx, 1, []string{"accepted"}, "rejected", true, joinTexts); err != nil {
+		t.Fatal(err)
+	}
+	want("reject", "Three, reworded (2)\n")
+	if _, err := s.DeleteLearning(ctx, 3, joinTexts); err != nil {
+		t.Fatal(err)
+	}
+	want("rm", "")
+
+	// A change that fails writes nothing, and no renderer is an error.
+	if err := s.SetLearningStatus(ctx, 2, []string{"proposed"}, "accepted", true, func([]Learning, []LearningOccurrence) string { return "x" }); err == nil {
+		t.Error("accept a rejected learning")
+	}
+	if err := s.SetLearningText(ctx, 9, "x", func([]Learning, []LearningOccurrence) string { return "x" }); err == nil {
+		t.Error("edit no learning")
+	}
+	if err := s.SetLearningStatus(ctx, 2, []string{"rejected"}, "accepted", true, nil); err == nil {
+		t.Error("no renderer")
+	}
+	want("failed changes", "")
+	if l, _ := s.GetLearning(ctx, 2); l.Status != "rejected" {
+		t.Errorf("a failed change stayed: %+v", l)
 	}
 }
