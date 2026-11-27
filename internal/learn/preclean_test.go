@@ -87,7 +87,7 @@ func TestCheck(t *testing.T) {
 		}
 	}
 
-	if !shortQuote("[pasted] [pasted] ok") || !shortQuote("[pasted][pasted] okay then") || shortQuote("[pasted] keep it short") {
+	if !shortQuote("x… [5000 bytes cut]") || !shortQuote("[pasted] [pasted] ok") || !shortQuote("[pasted][pasted] okay then") || shortQuote("[pasted] keep it short") {
 		t.Error("pasted marks counted as words")
 	}
 

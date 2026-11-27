@@ -287,7 +287,7 @@ func runFailure(err error, stderr []byte) error {
 	lines := strings.Split(strings.TrimSpace(string(stderr)), "\n")
 	if last := strings.TrimSpace(lines[len(lines)-1]); last != "" {
 		if len(last) > 300 {
-			last = last[:300] + "…"
+			last = strings.ToValidUTF8(last[:300], "") + "…"
 		}
 		return fmt.Errorf("%v: %s", err, last)
 	}

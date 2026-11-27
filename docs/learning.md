@@ -48,8 +48,10 @@ Per task, from its sessions' transcripts (parsed by `internal/learn`) and its no
   their own cap (16 KiB): past it others' lines are dropped first, then yours, oldest first;
 - task metadata: title, status, repos (not in `input_hash`).
 
-Closed tasks count: closing keeps their transcripts (`pruneClaudeDir` keeps `projects/`)
-and their notes stay in the database.
+Closed tasks count: closing keeps their transcripts and input history (`pruneClaudeDir`
+keeps `projects/` and `history.jsonl`, so pastes stay `[pasted]`) and their notes stay in
+the database. A task closed before this lost its `history.jsonl`: its pastes read as
+typed text.
 
 `atl learn --dry-run` prints each task's extract and its size and calls no model. Use it to
 tune the extract and measure the input before spending tokens.
@@ -368,21 +370,34 @@ words under a rule you never stated. Review shows each learning's quotes per tas
 marks those that share no word with its text (`?`): read them, task by task, before you
 accept.
 
+Residual: "your prompts" means what the task's transcript says you typed. Claude Code
+writes its transcripts and input history (`history.jsonl`) in the task's Claude config
+dir, which the task container mounts read-write (it has to), so an agent in a task can
+append lines that look like prompts of yours, with any text and date; nothing on the
+host tells them apart (the `UserPromptSubmit` hook comes through the same gate the agent
+can call). A hostile repo used by two tasks can so get a rule of its own proposed, with
+"your" quotes. Only your review stops it: a quote you don't remember typing, in the task
+it names, is the sign. Notes are not affected: who wrote each line is recorded by atl.
+
 ## Prerequisite: who wrote each notes line
 
-`atl note` defaults to `--author user` (`internal/cli/info.go`), so notes agents write from
-task sessions read as yours. And the `[author]` tag is only text: `atl notes --set` from a
-task container (or the assistant) replaces the whole text and can write `[user]` lines.
-So the author of a line is recorded outside the text:
+`atl note` defaulted to `--author user` (`internal/cli/info.go`), so notes agents wrote
+from task sessions read as yours. And the `[author]` tag is only text: `atl notes --set`
+from a task container (or the assistant) replaces the whole text and can write `[user]`
+lines. So the author of a line is recorded outside the text:
 
 - `model.AuthorAgent`. The task gate forces it on `atl note` (as the assistant's gate
-  forces `assistant`).
+  forces `assistant`). With the sandbox off there is no gate: atl run from a task's
+  session or scripts (`ATL_SESSION` or `ATL_TASK` set) writes as `agent`, from the
+  assistant (`ATL_ASSISTANT`) as `assistant`, whatever `--author` says, `atl note` and
+  `atl notes --set` alike (`hostWriter`). An agent there runs on the host and can unset
+  them: no boundary, only that its routine notes are not taken for yours.
 - Every notes write records, for each non-blank line, who wrote it first:
   `notes_line_authors(task_id, line_hash, copy, author, at)` (sha256 of the line; `copy` k
   for its k-th copy). Insert-or-ignore, never updated or deleted, so a line an agent wrote
   stays the agent's however it comes back (a stale editor buffer, a restored copy).
-  Writers: `user` (host CLI, TUI editor), `agent` (task gate), `assistant` (assistant
-  gate). An append records only the copies it adds.
+  Writers: `user` (host CLI outside sessions, TUI editor), `agent` (task gate, host CLI in
+  a task session), `assistant` (assistant gate, host CLI in the assistant). An append records only the copies it adds.
 - The hash is of a canonical form (frozen, V1): invalid UTF-8, U+FFFD, control and format
   characters (BOM, zero-width, bidi) dropped, whitespace runs made one space, trimmed; so
   the editor's tab and U+FFFD changes don't make a line new. A line an external editor

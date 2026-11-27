@@ -210,11 +210,17 @@ func (a *App) SetNotes(ctx context.Context, ref, text, base string) (string, err
 // them) and returns the text as stored. The write is the user's (atl notes
 // on the host).
 func (a *App) ReplaceNotes(ctx context.Context, ref, text string) (string, error) {
+	return a.ReplaceNotesAs(ctx, ref, model.AuthorUser, text)
+}
+
+// ReplaceNotesAs is ReplaceNotes written by author (atl notes --set from a
+// task session on the host: an agent's).
+func (a *App) ReplaceNotesAs(ctx context.Context, ref, author, text string) (string, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
 		return "", err
 	}
-	return a.Store.ReplaceNotes(ctx, t.ID, model.AuthorUser, text)
+	return a.Store.ReplaceNotes(ctx, t.ID, author, text)
 }
 
 // NotesHistory is the file that keeps, for task slug, the notes the

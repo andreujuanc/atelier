@@ -299,10 +299,14 @@ func check(ex Extract, r RawOccurrence) (Occurrence, string) {
 	return o, ""
 }
 
-// shortQuote reports whether q, its pasted marks left out, is under
-// MinQuote bytes or MinQuoteWords words.
+// cutMarkRE matches the mark capBytes leaves where it cut a text: atl's,
+// not the user's words.
+var cutMarkRE = regexp.MustCompile(`… \[\d+ bytes cut\]`)
+
+// shortQuote reports whether q, its pasted and cut marks left out, is
+// under MinQuote bytes or MinQuoteWords words.
 func shortQuote(q string) bool {
-	w := strings.Fields(strings.ReplaceAll(q, pastedMark, " "))
+	w := strings.Fields(cutMarkRE.ReplaceAllString(strings.ReplaceAll(q, pastedMark, " "), " "))
 	return len(strings.Join(w, " ")) < MinQuote || len(w) < MinQuoteWords
 }
 

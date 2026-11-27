@@ -166,8 +166,13 @@ func TestStripSpansLinear(t *testing.T) {
 // t0, and returns the prompts' texts.
 func pastesRun(t *testing.T, history []string, at []int, texts []string) []string {
 	t.Helper()
-	var p Pastes
-	if err := ReadHistory(strings.NewReader(strings.Join(history, "\n")), map[string]bool{"s1": true}, &p); err != nil {
+	return pastesRunWith(t, &Pastes{}, history, at, texts)
+}
+
+// pastesRunWith is pastesRun reading history into p.
+func pastesRunWith(t *testing.T, p *Pastes, history []string, at []int, texts []string) []string {
+	t.Helper()
+	if err := ReadHistory(strings.NewReader(strings.Join(history, "\n")), map[string]bool{"s1": true}, p); err != nil {
 		t.Fatal(err)
 	}
 	var lines []string
@@ -177,7 +182,7 @@ func pastesRun(t *testing.T, history []string, at []int, texts []string) []strin
 			t0.Add(time.Duration(at[i])*time.Second).Format(time.RFC3339)+`","message":{"role":"user","content":`+string(b)+`}}`)
 	}
 	var got []string
-	if err := parse(strings.NewReader(strings.Join(lines, "\n")), Defaults(), &p, func(pr Prompt) { got = append(got, pr.Text) }); err != nil {
+	if err := parse(strings.NewReader(strings.Join(lines, "\n")), Defaults(), p, func(pr Prompt) { got = append(got, pr.Text) }); err != nil {
 		t.Fatal(err)
 	}
 	return got
@@ -365,5 +370,36 @@ func TestPastesBounded(t *testing.T) {
 	}
 	if len(got) != 20000 || got[19999] != "typed 49999" {
 		t.Errorf("%d prompts", len(got))
+	}
+}
+
+// TestPastesTotalBounds: past maxDisplays an entry with a placeholder is
+// kept without its display (paired in order, its prompt read as typed, the
+// next entries still found), and past maxFitWork the fallback is not tried.
+func TestPastesTotalBounds(t *testing.T) {
+	inline := `{"1":{"id":1,"type":"text","content":"panic: boom\ngoroutine 1"}}`
+	history := []string{hist("why?\n[Pasted text #1 +1 lines]", 0, inline), hist("then this", 5, `{}`)}
+	texts := []string{"why?\npanic: boom\ngoroutine 1", "then this"}
+	want := fmt.Sprint([]string{"why?\n[pasted]", "then this"})
+	if got := pastesRun(t, history, []int{0, 5}, texts); fmt.Sprint(got) != want {
+		t.Fatalf("within the bounds: %q", got)
+	}
+	p := &Pastes{displays: maxDisplays - 10}
+	if got := pastesRunWith(t, p, history, []int{0, 5}, texts); fmt.Sprint(got) != fmt.Sprint(texts) {
+		t.Errorf("past maxDisplays: %q", got)
+	}
+	if p.displays != maxDisplays-10 || p.n != 2 {
+		t.Errorf("past maxDisplays: displays %d, n %d", p.displays, p.n)
+	}
+
+	const stored = `{"1":{"id":1,"type":"text","contentHash":"ab12"}}`
+	body := strings.Repeat("log line 0123456789\n", 60) + "end"
+	fallback := []string{hist("fix [Pasted text #1 +60 lines]", 0, stored)}
+	if got := pastesRun(t, fallback, []int{0}, []string{"fix " + body}); fmt.Sprint(got) != fmt.Sprint([]string{"fix [pasted]"}) {
+		t.Fatalf("fallback within the bounds: %q", got)
+	}
+	p = &Pastes{fitWork: maxFitWork}
+	if got := pastesRunWith(t, p, fallback, []int{0}, []string{"fix " + body}); fmt.Sprint(got) != fmt.Sprint([]string{"fix " + body}) {
+		t.Errorf("past maxFitWork: %q", got)
 	}
 }

@@ -21,6 +21,8 @@ import (
 type Pastes struct {
 	bySession map[string]*sessionHistory
 	n         int
+	displays  int // bytes of the entries' displays kept (maxDisplays)
+	fitWork   int // bytes of prompt text the fallback was tried on (maxFitWork)
 }
 
 // sessionHistory is one session's history entries in time order and how
@@ -65,11 +67,15 @@ type typedPrompt struct {
 	lines []int
 }
 
-// Bounds on what ReadHistory keeps: entries, and bytes of one entry with
-// a placeholder (others are kept as a hash).
+// Bounds on what ReadHistory keeps (history.jsonl is in the task's Claude
+// dir, which its agent can write): entries, bytes of one entry with a
+// placeholder (others are kept as a hash), and bytes of all of them. Past
+// maxDisplays an entry with a placeholder is kept without its display:
+// paired in order, never matched, so its prompt reads as typed.
 const (
 	maxPastes       = 50000
 	maxPasteDisplay = 64 << 10
+	maxDisplays     = 32 << 20
 )
 
 // pasteSlack: a history entry is written as its prompt is submitted,
@@ -108,7 +114,8 @@ func ReadHistory(r io.Reader, sessions map[string]bool, into *Pastes) error {
 				PastedContents map[string]pasted `json:"pastedContents"`
 			}
 			if json.Unmarshal(line, &h) == nil && sessions[h.SessionID] {
-				if tp := historyEntry(h.Display, h.PastedContents, time.UnixMilli(h.Timestamp)); tp != nil {
+				if tp := historyEntry(h.Display, h.PastedContents, time.UnixMilli(h.Timestamp), maxDisplays-into.displays); tp != nil {
+					into.displays += len(tp.display)
 					if into.bySession == nil {
 						into.bySession = map[string]*sessionHistory{}
 					}
@@ -140,8 +147,9 @@ type pasted struct {
 }
 
 // historyEntry makes the typedPrompt of a history entry; nil if it cannot
-// be used.
-func historyEntry(display string, pcs map[string]pasted, at time.Time) *typedPrompt {
+// be used. room: the bytes of display it may keep (past it, an entry with
+// a placeholder keeps none and never matches).
+func historyEntry(display string, pcs map[string]pasted, at time.Time, room int) *typedPrompt {
 	tp := &typedPrompt{at: at}
 	if !placeholderRE.MatchString(display) {
 		tp.exact, tp.hasExact = sha256.Sum256([]byte(strings.TrimSpace(display))), true
@@ -149,6 +157,9 @@ func historyEntry(display string, pcs map[string]pasted, at time.Time) *typedPro
 	}
 	if len(display) > maxPasteDisplay {
 		return nil
+	}
+	if len(display) > room {
+		return tp // paired (in order) but never matched
 	}
 	tp.display = display
 	exact := !opaqueRE.MatchString(display)
@@ -183,10 +194,13 @@ func historyEntry(display string, pcs map[string]pasted, at time.Time) *typedPro
 }
 
 // Bounds on the fallback (fits): the longest prompt text it is tried on,
-// and how many entries, nearest first, are tried for one prompt.
+// how many entries, nearest first, are tried for one prompt, and the bytes
+// of text all its tries on one Pastes may measure (past it, prompts with
+// no exact entry read as typed).
 const (
 	maxFitText  = 1 << 20
 	maxFitTries = 100
+	maxFitWork  = 256 << 20
 )
 
 // typedForm returns the prompt as typed, its pastes "[pasted]", for user
@@ -230,7 +244,8 @@ func (p *Pastes) typedForm(e *entry, text string) (string, bool) {
 		if j < 0 && len(text) <= maxFitText {
 			// The fallback entries in [next, end), nearest first.
 			hi := sort.SearchInts(sh.fallback, end)
-			for k, tries := hi-1, 0; k >= 0 && sh.fallback[k] >= sh.next && tries < maxFitTries; k, tries = k-1, tries+1 {
+			for k, tries := hi-1, 0; k >= 0 && sh.fallback[k] >= sh.next && tries < maxFitTries && p.fitWork < maxFitWork; k, tries = k-1, tries+1 {
+				p.fitWork += len(text)
 				if sh.entries[sh.fallback[k]].fits(text) {
 					j = sh.fallback[k]
 					break

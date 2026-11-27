@@ -135,9 +135,11 @@ func (a *App) seedLearnerClaudeDir(dir, trusted string) error {
 
 // pruneClaudeDir removes the task's Claude dir when the task closes, except
 // the transcripts (projects/), which atl show and atl transcript still read
-// for closed tasks. Nothing runs in the task any more. What the task may
-// have left in projects/ for atl to trip over later (symlinks, pipes) goes
-// too: only plain files and directories stay. Failures are warnings.
+// for closed tasks, and the input history (history.jsonl, a plain file),
+// which atl learn needs to tell pasted text from typed (closed tasks count).
+// Nothing runs in the task any more. What the task may have left in
+// projects/ for atl to trip over later (symlinks, pipes) goes too: only
+// plain files and directories stay. Failures are warnings.
 func (a *App) pruneClaudeDir(t *model.Task) {
 	dir := a.Paths.ClaudeDir(t.Slug)
 	entries, err := os.ReadDir(dir)
@@ -149,7 +151,7 @@ func (a *App) pruneClaudeDir(t *model.Task) {
 		return
 	}
 	for _, e := range entries {
-		if e.Name() == "projects" && e.IsDir() {
+		if (e.Name() == "projects" && e.IsDir()) || (e.Name() == "history.jsonl" && e.Type().IsRegular()) {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
