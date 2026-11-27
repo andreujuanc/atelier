@@ -30,6 +30,10 @@ type Config struct {
 
 	ProposeScore float64 `toml:"propose_score"` // a learning is proposed at this score ...
 	ProposeTasks int     `toml:"propose_tasks"` // ... from at least this many distinct tasks
+	// FadeRatio: a proposed learning goes back to candidate only below
+	// FadeRatio × ProposeScore (hysteresis: it does not flicker at the
+	// threshold).
+	FadeRatio float64 `toml:"fade_ratio"`
 	// OutdatedScore is the decayed score of contradictions at which an
 	// accepted learning goes back to review ("possibly outdated"; so does a
 	// net score below 0).
@@ -63,6 +67,7 @@ func Defaults() Config {
 
 		ProposeScore:  3,
 		ProposeTasks:  2,
+		FadeRatio:     0.75,
 		OutdatedScore: 2,
 
 		Budget:      800,
@@ -119,6 +124,7 @@ func (c Config) Validate() error {
 		{"weight_mild", c.WeightMild, 100},
 		{"propose_score", c.ProposeScore, 1000},
 		{"outdated_score", c.OutdatedScore, 1000},
+		{"fade_ratio", c.FadeRatio, 1},
 		{"max_call_usd", c.MaxCallUSD, 100},
 	}
 	for _, f := range floats {

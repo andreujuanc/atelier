@@ -292,14 +292,14 @@ func TestConfigDefaults(t *testing.T) {
 	if c.PromptCap != 2048 || c.ReplySnippet != 200 || c.TaskCap != 65536 || c.WeightStrong != 2 || c.WeightNormal != 1 ||
 		c.WeightMild != 0.5 || c.HalfLifeProposed != 45 || c.HalfLifeAccepted != 365 || c.ProposeScore != 3 || c.ProposeTasks != 2 ||
 		c.OutdatedScore != 2 || c.Budget != 800 || c.Parallelism != 3 || c.PrecleanModel != "haiku" || c.PrecleanEffort != "low" ||
-		c.AnalyseModel != "haiku" || c.AnalyseEffort != "medium" || c.MaxCallUSD != 0.25 {
+		c.AnalyseModel != "haiku" || c.AnalyseEffort != "medium" || c.MaxCallUSD != 0.25 || c.FadeRatio != 0.75 {
 		t.Errorf("defaults: %+v", c)
 	}
 	// Every field has a toml key.
 	b, _ := json.Marshal(c)
 	var m map[string]any
 	json.Unmarshal(b, &m)
-	if len(m) != 19 {
+	if len(m) != 20 {
 		t.Errorf("%d fields: update this test and the README's [learn] keys", len(m))
 	}
 }
@@ -321,6 +321,8 @@ func TestConfigValidate(t *testing.T) {
 		{func(c *Config) { c.WeightMild = 0 }, "learn.weight_mild"},
 		{func(c *Config) { c.ProposeScore = math.NaN() }, "learn.propose_score"},
 		{func(c *Config) { c.OutdatedScore = math.Inf(1) }, "learn.outdated_score"},
+		{func(c *Config) { c.FadeRatio = 0 }, "learn.fade_ratio"},
+		{func(c *Config) { c.FadeRatio = 1.5 }, "learn.fade_ratio"},
 		{func(c *Config) { c.WeightNormal = 3 }, "strong >= normal >= mild"},
 		{func(c *Config) { c.PrecleanModel = "" }, "learn.preclean_model"},
 		{func(c *Config) { c.AnalyseModel = "--dangerously" }, "learn.analyse_model"},

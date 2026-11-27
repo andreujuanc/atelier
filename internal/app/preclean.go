@@ -65,17 +65,62 @@ const (
 // a call, and removed before Preclean returns, also when ctx is cancelled.
 // Runs in a workspace are serialised (state/learn.lock).
 func (a *App) Preclean(ctx context.Context, ref string) ([]PrecleanTask, error) {
+	unlock, err := a.lockLearn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	ls := &learnerSession{a: a, ctx: ctx}
+	defer ls.close()
+	return a.preclean(ctx, ref, ls)
+}
+
+// lockLearn takes the workspace's learn lock (state/learn.lock), waiting
+// at most learnLockWait; atl learn runs only where atelier runs.
+func (a *App) lockLearn(ctx context.Context) (func(), error) {
 	if err := outsideSandbox("run atl learn"); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(a.Paths.StateDir, 0o755); err != nil {
 		return nil, err
 	}
-	unlock, err := lockFile(ctx, a.learnLock(), syscall.LOCK_EX, learnLockWait, "another atl learn runs in this workspace")
-	if err != nil {
-		return nil, err
+	return lockFile(ctx, a.learnLock(), syscall.LOCK_EX, learnLockWait, "another atl learn runs in this workspace")
+}
+
+// learnerSession starts the learner (startLearner) when a call first
+// needs it and keeps it for the rest of the run: pre-clean and Analyse
+// share it. close removes it.
+type learnerSession struct {
+	a       *App
+	ctx     context.Context
+	started bool
+	run     learnerRun
+	stop    func()
+	err     error
+}
+
+// get returns how to run a call in the learner, starting it the first
+// time; a learner that failed to start fails every get.
+func (s *learnerSession) get() (learnerRun, error) {
+	if !s.started {
+		s.started = true
+		s.run, s.stop, s.err = s.a.startLearner(s.ctx)
+		if s.err != nil {
+			s.err = fmt.Errorf("learn: %w", s.err)
+		}
 	}
-	defer unlock()
+	return s.run, s.err
+}
+
+func (s *learnerSession) close() {
+	if s.stop != nil {
+		s.stop()
+		s.stop = nil
+	}
+}
+
+// preclean is Preclean under the learn lock, with ls's learner.
+func (a *App) preclean(ctx context.Context, ref string, ls *learnerSession) ([]PrecleanTask, error) {
 	exs, err := a.LearnExtracts(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -108,11 +153,10 @@ func (a *App) Preclean(ctx context.Context, ref string) ([]PrecleanTask, error) 
 	}
 	fmt.Fprintf(a.out(), "learn: pre-clean of %d task(s) with %s (effort %s), %d at a time\n",
 		len(todo), cfg.PrecleanModel, cfg.PrecleanEffort, cfg.Parallelism)
-	run, stop, err := a.startLearner(ctx)
+	run, err := ls.get()
 	if err != nil {
-		return nil, fmt.Errorf("learn: %w", err)
+		return nil, err
 	}
-	defer stop()
 	argv := learn.PrecleanArgs(cfg.PrecleanModel, cfg.PrecleanEffort, cfg.MaxCallUSD)
 	sem := make(chan struct{}, max(cfg.Parallelism, 1))
 	var wg sync.WaitGroup
@@ -138,33 +182,13 @@ func (a *App) precleanTask(ctx context.Context, run learnerRun, argv []string, c
 			a.warnf("learn: task %s: drop its old pre-clean: %v", pt.Task.Slug, derr)
 		}
 	}
-	if ctx.Err() != nil {
-		fail(ctx.Err())
-		return
-	}
-	cctx, cancel := context.WithTimeout(ctx, precleanTimeout)
-	defer cancel()
-	start := time.Now()
-	stdout, stderr, runErr := run(cctx, argv, learn.PrecleanInput(pt.Extract))
-	switch {
-	case ctx.Err() != nil:
-		fail(ctx.Err())
-		return
-	case errors.Is(cctx.Err(), context.DeadlineExceeded), innerTimeout(runErr, time.Since(start)):
-		fail(fmt.Errorf("timed out after %s", precleanTimeout))
-		return
-	}
-	res, err := learn.ParsePreclean(stdout)
-	pt.CostUSD = res.CostUSD
-	if err != nil {
-		if runErr != nil && !strings.HasPrefix(err.Error(), "claude: ") {
-			err = runFailure(runErr, stderr)
-		}
+	var res learn.PrecleanResult
+	if err := learnerCall(ctx, run, argv, learn.PrecleanInput(pt.Extract), func(stdout []byte) (err error) {
+		res, err = learn.ParsePreclean(stdout)
+		pt.CostUSD = res.CostUSD
+		return err
+	}); err != nil {
 		fail(err)
-		return
-	}
-	if runErr != nil {
-		fail(runFailure(runErr, stderr))
 		return
 	}
 	pt.Occurrences, pt.Dropped = learn.Check(pt.Extract, res.Occurrences)
@@ -181,6 +205,37 @@ func (a *App) precleanTask(ctx context.Context, run learnerRun, argv []string, c
 		return
 	}
 	pt.Status = PrecleanRan
+}
+
+// learnerCall runs the learner call argv (run) with stdin within
+// precleanTimeout and reads its stdout with parse, which keeps what it
+// needs. The error is ctx's when ctx ended; a timeout; parse's error
+// starting "claude: " (the result said it was an error); else the
+// call's failure with the end of its stderr, or parse's error.
+func learnerCall(ctx context.Context, run learnerRun, argv []string, stdin []byte, parse func(stdout []byte) error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	cctx, cancel := context.WithTimeout(ctx, precleanTimeout)
+	defer cancel()
+	start := time.Now()
+	stdout, stderr, runErr := run(cctx, argv, stdin)
+	switch {
+	case ctx.Err() != nil:
+		return ctx.Err()
+	case errors.Is(cctx.Err(), context.DeadlineExceeded), innerTimeout(runErr, time.Since(start)):
+		return fmt.Errorf("timed out after %s", precleanTimeout)
+	}
+	if err := parse(stdout); err != nil {
+		if runErr != nil && !strings.HasPrefix(err.Error(), "claude: ") {
+			err = runFailure(runErr, stderr)
+		}
+		return err
+	}
+	if runErr != nil {
+		return runFailure(runErr, stderr)
+	}
+	return nil
 }
 
 // currentDigest returns the occurrences of ex's task's stored pre-clean

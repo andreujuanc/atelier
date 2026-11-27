@@ -153,6 +153,45 @@ INSERT INTO session_transcripts (session_id, path, first_seen)
   created_at INTEGER NOT NULL,
   cost_usd REAL NOT NULL DEFAULT 0
 );`,
+	// v10: learnings (atl learn's Analyse groups occurrences into them;
+	// atl learnings reviews them) and their occurrences, each by its
+	// stable key (learn.OccurrenceKey): a key that is here is not
+	// analysed again. item_id is the item it quotes (learn.ItemID).
+	// session is atelier's session id, 0 for a notes line; no foreign
+	// key, so the evidence outlives a session row. at, decided_at: unix
+	// ms (decided_at 0: not decided). learning_skips: the keys Analyse
+	// left unassigned (tries: in how many runs); from 2 tries not sent
+	// again while analyse_version is the current learn.AnalyseVersion.
+	`CREATE TABLE learnings (
+  id INTEGER PRIMARY KEY,
+  text TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('candidate','proposed','accepted','rejected')),
+  edited INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  decided_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE learning_occurrences (
+  key TEXT PRIMARY KEY,
+  learning_id INTEGER NOT NULL REFERENCES learnings(id) ON DELETE CASCADE,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL DEFAULT '',
+  session INTEGER NOT NULL DEFAULT 0,
+  at INTEGER NOT NULL,
+  strength TEXT NOT NULL CHECK (strength IN ('strong','normal','mild')),
+  polarity TEXT NOT NULL CHECK (polarity IN ('reinforce','contradict')),
+  quote TEXT NOT NULL,
+  text TEXT NOT NULL
+);
+CREATE INDEX learning_occurrences_learning ON learning_occurrences(learning_id);
+CREATE INDEX learning_occurrences_task ON learning_occurrences(task_id);
+CREATE TABLE learning_skips (
+  key TEXT PRIMARY KEY,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  analyse_version TEXT NOT NULL,
+  tries INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX learning_skips_task ON learning_skips(task_id);`,
 }
 
 // maxSessionTranscripts caps the session_transcripts rows of one session

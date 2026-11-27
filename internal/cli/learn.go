@@ -20,22 +20,25 @@ var noteAuthors = []string{model.AuthorUser, model.AuthorAgent, model.AuthorAssi
 // container (insideContainer) and not for the assistant (not in
 // sandbox.AssistantCommands).
 func (c *cli) learnCmd() *cobra.Command {
-	var dryRun, asJSON bool
+	var dryRun, asJSON, retrySkipped bool
 	var task string
 	cmd := &cobra.Command{
-		Use:   "learn [--task <task>] [--dry-run [--json]]",
+		Use:   "learn [--task <task>] [--retry-skipped] [--dry-run [--json]]",
 		Short: "Learn your preferences across tasks (--dry-run: print each task's extract, call no model)",
 		Args:  args(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if asJSON && !dryRun {
 				return usagef("--json goes with --dry-run")
 			}
+			if retrySkipped && dryRun {
+				return usagef("--retry-skipped does not go with --dry-run")
+			}
 			ap, err := c.App()
 			if err != nil {
 				return err
 			}
 			if !dryRun {
-				return c.learnRun(cmd, ap, task)
+				return c.learnRun(cmd, ap, task, retrySkipped)
 			}
 			exs, err := ap.LearnExtracts(cmd.Context(), task)
 			if err != nil {
@@ -70,6 +73,7 @@ func (c *cli) learnCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "build and print the extracts only; no model is called")
 	cmd.Flags().StringVar(&task, "task", "", "only this task (default: every task, open or closed)")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "with --dry-run: print the extracts as JSON")
+	cmd.Flags().BoolVar(&retrySkipped, "retry-skipped", false, "first forget which occurrences Analyse skipped (left out in 2 runs), so they are sent again")
 	return cmd
 }
 
@@ -82,15 +86,20 @@ func (c *cli) extractWarnings(exs []app.TaskExtract) {
 	}
 }
 
-// learnRun is `atl learn` without --dry-run: the pre-clean of each task
-// (app.Preclean), one row each: cached, ran (occurrences kept, dropped by
-// reason, cost), failed (why) or empty; then the totals. Analyse is not
-// there yet. A task that failed makes it exit 1.
-func (c *cli) learnRun(cmd *cobra.Command, ap *app.App, task string) error {
-	pts, err := ap.Preclean(cmd.Context(), task)
+// learnRun is `atl learn` without --dry-run (app.Learn): the pre-clean of
+// each task, one row each: cached, ran (occurrences kept, dropped by
+// reason, cost), failed (why) or empty; then the totals; then what
+// Analyse did and the status changes. A task whose pre-clean failed, or
+// a failed Analyse, makes it exit 1.
+func (c *cli) learnRun(cmd *cobra.Command, ap *app.App, task string, retrySkipped bool) error {
+	run, err := ap.Learn(cmd.Context(), task, retrySkipped)
 	if err != nil {
 		return err
 	}
+	if retrySkipped {
+		fmt.Fprintf(c.stderr, "learn: %d skipped occurrence(s) analysed again\n", run.RetriedSkips)
+	}
+	pts := run.Tasks
 	exs := make([]app.TaskExtract, len(pts))
 	for i, pt := range pts {
 		exs[i] = pt.TaskExtract
@@ -124,11 +133,61 @@ func (c *cli) learnRun(cmd *cobra.Command, ap *app.App, task string) error {
 	if err := tw.Flush(); err != nil {
 		return err
 	}
+	c.printAnalyse(run.Analyse)
+	var errs []string
 	if n := status[app.PrecleanFailed]; n > 0 {
-		return fmt.Errorf("learn: the pre-clean of %d task(s) failed; run atl learn again to retry them (the others are cached)", n)
+		errs = append(errs, fmt.Sprintf("the pre-clean of %d task(s) failed; run atl learn again to retry them (the others are cached)", n))
 	}
-	fmt.Fprintln(c.stdout, "analyse: not implemented yet")
+	if run.Analyse.Err != nil {
+		errs = append(errs, "analyse failed: "+oneLine(run.Analyse.Err.Error())+"; run atl learn again (the pre-cleans are cached)")
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("learn: %s", strings.Join(errs, "; "))
+	}
 	return nil
+}
+
+// printAnalyse prints what Analyse did and the status changes at the end
+// of the run.
+func (c *cli) printAnalyse(r app.AnalyseResult) {
+	switch {
+	case r.New == 0:
+		fmt.Fprintln(c.stdout, "analyse: no new occurrences")
+	default:
+		line := fmt.Sprintf("analyse: %d new occurrence(s): %d assigned", r.New, r.Assigned)
+		if r.ToNew > 0 || r.NewLearnings > 0 {
+			line += fmt.Sprintf(" (%d to %d new learning(s))", r.ToNew, r.NewLearnings)
+		}
+		if r.Joined > 0 {
+			line += fmt.Sprintf(", %d joined to their item's learning", r.Joined)
+		}
+		if r.Skipped > 0 {
+			line += fmt.Sprintf(", %d skipped (left out twice)", r.Skipped)
+		}
+		if r.Unassigned > 0 {
+			line += fmt.Sprintf(", %d left for the next run", r.Unassigned)
+		}
+		if r.DroppedLabels > 0 {
+			line += fmt.Sprintf(", %d new learning(s) dropped (bad label or text)", r.DroppedLabels)
+		}
+		line += fmt.Sprintf("; %d call(s), %s", r.Calls, usd(r.CostUSD, r.Calls == 0))
+		fmt.Fprintln(c.stdout, line)
+	}
+	var proposed, faded int
+	for _, t := range r.Transitions {
+		switch t.To {
+		case learn.StatusProposed:
+			proposed++
+		case learn.StatusCandidate:
+			faded++
+		}
+	}
+	if proposed > 0 {
+		fmt.Fprintf(c.stdout, "learnings: %d new proposal(s): atl learnings\n", proposed)
+	}
+	if faded > 0 {
+		fmt.Fprintf(c.stdout, "learnings: %d proposal(s) faded back to candidate\n", faded)
+	}
 }
 
 // usd is a cost in dollars; "-" when none was spent in this run.

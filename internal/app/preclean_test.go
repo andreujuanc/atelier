@@ -31,7 +31,9 @@ const precleanAnswer = `{"type":"result","subtype":"success","is_error":false,"t
 // learnStub replaces newEnv's stub claude with one for claude -p: it
 // records its argv, working dir, environment and stdin, counts its calls
 // and how many run at once, and answers as <out>/mode says: "" with
-// <out>/answer after <out>/delay seconds, "fail" with a failed result
+// <out>/answer after <out>/delay seconds (the n-th Analyse call, from 0:
+// <out>/analyse.<n> if there is one, else <out>/analyse;
+// its stdin kept as <out>/analyse-stdin.<n>), "fail" with a failed result
 // (exit 1), "crash" with nothing (exit 3), "sleep" never.
 func learnStub(t *testing.T, e *env) {
 	t.Helper()
@@ -51,14 +53,24 @@ fail) rm -f "$out/running.$$"; echo '{"type":"result","is_error":true,"total_cos
 crash) rm -f "$out/running.$$"; echo 'claude: unknown option --safe-mode' >&2; exit 3 ;;
 esac
 sleep "$(cat "$out/delay" 2> /dev/null || echo 0)"
-cat "$out/answer"
+case "$*" in
+*new_learnings*) n=$(ls "$out" | grep -c "^analyse-stdin\\."); cp "$out/stdin.$$" "$out/analyse-stdin.$n"; if [ -f "$out/analyse.$n" ]; then cat "$out/analyse.$n"; else cat "$out/analyse"; fi ;;
+*) cat "$out/answer" ;;
+esac
 rm -f "$out/running.$$"
 `, e.out)
 	if err := os.WriteFile(filepath.Join(filepath.Dir(e.out), "bin", "claude"), []byte(stub), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	e.setStub(t, "answer", precleanAnswer)
+	e.setStub(t, "analyse", analyseAnswer(`[]`, `[]`))
 	e.setStub(t, "mode", "")
+}
+
+// analyseAnswer is a result of an Analyse call with assignments and
+// new_learnings (JSON arrays).
+func analyseAnswer(assignments, newLearnings string) string {
+	return `{"type":"result","is_error":false,"total_cost_usd":0.01,"structured_output":{"assignments":` + assignments + `,"new_learnings":` + newLearnings + `}}`
 }
 
 func (e *env) setStub(t *testing.T, name, content string) {

@@ -63,13 +63,19 @@ const PrecleanSchema = `{"type":"object","additionalProperties":false,"required"
 // (--safe-mode: CLAUDE.md, plugins); the prompt replaces Claude Code's
 // system prompt; the session is not saved.
 func PrecleanArgs(model, effort string, maxUSD float64) []string {
+	return claudeArgs(model, effort, maxUSD, PrecleanSchema, precleanPromptV2)
+}
+
+// claudeArgs is the claude command of a learner call (PrecleanArgs,
+// AnalyseArgs) with its JSON schema and system prompt.
+func claudeArgs(model, effort string, maxUSD float64, schema, prompt string) []string {
 	return []string{"claude", "-p",
 		"--model", model, "--effort", effort,
 		"--max-budget-usd", strconv.FormatFloat(maxUSD, 'f', -1, 64),
 		"--tools", "", "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands", "--safe-mode",
 		"--no-session-persistence",
-		"--output-format", "json", "--json-schema", PrecleanSchema,
-		"--system-prompt", precleanPromptV2}
+		"--output-format", "json", "--json-schema", schema,
+		"--system-prompt", prompt}
 }
 
 // CacheKey identifies a pre-clean's result: the extract's InputHash, the
@@ -319,16 +325,36 @@ type PrecleanResult struct {
 	Usage       json.RawMessage // usage, as claude gives it; nil if not given
 }
 
-// maxErrorText bounds the model's text quoted in a ParsePreclean error.
+// maxErrorText bounds the model's text quoted in a parse error.
 const maxErrorText = 300
 
 // ParsePreclean reads the stdout of `claude -p --output-format json`
-// (PrecleanArgs): its result object, the last line that is one (lines
-// before it, warnings say, are skipped). The occurrences are its
+// (PrecleanArgs, see parseAnswer). The occurrences are its
 // structured_output (--json-schema) or else the JSON object in its result
 // text, prose around it skipped. A result that is an error (is_error) is
 // an error, with its text.
 func ParsePreclean(stdout []byte) (PrecleanResult, error) {
+	var ans struct {
+		Occurrences *[]RawOccurrence `json:"occurrences"`
+	}
+	cost, usage, err := parseAnswer(stdout, "occurrences", &ans, func() bool { return ans.Occurrences != nil })
+	res := PrecleanResult{CostUSD: cost, Usage: usage}
+	if err != nil {
+		return res, err
+	}
+	res.Occurrences = *ans.Occurrences
+	return res, nil
+}
+
+// parseAnswer reads the result object of `claude -p --output-format json`
+// in stdout, the last line that is one (lines before it, warnings say,
+// are skipped), and decodes its answer into v: its structured_output
+// (--json-schema), or else the first JSON object with key in its result
+// text, prose around it skipped. filled reports whether v holds what it
+// must. The result's total_cost_usd and usage come back also with an
+// error. A result that is an error (is_error) is an error starting
+// "claude: ", with its text.
+func parseAnswer(stdout []byte, key string, v any, filled func() bool) (cost float64, usage json.RawMessage, err error) {
 	var env struct {
 		Type             string          `json:"type"`
 		IsError          bool            `json:"is_error"`
@@ -351,33 +377,27 @@ func ParsePreclean(stdout []byte) (PrecleanResult, error) {
 		}
 	}
 	if !found {
-		return PrecleanResult{}, errors.New("no result in claude's output")
+		return 0, nil, errors.New("no result in claude's output")
 	}
-	res := PrecleanResult{CostUSD: env.TotalCostUSD, Usage: env.Usage}
+	cost, usage = env.TotalCostUSD, env.Usage
 	if env.IsError {
-		return res, fmt.Errorf("claude: %s", clip(firstNonEmpty(env.Result, env.Subtype, "an error"), maxErrorText))
-	}
-	var ans struct {
-		Occurrences *[]RawOccurrence `json:"occurrences"`
+		return cost, usage, fmt.Errorf("claude: %s", clip(firstNonEmpty(env.Result, env.Subtype, "an error"), maxErrorText))
 	}
 	if len(env.StructuredOutput) > 0 && string(env.StructuredOutput) != "null" {
-		if err := json.Unmarshal(env.StructuredOutput, &ans); err != nil || ans.Occurrences == nil {
-			return res, fmt.Errorf("structured output is not {\"occurrences\": [...]}: %s", clip(string(env.StructuredOutput), maxErrorText))
+		if err := json.Unmarshal(env.StructuredOutput, v); err != nil || !filled() {
+			return cost, usage, fmt.Errorf("structured output is not {%q: [...]}: %s", key, clip(string(env.StructuredOutput), maxErrorText))
 		}
-		res.Occurrences = *ans.Occurrences
-		return res, nil
+		return cost, usage, nil
 	}
-	if !findObject(env.Result, &ans) || ans.Occurrences == nil {
-		return res, fmt.Errorf("no {\"occurrences\": [...]} in the answer: %s", clip(env.Result, maxErrorText))
+	if !findObject(env.Result, key, v) || !filled() {
+		return cost, usage, fmt.Errorf("no {%q: [...]} in the answer: %s", key, clip(env.Result, maxErrorText))
 	}
-	res.Occurrences = *ans.Occurrences
-	return res, nil
+	return cost, usage, nil
 }
 
-// findObject decodes into v the first JSON object in s that has an
-// "occurrences" key, skipping text before and after it (prose, a code
-// fence).
-func findObject(s string, v any) bool {
+// findObject decodes into v the first JSON object in s that has key,
+// skipping text before and after it (prose, a code fence).
+func findObject(s, key string, v any) bool {
 	for i := 0; i < len(s); i++ {
 		j := strings.IndexByte(s[i:], '{')
 		if j < 0 {
@@ -389,7 +409,7 @@ func findObject(s string, v any) bool {
 		if dec.Decode(&raw) != nil {
 			continue
 		}
-		if _, ok := raw["occurrences"]; !ok {
+		if _, ok := raw[key]; !ok {
 			continue
 		}
 		b, _ := json.Marshal(raw)

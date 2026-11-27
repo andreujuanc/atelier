@@ -114,6 +114,8 @@ func TestInsideTaskContainer(t *testing.T) {
 		{"resume", "boxed"}, {"status", "boxed", "done"}, {"rename", "boxed", "y"}, {"diff", "boxed"}, {"pr", "boxed"},
 		{"done", "boxed"}, {"cancel", "boxed"}, {"doctor"}, {"transcript", "boxed"}, {"repos"}, {"assistant"},
 		{"gate", "boxed", "--task-id", "1"}, {"token"}, {"token", "--paste"}, {"learn", "--dry-run"},
+		{"learnings"}, {"learnings", "ls"}, {"learnings", "show", "1"}, {"learnings", "accept", "1"}, {"learnings", "reject", "1"},
+		{"learnings", "edit", "1"}, {"learnings", "rm", "1"},
 	} {
 		code, out, errs := atl(t, args...)
 		if code != 1 || out != "" || !strings.Contains(errs, "does not work inside a task container") ||
