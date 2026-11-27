@@ -530,8 +530,10 @@ func claudeIDOK(id string) bool {
 
 // recordTranscript stores the event's transcript path: SessionStart (any
 // source: /clear, resume and compaction may start a new file) overwrites,
-// other events only fill an empty one. At most one statement, and none
-// when the row already has the value.
+// other events only fill an empty one, and add another path to the
+// session's transcript files (session_transcripts, which setting
+// transcript_path also adds to). At most one statement, and none when the
+// row already has the value.
 func recordTranscript(ctx context.Context, event string, in Input, sess *model.Session, st *store.Store) error {
 	if in.TranscriptPath == "" || in.TranscriptPath == sess.TranscriptPath {
 		return nil
@@ -540,7 +542,7 @@ func recordTranscript(ctx context.Context, event string, in Input, sess *model.S
 		return st.SetTranscriptPath(ctx, sess.ID, in.TranscriptPath)
 	}
 	if sess.TranscriptPath != "" {
-		return nil
+		return st.AddSessionTranscript(ctx, sess.ID, in.TranscriptPath)
 	}
 	return st.SetTranscriptPathIfEmpty(ctx, sess.ID, in.TranscriptPath)
 }

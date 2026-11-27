@@ -1,6 +1,6 @@
 # Learning module (design)
 
-Status: design, not built. Task `atelier-learning-module`.
+Status: being built (phases in docs/PROGRESS.md). Task `atelier-learning-module`.
 
 `atl learn` reads what happened across a workspace's tasks (your prompts and the tasks'
 notes) and proposes **learnings**: cross-task preferences about how agents should work
@@ -32,15 +32,21 @@ atl learn (host)
 
 ### 1a. Static extract (no AI)
 
-Per task, from its sessions' transcripts (`sessions.transcript_path`, parsed with
-`ParseTranscript`) and its notes:
+Per task, from its sessions' transcripts (parsed by `internal/learn`) and its notes:
 
+- transcript history: every file a session has had (`session_transcripts`; /clear, resume
+  and compaction can start a new one), each read once, entries de-duplicated by uuid;
 - your prompts only: no tool output, no pasted blocks, no injected context (hook output,
   system reminders), no slash-command noise; each turn capped (e.g. 2 KiB);
+- kinds: `prompt` (typed at the input) or `rejection` (what you typed when rejecting a tool
+  use; not feedback relayed from a teammate, another process or a channel). With
+  `--permission-prompt-tool` the tool's own message would read as a rejection; atl starts
+  interactive `claude` without it;
 - the last 200 characters of Claude's reply before each prompt, so a bare "no, shorter"
   can be understood (pre-clean reads it; it never reaches Analyse);
-- the task's notes, each line with its author from `NotesBlame` (below) and date;
-- task metadata: title, status, repos.
+- the task's notes, each line with its author from `NotesBlame` (below) and date, within
+  their own cap (16 KiB): past it others' lines are dropped first, then yours, oldest first;
+- task metadata: title, status, repos (not in `input_hash`).
 
 Closed tasks count: closing keeps their transcripts (`pruneClaudeDir` keeps `projects/`)
 and their notes stay in the database.
@@ -201,6 +207,7 @@ learnings(id, text, status, created_at, updated_at, decided_at)
 learning_occurrences(id, learning_id, task_id, session_id, at, strength, polarity, quote)
 learn_digests(task_id, input_hash, occurrences_json, created_at)
 notes_line_authors(task_id, line_hash, copy, author, at)   -- phase 0
+session_transcripts(session_id, path, first_seen)          -- phase 1
 ```
 
 ## Surfaces

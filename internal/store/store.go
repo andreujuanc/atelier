@@ -118,7 +118,34 @@ WHERE notes = '' AND EXISTS (SELECT 1 FROM task_notes n WHERE n.task_id = tasks.
   at INTEGER NOT NULL,
   PRIMARY KEY (task_id, line_hash, copy)
 );`,
+	// v8: every transcript file a session has had (transcript_path keeps
+	// only the latest: /clear, resume and compaction can start a new one),
+	// at most maxSessionTranscripts per session. The triggers record each
+	// path transcript_path is set to; AddSessionTranscript the others a
+	// hook reports. The current paths are recorded now.
+	`CREATE TABLE session_transcripts (
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  first_seen INTEGER NOT NULL,
+  PRIMARY KEY (session_id, path)
+);
+CREATE TRIGGER session_transcripts_insert AFTER INSERT ON sessions WHEN NEW.transcript_path != ''
+BEGIN
+  INSERT OR IGNORE INTO session_transcripts (session_id, path, first_seen) VALUES (NEW.id, NEW.transcript_path, NEW.last_event_at);
+END;
+CREATE TRIGGER session_transcripts_update AFTER UPDATE OF transcript_path ON sessions WHEN NEW.transcript_path != ''
+BEGIN
+  INSERT OR IGNORE INTO session_transcripts (session_id, path, first_seen)
+    SELECT NEW.id, NEW.transcript_path, NEW.last_event_at
+    WHERE (SELECT count(*) FROM session_transcripts WHERE session_id = NEW.id) < 100;
+END;
+INSERT INTO session_transcripts (session_id, path, first_seen)
+  SELECT id, transcript_path, last_event_at FROM sessions WHERE transcript_path != '';`,
 }
+
+// maxSessionTranscripts caps the session_transcripts rows of one session
+// (the v8 trigger has it as a literal).
+const maxSessionTranscripts = 100
 
 // migrationSteps holds, by index in migrations, Go code to run right after
 // that migration's SQL, in the same transaction: what SQL cannot do.

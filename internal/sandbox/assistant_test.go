@@ -52,6 +52,7 @@ func TestCheckAssistantArgs(t *testing.T) {
 		{[]string{"assistant"}, "does not run for the assistant"},
 		{[]string{"token"}, "does not run for the assistant"},
 		{[]string{"token", "--paste"}, "does not run for the assistant"},
+		{[]string{"learn", "--dry-run"}, "does not run for the assistant"},
 		{[]string{"gate", "--assistant"}, "does not run for the assistant"},
 		{[]string{"hook", "Stop"}, "does not run for the assistant"},
 		{[]string{"workspace", "new", "x"}, "does not run for the assistant"},

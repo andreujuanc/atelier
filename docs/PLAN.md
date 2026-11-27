@@ -30,13 +30,14 @@ internal/hook            `atl hook <event>` handler, state machine, ro guard    
 internal/palette         session-state colours shared by tui and `atl statusline`
 internal/gen             CLAUDE.md + .claude/settings.json generation           (M4)
 internal/project         project TOML load (M5), script runner + env (M7)
+internal/learn           learning: config, static extract (prompts typed, notes blame), input hash (L1)
 internal/cli             cobra commands                                         (M5)
 internal/tui             Bubble Tea UI                                          (M6)
 test/e2e.sh              end-to-end script (+ test/stubs/claude, test/stubs/gh) (M8)
 ```
 
 Dependency direction (no cycles): `model ← config ← store`; `gitx`, `tmux` depend on nothing internal;
-`gen ← model`; `palette ← model`; `hook ← store, config, model, palette`; `project ← config`; `app ← everything above`;
+`gen ← model`; `palette ← model`; `learn ← model`; `workspace ← learn`; `hook ← store, config, model, palette`; `project ← config`; `app ← everything above`;
 `tui ← app, palette`; `cli ← app, hook, tui`.
 
 ## 2. Data model
@@ -129,6 +130,7 @@ CREATE INDEX sessions_task ON sessions(task_id);
 -- migration v2: ALTER TABLE sessions ADD COLUMN launch_seq INTEGER NOT NULL DEFAULT 0 (bumped by ClaimStopped / SetSessionLaunch)
 -- migration v5: ALTER TABLE tasks ADD COLUMN notes TEXT NOT NULL DEFAULT '' (one notes text per task; see §7)
 -- migration v7: notes_line_authors(task_id FK ON DELETE CASCADE, line_hash BLOB, copy, author, at, PK (task_id, line_hash, copy)): who first wrote each notes line (see §7)
+-- migration v8: session_transcripts(session_id FK ON DELETE CASCADE, path, first_seen, PK (session_id, path)): every transcript file a session had (triggers on sessions.transcript_path + AddSessionTranscript; max 100 per session)
 CREATE INDEX sessions_claude ON sessions(claude_session_id);
 ```
 

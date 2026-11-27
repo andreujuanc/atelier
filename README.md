@@ -196,6 +196,7 @@ atl cancel <task> [--force]
 atl note <task> <text...> [--author user|assistant|agent]   # append a dated line to the notes
 atl notes <task> [--set < file | --clear]
 atl transcript <task> [--session ID] [--tail N]       # condensed Claude transcript
+atl learn --dry-run [--task T] [--json]   # what learning reads per task: your prompts, notes (docs/learning.md)
 atl assistant [task]                 # the atelier assistant (own container per workspace)
 atl repos                            # git repos in the repos dir
 atl repos pin <repo>                 # accept a changed origin URL
@@ -230,6 +231,7 @@ Strict TOML: every key optional, unknown keys are an error. `~/` expands in `rep
 | `[sandbox] mounts` | none | host paths every task gets read-only ([docs/sandbox.md](docs/sandbox.md#host-files-for-every-task)) |
 | `[sandbox] context` | none | text added to sandboxed sessions' start context (max 1000 bytes) |
 | `[sandbox] registries` | none | registries tasks may pull from besides Docker Hub, ghcr.io, quay.io, mcr.microsoft.com, gcr.io, registry.k8s.io, public.ecr.aws (`"localhost:5000"`, `"*.pkg.dev"`; [docs/sandbox.md](docs/sandbox.md#registries-tasks-may-pull-from)) |
+| `[learn] ...` | [docs/learning.md](docs/learning.md#defaults-to-tune) | `prompt_cap` 2048 (bytes), `reply_snippet` 200 (chars), `task_cap` 65536 (bytes; oldest prompts dropped past it), `notes_cap` 16384 (bytes; others' lines dropped before yours), `weight_strong`/`_normal`/`_mild`, `half_life_proposed`/`_accepted` (days), `propose_score`, `propose_tasks`, `outdated_score`, `budget`, `parallelism`, `preclean_model`/`_effort`, `analyse_model`/`_effort` |
 
 ```toml
 repos = "~/src/work"
