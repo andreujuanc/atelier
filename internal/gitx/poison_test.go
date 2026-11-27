@@ -309,6 +309,10 @@ var gitxCalls = []struct {
 		return intErr(UniqueCommitsAt(ctx, p.repo, "atl/task", tip))
 	}},
 	{"OrphanCommits", func(ctx context.Context, p *poisoned) error { return intErr(OrphanCommits(ctx, p.wt)) }},
+	{"LeftoverOrphanCommits", func(ctx context.Context, p *poisoned) error {
+		_, _, err := LeftoverOrphanCommits(ctx, p.repo, p.wt)
+		return err
+	}},
 	{"CommitsAhead", func(ctx context.Context, p *poisoned) error { return intErr(CommitsAhead(ctx, p.wt, "origin/main")) }},
 	{"LastCommit", func(ctx context.Context, p *poisoned) error {
 		_, _, _, err := LastCommit(ctx, p.wt)

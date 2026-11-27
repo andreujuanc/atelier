@@ -741,6 +741,49 @@ func TestDoneLeftoverWorktree(t *testing.T) {
 	}
 }
 
+// A leftover whose registered HEAD is detached with commits on no branch
+// is not pruned, even with force: pruning would lose them. Done is refused
+// with the commit to put on a branch, and once it is, goes through.
+func TestDoneLeftoverDetachedHead(t *testing.T) {
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "lost", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	git(t, wt, "checkout", "-q", "--detach")
+	head := e.commitIn(t, task.Slug, "api", "only-here.txt")
+	if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	api := e.canonical("api")
+	for _, force := range []bool{false, true} {
+		_, err := e.app.Done(ctx, task.Slug, force)
+		if err == nil || !strings.Contains(err.Error(), "not on any branch") || !strings.Contains(err.Error(), head) {
+			t.Fatalf("Done force=%v: %v, want a refusal naming %s", force, err, head)
+		}
+		got, err := e.app.Store.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Status.Open() {
+			t.Fatalf("force=%v: status %s", force, got.Status)
+		}
+		if n := worktreeCount(t, api); n != 2 {
+			t.Fatalf("force=%v: %d worktrees, want the leftover still registered", force, n)
+		}
+	}
+	git(t, api, "branch", "rescued", head)
+	if _, err := e.app.Done(ctx, task.Slug, false); err != nil {
+		t.Fatal(err)
+	}
+	if n := worktreeCount(t, api); n != 1 {
+		t.Fatalf("%d worktrees after done", n)
+	}
+}
+
 // A directory in a worktree that the user may not empty (node_modules
 // made by root in a container) fails Done before anything of the worktree
 // is removed: the task stays open, its worktree whole, and a second Done,

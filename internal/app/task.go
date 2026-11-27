@@ -1022,8 +1022,9 @@ type closeWorktree struct {
 	name, repo, path string
 	missing          bool // its dir was deleted by hand: only pruned
 	// Its dir has no .git (gitx.ErrNoGitLink): a removal that stopped part
-	// way, or a .git deleted by hand. git can tell nothing of it, so it is
-	// pruned, and its dir deleted only with force.
+	// way, or a .git deleted by hand. git can tell nothing of what is in
+	// it, so once the HEAD registered for it is checked for commits on no
+	// branch, it is pruned, and its dir deleted only with force.
 	leftover bool
 }
 
@@ -1060,8 +1061,30 @@ func (a *App) closeWorktrees(ctx context.Context, t *model.Task, force bool) ([]
 	// Commits only HEAD reaches (detached HEAD, stopped rebase) would be
 	// lost with the worktree; --force never discards commits.
 	var orphans []string
+	checked := wts[:0:0]
 	for _, w := range wts {
-		if w.missing || w.leftover {
+		if w.leftover {
+			// Its HEAD is still registered in the clone, and goes with the
+			// registration: what it alone reaches is checked there.
+			n, heads, err := gitx.LeftoverOrphanCommits(ctx, w.repo, w.path)
+			if err != nil {
+				if !force {
+					return nil, fmt.Errorf("task %s: repo %s: %s has no .git and its HEAD cannot be checked for commits "+
+						"on no branch: %w (use --force to close the task and leave it alone)", t.Slug, w.name, w.path, err)
+				}
+				a.warnf("repo %s: %s has no .git and its HEAD cannot be checked: %v; left alone", w.name, w.path, err)
+				continue
+			}
+			if n > 0 {
+				orphans = append(orphans, fmt.Sprintf("%s: %s has no .git, and the HEAD still registered for it (%s) has "+
+					"%d commit(s) not on any branch (git -C %s branch <name> %s)",
+					w.name, w.path, strings.Join(heads, ", "), n, w.repo, heads[0]))
+			}
+			checked = append(checked, w)
+			continue
+		}
+		checked = append(checked, w)
+		if w.missing {
 			continue
 		}
 		n, err := gitx.OrphanCommits(ctx, w.path)
@@ -1099,7 +1122,7 @@ func (a *App) closeWorktrees(ctx context.Context, t *model.Task, force bool) ([]
 				t.Slug, strings.Join(dirty, ", "))
 		}
 	}
-	return wts, nil
+	return checked, nil
 }
 
 // removeWorktrees removes the worktrees wts of task t, once nothing of the

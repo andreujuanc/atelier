@@ -909,6 +909,74 @@ func RemoveLeftover(repo, path string, all bool) error {
 	return nil
 }
 
+// LeftoverOrphanCommits is OrphanCommits for what is left at path of a
+// worktree of repo whose .git is gone (ErrNoGitLink): the registrations of
+// it in repo still hold its HEAD, which RemoveLeftover deletes. Each HEAD
+// is read as data; one on a branch loses nothing (the branch stays), a
+// detached one (a commit, as during a rebase) is counted in repo, as
+// OrphanCommits counts. git runs in repo only, never with a registration
+// as its git dir. A HEAD that is neither is an error, as is a commit that
+// repo does not have: what is in it cannot be told. It returns the count
+// and the detached HEADs.
+func LeftoverOrphanCommits(ctx context.Context, repo, path string) (n int, detached []string, err error) {
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return 0, nil, err
+	}
+	gitDir, err := nofollow.Open(filepath.Join(repo, ".git"))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer gitDir.Close()
+	ids, err := worktreeIDs(gitDir, path)
+	if err != nil {
+		return 0, nil, err
+	}
+	for _, id := range ids {
+		data, err := gitDir.ReadFile("worktrees/"+id+"/HEAD", 4<<10)
+		if err != nil {
+			return 0, nil, fmt.Errorf("HEAD of worktree %s: %w", path, err)
+		}
+		head := strings.TrimSpace(string(data))
+		switch {
+		case strings.HasPrefix(head, "ref: refs/"):
+		case isObjectID(head):
+			detached = append(detached, head)
+		default:
+			return 0, nil, fmt.Errorf("HEAD of worktree %s: unexpected %q", path, head)
+		}
+	}
+	if len(detached) == 0 {
+		return 0, nil, nil
+	}
+	// Each must be a commit of repo's: rev-list would count a missing one
+	// as nothing to lose only with --ignore-missing, which is not passed.
+	args := append([]string{"rev-list", "--count"}, detached...)
+	out, err := run(ctx, repo, append(args, "--not", "--branches", "--remotes", "--tags")...)
+	if err != nil {
+		return 0, nil, err
+	}
+	n, err = strconv.Atoi(out)
+	if err != nil {
+		return 0, nil, fmt.Errorf("git rev-list: unexpected output %q", out)
+	}
+	return n, detached, nil
+}
+
+// isObjectID reports whether s is a full object name (SHA-1 or SHA-256),
+// lowercase hex.
+func isObjectID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // unregister removes the entries ids of gitDir's worktrees/: the
 // registrations of the worktree at path.
 func unregister(gitDir *nofollow.Dir, path string, ids []string) error {

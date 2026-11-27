@@ -811,6 +811,58 @@ func TestRemoveWorktree(t *testing.T) {
 			t.Fatal("leftover dir kept with all")
 		}
 	})
+
+	// The HEAD still registered for a leftover is what pruning it loses:
+	// on a branch nothing, detached the commits only it reaches, and one
+	// that cannot be told is an error.
+	t.Run("leftover HEAD", func(t *testing.T) {
+		wt, _ := f.addWorktree(t, ctx, "lhead")
+		count := func() (int, error) {
+			t.Helper()
+			n, _, err := LeftoverOrphanCommits(ctx, f.repo, wt)
+			return n, err
+		}
+		if n, err := count(); n != 0 || err != nil {
+			t.Fatalf("on its branch: %d, %v", n, err)
+		}
+		git(t, wt, "checkout", "-q", "--detach")
+		commitFile(t, wt, "a.txt", "a\n", "a")
+		commitFile(t, wt, "b.txt", "b\n", "b")
+		head := strings.TrimSpace(git(t, wt, "rev-parse", "HEAD"))
+		must(t, os.Remove(filepath.Join(wt, ".git")))
+		n, heads, err := LeftoverOrphanCommits(ctx, f.repo, wt)
+		if n != 2 || err != nil || len(heads) != 1 || heads[0] != head {
+			t.Fatalf("detached: %d %v, %v; want 2 [%s]", n, heads, err, head)
+		}
+		git(t, f.repo, "branch", "rescued", head)
+		if n, err := count(); n != 0 || err != nil {
+			t.Fatalf("detached, then on a branch: %d, %v", n, err)
+		}
+		var id string
+		for _, e := range mustReadDir(t, filepath.Join(f.repo, ".git", "worktrees")) {
+			if strings.Contains(e, "lhead") {
+				id = e
+			}
+		}
+		headFile := filepath.Join(f.repo, ".git", "worktrees", id, "HEAD")
+		for _, bad := range []string{"junk\n", strings.Repeat("0", 40) + "\n"} {
+			writeFile(t, headFile, bad)
+			if _, err := count(); err == nil {
+				t.Errorf("HEAD %q: no error", bad)
+			}
+		}
+	})
+}
+
+func mustReadDir(t *testing.T, dir string) []string {
+	t.Helper()
+	es, err := os.ReadDir(dir)
+	must(t, err)
+	var names []string
+	for _, e := range es {
+		names = append(names, e.Name())
+	}
+	return names
 }
 
 func exists(p string) bool {
