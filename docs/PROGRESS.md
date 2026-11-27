@@ -95,3 +95,17 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 - (user, 2026-11-25) Releases are automatic: every merge to main (code, not docs-only) runs `.github/workflows/release.yml` → tests (ci.yml) → static linux/amd64+arm64 binaries, SHA256SUMS, build provenance attestation → GitHub release `v<VERSION>.<n>` (`.github/next-version.sh`; `VERSION` holds MAJOR.MINOR). `atl update` / TUI `U` install the latest release only after the checksum matches and `gh attestation verify --signer-workflow …/release.yml --source-ref refs/heads/main` passes: a task can push branches whose workflows may publish releases, but none of those verify. The TUI checks GitHub at most every 6 h (cache `$XDG_STATE_HOME/atelier/update-check.json`), only for release builds, off with `ATL_UPDATE_CHECK=off`; after `U` it re-executes itself on the new binary once in normal mode with nothing running.
 - (user, 2026-11-25) Update verification no longer needs `gh` on the host (it was only an `atl pr` requirement, which `atl update` made mandatory). Releases are signed instead: release.yml (job in the `release` environment, deployment branches = main only) signs `"atelier release <tag>\n" + SHA256SUMS` with Ed25519 (`.github/sign-release.sh`, openssl; the private key is the environment secret RELEASE_SIGNING_KEY) and checks the signature against `internal/update/release-key.pub` before publishing. atl embeds that file (several keys allowed, for rotation) and verifies with crypto/ed25519: no new dependency. The tag is in the signed message so a signature cannot vouch for another release. sigstore-go (verify the existing attestation in-process) was rejected: a large dependency tree in a security tool. The build provenance attestation is still published, for manual `gh attestation verify`.
 - (2026-11-25) atl update finds the latest release from github.com's `/releases/latest` redirect and downloads `/releases/download/<tag>/<asset>`, not through api.github.com: the API allows 60 unauthenticated requests an hour per IP, shared by everything behind it, and v0.1.1 hit that (403) in real use. No JSON, no API at all.
+
+## Learning module (`docs/learning.md`)
+
+| Phase | State |
+|---|---|
+| L0 notes provenance (`agent` author, `notes_edits`, `NotesBlame`) | in progress |
+| L1 static extract, `atl learn --dry-run` | todo |
+| L2 pre-clean (learner container, per-task `claude -p`, quote check, cache) | todo |
+| L3 analyse, scoring, `learnings` tables, `atl learnings` | todo |
+| L4 delivery in SessionStart (tasks + assistant) | todo |
+| L5 TUI run key + review list | todo |
+
+Decisions:
+- (user, 2026-11-27) Manual trigger only; per workspace only; no repo-specific learnings (tasks are multi-repo); cheap models at low/medium effort; nothing injected without the user accepting it; scores weighted by strength, repetition and time decay.
