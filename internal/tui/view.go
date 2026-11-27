@@ -94,6 +94,17 @@ type layout struct {
 	// what the panes hold inside their borders
 	listInW, listInH, detailInW, detailInH int
 	help                                   []string // the help lines under the status line
+	status                                 []string // the status line, or the rows an error wraps to
+}
+
+// maxStatusRows is how many rows an error in the status line may wrap to
+// on a terminal h rows high: one on a short one, else up to a quarter of
+// it, at most 6.
+func maxStatusRows(h int) int {
+	if h < 12 {
+		return 1
+	}
+	return min(h/4, 6)
 }
 
 func (m *Model) layout() layout {
@@ -101,7 +112,8 @@ func (m *Model) layout() layout {
 	var l layout
 	l.header = h >= 10
 	l.help = m.helpLines(w)
-	l.bodyH = h - 1 - len(l.help)
+	l.status = m.statusLines(w, maxStatusRows(h))
+	l.bodyH = h - len(l.status) - len(l.help)
 	if l.header {
 		l.bodyH--
 	}
@@ -221,7 +233,7 @@ func (m *Model) render() string {
 	if over := m.overlay(w, len(lines)); over != nil {
 		lines = composite(lines, over, w)
 	}
-	lines = append(append(lines, m.statusLine(w)), l.help...)
+	lines = append(append(lines, l.status...), l.help...)
 	if len(lines) > h {
 		lines = lines[len(lines)-h:]
 	}
@@ -662,6 +674,43 @@ func orDash(s string) string {
 	return s
 }
 
+// statusLines is the status line; an error too long for it is shown whole
+// instead, wrapped to at most rows rows (the last cut short if it needs
+// more), under a row of what is in progress, if anything.
+func (m *Model) statusLines(w, rows int) []string {
+	st := clean(m.status)
+	plain := m.mode != modeFilter && m.mode != modeRename &&
+		(m.mode != modeNotes || m.notes == nil || m.notes.ask == askNone)
+	if !plain || !m.statusErr || st == "" || rows <= 1 || w <= 1 {
+		return []string{m.statusLine(w)}
+	}
+	busy := ""
+	if ops := m.busyOps(); len(ops) > 0 {
+		busy = keyStyle.Render(m.spinner()+" working… ") + dimStyle.Render(clean(strings.Join(ops, ", ")))
+	}
+	need := ansi.StringWidth("✗ " + st)
+	if busy != "" {
+		need += ansi.StringWidth(busy) + 2
+	}
+	if need <= w {
+		return []string{m.statusLine(w)}
+	}
+	var out []string
+	if busy != "" {
+		out = append(out, trunc(busy, w))
+	}
+	wrapped := strings.Split(ansi.Wrap("✗ "+st, w, ""), "\n")
+	if n := rows - len(out); len(wrapped) > n {
+		wrapped = wrapped[:n]
+		wrapped[n-1] = ansi.Truncate(strings.TrimRight(wrapped[n-1], " "), w-1, "") + "…"
+	}
+	for _, l := range wrapped {
+		out = append(out, errStyle.Render(trunc(strings.TrimRight(l, " "), w)))
+	}
+	return out
+}
+
+// statusLine is the status line on one row: what does not fit is cut.
 func (m *Model) statusLine(w int) string {
 	var s string
 	switch {

@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -387,6 +388,60 @@ func (d *Dir) RemoveAll(rel string) error {
 	defer d.closeParent(fd)
 	if err := removeAllAt(fd, base); err != nil {
 		return pathErr("removeall", d.join(rel), err)
+	}
+	return nil
+}
+
+// ErrNotEmptiable is the error of CheckEmptiable for a directory with
+// entries that this process may not remove.
+var ErrNotEmptiable = errors.New("has entries this user may not remove")
+
+// CheckEmptiable walks d as RemoveAll(".") would, without following a
+// symlink or changing anything, and returns an error naming the first
+// directory with entries this process may not remove (it may not write
+// and search the directory: one made by root in a container, say),
+// satisfying errors.Is(err, ErrNotEmptiable) and fs.ErrPermission. Run
+// first, it keeps RemoveAll from failing part way for want of permission;
+// what changes meanwhile can still make it fail.
+func (d *Dir) CheckEmptiable() error {
+	return checkEmptiableAt(d.fd, ".", d.path)
+}
+
+// checkEmptiableAt is CheckEmptiable for the directory name, in the one
+// open at parent, at path.
+func checkEmptiableAt(parent int, name, path string) error {
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
+		return nil // gone, or not a directory: its parent's permissions remove it
+	}
+	if err != nil {
+		return pathErr("check", path, err)
+	}
+	dir := os.NewFile(uintptr(fd), path)
+	defer dir.Close()
+	entries, err := dir.ReadDir(-1)
+	if err != nil {
+		return pathErr("check", path, err)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	if err := unix.Faccessat(fd, ".", unix.W_OK|unix.X_OK, 0); err != nil {
+		owner := ""
+		var st unix.Stat_t
+		if unix.Fstat(fd, &st) == nil {
+			owner = fmt.Sprintf(" (owner uid %d)", st.Uid)
+		}
+		return &fs.PathError{Op: "check", Path: path,
+			Err: fmt.Errorf("%w%s: %w", ErrNotEmptiable, owner, fs.ErrPermission)}
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if err := checkEmptiableAt(fd, e.Name(), filepath.Join(path, e.Name())); err != nil {
+			return err
+		}
 	}
 	return nil
 }

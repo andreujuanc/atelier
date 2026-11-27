@@ -14,6 +14,7 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/gen"
+	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/store"
 	"github.com/andreujuanc/atelier/internal/tmux"
@@ -693,6 +694,117 @@ func TestDoneMissingWorktree(t *testing.T) {
 		t.Fatalf("%d worktrees after done", n)
 	}
 	assertNoBranch(t, api, "atl/gone")
+}
+
+// A worktree dir left without its .git (a removal that stopped part way,
+// as an older atl's did on files it could not delete) does not block Done:
+// it is pruned, the branch is deleted, and what is left in it is kept
+// (with a warning) unless force.
+func TestDoneLeftoverWorktree(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(fmt.Sprint("force=", force), func(t *testing.T) {
+			e := newTaskEnv(t)
+			ctx := context.Background()
+			e.addRepo(t, "api", "main")
+			task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "half", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wt := e.app.Paths.WorktreePath(task.Slug, "api")
+			if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(wt, "left.txt"), []byte("x\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got, err := e.app.Done(ctx, task.Slug, force)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != model.StatusDone {
+				t.Fatalf("status %s", got.Status)
+			}
+			api := e.canonical("api")
+			if n := worktreeCount(t, api); n != 1 {
+				t.Fatalf("%d worktrees after done", n)
+			}
+			assertNoBranch(t, api, "atl/half")
+			out := e.app.Out.(*bytes.Buffer).String()
+			if force {
+				if exists(wt) {
+					t.Fatal("leftover kept with force")
+				}
+			} else if !exists(filepath.Join(wt, "left.txt")) || !strings.Contains(out, "not a worktree any more") {
+				t.Fatalf("leftover not kept with a warning: %q", out)
+			}
+		})
+	}
+}
+
+// A directory in a worktree that the user may not empty (node_modules
+// made by root in a container) fails Done before anything of the worktree
+// is removed: the task stays open, its worktree whole, and a second Done,
+// once that is fixed, closes it.
+func TestDoneNotEmptiable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root may empty any directory")
+	}
+	e := newTaskEnv(t)
+	ctx := context.Background()
+	e.addRepo(t, "api", "main")
+	task, err := e.app.NewTask(ctx, NewTaskOpts{Title: "rooted", NoFetch: true, Repos: []RepoArg{{"api", model.ModeRW}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := e.app.Paths.WorktreePath(task.Slug, "api")
+	// Ignored, as node_modules is: not a change that blocks Done.
+	excl := strings.TrimSpace(git(t, wt, "rev-parse", "--git-path", "info/exclude"))
+	if !filepath.IsAbs(excl) {
+		excl = filepath.Join(wt, excl)
+	}
+	if err := os.MkdirAll(filepath.Dir(excl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(excl, []byte("node_modules/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mods := filepath.Join(wt, "node_modules", "pkg")
+	if err := os.MkdirAll(mods, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mods, "index.js"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(mods, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(mods, 0o755) })
+	_, err = e.app.Done(ctx, task.Slug, false)
+	if err == nil || !strings.Contains(err.Error(), mods) || !strings.Contains(err.Error(), "sudo") {
+		t.Fatalf("Done: %v, want an error naming %s", err, mods)
+	}
+	got, err := e.app.Store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Status.Open() {
+		t.Fatalf("status %s after the failed Done", got.Status)
+	}
+	if err := gitx.CheckWorktree(ctx, wt, e.canonical("api")); err != nil {
+		t.Fatalf("worktree after the failed Done: %v", err)
+	}
+	if d, err := gitx.IsDirty(ctx, wt); err != nil || d {
+		t.Fatalf("worktree dirty after the failed Done: %v %v", d, err)
+	}
+	if err := os.Chmod(mods, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.app.Done(ctx, task.Slug, false); err != nil {
+		t.Fatal(err)
+	}
+	if exists(wt) {
+		t.Fatal("worktree left after the second Done")
+	}
 }
 
 func assertNoBranch(t *testing.T, repo, branch string) {

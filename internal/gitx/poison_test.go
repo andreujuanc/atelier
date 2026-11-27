@@ -394,7 +394,7 @@ func errString(err error) string {
 }
 
 // noGit are exported functions that do not run git.
-var noGit = []string{"GuardedEnv"}
+var noGit = []string{"GuardedEnv", "RemoveLeftover"}
 
 // TestPoisonedRepoCoversEveryFunction: every exported function of the
 // package is either run against the poisoned repo or known not to run git.
