@@ -76,6 +76,14 @@ func (s *Store) ListLearnings(ctx context.Context) ([]Learning, error) {
 	return out, rows.Err()
 }
 
+// CountLearnings returns how many learnings have status (the TUI's top
+// bar counts the proposed ones).
+func (s *Store) CountLearnings(ctx context.Context, status string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM learnings WHERE status = ?`, status).Scan(&n)
+	return n, err
+}
+
 // GetLearning returns learning id; ErrNotFound (wrapped) if there is none.
 func (s *Store) GetLearning(ctx context.Context, id int64) (Learning, error) {
 	l, err := scanLearning(s.db.QueryRowContext(ctx, `SELECT `+learningCols+` FROM learnings WHERE id = ?`, id))

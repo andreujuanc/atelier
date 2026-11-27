@@ -53,6 +53,8 @@ func (m *Model) handlePaste(msg tea.PasteMsg) tea.Cmd {
 		var cmd tea.Cmd
 		m.renameInput, cmd = m.renameInput.Update(msg)
 		return cmd
+	case modeLearnEdit:
+		return m.learnEditPaste(msg)
 	case modeNotes:
 		e := m.notes
 		switch {
@@ -129,6 +131,9 @@ func (m *Model) restyleInputs() {
 	}
 	if m.notes != nil {
 		m.notes.restyle()
+	}
+	if m.learn != nil && m.learn.edit != nil {
+		m.learn.edit.restyle()
 	}
 }
 

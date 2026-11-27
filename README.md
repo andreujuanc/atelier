@@ -160,12 +160,20 @@ running, idle, stopped). Colours follow the terminal's light or dark background.
 | `p` | open PRs (`atl pr`) |
 | `D` | diff |
 | `A` | the atelier assistant, about the selected task |
+| `L` | the learnings: review what `atl learn` proposes (the top bar says `2 learnings to review (L)` when some wait) |
+| `l` | run `atl learn` (asks first: it calls a model) on the terminal; `enter` at its end comes back |
 | `1`-`5` | set status: backlog, active, review, done, cancelled |
 | `/` | filter by slug or title |
 | `w` | switch workspace |
 | `U` | update atl (shown in the top bar when a newer release exists) |
 | `?` | every key, with what it does (any key closes it) |
 | `q` | quit (waits for running operations; `ctrl+c` again forces) |
+
+Learnings (`L`): proposed first, then accepted, by score; the selected one's quotes below,
+newest first (`?`: a quote that shares no word with the text). `a` accept, `x` reject (asks;
+it is not proposed again), `e` edit (`enter` or `ctrl+s` save, `esc` cancel), `d` delete (asks; the next
+`atl learn` may propose it again: reject stops it), `h` also candidates and rejected, `r`
+refresh, `l` run `atl learn`, `?` keys, `esc`/`q` back. Changes are refused while `atl learn` runs.
 
 Repo picker: type to filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter`
 confirms, `esc` clears the filter, else cancels.

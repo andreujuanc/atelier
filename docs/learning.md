@@ -434,8 +434,16 @@ Every TUI action also exists in the CLI.
 | `atl learnings edit <id>` | reword (one line from stdin, checked like a model's text) |
 | `atl learnings rm <id>` | forget it and its occurrences |
 
-TUI: a key to run `atl learn`, and a review list (proposed first) with accept / edit /
-reject. The assistant may run `atl learnings`, `atl learnings ls` and `atl learnings
+TUI: `l` runs `atl learn` (after a question naming the models and that it costs money) on
+the terminal, as `D` runs `atl diff`: its per-task rows and cost stay on screen until enter,
+then the TUI comes back (its last stderr line on the status line if it failed; a run already
+going is refused by `state/learn.lock`). `L` opens the review list: proposed, then accepted
+(`h`: also candidates and rejected), by score, with score, trend, tasks, flags; the selected
+learning's occurrences below, newest first, `?` on unrelated quotes. `a` accept, `x` reject
+(asks), `e` edit (one-line box, `enter` or `ctrl+s` saves, refusals shown), `d` rm (asks; says the evidence
+comes back and reject is what stops it), `r` refresh; through the same App calls as the
+CLI, refused while `atl learn` runs. The top bar says `N learnings to review (L)` (a count
+of the proposed, on the list's refresh). The assistant may run `atl learnings`, `atl learnings ls` and `atl learnings
 show` (with `--all`, `--json`): on its gate's allowlist and allowed in its permissions;
 its gate refuses `accept`, `reject`, `edit`, `rm` in any spelling, and its permissions
 deny them. Task containers run no `atl learnings` at all.

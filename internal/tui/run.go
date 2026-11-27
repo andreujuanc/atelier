@@ -8,13 +8,17 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/andreujuanc/atelier/internal/app"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/store"
 )
 
 // forceGrace is how long a forced quit waits for cancelled operations.
@@ -33,11 +37,20 @@ func Run(a *app.App) error { return RunContext(context.Background(), a) }
 // cancelled once they have returned — or on a forced quit (second ctrl+c),
 // after which they get forceGrace to wind down. App.Out is restored only
 // when no operation can still write to it.
-func RunContext(ctx context.Context, a *app.App) error {
+func RunContext(parent context.Context, a *app.App) error {
+	// A child on the terminal (D, l, attach) gets the SIGINT of its ctrl+c,
+	// and so does atl: the TUI must not stop then (signalGuard).
+	execing := &atomic.Bool{}
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	ctx, cancelRun := signalGuard(parent, sigs, execing)
+	defer cancelRun()
 	opsCtx, cancelOps := context.WithCancel(ctx)
 	defer cancelOps()
 	tr := &tracker{}
 	m := New(opsCtx, &trackedBackend{Backend: NewBackend(a), tr: tr})
+	m.execing = execing
 	if a.Workspace != nil && a.Workspace.Workspace != nil {
 		m.workspace = a.Workspace.Name
 	}
@@ -54,6 +67,7 @@ func RunContext(ctx context.Context, a *app.App) error {
 		}
 		return c
 	}
+	m.learnCmd = func() *exec.Cmd { return exec.Command(bin, "learn") }
 	p := tea.NewProgram(m, tea.WithContext(ctx))
 
 	// Progress and warnings from the app would corrupt the screen: route
@@ -454,4 +468,137 @@ func (b *trackedBackend) DirtyTasks(ctx context.Context) (map[int64]bool, error)
 		return nil, errStopped
 	}
 	return b.Backend.DirtyTasks(ctx)
+}
+
+func (b *trackedBackend) Learnings(ctx context.Context) ([]app.LearningView, error) {
+	if !b.tr.begin() {
+		return nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.Learnings(ctx)
+}
+
+func (b *trackedBackend) Learning(ctx context.Context, id int64) (app.LearningView, []store.LearningOccurrence, error) {
+	if !b.tr.begin() {
+		return app.LearningView{}, nil, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.Learning(ctx, id)
+}
+
+func (b *trackedBackend) ProposedLearnings(ctx context.Context) (int, error) {
+	if !b.tr.begin() {
+		return 0, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.ProposedLearnings(ctx)
+}
+
+func (b *trackedBackend) DecideLearning(ctx context.Context, id int64, accept bool) error {
+	if !b.tr.begin() {
+		return errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.DecideLearning(ctx, id, accept)
+}
+
+func (b *trackedBackend) EditLearning(ctx context.Context, id int64, text string) (string, error) {
+	if !b.tr.begin() {
+		return "", errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.EditLearning(ctx, id, text)
+}
+
+func (b *trackedBackend) DeleteLearning(ctx context.Context, id int64) (int, error) {
+	if !b.tr.begin() {
+		return 0, errStopped
+	}
+	defer b.tr.end()
+	return b.Backend.DeleteLearning(ctx, id)
+}
+
+// signalGuard returns the context the TUI runs in: cancelled when parent
+// is, or on a SIGINT or SIGTERM read from sigs, except that while execing
+// (a child runs on the terminal: atl diff, atl learn, an attach) a SIGINT
+// and parent's cancellation are ignored: they are the child's ctrl+c (the
+// terminal is in cooked mode then, so it reaches atl too, whose signal
+// context, parent, it cancels). Outside that, nothing changes: in the TUI
+// ctrl+c is a key, not a signal.
+func signalGuard(parent context.Context, sigs <-chan os.Signal, execing *atomic.Bool) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	go func() {
+		done := parent.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case s := <-sigs:
+				if s == syscall.SIGTERM || !execing.Load() {
+					cancel()
+					return
+				}
+			case <-done:
+				if !execing.Load() {
+					cancel()
+					return
+				}
+				done = nil // a signal during the exec: sigs says which
+			}
+		}
+	}()
+	return ctx, cancel
+}
+
+// guardedExec is tea.Exec(c, fn) with execing set (signalGuard) for all
+// the time the terminal is handed over (execGuard).
+func guardedExec(execing *atomic.Bool, c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd {
+	start, done := execGuard(execing, fn)
+	execCmd := tea.Exec(c, done)
+	return func() tea.Msg {
+		start()
+		return execCmd()
+	}
+}
+
+// execGuard returns start, which sets execing, and done, fn clearing it
+// first. guardedExec calls start before Bubble Tea releases the terminal,
+// and Bubble Tea calls done once it has it back, also when the exec could
+// not start. Execs are serialised by the event loop: one flag is enough.
+// A nil execing is not watched.
+func execGuard(execing *atomic.Bool, fn tea.ExecCallback) (start func(), done tea.ExecCallback) {
+	start = func() {
+		if execing != nil {
+			execing.Store(true)
+		}
+	}
+	done = func(err error) tea.Msg {
+		if execing != nil {
+			execing.Store(false)
+		}
+		return fn(err)
+	}
+	return start, done
+}
+
+// cmdExec is an *exec.Cmd as a tea.ExecCommand (as tea.ExecProcess wraps
+// it): the terminal's streams for those the command does not set.
+type cmdExec struct{ *exec.Cmd }
+
+func (c cmdExec) SetStdin(r io.Reader) {
+	if c.Stdin == nil {
+		c.Stdin = r
+	}
+}
+
+func (c cmdExec) SetStdout(w io.Writer) {
+	if c.Stdout == nil {
+		c.Stdout = w
+	}
+}
+
+func (c cmdExec) SetStderr(w io.Writer) {
+	if c.Stderr == nil {
+		c.Stderr = w
+	}
 }

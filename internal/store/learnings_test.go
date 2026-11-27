@@ -32,6 +32,12 @@ func TestLearnings(t *testing.T) {
 		t.Fatalf("learnings: %+v %v", ls, err)
 	}
 	short, push := ls[0].ID, ls[1].ID
+	if n, err := s.CountLearnings(ctx, "candidate"); n != 2 || err != nil {
+		t.Errorf("count candidates: %d %v", n, err)
+	}
+	if n, err := s.CountLearnings(ctx, "proposed"); n != 0 || err != nil {
+		t.Errorf("count proposed: %d %v", n, err)
+	}
 	occs, err := s.ListLearningOccurrences(ctx, short)
 	if err != nil || len(occs) != 2 || occs[0].TaskSlug != "a" || occs[1].TaskSlug != "b" || !occs[0].At.Equal(at) || occs[0].Session != 3 {
 		t.Fatalf("occurrences: %+v %v", occs, err)
