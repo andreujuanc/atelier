@@ -27,6 +27,7 @@ func (a *App) LearnConfig() learn.Config {
 // for it (a transcript or input history that could not be opened or read).
 type TaskExtract struct {
 	learn.Extract
+	TaskID   int64
 	Warnings []string
 }
 
@@ -91,7 +92,7 @@ type learnFile struct {
 }
 
 func (a *App) taskExtract(ctx context.Context, t *model.Task, sessions []model.Session, paths map[int64][]string, cfg learn.Config) (TaskExtract, error) {
-	var te TaskExtract
+	te := TaskExtract{TaskID: t.ID}
 	warn := func(format string, args ...any) {
 		te.Warnings = append(te.Warnings, fmt.Sprintf("task %s, ", t.Slug)+fmt.Sprintf(format, args...))
 	}

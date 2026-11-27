@@ -141,6 +141,18 @@ BEGIN
 END;
 INSERT INTO session_transcripts (session_id, path, first_seen)
   SELECT id, transcript_path, last_event_at FROM sessions WHERE transcript_path != '';`,
+	// v9: the last pre-clean of each task (atl learn): the extract's
+	// input_hash, the key of what produced it (learn.CacheKey: input,
+	// prompt version, model, effort), the occurrences kept (JSON), and
+	// its cost. Only a call that succeeded is stored.
+	`CREATE TABLE learn_digests (
+  task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  input_hash TEXT NOT NULL,
+  cache_key TEXT NOT NULL,
+  occurrences_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  cost_usd REAL NOT NULL DEFAULT 0
+);`,
 }
 
 // maxSessionTranscripts caps the session_transcripts rows of one session

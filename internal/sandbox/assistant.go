@@ -186,3 +186,12 @@ func AssistantCommandPath(path string) bool {
 	sub, ok := strings.CutPrefix(path, "atl ")
 	return ok && slices.Contains(AssistantCommands, sub)
 }
+
+// learnerSlug stands for a task slug in the learner's sandbox ID, as
+// assistantSlug does for the assistant's.
+const learnerSlug = "_learner"
+
+// LearnerID names the sandbox of `atl learn`'s learner (its container is
+// ContainerName of it): "_learner-<6 hex digits of its Claude dir>", one
+// per workspace, never a task's ID nor the assistant's.
+func LearnerID(claudeDir string) string { return ID(learnerSlug, claudeDir) }

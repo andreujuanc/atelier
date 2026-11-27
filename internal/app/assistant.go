@@ -287,11 +287,16 @@ func (a *App) ensureAssistantSandbox(ctx context.Context, busy bool) (string, er
 
 // assistantImageMissing is the one line that says the assistant's image
 // is not on the Docker daemon, which atl does not pull for it.
-func assistantImageMissing(image string) error {
+func assistantImageMissing(image string) error { return unpulledImageMissing(image, "the assistant") }
+
+// unpulledImageMissing is the one line that says the workspace's task
+// image is not on the Docker daemon, which atl does not pull for who (it
+// runs the image's claude with the token).
+func unpulledImageMissing(image, who string) error {
 	if image == sandbox.DefaultImage {
 		return missingImage(image, "default")
 	}
-	return errors.New("task image " + image + " (from $ATL_SANDBOX_IMAGE) is not on the Docker daemon, and atl does not pull it for the assistant " +
+	return errors.New("task image " + image + " (from $ATL_SANDBOX_IMAGE) is not on the Docker daemon, and atl does not pull it for " + who + " " +
 		"(it runs the image's claude): build or pull it yourself")
 }
 

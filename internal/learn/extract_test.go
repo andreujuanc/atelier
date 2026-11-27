@@ -292,14 +292,14 @@ func TestConfigDefaults(t *testing.T) {
 	if c.PromptCap != 2048 || c.ReplySnippet != 200 || c.TaskCap != 65536 || c.WeightStrong != 2 || c.WeightNormal != 1 ||
 		c.WeightMild != 0.5 || c.HalfLifeProposed != 45 || c.HalfLifeAccepted != 365 || c.ProposeScore != 3 || c.ProposeTasks != 2 ||
 		c.OutdatedScore != 2 || c.Budget != 800 || c.Parallelism != 3 || c.PrecleanModel != "haiku" || c.PrecleanEffort != "low" ||
-		c.AnalyseModel != "haiku" || c.AnalyseEffort != "medium" {
+		c.AnalyseModel != "haiku" || c.AnalyseEffort != "medium" || c.MaxCallUSD != 0.25 {
 		t.Errorf("defaults: %+v", c)
 	}
 	// Every field has a toml key.
 	b, _ := json.Marshal(c)
 	var m map[string]any
 	json.Unmarshal(b, &m)
-	if len(m) != 18 {
+	if len(m) != 19 {
 		t.Errorf("%d fields: update this test and the README's [learn] keys", len(m))
 	}
 }
@@ -326,6 +326,8 @@ func TestConfigValidate(t *testing.T) {
 		{func(c *Config) { c.AnalyseModel = "--dangerously" }, "learn.analyse_model"},
 		{func(c *Config) { c.AnalyseModel = "sonnet; rm" }, "learn.analyse_model"},
 		{func(c *Config) { c.PrecleanEffort = "huge" }, "learn.preclean_effort"},
+		{func(c *Config) { c.MaxCallUSD = 0 }, "learn.max_call_usd"},
+		{func(c *Config) { c.MaxCallUSD = 1000 }, "learn.max_call_usd"},
 	} {
 		cfg := Defaults()
 		c.set(&cfg)

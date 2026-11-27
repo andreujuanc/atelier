@@ -71,9 +71,46 @@ container (below), a few at a time (about 3). Output: **occurrences**, not concl
 atl checks that every `quote` appears in that task's extract and drops any occurrence
 whose quote does not.
 
-Cache: `learn_digests(task_id, input_hash, occurrences, created_at)`. `input_hash` covers
-the extract (transcript turns and the notes text; notes are edited in place, so a hash,
-not an offset). Pre-clean runs again only for tasks whose input changed.
+As built (`internal/learn/preclean.go`, `internal/app/preclean.go`):
+
+- The call: `claude -p --model <preclean_model> --effort <preclean_effort>
+  --max-budget-usd <max_call_usd> --tools "" --setting-sources "" --strict-mcp-config
+  --disable-slash-commands --safe-mode --no-session-persistence --output-format json
+  --json-schema <schema> --system-prompt <prompt>`. `--tools ""` leaves no tools at all;
+  `--setting-sources ""` loads no settings file (no `env` block, hooks or permissions:
+  `--safe-mode` alone keeps a settings `env` block, which could send the call elsewhere);
+  `--safe-mode` drops CLAUDE.md, plugins and skills; the prompt (`precleanPromptV2`)
+  replaces Claude Code's system prompt and leaves out repo and project conventions
+  (package manager, build and lint commands, layout): only how agents work with you.
+- The input, on stdin, is the extract's `task`, `prompts` and `notes` as JSON, each prompt
+  and notes line with an `index`, which occurrences cite. The answer is the result's
+  `structured_output` (else the JSON object in its text, prose around it skipped).
+  `total_cost_usd` is shown per task and in total.
+- The model answers, per occurrence, `source` (`{type: prompt|note, index}`), `quote`,
+  `text`, `strength`, `polarity`. atl fills `at` and `session` from the cited item; the
+  task is the digest's. The quote is kept with its whitespace runs made one space.
+- atl drops an occurrence (counted by reason) when: its source is not `prompt`/`note` or
+  its index is out of range; it cites a notes line not written by `user`; it cites a
+  prompt that is only `[pasted]`; its strength or polarity is unknown; its text is empty,
+  over 200 bytes, or has a newline or another control or format character; its quote
+  (whitespace runs made one space) is empty or only `[pasted]`, has a control or format
+  character, is under 12 bytes or 3 words or over 300 bytes, or is not a substring of the
+  cited prompt's `text` (never `reply_before`) or of the cited notes line's body (not its
+  `- <date> [<author>]` start), made the same way.
+- The check only proves the quote is the user's words, not that it means `text`: Analyse
+  and Review show and weigh the quote, not just `text`.
+- A task with nothing to read (no prompt beyond `[pasted]`, no notes line of yours) is
+  not sent. Each call has 5 minutes; up to `parallelism` run at once. A call that fails
+  (error result, exit status, timeout, budget, unreadable answer) is reported and not
+  cached.
+
+Cache: `learn_digests`, one row per task: the extract's `input_hash`, a `cache_key`
+(sha256 of the pre-clean version, prompt, schema, `input_hash`, model and effort), the
+kept occurrences as JSON, and the cost. `input_hash` covers the extract (transcript turns
+and the notes text; notes are edited in place, so a hash, not an offset). Pre-clean runs
+again only for tasks whose key changed. A task's row goes when its call fails or it has
+nothing to read any more; Analyse reads only rows whose key is current
+(`App.LearnDigests`).
 
 Notes lines not written by you (see [Prerequisite](#prerequisite-who-wrote-each-notes-line))
 are context about what the task was doing, never your preferences: the prompt says so,
@@ -147,10 +184,30 @@ Optional, later: firmer wording for high scores ("Never …") than for low ones
 ## The learner container
 
 Like the assistant's: one per workspace, from the workspace's task image, never pulled,
-logged in with the workspace token. It sees only its own dir, where atl writes the
-extracts and reads the results. It does not see task dirs, worktrees, repos or
-`[sandbox] mounts`. Its gate refuses every Docker request and every `atl` command. It
-runs `claude -p` and exits; there is no tmux window.
+logged in with the workspace token. It does not see task dirs, worktrees, repos or
+`[sandbox] mounts`. It runs `claude -p` and exits; there is no tmux window.
+
+As built:
+
+- Container `atl-_learner-<hash>`, labelled like atl's others, made for one `atl learn`
+  run (only when a task needs a call) and removed when the run ends, also on failure or
+  interrupt (an interrupted run looks for it once more, in case a `docker run` it ended
+  made it after all); one an earlier run left behind is removed first. Runs in a
+  workspace are serialised by `<workspace>/state/learn.lock`.
+- It mounts one thing: its own Claude config dir, `<workspace>/run/claude/learner/`
+  (`$CLAUDE_CONFIG_DIR`). Nothing of your Claude setup is copied there (no settings,
+  CLAUDE.md, skills, agents, commands; what is there of them is removed): atl writes only
+  the state file's onboarding and trust keys. No run dir, so no gate, no `atl` and no
+  Docker socket in it; its working dir `/tmp/atl-learner` is an empty dir in the
+  container. The extract goes in on the stdin of `docker exec -i`, the answer comes back
+  on stdout; the token is passed by name (`docker exec -e CLAUDE_CODE_OAUTH_TOKEN`), on
+  no command line.
+- In the container `claude` runs under `timeout -k 10 <5 min − 10 s>` when the image has
+  `timeout`, so a call atl gives up on stops spending; without it, it runs on until the
+  container goes at the end of the run. Each call may spend at most `max_call_usd`.
+- With `ATL_SANDBOX=off`, as the assistant: the host's `claude` with your Claude config
+  dir (its settings files are not loaded: `--setting-sources ""`), in a new empty
+  temporary dir.
 
 ## Safety
 
@@ -205,7 +262,7 @@ Migration adds (timestamps as INTEGER unix ms, as elsewhere):
 learnings(id, text, status, created_at, updated_at, decided_at)
     status: proposed | accepted | rejected
 learning_occurrences(id, learning_id, task_id, session_id, at, strength, polarity, quote)
-learn_digests(task_id, input_hash, occurrences_json, created_at)
+learn_digests(task_id, input_hash, cache_key, occurrences_json, created_at, cost_usd)  -- phase 2 (v9)
 notes_line_authors(task_id, line_hash, copy, author, at)   -- phase 0
 session_transcripts(session_id, path, first_seen)          -- phase 1
 ```
@@ -216,7 +273,7 @@ Every TUI action also exists in the CLI.
 
 | CLI | |
 |---|---|
-| `atl learn [--dry-run]` | run the pipeline; `--dry-run` prints the extracts only |
+| `atl learn [--task T] [--dry-run [--json]]` | run the pipeline (so far: pre-clean, one row per task: cached, ran with occurrences kept, dropped by reason and cost, failed with why, or empty; exit 1 if one failed); `--dry-run` prints the extracts only |
 | `atl learnings [ls]` | list with score, status, tasks |
 | `atl learnings show <id>` | occurrences and quotes |
 | `atl learnings accept\|reject <id>` | decide |
@@ -247,5 +304,7 @@ reject. The assistant may run `atl learnings ls` and `show` (allowed, read-only)
 | accepted → "possibly outdated" | score of contradictions ≥ 2 (decayed), or net score < 0 |
 | injection budget | 800 bytes |
 | pre-clean parallelism | 3 |
+| pre-clean timeout | 5 minutes per call (not configurable) |
+| spend per model call | at most $0.25 (`max_call_usd`) |
 
 All in one Go struct with these defaults, overridable from `[learn]` in `atelier.toml`.

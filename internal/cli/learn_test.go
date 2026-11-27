@@ -83,8 +83,8 @@ func TestLearnDryRun(t *testing.T) {
 	}
 	st.Close()
 
-	if code, _, errs := atl(t, "learn"); code != 2 || !strings.Contains(errs, "only --dry-run is implemented yet") {
-		t.Errorf("learn: %d %s", code, errs)
+	if code, _, errs := atl(t, "learn", "--json"); code != 2 || !strings.Contains(errs, "--json goes with --dry-run") {
+		t.Errorf("learn --json: %d %s", code, errs)
 	}
 	if code, _, _ := atl(t, "learn", "--dry-run", "extra"); code != 2 {
 		t.Errorf("learn with an argument: %d", code)
@@ -161,5 +161,83 @@ func TestLearnDryRun(t *testing.T) {
 	}
 	if code, _, errs := atl(t, "learn", "--dry-run"); code != 1 || !strings.Contains(errs, "unknown keys: learn.reply_snippets") {
 		t.Errorf("unknown [learn] key: %d %s", code, errs)
+	}
+}
+
+// TestLearnRun: atl learn without --dry-run runs the pre-clean of each
+// task (here with a stub claude, ATL_SANDBOX=off), one row each, then
+// says analyse is not there yet; a task that failed makes it exit 1.
+func TestLearnRun(t *testing.T) {
+	root := setup(t)
+	for _, title := range []string{"Fix", "Docs"} {
+		if code, _, errs := atl(t, "new", title, "--repo", "api", "--no-fetch"); code != 0 {
+			t.Fatalf("new %s: %d %s", title, code, errs)
+		}
+	}
+	if code, _, errs := atl(t, "note", "fix", "write no prose"); code != 0 {
+		t.Fatalf("note: %d %s", code, errs)
+	}
+	bin := filepath.Join(root, "stubbin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	answer := filepath.Join(root, "answer.json")
+	calls := filepath.Join(root, "calls")
+	stub := "#!/bin/sh\ncat > /dev/null\necho call >> " + calls + "\ncat " + answer + "\ngrep -q is_error..true " + answer + " && exit 1\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	good := `{"type":"result","is_error":false,"total_cost_usd":0.002,"structured_output":{"occurrences":[` +
+		`{"source":{"type":"note","index":0},"quote":"write no prose","text":"No prose","strength":"strong","polarity":"reinforce"},` +
+		`{"source":{"type":"note","index":0},"quote":"never add any emojis","text":"No emojis","strength":"mild","polarity":"reinforce"}]}}`
+	if err := os.WriteFile(answer, []byte(good), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	row := func(out, slug string) string {
+		for _, l := range strings.Split(out, "\n") {
+			if f := strings.Fields(l); len(f) > 0 && f[0] == slug {
+				return strings.Join(f, " ")
+			}
+		}
+		return ""
+	}
+
+	code, out, errs := atl(t, "learn")
+	if code != 0 {
+		t.Fatalf("learn: %d %s", code, errs)
+	}
+	if r := row(out, "fix"); r != "fix ran 1 $0.0020 dropped 1 quote not found" {
+		t.Errorf("fix: %q\n%s", r, out)
+	}
+	if r := row(out, "docs"); r != "docs empty 0 -" {
+		t.Errorf("docs: %q", r)
+	}
+	if r := row(out, "total"); r != "total (2 tasks) 1 ran, 1 empty 1 $0.0020" || !strings.HasSuffix(out, "analyse: not implemented yet\n") {
+		t.Errorf("output:\n%s", out)
+	}
+	if !strings.Contains(errs, "pre-clean of 1 task(s) with haiku (effort low)") {
+		t.Errorf("stderr: %q", errs)
+	}
+
+	code, out, _ = atl(t, "learn", "--task", "fix")
+	if r := row(out, "fix"); code != 0 || r != "fix cached 1 -" {
+		t.Errorf("again: %d %q", code, r)
+	}
+	if b, _ := os.ReadFile(calls); strings.Count(string(b), "call") != 1 {
+		t.Errorf("calls: %q", b)
+	}
+
+	// A failed call: the task says why, atl learn exits 1, nothing analysed.
+	if code, _, errs := atl(t, "note", "fix", "no emojis"); code != 0 {
+		t.Fatalf("note: %d %s", code, errs)
+	}
+	if err := os.WriteFile(answer, []byte(`{"type":"result","is_error":true,"total_cost_usd":0,"result":"Not logged in"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errs = atl(t, "learn")
+	if code != 1 || row(out, "fix") != "fix failed - $0.0000 claude: Not logged in" ||
+		!strings.Contains(errs, "the pre-clean of 1 task(s) failed") || strings.Contains(out, "analyse") {
+		t.Errorf("failed: %d\n%s\n%s", code, out, errs)
 	}
 }

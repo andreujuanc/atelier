@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -240,6 +241,21 @@ func ExecArgv(container, workdir string, envKeys, argv []string) []string {
 		}
 	}
 	out = append(out, container, "sh", "-c", `PATH=`+filepath.Dir(InBin)+`:$PATH WAYLAND_DISPLAY=`+CopyDisplay+` exec "$@"`, "atl-exec")
+	return append(out, argv...)
+}
+
+// PipeExecArgv is the command that runs argv in container (its full ID)
+// with no terminal: stdin is passed on (docker exec -i), stdout and stderr
+// come back. The variables named in envKeys are passed on from the
+// command's environment, by name, so their values are on no command line.
+func PipeExecArgv(container string, envKeys, argv []string) []string {
+	out := []string{"docker", "exec", "-i"}
+	keys := slices.Clone(envKeys)
+	sort.Strings(keys)
+	for _, k := range slices.Compact(keys) {
+		out = append(out, "-e", k)
+	}
+	out = append(out, container)
 	return append(out, argv...)
 }
 

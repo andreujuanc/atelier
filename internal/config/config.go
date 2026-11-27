@@ -216,6 +216,11 @@ func (p Paths) AssistantRunDir() string { return filepath.Join(p.runRoot(), "ass
 // Claude dirs, which are named by 12 hex digits.
 func (p Paths) AssistantClaudeDir() string { return filepath.Join(p.runRoot(), "claude", "assistant") }
 
+// LearnerClaudeDir returns the Claude Code config dir of `atl learn`'s
+// container (its $CLAUDE_CONFIG_DIR, the one thing it mounts):
+// "claude/learner" next to the task and assistant Claude dirs.
+func (p Paths) LearnerClaudeDir() string { return filepath.Join(p.runRoot(), "claude", "learner") }
+
 // ClaudeConfigDir returns Claude Code's config dir: $CLAUDE_CONFIG_DIR,
 // else ~/.claude ("" if neither is known).
 func ClaudeConfigDir() string {

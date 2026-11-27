@@ -40,8 +40,10 @@ type Config struct {
 
 	PrecleanModel  string `toml:"preclean_model"`
 	PrecleanEffort string `toml:"preclean_effort"`
-	AnalyseModel   string `toml:"analyse_model"`
-	AnalyseEffort  string `toml:"analyse_effort"`
+	// MaxCallUSD caps what one model call may spend (claude --max-budget-usd).
+	MaxCallUSD    float64 `toml:"max_call_usd"`
+	AnalyseModel  string  `toml:"analyse_model"`
+	AnalyseEffort string  `toml:"analyse_effort"`
 }
 
 // Defaults returns the defaults of docs/learning.md ("Defaults (to tune)").
@@ -68,6 +70,7 @@ func Defaults() Config {
 
 		PrecleanModel:  "haiku",
 		PrecleanEffort: "low",
+		MaxCallUSD:     0.25,
 		AnalyseModel:   "haiku",
 		AnalyseEffort:  "medium",
 	}
@@ -116,6 +119,7 @@ func (c Config) Validate() error {
 		{"weight_mild", c.WeightMild, 100},
 		{"propose_score", c.ProposeScore, 1000},
 		{"outdated_score", c.OutdatedScore, 1000},
+		{"max_call_usd", c.MaxCallUSD, 100},
 	}
 	for _, f := range floats {
 		if !(f.v > 0 && f.v <= f.max) { // NaN too
