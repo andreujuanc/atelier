@@ -142,7 +142,7 @@ func (m *Model) addDone(msg addDoneMsg) tea.Cmd {
 	text := addSummary(msg.slug, added, failed, restarted)
 	switch {
 	case msg.err != nil && text != "":
-		m.setStatusErr(firstLine(text+"; "+msg.err.Error()), true)
+		m.setStatusErr(strings.TrimSpace(text+"; "+msg.err.Error()), true)
 	case msg.err != nil:
 		m.setErr(fmt.Errorf("add: %w", msg.err))
 	case len(failed) > 0:

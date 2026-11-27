@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/andreujuanc/atelier/internal/nofollow"
 )
 
 // TestMain isolates git from the user's global/system config and supplies an
@@ -747,6 +750,124 @@ func TestRemoveWorktree(t *testing.T) {
 			t.Fatal("deleted worktree still listed after prune")
 		}
 	})
+
+	// A directory in it that this user may not empty (made by root in a
+	// container) fails the removal before anything is removed, even with
+	// force: the worktree stays whole, not half deleted without its .git.
+	t.Run("not emptiable", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root may empty any directory")
+		}
+		wt, _ := f.addWorktree(t, ctx, "rootfiles")
+		mods := filepath.Join(wt, "node_modules", "pkg")
+		must(t, os.MkdirAll(mods, 0o755))
+		writeFile(t, filepath.Join(mods, "index.js"), "x\n")
+		must(t, os.Chmod(mods, 0o555))
+		t.Cleanup(func() { os.Chmod(mods, 0o755) })
+		err := RemoveWorktree(ctx, f.repo, wt, true)
+		if !errors.Is(err, nofollow.ErrNotEmptiable) || !errors.Is(err, fs.ErrPermission) || !strings.Contains(err.Error(), mods) {
+			t.Fatalf("remove: %v, want ErrNotEmptiable naming %s", err, mods)
+		}
+		if err := CheckWorktree(ctx, wt, f.repo); err != nil {
+			t.Fatalf("worktree after the failed removal: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(wt, "README.md")); err != nil {
+			t.Fatalf("a tracked file went: %v", err)
+		}
+		must(t, os.Chmod(mods, 0o755))
+		if err := RemoveWorktree(ctx, f.repo, wt, true); err != nil {
+			t.Fatal(err)
+		}
+		if exists(wt) || listed(wt) {
+			t.Fatal("worktree left after the retry")
+		}
+	})
+
+	// A directory with no .git (a removal stopped part way by an older
+	// atl, a .git deleted by hand) loses its registration; what is in it
+	// is kept unless all.
+	t.Run("leftover", func(t *testing.T) {
+		wt, _ := f.addWorktree(t, ctx, "leftover")
+		must(t, os.Remove(filepath.Join(wt, ".git")))
+		writeFile(t, filepath.Join(wt, "mine.txt"), "x\n")
+		if err := CheckWorktree(ctx, wt, f.repo); !errors.Is(err, ErrNoGitLink) {
+			t.Fatalf("check: %v, want ErrNoGitLink", err)
+		}
+		if err := RemoveLeftover(f.repo, wt, false); err != nil {
+			t.Fatal(err)
+		}
+		if listed(wt) {
+			t.Fatal("leftover still registered")
+		}
+		if !exists(filepath.Join(wt, "mine.txt")) {
+			t.Fatal("what is in the leftover went without all")
+		}
+		// The branch is free again.
+		git(t, f.repo, "branch", "-D", "atl/leftover")
+		if err := RemoveLeftover(f.repo, wt, true); err != nil {
+			t.Fatal(err)
+		}
+		if exists(wt) {
+			t.Fatal("leftover dir kept with all")
+		}
+	})
+
+	// The HEAD still registered for a leftover is what pruning it loses:
+	// on a branch nothing, detached the commits only it reaches, and one
+	// that cannot be told is an error.
+	t.Run("leftover HEAD", func(t *testing.T) {
+		wt, _ := f.addWorktree(t, ctx, "lhead")
+		count := func() (int, error) {
+			t.Helper()
+			n, _, err := LeftoverOrphanCommits(ctx, f.repo, wt)
+			return n, err
+		}
+		if n, err := count(); n != 0 || err != nil {
+			t.Fatalf("on its branch: %d, %v", n, err)
+		}
+		git(t, wt, "checkout", "-q", "--detach")
+		commitFile(t, wt, "a.txt", "a\n", "a")
+		commitFile(t, wt, "b.txt", "b\n", "b")
+		head := strings.TrimSpace(git(t, wt, "rev-parse", "HEAD"))
+		must(t, os.Remove(filepath.Join(wt, ".git")))
+		n, heads, err := LeftoverOrphanCommits(ctx, f.repo, wt)
+		if n != 2 || err != nil || len(heads) != 1 || heads[0] != head {
+			t.Fatalf("detached: %d %v, %v; want 2 [%s]", n, heads, err, head)
+		}
+		git(t, f.repo, "branch", "rescued", head)
+		if n, err := count(); n != 0 || err != nil {
+			t.Fatalf("detached, then on a branch: %d, %v", n, err)
+		}
+		var id string
+		for _, e := range mustReadDir(t, filepath.Join(f.repo, ".git", "worktrees")) {
+			if strings.Contains(e, "lhead") {
+				id = e
+			}
+		}
+		headFile := filepath.Join(f.repo, ".git", "worktrees", id, "HEAD")
+		for _, bad := range []string{"junk\n", strings.Repeat("0", 40) + "\n"} {
+			writeFile(t, headFile, bad)
+			if _, err := count(); err == nil {
+				t.Errorf("HEAD %q: no error", bad)
+			}
+		}
+	})
+}
+
+func mustReadDir(t *testing.T, dir string) []string {
+	t.Helper()
+	es, err := os.ReadDir(dir)
+	must(t, err)
+	var names []string
+	for _, e := range es {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+func exists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
 }
 
 func TestCurrentBranchAndHead(t *testing.T) {

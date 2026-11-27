@@ -746,3 +746,34 @@ func TestNotesTooManyLines(t *testing.T) {
 		t.Fatal("still loading after the reload answered")
 	}
 }
+
+// An error too long for the status line is shown whole, wrapped over a few
+// rows (the body gives them up), not cut at the width or at its first
+// newline; one that needs more rows than that is cut on the last.
+func TestStatusErrorWraps(t *testing.T) {
+	m, _ := newTest(t, &fakeBackend{tasks: sampleTasks()})
+	tail := "fatal: not a git repository (or any of the parent directories): .git"
+	m.setErr(fmt.Errorf("done: task deposits-indexer-ood: repo mobile-app-backend: "+
+		"/home/u/atelier/workspaces/ed/tasks/deposits-indexer-ood/mobile-app-backend is not a worktree of "+
+		"/home/u/Repos/ed/mobile-app-backend: git rev-parse failed:\n%s", tail))
+	v := checkView(t, m, 120, 40)
+	if flat := strings.Join(strings.Fields(v), " "); !strings.Contains(flat, tail) {
+		t.Fatalf("the error's end is not shown:\n%s", v)
+	}
+
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 16}) // 4 rows at most
+	m.setErr(errors.New(strings.Repeat("word ", 100) + "END"))
+	v = checkView(t, m, 40, 16)
+	if strings.Contains(v, "END") || !strings.Contains(v, "…") {
+		t.Fatalf("an error longer than its rows is not cut:\n%s", v)
+	}
+	if n := strings.Count(v, "word"); n < 20 {
+		t.Fatalf("only %d words of the error shown:\n%s", n, v)
+	}
+
+	m.setErr(errors.New("short"))
+	v = checkView(t, m, 40, 16)
+	if strings.Count(v, "✗") != 1 {
+		t.Fatalf("a short error:\n%s", v)
+	}
+}

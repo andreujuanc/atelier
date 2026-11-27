@@ -309,6 +309,10 @@ var gitxCalls = []struct {
 		return intErr(UniqueCommitsAt(ctx, p.repo, "atl/task", tip))
 	}},
 	{"OrphanCommits", func(ctx context.Context, p *poisoned) error { return intErr(OrphanCommits(ctx, p.wt)) }},
+	{"LeftoverOrphanCommits", func(ctx context.Context, p *poisoned) error {
+		_, _, err := LeftoverOrphanCommits(ctx, p.repo, p.wt)
+		return err
+	}},
 	{"CommitsAhead", func(ctx context.Context, p *poisoned) error { return intErr(CommitsAhead(ctx, p.wt, "origin/main")) }},
 	{"LastCommit", func(ctx context.Context, p *poisoned) error {
 		_, _, _, err := LastCommit(ctx, p.wt)
@@ -394,7 +398,7 @@ func errString(err error) string {
 }
 
 // noGit are exported functions that do not run git.
-var noGit = []string{"GuardedEnv"}
+var noGit = []string{"GuardedEnv", "RemoveLeftover"}
 
 // TestPoisonedRepoCoversEveryFunction: every exported function of the
 // package is either run against the poisoned repo or known not to run git.

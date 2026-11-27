@@ -314,13 +314,19 @@ func IsRepo(path string) bool {
 	return err == nil && top != "" && samePath(top, path)
 }
 
+// ErrNoGitLink is the error of CheckWorktree for a directory with no .git
+// in it: a worktree whose removal stopped part way (its .git goes last, see
+// RemoveWorktree, but it can be deleted by hand), or never one at all.
+var ErrNoGitLink = errors.New("it has no .git")
+
 // CheckWorktree returns nil if path is a worktree of the canonical clone
 // repo: a directory (not a symlink to one) that is the top of a work tree
 // whose common git dir is repo's .git. A sandboxed task can replace its
 // worktree with a symlink, or point the worktree's .git file at another
 // repo's git dir, to make git that atl runs there (with the user's
 // credentials, for a push or fetch) act on another repo. A missing path is
-// an error that satisfies errors.Is(err, fs.ErrNotExist).
+// an error that satisfies errors.Is(err, fs.ErrNotExist); a directory with
+// no .git in it, one that satisfies errors.Is(err, ErrNoGitLink).
 func CheckWorktree(ctx context.Context, path, repo string) error {
 	fi, err := os.Lstat(path)
 	if err != nil {
@@ -332,6 +338,10 @@ func CheckWorktree(ctx context.Context, path, repo string) error {
 			what = "a symlink"
 		}
 		return fmt.Errorf("%s is %s, not a worktree of %s", path, what, repo)
+	}
+	// Without a .git, git would look for a repo in the directories above.
+	if _, err := os.Lstat(filepath.Join(path, ".git")); errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%s is not a worktree of %s: %w", path, repo, ErrNoGitLink)
 	}
 	common, top, err := commonDirAndTop(ctx, path)
 	if err != nil {
@@ -831,8 +841,8 @@ func linkWorktree(gitDir *nofollow.Dir, path, id string) error {
 // every task with the repo rw can write its git dir (worktrees/ too). Such
 // a task swaps a directory there for a symlink once the deletion starts,
 // and git deletes on the host what the symlink points to. So the two
-// directories are removed here through file descriptors (os.RemoveAll,
-// package nofollow), which follow no symlink, and only this worktree's
+// directories are removed here through file descriptors (package
+// nofollow), which follow no symlink, and only this worktree's
 // registrations go: a stale one a task planted is left alone.
 func RemoveWorktree(ctx context.Context, repo, path string, force bool) error {
 	path, err := filepath.Abs(path)
@@ -863,10 +873,113 @@ func RemoveWorktree(ctx context.Context, repo, path string, force bool) error {
 				return err
 			}
 		}
-		if err := os.RemoveAll(path); err != nil {
+		if err := removeDir(path); err != nil {
 			return fmt.Errorf("remove worktree %s: %w", path, err)
 		}
 	}
+	return unregister(gitDir, path, ids)
+}
+
+// RemoveLeftover removes what is left at path of a worktree of repo whose
+// .git is gone (ErrNoGitLink): repo's registrations of a worktree at path,
+// as `git worktree prune` would, and, with all, the directory and what is
+// in it. Nothing in it is run, and no symlink is followed.
+func RemoveLeftover(repo, path string, all bool) error {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("remove worktree: %w", err)
+	}
+	gitDir, err := nofollow.Open(filepath.Join(repo, ".git"))
+	if err != nil {
+		return fmt.Errorf("remove worktree %s: %w", path, err)
+	}
+	defer gitDir.Close()
+	ids, err := worktreeIDs(gitDir, path)
+	if err != nil {
+		return fmt.Errorf("remove worktree %s: %w", path, err)
+	}
+	if err := unregister(gitDir, path, ids); err != nil {
+		return err
+	}
+	if all {
+		if err := removeDir(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("remove %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+// LeftoverOrphanCommits is OrphanCommits for what is left at path of a
+// worktree of repo whose .git is gone (ErrNoGitLink): the registrations of
+// it in repo still hold its HEAD, which RemoveLeftover deletes. Each HEAD
+// is read as data; one on a branch loses nothing (the branch stays), a
+// detached one (a commit, as during a rebase) is counted in repo, as
+// OrphanCommits counts. git runs in repo only, never with a registration
+// as its git dir. A HEAD that is neither is an error, as is a commit that
+// repo does not have: what is in it cannot be told. It returns the count
+// and the detached HEADs.
+func LeftoverOrphanCommits(ctx context.Context, repo, path string) (n int, detached []string, err error) {
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return 0, nil, err
+	}
+	gitDir, err := nofollow.Open(filepath.Join(repo, ".git"))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer gitDir.Close()
+	ids, err := worktreeIDs(gitDir, path)
+	if err != nil {
+		return 0, nil, err
+	}
+	for _, id := range ids {
+		data, err := gitDir.ReadFile("worktrees/"+id+"/HEAD", 4<<10)
+		if err != nil {
+			return 0, nil, fmt.Errorf("HEAD of worktree %s: %w", path, err)
+		}
+		head := strings.TrimSpace(string(data))
+		switch {
+		case strings.HasPrefix(head, "ref: refs/"):
+		case isObjectID(head):
+			detached = append(detached, head)
+		default:
+			return 0, nil, fmt.Errorf("HEAD of worktree %s: unexpected %q", path, head)
+		}
+	}
+	if len(detached) == 0 {
+		return 0, nil, nil
+	}
+	// Each must be a commit of repo's: rev-list would count a missing one
+	// as nothing to lose only with --ignore-missing, which is not passed.
+	args := append([]string{"rev-list", "--count"}, detached...)
+	out, err := run(ctx, repo, append(args, "--not", "--branches", "--remotes", "--tags")...)
+	if err != nil {
+		return 0, nil, err
+	}
+	n, err = strconv.Atoi(out)
+	if err != nil {
+		return 0, nil, fmt.Errorf("git rev-list: unexpected output %q", out)
+	}
+	return n, detached, nil
+}
+
+// isObjectID reports whether s is a full object name (SHA-1 or SHA-256),
+// lowercase hex.
+func isObjectID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// unregister removes the entries ids of gitDir's worktrees/: the
+// registrations of the worktree at path.
+func unregister(gitDir *nofollow.Dir, path string, ids []string) error {
 	for _, id := range ids {
 		if err := gitDir.RemoveAll("worktrees/" + id); err != nil {
 			return fmt.Errorf("remove worktree %s: %w", path, err)
@@ -874,6 +987,40 @@ func RemoveWorktree(ctx context.Context, repo, path string, force bool) error {
 	}
 	gitDir.Remove("worktrees") // only once empty, as git does
 	return nil
+}
+
+// removeDir removes the directory path and what is in it, following no
+// symlink. A directory in it this user may not empty (one made by root in
+// a container, say) is an error before anything is removed
+// (nofollow.ErrNotEmptiable); and its .git goes last, so that should
+// something else not go, it is still a worktree, which git can tell the
+// state of and a retry can remove.
+func removeDir(path string) error {
+	d, err := nofollow.Open(path)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.CheckEmptiable(); err != nil {
+		return err
+	}
+	names, err := d.ReadDirNames(".")
+	for _, n := range names {
+		if n == ".git" {
+			continue
+		}
+		if rerr := d.RemoveAll(n); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if err := d.RemoveAll(".git"); err != nil {
+		return err
+	}
+	// By name: a symlink put there meanwhile is removed, not followed.
+	return os.Remove(path)
 }
 
 // worktreeIDs returns the names of the entries of gitDir's worktrees/ that

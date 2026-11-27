@@ -17,6 +17,7 @@ import (
 	"github.com/andreujuanc/atelier/internal/gen"
 	"github.com/andreujuanc/atelier/internal/gitx"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/nofollow"
 	"github.com/andreujuanc/atelier/internal/project"
 	"github.com/andreujuanc/atelier/internal/store"
 	"github.com/andreujuanc/atelier/internal/tmux"
@@ -516,7 +517,9 @@ func (a *App) runTeardown(ctx context.Context, t *model.Task, force bool) error 
 		if r.Mode != model.ModeRW {
 			continue
 		}
-		if _, err := os.Lstat(a.Paths.WorktreePath(t.Slug, r.Name)); errors.Is(err, os.ErrNotExist) {
+		// Nothing to tear down in a worktree that is gone, or whose
+		// removal stopped part way (closeWorktree.leftover).
+		if _, err := a.checkWorktree(ctx, t, r); errors.Is(err, os.ErrNotExist) || errors.Is(err, gitx.ErrNoGitLink) {
 			continue
 		}
 		c, err := container()
@@ -1018,13 +1021,19 @@ func (a *App) finishTask(ctx context.Context, t *model.Task, force bool, to mode
 type closeWorktree struct {
 	name, repo, path string
 	missing          bool // its dir was deleted by hand: only pruned
+	// Its dir has no .git (gitx.ErrNoGitLink): a removal that stopped part
+	// way, or a .git deleted by hand. git can tell nothing of what is in
+	// it, so once the HEAD registered for it is checked for commits on no
+	// branch, it is pruned, and its dir deleted only with force.
+	leftover bool
 }
 
 // closeWorktrees returns the rw worktrees closing task t removes, after
 // the checks that must pass before anything of the task is torn down: no
 // commits that only HEAD reaches (even with force) and, unless force, no
 // uncommitted changes. A repo whose path is no longer a worktree of its
-// clone is an error, or with force a warning and left out.
+// clone is an error, or with force a warning and left out; a directory
+// with no .git, a leftover (see closeWorktree).
 func (a *App) closeWorktrees(ctx context.Context, t *model.Task, force bool) ([]closeWorktree, error) {
 	var wts []closeWorktree
 	for _, r := range t.Repos {
@@ -1036,6 +1045,10 @@ func (a *App) closeWorktrees(ctx context.Context, t *model.Task, force bool) ([]
 		// whatever it names.
 		p, cerr := a.checkWorktree(ctx, t, r)
 		missing := errors.Is(cerr, os.ErrNotExist)
+		if errors.Is(cerr, gitx.ErrNoGitLink) {
+			wts = append(wts, closeWorktree{name: r.Name, repo: a.Paths.RepoPath(r.Name), path: p, leftover: true})
+			continue
+		}
 		if cerr != nil && !missing {
 			if !force {
 				return nil, fmt.Errorf("task %s: repo %s: %w (use --force to close the task and leave it alone)", t.Slug, r.Name, cerr)
@@ -1043,12 +1056,34 @@ func (a *App) closeWorktrees(ctx context.Context, t *model.Task, force bool) ([]
 			a.warnf("repo %s: %v; left alone", r.Name, cerr)
 			continue
 		}
-		wts = append(wts, closeWorktree{r.Name, a.Paths.RepoPath(r.Name), p, missing})
+		wts = append(wts, closeWorktree{name: r.Name, repo: a.Paths.RepoPath(r.Name), path: p, missing: missing})
 	}
 	// Commits only HEAD reaches (detached HEAD, stopped rebase) would be
 	// lost with the worktree; --force never discards commits.
 	var orphans []string
+	checked := wts[:0:0]
 	for _, w := range wts {
+		if w.leftover {
+			// Its HEAD is still registered in the clone, and goes with the
+			// registration: what it alone reaches is checked there.
+			n, heads, err := gitx.LeftoverOrphanCommits(ctx, w.repo, w.path)
+			if err != nil {
+				if !force {
+					return nil, fmt.Errorf("task %s: repo %s: %s has no .git and its HEAD cannot be checked for commits "+
+						"on no branch: %w (use --force to close the task and leave it alone)", t.Slug, w.name, w.path, err)
+				}
+				a.warnf("repo %s: %s has no .git and its HEAD cannot be checked: %v; left alone", w.name, w.path, err)
+				continue
+			}
+			if n > 0 {
+				orphans = append(orphans, fmt.Sprintf("%s: %s has no .git, and the HEAD still registered for it (%s) has "+
+					"%d commit(s) not on any branch (git -C %s branch <name> %s)",
+					w.name, w.path, strings.Join(heads, ", "), n, w.repo, heads[0]))
+			}
+			checked = append(checked, w)
+			continue
+		}
+		checked = append(checked, w)
 		if w.missing {
 			continue
 		}
@@ -1071,7 +1106,7 @@ func (a *App) closeWorktrees(ctx context.Context, t *model.Task, force bool) ([]
 	if !force {
 		var dirty []string
 		for _, w := range wts {
-			if w.missing {
+			if w.missing || w.leftover {
 				continue
 			}
 			d, err := gitx.IsDirty(ctx, w.path)
@@ -1087,7 +1122,7 @@ func (a *App) closeWorktrees(ctx context.Context, t *model.Task, force bool) ([]
 				t.Slug, strings.Join(dirty, ", "))
 		}
 	}
-	return wts, nil
+	return checked, nil
 }
 
 // removeWorktrees removes the worktrees wts of task t, once nothing of the
@@ -1096,6 +1131,19 @@ func (a *App) closeWorktrees(ctx context.Context, t *model.Task, force bool) ([]
 func (a *App) removeWorktrees(ctx context.Context, t *model.Task, wts []closeWorktree, force bool) ([]closeWorktree, error) {
 	var removed []closeWorktree
 	for _, w := range wts {
+		if w.leftover {
+			// Nothing is run there, nor followed (gitx.RemoveLeftover).
+			// Its registrations go, which frees the branch; what is left
+			// in it is kept unless force, as what git cannot vouch for.
+			if err := gitx.RemoveLeftover(w.repo, w.path, force); err != nil {
+				a.warnf("repo %s: %v%s", w.name, err, notOursHint(err))
+			} else if !force {
+				a.warnf("repo %s: %s is not a worktree any more (no .git: a removal that stopped part way?); "+
+					"kept what is in it, delete it yourself", w.name, w.path)
+			}
+			removed = append(removed, w)
+			continue
+		}
 		// Again, now that nothing of the task runs any more: what it left
 		// there last is what git would remove.
 		if err := gitx.CheckWorktree(ctx, w.path, w.repo); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1106,6 +1154,14 @@ func (a *App) removeWorktrees(ctx context.Context, t *model.Task, wts []closeWor
 			continue
 		}
 		if err := gitx.RemoveWorktree(ctx, w.repo, w.path, force); err != nil {
+			if errors.Is(err, nofollow.ErrNotEmptiable) {
+				// Nothing was removed: the worktree is as it was.
+				if !force {
+					return nil, fmt.Errorf("task %s: repo %s: %w%s, then close the task again", t.Slug, w.name, err, notOursHint(err))
+				}
+				a.warnf("repo %s: left its worktree: %v%s", w.name, err, notOursHint(err))
+				continue
+			}
 			if !force {
 				// It was clean before teardown, so teardown left changes.
 				if d, derr := gitx.IsDirty(ctx, w.path); derr == nil && d {
@@ -1120,6 +1176,16 @@ func (a *App) removeWorktrees(ctx context.Context, t *model.Task, wts []closeWor
 		removed = append(removed, w)
 	}
 	return removed, nil
+}
+
+// notOursHint is what to say after err when it is a directory atl may not
+// empty (nofollow.ErrNotEmptiable), else "".
+func notOursHint(err error) string {
+	if !errors.Is(err, nofollow.ErrNotEmptiable) {
+		return ""
+	}
+	return "; likely made in a container run as root: remove it with sudo " +
+		"(and run such containers as your user)"
 }
 
 // removeTaskDir removes task slug's generated files, then its task dir if

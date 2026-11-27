@@ -636,7 +636,9 @@ func (m *Model) clampOffset() {
 
 func (m *Model) setStatus(s string) { m.setStatusErr(s, false) }
 
-func (m *Model) setErr(err error) { m.setStatusErr(firstLine(err.Error()), true) }
+// setErr shows err whole: the status line wraps an error that does not fit
+// on it (statusLines).
+func (m *Model) setErr(err error) { m.setStatusErr(strings.TrimSpace(err.Error()), true) }
 
 func (m *Model) setStatusErr(s string, isErr bool) {
 	m.status, m.statusErr, m.statusFromOut, m.statusOK = s, isErr, false, false
@@ -967,7 +969,7 @@ func (m *Model) opDone(msg opMsg) tea.Cmd {
 	delete(m.busy, msg.id)
 	if msg.err != nil {
 		if msg.text != "" {
-			m.setStatusErr(firstLine(msg.text+"; "+msg.err.Error()), true)
+			m.setStatusErr(strings.TrimSpace(msg.text+"; "+msg.err.Error()), true)
 		} else {
 			m.setErr(fmt.Errorf("%s: %w", msg.op, msg.err))
 		}
