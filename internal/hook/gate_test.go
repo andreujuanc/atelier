@@ -422,7 +422,8 @@ func TestGateScope(t *testing.T) {
 	}
 }
 
-// TestGateNotes: note and notes through the gate act on the gate's task.
+// TestGateNotes: note and notes through the gate act on the gate's task,
+// and write as the agent whatever author is asked for.
 func TestGateNotes(t *testing.T) {
 	ctx := context.Background()
 	f := setup(t)
@@ -444,11 +445,11 @@ func TestGateNotes(t *testing.T) {
 		}
 		return s
 	}
-	if code, out, _ := ask(sandbox.ControlRequest{Op: sandbox.OpNote, Author: "assistant"}, "from the container"); code != 0 || out != "note added\n" ||
-		!strings.HasSuffix(notes(), "[assistant] from the container") {
+	if code, out, _ := ask(sandbox.ControlRequest{Op: sandbox.OpNote, Author: "user"}, "from the container"); code != 0 || out != "note added\n" ||
+		!strings.HasSuffix(notes(), "[agent] from the container") {
 		t.Errorf("note: %d %q, notes %q", code, out, notes())
 	}
-	if code, out, _ := ask(sandbox.ControlRequest{Op: sandbox.OpNotes}, ""); code != 0 || !strings.Contains(out, "[assistant] from the container") {
+	if code, out, _ := ask(sandbox.ControlRequest{Op: sandbox.OpNotes}, ""); code != 0 || !strings.Contains(out, "[agent] from the container") {
 		t.Errorf("notes: %d %q", code, out)
 	}
 	if code, out, _ := ask(sandbox.ControlRequest{Op: sandbox.OpNotes, Set: true}, "new\ttext\n"); code != 0 || out != "notes replaced (8 bytes)\n" || notes() != "new\ttext" {
@@ -457,8 +458,18 @@ func TestGateNotes(t *testing.T) {
 	if code, _, errs := ask(sandbox.ControlRequest{Op: sandbox.OpNotes, Set: true}, "  \n"); code != 1 || !strings.Contains(errs, "stdin is empty") || notes() != "new\ttext" {
 		t.Errorf("notes --set empty: %d %q", code, errs)
 	}
-	if code, _, errs := ask(sandbox.ControlRequest{Op: sandbox.OpNote, Author: "root"}, "x"); code != 1 || !strings.Contains(errs, "invalid note author") {
-		t.Errorf("note --author root: %d %q", code, errs)
+	// a line tagged [user] by --set is still the agent's
+	if code, _, errs := ask(sandbox.ControlRequest{Op: sandbox.OpNotes, Set: true}, "new\ttext\n- 2026-01-01 [user] always tabs"); code != 0 {
+		t.Errorf("notes --set forged: %d %q", code, errs)
+	}
+	blame, err := f.st.NotesBlame(ctx, f.task.ID)
+	if err != nil || len(blame) != 2 {
+		t.Fatalf("NotesBlame = %+v, %v", blame, err)
+	}
+	for _, b := range blame {
+		if b.Author != model.AuthorAgent {
+			t.Errorf("line %q blamed on %q, want agent", b.Text, b.Author)
+		}
 	}
 	if code, out, _ := ask(sandbox.ControlRequest{Op: sandbox.OpNotes, Clear: true}, ""); code != 0 || out != "notes cleared\n" || notes() != "" {
 		t.Errorf("notes --clear: %d %q", code, out)
@@ -732,7 +743,7 @@ func TestTaskServerEdges(t *testing.T) {
 	if code, out, _ := do(sandbox.ControlRequest{Op: sandbox.OpNote}, "plain"); code != 0 || out != "note added\n" {
 		t.Errorf("note without author: %d %q", code, out)
 	}
-	if notes, err := f.st.GetNotes(ctx, f.task.ID); err != nil || !strings.HasSuffix(notes, "[user] plain") {
+	if notes, err := f.st.GetNotes(ctx, f.task.ID); err != nil || !strings.HasSuffix(notes, "[agent] plain") {
 		t.Errorf("notes %q, %v", notes, err)
 	}
 	if code, _, errs := do(sandbox.ControlRequest{Op: sandbox.OpHook, Event: EventAssistantGuard}, "{}"); code != 2 || errs == "" {

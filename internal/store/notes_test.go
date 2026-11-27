@@ -164,7 +164,7 @@ func TestNotes(t *testing.T) {
 
 	// SetNotes: compare-and-set against the text the edit started from.
 	base, _ := s.GetNotes(ctx, a.ID)
-	saved, err := s.SetNotes(ctx, a.ID, "mine\r\n\twith tab\x07\n\n", base)
+	saved, err := s.SetNotes(ctx, a.ID, model.AuthorUser, "mine\r\n\twith tab\x07\n\n", base)
 	if err != nil || saved != "mine\n\twith tab" {
 		t.Fatalf("SetNotes = %q, %v", saved, err)
 	}
@@ -180,7 +180,7 @@ func TestNotes(t *testing.T) {
 	if cur != "mine\n\twith tab\n- "+today+" [assistant] agent" {
 		t.Fatalf("after append: %q", cur)
 	}
-	_, err = s.SetNotes(ctx, a.ID, "stale edit", saved)
+	_, err = s.SetNotes(ctx, a.ID, model.AuthorUser, "stale edit", saved)
 	var ce *model.NotesConflictError
 	if !errors.Is(err, model.ErrNotesConflict) || !errors.As(err, &ce) || ce.Current != cur {
 		t.Fatalf("stale SetNotes = %v", err)
@@ -189,14 +189,14 @@ func TestNotes(t *testing.T) {
 		t.Fatalf("conflict changed the notes: %q", text)
 	}
 	// overwrite: compare against the reported text
-	if saved, err := s.SetNotes(ctx, a.ID, "stale edit", ce.Current); err != nil || saved != "stale edit" {
+	if saved, err := s.SetNotes(ctx, a.ID, model.AuthorUser, "stale edit", ce.Current); err != nil || saved != "stale edit" {
 		t.Fatalf("overwrite = %q, %v", saved, err)
 	}
-	if _, err := s.SetNotes(ctx, 999, "x", ""); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SetNotes(ctx, 999, model.AuthorUser, "x", ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("SetNotes(unknown) = %v", err)
 	}
 	// ReplaceNotes ignores the current text; "" clears
-	if saved, err := s.ReplaceNotes(ctx, a.ID, ""); err != nil || saved != "" {
+	if saved, err := s.ReplaceNotes(ctx, a.ID, model.AuthorUser, ""); err != nil || saved != "" {
 		t.Fatalf("ReplaceNotes(\"\") = %q, %v", saved, err)
 	}
 	if text, _ := s.GetNotes(ctx, a.ID); text != "" {
@@ -222,14 +222,14 @@ func TestNotesCap(t *testing.T) {
 	ctx := context.Background()
 	a := mkTask(t, s, "a", model.StatusActive, 0)
 	full := strings.Repeat("x", model.MaxNotesLen)
-	if _, err := s.SetNotes(ctx, a.ID, full+"\n\n  ", ""); err != nil {
+	if _, err := s.SetNotes(ctx, a.ID, model.AuthorUser, full+"\n\n  ", ""); err != nil {
 		t.Fatalf("SetNotes at the cap: %v", err) // trailing blanks don't count
 	}
-	if _, err := s.ReplaceNotes(ctx, a.ID, full+"y"); !errors.Is(err, model.ErrNotesTooLarge) ||
+	if _, err := s.ReplaceNotes(ctx, a.ID, model.AuthorUser, full+"y"); !errors.Is(err, model.ErrNotesTooLarge) ||
 		!strings.Contains(err.Error(), "65537 bytes") || !strings.Contains(err.Error(), "64 KiB") {
 		t.Fatalf("ReplaceNotes over the cap = %v", err)
 	}
-	if _, err := s.SetNotes(ctx, a.ID, full+"y", full); !errors.Is(err, model.ErrNotesTooLarge) {
+	if _, err := s.SetNotes(ctx, a.ID, model.AuthorUser, full+"y", full); !errors.Is(err, model.ErrNotesTooLarge) {
 		t.Fatalf("SetNotes over the cap = %v", err)
 	}
 	if _, err := s.AppendNote(ctx, a.ID, model.AuthorUser, "more"); !errors.Is(err, model.ErrNotesTooLarge) {
@@ -239,7 +239,7 @@ func TestNotesCap(t *testing.T) {
 		t.Fatalf("notes changed by refused writes (len %d)", len(text))
 	}
 	// an append that fits is fine
-	if _, err := s.ReplaceNotes(ctx, a.ID, strings.Repeat("x", model.MaxNotesLen-100)); err != nil {
+	if _, err := s.ReplaceNotes(ctx, a.ID, model.AuthorUser, strings.Repeat("x", model.MaxNotesLen-100)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AppendNote(ctx, a.ID, model.AuthorUser, "fits"); err != nil {
@@ -356,7 +356,7 @@ func TestMigrationV5FromV4(t *testing.T) {
 	}
 	// idempotent: running the v5 UPDATE again (and reopening) changes
 	// nothing, even after the notes were edited
-	if _, err := s.SetNotes(ctx, 3, "edited", ""); err != nil {
+	if _, err := s.SetNotes(ctx, 3, model.AuthorUser, "edited", ""); err != nil {
 		t.Fatal(err)
 	}
 	want[3] = "edited"

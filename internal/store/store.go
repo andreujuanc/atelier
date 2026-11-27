@@ -106,6 +106,25 @@ WHERE notes = '' AND EXISTS (SELECT 1 FROM task_notes n WHERE n.task_id = tasks.
 	// session's Claude still had in flight when it last went idle, one line
 	// each, as its Stop hook reported it ('': none, or not reported).
 	`ALTER TABLE sessions ADD COLUMN background TEXT NOT NULL DEFAULT '';`,
+	// v7: who first wrote each notes line (see Store.NotesBlame): the
+	// sha256 of the line (lineHashV1), which copy of it, author and
+	// time. The lines of the notes from before are recorded as unknown's
+	// (migrationSteps).
+	`CREATE TABLE notes_line_authors (
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  line_hash BLOB NOT NULL,
+  copy INTEGER NOT NULL,
+  author TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (task_id, line_hash, copy)
+);`,
+}
+
+// migrationSteps holds, by index in migrations, Go code to run right after
+// that migration's SQL, in the same transaction: what SQL cannot do.
+// Never edit an entry, only add.
+var migrationSteps = map[int]func(context.Context, *sql.Tx) error{
+	6: backfillNoteLinesV1, // v7
 }
 
 // DefaultBusyTimeout is how long Open waits on a locked database.
@@ -312,6 +331,11 @@ func (s *Store) migrate(ctx context.Context) error {
 	for i := v; i < len(migrations); i++ {
 		if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
 			return fmt.Errorf("migration %d: %w", i+1, err)
+		}
+		if step := migrationSteps[i]; step != nil {
+			if err := step(ctx, tx); err != nil {
+				return fmt.Errorf("migration %d: %w", i+1, err)
+			}
 		}
 	}
 	// PRAGMA does not accept bound parameters; the value is an int we control.

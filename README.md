@@ -193,7 +193,7 @@ atl fetch [task] [--repo R]          # git fetch origin in each repo of the task
 atl pr <task>                        # gh pr create per rw repo with pushed commits; status → review
 atl done <task> [--force]            # remove worktrees, Docker objects, fully pushed branches
 atl cancel <task> [--force]
-atl note <task> <text...> [--author user|assistant]   # append a dated line to the notes
+atl note <task> <text...> [--author user|assistant|agent]   # append a dated line to the notes
 atl notes <task> [--set < file | --clear]
 atl transcript <task> [--session ID] [--tail N]       # condensed Claude transcript
 atl assistant [task]                 # the atelier assistant (own container per workspace)

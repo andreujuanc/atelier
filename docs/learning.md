@@ -170,11 +170,23 @@ So the author of a line is recorded outside the text:
 
 - `model.AuthorAgent`. The task gate forces it on `atl note` (as the assistant's gate
   forces `assistant`).
-- Every notes write records who made it: `notes_edits(task_id, author, text, at)`, the
-  full text after the write. Writers: `user` (host CLI, TUI editor), `agent` (task gate),
-  `assistant` (assistant gate).
-- `NotesBlame(task)`: each line of the current notes with the author of the earliest
-  recorded edit that introduced it (`unknown` for lines from before the migration).
+- Every notes write records, for each non-blank line, who wrote it first:
+  `notes_line_authors(task_id, line_hash, copy, author, at)` (sha256 of the line; `copy` k
+  for its k-th copy). Insert-or-ignore, never updated or deleted, so a line an agent wrote
+  stays the agent's however it comes back (a stale editor buffer, a restored copy).
+  Writers: `user` (host CLI, TUI editor), `agent` (task gate), `assistant` (assistant
+  gate). An append records only the copies it adds.
+- The hash is of a canonical form (frozen, V1): invalid UTF-8, U+FFFD, control and format
+  characters (BOM, zero-width, bidi) dropped, whitespace runs made one space, trimmed; so
+  the editor's tab and U+FFFD changes don't make a line new. A line an external editor
+  rewrites in other ways (NFC, wrapping, smart quotes) on the user's round trip counts as
+  theirs: the user's review of every learning is the final defence.
+- The migration records the existing lines as `unknown`, raw and as sanitising splits them.
+- Cap: 10000 rows per author and task. Past it the author's new lines are `unknown`; while
+  any other author is past it, the user's whole-text writes record nothing (they could
+  bring back an unrecorded line), only `atl note` appends do.
+- `NotesBlame(task)`: each line of the current notes with its first writer (copies matched
+  by count, not position; `unknown` if not recorded; blank lines marked `Blank`).
 
 The learner uses the blame, never the tags. Lines from `agent`, `assistant` or `unknown`
 are context; only `user` lines can be preferences.
@@ -188,7 +200,7 @@ learnings(id, text, status, created_at, updated_at, decided_at)
     status: proposed | accepted | rejected
 learning_occurrences(id, learning_id, task_id, session_id, at, strength, polarity, quote)
 learn_digests(task_id, input_hash, occurrences_json, created_at)
-notes_edits(id, task_id, author, text, at)          -- phase 0
+notes_line_authors(task_id, line_hash, copy, author, at)   -- phase 0
 ```
 
 ## Surfaces
@@ -209,7 +221,7 @@ reject. The assistant may run `atl learnings ls` and `show` (allowed, read-only)
 
 ## Phases
 
-0. Notes provenance: `agent` author forced by the task gate, `notes_edits`, `NotesBlame`.
+0. Notes provenance: `agent` author forced by the task gate, `notes_line_authors`, `NotesBlame`.
 1. Static extract and `atl learn --dry-run`.
 2. Pre-clean: learner container, per-task `claude -p` with a schema, quote check, cache.
 3. Analyse, scoring, the tables, review through `atl learnings`.

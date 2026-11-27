@@ -79,10 +79,10 @@ func TestInsideTaskContainer(t *testing.T) {
 	if code, out, errs := atl(t, "note", "boxed", "from", "inside", "--author", "assistant"); code != 0 || out != "note added\n" {
 		t.Errorf("note: %d %q %s", code, out, errs)
 	}
-	if !strings.HasSuffix(notes(boxed.ID), "[assistant] from inside") {
+	if !strings.HasSuffix(notes(boxed.ID), "[agent] from inside") { // the gate writes as the agent
 		t.Errorf("boxed notes = %q", notes(boxed.ID))
 	}
-	if code, out, errs := atl(t, "notes", "boxed"); code != 0 || !strings.HasSuffix(out, "[assistant] from inside\n") {
+	if code, out, errs := atl(t, "notes", "boxed"); code != 0 || !strings.HasSuffix(out, "[agent] from inside\n") {
 		t.Errorf("notes: %d %q %s", code, out, errs)
 	}
 	var out, errb bytes.Buffer

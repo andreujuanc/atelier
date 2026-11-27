@@ -330,12 +330,17 @@ func (c *cli) transcriptCmd() *cobra.Command {
 func (c *cli) noteCmd() *cobra.Command {
 	var author string
 	cmd := &cobra.Command{
-		Use:   "note <task> <text...> [--author user|assistant]",
+		Use:   "note <task> <text...> [--author user|assistant|agent]",
 		Short: "Append a dated line (- YYYY-MM-DD [author] text) to a task's notes",
 		Args:  args(cobra.MinimumNArgs(2)),
 		RunE: func(cmd *cobra.Command, a []string) error {
+			if c.forAssistant {
+				// The assistant's notes are its own, whatever --author says (its
+				// gate also refuses any other: sandbox.CheckAssistantArgs).
+				author = model.AuthorAssistant
+			}
 			if !model.ValidAuthor(author) {
-				return usagef("--author must be user or assistant, not %q", author)
+				return usagef("--author must be user, assistant or agent, not %q", author)
 			}
 			body := strings.TrimSpace(strings.Join(a[1:], " "))
 			if body == "" {
@@ -355,7 +360,7 @@ func (c *cli) noteCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&author, "author", model.AuthorUser, "user or assistant")
+	cmd.Flags().StringVar(&author, "author", model.AuthorUser, "user, assistant or agent (from a task container, always agent)")
 	return cmd
 }
 

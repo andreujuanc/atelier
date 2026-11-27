@@ -196,11 +196,25 @@ type Session struct {
 	LaunchSeq int64
 }
 
-// Note authors.
+// Note authors. AuthorAgent is a Claude in a task's container (its gate
+// forces it). AuthorUnknown is only read, never written: the author of a
+// notes line no recorded edit explains (see BlamedLine).
 const (
 	AuthorUser      = "user"
 	AuthorAssistant = "assistant"
+	AuthorAgent     = "agent"
+	AuthorUnknown   = "unknown"
 )
 
-// ValidAuthor reports whether a is a known note author.
-func ValidAuthor(a string) bool { return a == AuthorUser || a == AuthorAssistant }
+// ValidAuthor reports whether a is a note author a write may name
+// (AuthorUnknown is not).
+func ValidAuthor(a string) bool { return a == AuthorUser || a == AuthorAssistant || a == AuthorAgent }
+
+// BlamedLine is one line of a task's notes with who first wrote it, and
+// when (Store.NotesBlame).
+type BlamedLine struct {
+	Text   string
+	Blank  bool      // nothing but whitespace, control, format characters or U+FFFD: no Author, no At
+	Author string    // an Author* constant; AuthorUnknown if not recorded
+	At     time.Time // zero if not recorded
+}

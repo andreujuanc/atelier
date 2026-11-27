@@ -161,8 +161,8 @@ func firstLineOf(s string) string {
 
 // AppendNote appends the line "- YYYY-MM-DD [author] body" to a task's
 // notes (open or closed) and returns it. The body is sanitised and trimmed
-// and must not be empty; author is model.AuthorUser ("" means user) or
-// model.AuthorAssistant.
+// and must not be empty; model.ValidAuthor must accept author ("" means
+// user).
 func (a *App) AppendNote(ctx context.Context, ref, body, author string) (string, error) {
 	body = strings.TrimSpace(model.SanitizeNotes(body))
 	if body == "" {
@@ -172,7 +172,7 @@ func (a *App) AppendNote(ctx context.Context, ref, body, author string) (string,
 		author = model.AuthorUser
 	}
 	if !model.ValidAuthor(author) {
-		return "", fmt.Errorf("invalid note author %q (want user or assistant)", author)
+		return "", fmt.Errorf("invalid note author %q (want user, assistant or agent)", author)
 	}
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
@@ -197,23 +197,24 @@ func (a *App) Notes(ctx context.Context, ref string) (*model.Task, string, error
 // SetNotes replaces a task's notes with text if they are still base, the
 // text the edit started from (compare-and-set); else it fails with a
 // *model.NotesConflictError holding the current text. It returns the text
-// as stored (model.SanitizeNotes).
+// as stored (model.SanitizeNotes). The write is the user's (the TUI editor).
 func (a *App) SetNotes(ctx context.Context, ref, text, base string) (string, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
 		return "", err
 	}
-	return a.Store.SetNotes(ctx, t.ID, text, base)
+	return a.Store.SetNotes(ctx, t.ID, model.AuthorUser, text, base)
 }
 
 // ReplaceNotes replaces a task's notes with text unconditionally ("" clears
-// them) and returns the text as stored.
+// them) and returns the text as stored. The write is the user's (atl notes
+// on the host).
 func (a *App) ReplaceNotes(ctx context.Context, ref, text string) (string, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
 		return "", err
 	}
-	return a.Store.ReplaceNotes(ctx, t.ID, text)
+	return a.Store.ReplaceNotes(ctx, t.ID, model.AuthorUser, text)
 }
 
 // NotesHistory is the file that keeps, for task slug, the notes the
@@ -228,7 +229,8 @@ func (a *App) NotesHistory(slug string) string {
 // appended, under a dated heading, to NotesHistory, and are then replaced
 // only if they are still those (a compare-and-set, retried a few times), so
 // the user's text is never lost, whatever the assistant's container asked
-// for. If they cannot be kept, nothing changes.
+// for. If they cannot be kept, nothing changes. The write is the
+// assistant's.
 func (a *App) ReplaceNotesKept(ctx context.Context, ref, text string) (string, error) {
 	t, err := a.Store.ResolveTask(ctx, ref)
 	if err != nil {
@@ -242,7 +244,7 @@ func (a *App) ReplaceNotesKept(ctx context.Context, ref, text string) (string, e
 		if err := a.keepNotes(t.Slug, prev); err != nil {
 			return "", fmt.Errorf("task %s: keep its notes before they are replaced: %w", t.Slug, err)
 		}
-		out, err := a.Store.SetNotes(ctx, t.ID, text, prev)
+		out, err := a.Store.SetNotes(ctx, t.ID, model.AuthorAssistant, text, prev)
 		if errors.Is(err, model.ErrNotesConflict) && i < 3 {
 			continue
 		}

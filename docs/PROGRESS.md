@@ -100,8 +100,8 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 
 | Phase | State |
 |---|---|
-| L0 notes provenance (`agent` author, `notes_edits`, `NotesBlame`) | in progress |
-| L1 static extract, `atl learn --dry-run` | todo |
+| L0 notes provenance (`agent` author, `notes_line_authors`, `NotesBlame`) | done (reviewed, 3 fix rounds) |
+| L1 static extract, `atl learn --dry-run` | in progress |
 | L2 pre-clean (learner container, per-task `claude -p`, quote check, cache) | todo |
 | L3 analyse, scoring, `learnings` tables, `atl learnings` | todo |
 | L4 delivery in SessionStart (tasks + assistant) | todo |
@@ -109,3 +109,4 @@ Resume point for the orchestrator. Spec: `SPEC.md`. Plan: `docs/PLAN.md`.
 
 Decisions:
 - (user, 2026-11-27) Manual trigger only; per workspace only; no repo-specific learnings (tasks are multi-repo); cheap models at low/medium effort; nothing injected without the user accepting it; scores weighted by strength, repetition and time decay.
+- (L0) Line authors kept as sha256 of a FROZEN canonical form (`canonLineV1`: no control/format chars or U+FFFD, tabs → spaces, whitespace collapsed), first writer wins, never deleted. Task gate forces `agent`; assistant `note` forced `assistant` in code too. Cap 10000 rows per (task, author); while another author is at its cap, user whole-text writes record nothing (fail closed). Migration v7 backfills existing notes as `unknown` via a new Go-step hook (`migrationSteps`). Known, accepted: an agent flood can make a task's editor-written user lines `unknown`; external-editor rewrites (NFC, wrapping) of agent lines count as the user's (review is the final defence).

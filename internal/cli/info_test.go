@@ -489,6 +489,15 @@ func TestForAssistant(t *testing.T) {
 		strings.Index(s, "the user's plan") > strings.Index(s, "the assistant's text") {
 		t.Errorf("history:\n%s", s)
 	}
+	// a note run for the assistant is the assistant's, whatever --author says
+	for _, au := range []string{"user", "agent", "assistant"} {
+		if code, _, errs := atl(t, "note", "--for-assistant", "beta", "by "+au, "--author", au); code != 0 {
+			t.Fatalf("note --author %s: %d %s", au, code, errs)
+		}
+	}
+	if _, out, _ := atl(t, "notes", "beta"); strings.Count(out, "[assistant] by ") != 3 || strings.Contains(out, "[user]") || strings.Contains(out, "[agent]") {
+		t.Errorf("notes after the assistant's notes: %q", out)
+	}
 }
 
 // TestShowSanitizesSessionFields: a session's Claude id and transcript path
