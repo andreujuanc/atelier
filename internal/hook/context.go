@@ -59,7 +59,7 @@ const slugPlaceholder = "<slug>"
 const cheatCommon = "- `atl note <slug> \"...\"` — append a dated status note for later sessions; " +
 	"authorship is recorded automatically (don't pass --author)\n" +
 	"- `atl notes <slug>` — print the notes; `--set` replaces them from stdin, `--clear` empties them\n" +
-	"- `atl push [--repo R] [--force]` — push atl/<slug> (--force = with-lease, after a rebase)\n" +
+	"- `atl push [--repo R] [--force]` — push this task's branch (--force = with-lease, after a rebase)\n" +
 	"- `atl fetch [--repo R]` — git fetch origin\n"
 
 // cheatSandboxed is the cheat sheet of a sandboxed session: the complete
@@ -71,11 +71,14 @@ const cheatSandboxed = "\natl in this session (complete list, no need for `atl h
 // every atl command: the useful ones, and those to leave to the user.
 const cheatHost = "\natl in this session (no need for `atl help`):\n" + cheatCommon +
 	"- `atl show <slug>` / `atl diff <slug>` / `atl transcript <slug> [--session ID]` — inspect the task\n" +
-	"- `atl pr`, `done`, `cancel`, `status`, `add`, `rename`: only when the user asks " +
-	"(they end or change the task and its sessions)\n"
+	"- Only when the user asks (they end or change the task and its sessions): " +
+	"`atl pr <slug>`, `atl done <slug>`, `atl cancel <slug>`, " +
+	"`atl status <slug> <backlog|active|review|done|cancelled>`, `atl add <slug> <repo>[:rw|ro]...`, " +
+	"`atl rename <slug> <new title...>`\n"
 
-// cheatHostSlugs is how many times cheatHost names the slug.
-const cheatHostSlugs = 6
+// cheatHostSlugs is how many times cheatHost names the slug (a test
+// checks it).
+const cheatHostSlugs = 11
 
 // cheatSheet is the atl cheat sheet of the start context (with a blank
 // line before it), right before the notes: cheatSandboxed or cheatHost

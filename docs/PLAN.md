@@ -341,7 +341,7 @@ kept, other control/format chars → spaces, ≤1000 bytes; longer makes app.New
 port offset. Order: task block (sandbox note and mounts line ≤240 bytes when sandboxed), "User preferences", ATL_CONTEXT,
 an atl cheat sheet ("atl in this session (…no need for `atl help`)": `atl note`/`notes`/`push`/`fetch`; sandboxed: "Every
 other atl command is refused here"; host: also `show`/`diff`/`transcript`, and `pr`/`done`/`cancel`/`status`/`add`/`rename`
-only when the user asks; ≤855 bytes), then the notes, last. The whole is ≤9,900 characters (UTF-16 code units, as JavaScript
+only when the user asks; ≤1167 bytes), then the notes, last. The whole is ≤9,900 characters (UTF-16 code units, as JavaScript
 counts; Claude Code replaces a hook context over 10,000 characters with a file path and a 2,000-character preview; 100
 spare). The notes get what the rest leaves; those that don't fit keep their END (appended lines are the newest): cut at a
 line start (else a rune boundary when one line is too long), prefixed with "… (earlier notes truncated; `atl notes <slug>`

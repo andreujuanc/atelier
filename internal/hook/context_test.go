@@ -646,13 +646,15 @@ func TestCheatSheet(t *testing.T) {
 		Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "main"}}}
 	common := "- `atl note shop-checkout-fix \"...\"` — append a dated status note for later sessions; authorship is recorded automatically (don't pass --author)\n" +
 		"- `atl notes shop-checkout-fix` — print the notes; `--set` replaces them from stdin, `--clear` empties them\n" +
-		"- `atl push [--repo R] [--force]` — push atl/shop-checkout-fix (--force = with-lease, after a rebase)\n" +
+		"- `atl push [--repo R] [--force]` — push this task's branch (--force = with-lease, after a rebase)\n" +
 		"- `atl fetch [--repo R]` — git fetch origin\n"
 	sandboxed := "\n\natl in this session (complete list, no need for `atl help`):\n" + common +
 		"Every other atl command is refused here; ask the user instead.\n"
 	host := "\n\natl in this session (no need for `atl help`):\n" + common +
 		"- `atl show shop-checkout-fix` / `atl diff shop-checkout-fix` / `atl transcript shop-checkout-fix [--session ID]` — inspect the task\n" +
-		"- `atl pr`, `done`, `cancel`, `status`, `add`, `rename`: only when the user asks (they end or change the task and its sessions)\n"
+		"- Only when the user asks (they end or change the task and its sessions): `atl pr shop-checkout-fix`, " +
+		"`atl done shop-checkout-fix`, `atl cancel shop-checkout-fix`, `atl status shop-checkout-fix <backlog|active|review|done|cancelled>`, " +
+		"`atl add shop-checkout-fix <repo>[:rw|ro]...`, `atl rename shop-checkout-fix <new title...>`\n"
 	for _, notes := range []string{"", "- 2026-04-01 [user] hi"} {
 		section := ""
 		if notes != "" {

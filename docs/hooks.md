@@ -31,14 +31,14 @@ bytes); the learnings you accepted, as a "User preferences" section (`[learn] in
 800 bytes, at most 4000; see [learning.md](learning.md#5-delivery)); the environment notes
 (below); an atl cheat sheet, the atl commands the session may run (in a sandbox the complete
 list, the gate refusing the rest; on the host also `show`/`diff`/`transcript`, and which
-commands to leave to the user; at most 855 bytes), so agents need not run `atl help`; and
+commands to leave to the user; at most 1167 bytes), so agents need not run `atl help`; and
 last the task's notes.
 
 The whole context stays within 9,900 characters: Claude Code caps a hook's context at
 10,000 characters ([hooks](https://code.claude.com/docs/en/hooks)) and past that replaces
 all of it with a file path and a 2,000-character preview. Characters are counted as
 JavaScript counts them (UTF-16 code units: an emoji counts 2); the 100 spare are a safety
-margin. The notes get the room the rest leaves, about 8,400 characters in a usual task
+margin. The notes get the room the rest leaves, about 8,300 characters in a usual task
 (7,500 sandboxed): when they do not fit, the oldest lines are dropped (the end is kept, from
 a line start, or a character boundary when one line is too long) after a line "… (earlier
 notes truncated; `atl notes <slug>` for all)"; with less than 40 characters of room they are
