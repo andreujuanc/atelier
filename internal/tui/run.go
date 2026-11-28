@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -40,11 +39,10 @@ func Run(a *app.App) error { return RunContext(context.Background(), a) }
 func RunContext(parent context.Context, a *app.App) error {
 	// A child on the terminal (D, l, attach) gets the SIGINT of its ctrl+c,
 	// and so does atl: the TUI must not stop then (signalGuard).
-	execing := &atomic.Bool{}
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigs)
-	ctx, cancelRun := signalGuard(parent, sigs, execing)
+	ctx, cancelRun, execing := signalGuard(parent, sigs)
 	defer cancelRun()
 	opsCtx, cancelOps := context.WithCancel(ctx)
 	defer cancelOps()
@@ -518,15 +516,82 @@ func (b *trackedBackend) DeleteLearning(ctx context.Context, id int64) (int, err
 	return b.Backend.DeleteLearning(ctx, id)
 }
 
-// signalGuard returns the context the TUI runs in: cancelled when parent
-// is, or on a SIGINT or SIGTERM read from sigs, except that while execing
-// (a child runs on the terminal: atl diff, atl learn, an attach) a SIGINT
-// and parent's cancellation are ignored: they are the child's ctrl+c (the
-// terminal is in cooked mode then, so it reaches atl too, whose signal
-// context, parent, it cancels). Outside that, nothing changes: in the TUI
-// ctrl+c is a key, not a signal.
-func signalGuard(parent context.Context, sigs <-chan os.Signal, execing *atomic.Bool) (context.Context, context.CancelFunc) {
+// execQuiet is how long after a child on the terminal ends a SIGINT (or
+// the cancellation of atl's signal context) is still taken for its
+// ctrl+c: the signal reaches atl as it reaches the child, but atl may read
+// it only after the child has exited. The terminal is back in raw mode by
+// then, so a ctrl+c typed now is a key, not a signal: only a kill -INT
+// from elsewhere is ignored in that window.
+const execQuiet = 500 * time.Millisecond
+
+// execState tracks the children run on the terminal (atl diff, atl learn,
+// an attach) for signalGuard: a SIGINT and the cancellation of atl's
+// signal context during one, or read just after it, are its ctrl+c (the
+// terminal is in cooked mode then, so it reaches atl too) and do not stop
+// the TUI. A nil *execState watches nothing.
+type execState struct {
+	mu     sync.Mutex
+	active bool
+	quiet  time.Time // until when signals read are still the last child's
+	spent  bool      // the parent context was cancelled by a child's ctrl+c
+	sigs   <-chan os.Signal
+	parent context.Context
+	cancel context.CancelFunc
+	now    func() time.Time
+}
+
+// start marks a child on the terminal (before the terminal is released).
+func (e *execState) start() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.active = true
+}
+
+// end marks the child gone (once the terminal is back). The signals
+// already waiting are its own (a SIGTERM still stops the TUI), as is the
+// parent's cancellation if it happened; those read within execQuiet from
+// now too.
+func (e *execState) end() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for drained := false; !drained; {
+		select {
+		case s := <-e.sigs:
+			if s == syscall.SIGTERM {
+				e.cancel()
+			}
+		default:
+			drained = true
+		}
+	}
+	if e.parent.Err() != nil {
+		e.spent = true
+	}
+	e.active = false
+	e.quiet = e.now().Add(execQuiet)
+}
+
+// fromChild reports whether a signal (or the parent's cancellation) read at
+// at is a child's ctrl+c.
+func (e *execState) fromChild(at time.Time) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.active || at.Before(e.quiet)
+}
+
+// signalGuard returns the context the TUI runs in, cancelled when parent
+// is or on a SIGINT or SIGTERM read from sigs, except for a child's ctrl+c
+// (execState), and the execState that tells it the children. Outside a
+// child, nothing changes: in the TUI ctrl+c is a key, not a signal.
+func signalGuard(parent context.Context, sigs <-chan os.Signal) (context.Context, context.CancelFunc, *execState) {
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	e := &execState{sigs: sigs, parent: parent, cancel: cancel, now: time.Now}
 	go func() {
 		done := parent.Done()
 		for {
@@ -534,25 +599,29 @@ func signalGuard(parent context.Context, sigs <-chan os.Signal, execing *atomic.
 			case <-ctx.Done():
 				return
 			case s := <-sigs:
-				if s == syscall.SIGTERM || !execing.Load() {
+				if s == syscall.SIGTERM || !e.fromChild(e.now()) {
 					cancel()
 					return
 				}
 			case <-done:
-				if !execing.Load() {
+				at := e.now()
+				e.mu.Lock()
+				spent := e.spent
+				e.mu.Unlock()
+				if !spent && !e.fromChild(at) {
 					cancel()
 					return
 				}
-				done = nil // a signal during the exec: sigs says which
+				done = nil // a child's ctrl+c: sigs says if more comes
 			}
 		}
 	}()
-	return ctx, cancel
+	return ctx, cancel, e
 }
 
-// guardedExec is tea.Exec(c, fn) with execing set (signalGuard) for all
-// the time the terminal is handed over (execGuard).
-func guardedExec(execing *atomic.Bool, c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd {
+// guardedExec is tea.Exec(c, fn) with the child marked in execing
+// (signalGuard) for all the time the terminal is handed over (execGuard).
+func guardedExec(execing *execState, c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd {
 	start, done := execGuard(execing, fn)
 	execCmd := tea.Exec(c, done)
 	return func() tea.Msg {
@@ -561,21 +630,15 @@ func guardedExec(execing *atomic.Bool, c tea.ExecCommand, fn tea.ExecCallback) t
 	}
 }
 
-// execGuard returns start, which sets execing, and done, fn clearing it
+// execGuard returns start, which marks the child, and done, fn ending it
 // first. guardedExec calls start before Bubble Tea releases the terminal,
 // and Bubble Tea calls done once it has it back, also when the exec could
-// not start. Execs are serialised by the event loop: one flag is enough.
+// not start. Execs are serialised by the event loop: one state is enough.
 // A nil execing is not watched.
-func execGuard(execing *atomic.Bool, fn tea.ExecCallback) (start func(), done tea.ExecCallback) {
-	start = func() {
-		if execing != nil {
-			execing.Store(true)
-		}
-	}
+func execGuard(execing *execState, fn tea.ExecCallback) (start func(), done tea.ExecCallback) {
+	start = execing.start
 	done = func(err error) tea.Msg {
-		if execing != nil {
-			execing.Store(false)
-		}
+		execing.end()
 		return fn(err)
 	}
 	return start, done

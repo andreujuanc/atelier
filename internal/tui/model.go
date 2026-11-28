@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"charm.land/bubbles/v2/textinput"
@@ -189,9 +188,9 @@ type Model struct {
 	diffCmd func(slug string) *exec.Cmd
 	// learnCmd returns the command that runs atl learn (l).
 	learnCmd func() *exec.Cmd
-	// execing is set while a child runs on the terminal (signalGuard);
+	// execing marks the children run on the terminal (signalGuard);
 	// nil: not watched.
-	execing *atomic.Bool
+	execing *execState
 	// flushOut, if set, returns once every App.Out line written so far has
 	// been delivered to the program (as warnMsg): an op's result message
 	// sent after it is then handled after the op's output lines.

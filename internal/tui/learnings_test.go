@@ -8,7 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -536,76 +536,150 @@ func TestLearnStatusPrefix(t *testing.T) {
 	}
 }
 
+// fakeClock is a settable now for execState.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *fakeClock) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+func (c *fakeClock) Add(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// stopped reports whether ctx is done within 50ms.
+func stopped(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	case <-time.After(50 * time.Millisecond):
+		return false
+	}
+}
+
 // TestSignalGuard: while a child runs on the terminal, its ctrl+c
 // (SIGINT, and the cancelled signal context of atl) does not stop the
-// TUI; otherwise both still do, and SIGTERM always does.
+// TUI, nor when read up to execQuiet after it ended; otherwise both still
+// do, and SIGTERM always does.
 func TestSignalGuard(t *testing.T) {
-	stopped := func(ctx context.Context) bool {
-		select {
-		case <-ctx.Done():
-			return true
-		case <-time.After(50 * time.Millisecond):
-			return false
-		}
-	}
-	execing := &atomic.Bool{}
+	clock := &fakeClock{t: time.Unix(1e9, 0)}
 	parent, cancelParent := context.WithCancel(context.Background())
 	sigs := make(chan os.Signal, 4)
-	ctx, cancel := signalGuard(parent, sigs, execing)
+	ctx, cancel, e := signalGuard(parent, sigs)
 	defer cancel()
-	execing.Store(true)
+	e.now = clock.Now
+	e.start()
 	sigs <- os.Interrupt
 	cancelParent()
 	if stopped(ctx) {
 		t.Fatal("stopped by a ctrl+c during an exec")
 	}
-	execing.Store(false)
+	e.end()
 	if stopped(ctx) {
 		t.Fatal("stopped once the exec ended")
 	}
+	// The child exited before atl read the signal of its ctrl+c.
+	clock.Add(execQuiet / 2)
+	sigs <- os.Interrupt
+	if stopped(ctx) {
+		t.Fatal("stopped by the child's SIGINT read after it ended")
+	}
+	clock.Add(execQuiet)
 	sigs <- os.Interrupt
 	if !stopped(ctx) {
 		t.Fatal("SIGINT outside an exec did not stop")
 	}
 
+	// The parent cancelled by the child's ctrl+c, seen only after it ended.
 	parent, cancelParent = context.WithCancel(context.Background())
-	ctx, cancel = signalGuard(parent, sigs, execing)
+	ctx, cancel, e = signalGuard(parent, make(chan os.Signal, 4))
+	defer cancel()
+	e.now = clock.Now
+	e.start()
+	cancelParent()
+	e.end()
+	clock.Add(2 * execQuiet)
+	if stopped(ctx) {
+		t.Fatal("stopped by the child's cancellation of the parent")
+	}
+
+	parent, cancelParent = context.WithCancel(context.Background())
+	ctx, cancel, _ = signalGuard(parent, sigs)
 	defer cancel()
 	cancelParent()
 	if !stopped(ctx) {
 		t.Fatal("parent cancelled outside an exec did not stop")
 	}
 
-	ctx, cancel = signalGuard(context.Background(), sigs, execing)
+	ctx, cancel, e = signalGuard(context.Background(), sigs)
 	defer cancel()
-	execing.Store(true)
+	e.start()
 	sigs <- syscall.SIGTERM
 	if !stopped(ctx) {
 		t.Fatal("SIGTERM during an exec did not stop")
 	}
 }
 
-// TestExecGuard: execing is set from start (before the terminal is
+// TestExecStateEndDrains: the signals waiting when a child ends are its
+// own, whenever they are read: end takes them (a SIGTERM among them still
+// stops the TUI), with no reader of its own.
+func TestExecStateEndDrains(t *testing.T) {
+	for _, c := range []struct {
+		sigs []os.Signal
+		stop bool
+	}{
+		{[]os.Signal{os.Interrupt, os.Interrupt}, false},
+		{[]os.Signal{os.Interrupt, syscall.SIGTERM}, true},
+	} {
+		sigs := make(chan os.Signal, 4)
+		ctx, cancel := context.WithCancel(context.Background())
+		e := &execState{sigs: sigs, parent: context.Background(), cancel: cancel, now: time.Now}
+		e.start()
+		for _, s := range c.sigs {
+			sigs <- s
+		}
+		e.end()
+		if len(sigs) != 0 || (ctx.Err() != nil) != c.stop {
+			t.Errorf("%v: %d left, stopped %v", c.sigs, len(sigs), ctx.Err() != nil)
+		}
+		cancel()
+	}
+	// The parent cancelled when the child ends: spent, whenever its Done is
+	// read.
+	parent, cancelParent := context.WithCancel(context.Background())
+	e := &execState{sigs: make(chan os.Signal), parent: parent, cancel: func() {}, now: time.Now}
+	e.start()
+	cancelParent()
+	e.end()
+	if !e.spent {
+		t.Error("parent's cancellation during the exec not kept")
+	}
+}
+
+// TestExecGuard: the child is marked from start (before the terminal is
 // released) until done (once it is back), also when the exec failed to
-// start; a nil flag is not watched.
+// start; a nil state is not watched.
 func TestExecGuard(t *testing.T) {
-	execing := &atomic.Bool{}
+	e := &execState{sigs: make(chan os.Signal), parent: context.Background(), cancel: func() {}, now: time.Now}
+	active := func() bool { e.mu.Lock(); defer e.mu.Unlock(); return e.active }
 	var got error
-	start, done := execGuard(execing, func(err error) tea.Msg { got = err; return execDoneMsg{err: err} })
-	if execing.Load() {
+	start, done := execGuard(e, func(err error) tea.Msg { got = err; return execDoneMsg{err: err} })
+	if active() {
 		t.Fatal("set before start")
 	}
 	start()
-	if !execing.Load() {
+	if !active() {
 		t.Fatal("not set during the exec")
 	}
-	if msg, ok := done(nil).(execDoneMsg); !ok || msg.err != nil || execing.Load() {
-		t.Fatalf("done: %v, execing %v", msg, execing.Load())
+	if msg, ok := done(nil).(execDoneMsg); !ok || msg.err != nil || active() {
+		t.Fatalf("done: %v, active %v", msg, active())
 	}
 	failed := errors.New("could not release the terminal")
 	start()
-	if done(failed); got != failed || execing.Load() {
-		t.Fatalf("failed start: %v, execing %v", got, execing.Load())
+	if done(failed); got != failed || active() {
+		t.Fatalf("failed start: %v, active %v", got, active())
 	}
 	start, done = execGuard(nil, func(error) tea.Msg { return nil })
 	start()
@@ -615,7 +689,7 @@ func TestExecGuard(t *testing.T) {
 // TestExecsAreGuarded: D (atl diff) and l (atl learn) go through
 // guardedExec: execing is set when their command makes the exec message.
 func TestExecsAreGuarded(t *testing.T) {
-	execing := &atomic.Bool{}
+	execing := &execState{sigs: make(chan os.Signal), parent: context.Background(), cancel: func() {}, now: time.Now}
 	m, _ := newTest(t, &fakeBackend{tasks: sampleTasks()})
 	m.execing = execing
 	m.diffCmd = func(string) *exec.Cmd { return exec.Command("true") }
@@ -624,12 +698,12 @@ func TestExecsAreGuarded(t *testing.T) {
 	key(m, "l")
 	learnRun := press(m, "enter")
 	for name, cmd := range map[string]tea.Cmd{"D": diff, "l": learnRun} {
-		execing.Store(false)
+		execing.active = false
 		if cmd == nil {
 			t.Fatalf("%s: no command", name)
 		}
 		cmd()
-		if !execing.Load() {
+		if !execing.active {
 			t.Errorf("%s: execing not set before the terminal is released", name)
 		}
 	}
