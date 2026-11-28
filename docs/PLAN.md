@@ -336,12 +336,17 @@ exit 0 (fail open) and log.
 
 SessionStart output: for sessions inside a task, after the DB update, print one JSON line
 `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":...}}` (task, repos + base, ro warning, port offset,
-"Notes:" section with the task's notes text, ≤2500 bytes). If the hook's environment has a non-blank `ATL_CONTEXT`, its sanitised text (newlines
+"Notes:" section with the task's notes text). If the hook's environment has a non-blank `ATL_CONTEXT`, its sanitised text (newlines
 kept, other control/format chars → spaces, ≤1000 bytes; longer makes app.New and doctor fail, the hook only cuts it) is added as an "Environment notes (ATL_CONTEXT)" section after the
-port offset. Priority: fixed info and ATL_CONTEXT first, then notes; the footer ("Use `atl note <slug> \"...\"` …") always
-survives. Notes that don't fit keep their END (appended lines are the newest): cut at a line start (else a rune boundary when
-one line is too long), prefixed with "… (earlier notes truncated; `atl notes <slug>` for all)"; with less than 40 bytes of room
-the section is left out. This is the ONLY stdout output of `atl hook`.
+port offset. Order: task block (sandbox note and mounts line ≤240 bytes when sandboxed), "User preferences", ATL_CONTEXT,
+an atl cheat sheet ("atl in this session (…no need for `atl help`)": `atl note`/`notes`/`push`/`fetch`; sandboxed: "Every
+other atl command is refused here"; host: also `show`/`diff`/`transcript`, and `pr`/`done`/`cancel`/`status`/`add`/`rename`
+only when the user asks; ≤1167 bytes), then the notes, last. The whole is ≤9,900 characters (UTF-16 code units, as JavaScript
+counts; Claude Code replaces a hook context over 10,000 characters with a file path and a 2,000-character preview; 100
+spare). The notes get what the rest leaves; those that don't fit keep their END (appended lines are the newest): cut at a
+line start (else a rune boundary when one line is too long), prefixed with "… (earlier notes truncated; `atl notes <slug>`
+for all)"; with less than 40 characters of room the section is left out. A task block too big for the rest to fit (very
+many repos) is cut at a line end, "…" line, ATL_PORT_OFFSET kept. This is the ONLY stdout output of `atl hook`.
 
 `atl statusline` (hidden; `hook.StatusLineMain()`, before cobra in main.go): Claude Code's status line command
 (stdin JSON verified against Claude Code 2.1.317: base hook fields `session_id`, `transcript_path`, `cwd`, plus

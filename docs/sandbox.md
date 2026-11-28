@@ -256,7 +256,8 @@ sends the text to the gate, which puts it in a tmux buffer and your terminal's c
 ## Start context
 
 A sandboxed session's start context explains the sandbox (repo setup first, what the gate
-refuses, `atl push`/`atl fetch`) and names the mounted host paths. `context` /
+refuses, `atl push`/`atl fetch`), names the mounted host paths and, before the notes, gives the
+complete list of atl commands the session may run (`atl note`, `atl notes`, `atl push`, `atl fetch`). `context` /
 `ATL_CONTEXT` is not passed to task containers (it describes the host); use
 `[sandbox] context` / `ATL_SANDBOX_CONTEXT`. The assistant gets `ATL_CONTEXT`, also in its container.
 
