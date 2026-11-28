@@ -28,6 +28,10 @@ func TestCheckAssistantArgs(t *testing.T) {
 		{"note", "alpha", "x", "--author=assistant"}, {"note", "--author", "assistant", "alpha", "x"},
 		{"notes", "alpha"}, {"notes", "alpha", "--set"}, {"notes", "alpha", "--clear"}, {"rename", "alpha", "New", "title"},
 		{"doctor"}, {"help"}, {"help", "open"}, {"help", "done"}, {"ls", "-h"}, {"ls", "--help"}, {"status", "alpha", "backlog"},
+		// Learnings: read only.
+		{"learnings"}, {"learnings", "--json"}, {"learnings", "--all", "--json"}, {"learnings", "ls"}, {"learnings", "ls", "--all", "--json"},
+		{"learnings", "--json", "ls"}, {"learnings", "show", "3"}, {"learnings", "show", "3", "--json"}, {"learnings", "show", "--json", "3"},
+		{"learnings", "--help"}, {"help", "learnings"},
 	} {
 		if err := CheckAssistantArgs(args); err != nil {
 			t.Errorf("%q refused: %v", args, err)
@@ -52,6 +56,31 @@ func TestCheckAssistantArgs(t *testing.T) {
 		{[]string{"assistant"}, "does not run for the assistant"},
 		{[]string{"token"}, "does not run for the assistant"},
 		{[]string{"token", "--paste"}, "does not run for the assistant"},
+		{[]string{"learn", "--dry-run"}, "does not run for the assistant"},
+		// Deciding on learnings is the user's: in every spelling.
+		{[]string{"learnings", "accept", "1"}, "changes a learning"},
+		{[]string{"learnings", "reject", "1"}, "changes a learning"},
+		{[]string{"learnings", "edit", "1"}, "changes a learning"},
+		{[]string{"learnings", "rm", "1"}, "changes a learning"},
+		{[]string{"learnings", "", "accept", "1"}, "changes a learning"},
+		{[]string{"learnings", "--json", "accept", "1"}, "changes a learning"},
+		{[]string{"learnings", "--all=true", "reject", "1"}, "changes a learning"},
+		{[]string{"learnings", "accept", "--help=false", "1"}, "changes a learning"},
+		{[]string{"learnings", "--help", "--help=false", "rm", "1"}, "changes a learning"},
+		{[]string{"learnings", "-h", "edit", "1"}, "changes a learning"},
+		{[]string{"learnings", "-h", "-h=false", "edit", "1"}, "is not accepted"}, // refused as -f
+		{[]string{"learnings", "--", "accept", "1"}, "changes a learning"},
+		{[]string{"learnings", "ls", "accept", "1"}, "changes a learning"},
+		{[]string{"learnings", "show", "rm"}, "changes a learning"},
+		{[]string{"learnings", "accept"}, "changes a learning"},
+		{[]string{"learnings", "accept", "--help"}, "changes a learning"},
+		{[]string{"learnings", ""}, "does not run for the assistant"},
+		{[]string{"learnings", "1"}, "does not run for the assistant"},
+		{[]string{"learnings", "ACCEPT", "1"}, "does not run for the assistant"},
+		{[]string{"learnings", "decide", "1"}, "does not run for the assistant"},
+		{[]string{"learnings accept", "1"}, "does not run for the assistant"},
+		{[]string{"learnings", "show", "1", "-w", "beta"}, "--workspace"},
+		{[]string{"--help", "--help=false", "learnings", "accept", "1"}, "not accepted"},
 		{[]string{"gate", "--assistant"}, "does not run for the assistant"},
 		{[]string{"hook", "Stop"}, "does not run for the assistant"},
 		{[]string{"workspace", "new", "x"}, "does not run for the assistant"},
@@ -312,6 +341,8 @@ func TestControlAtlResolved(t *testing.T) {
 	for _, resolve := range []func([]string) (string, bool, error){
 		func([]string) (string, bool, error) { return "atl token", false, nil },
 		func([]string) (string, bool, error) { return "atl repos pin", false, nil },
+		func([]string) (string, bool, error) { return "atl learnings accept", false, nil },
+		func([]string) (string, bool, error) { return "atl learnings rm", false, nil },
 		func([]string) (string, bool, error) { return "atl", false, nil },
 		func([]string) (string, bool, error) { return "", false, errors.New(`unknown command "x" for "atl"`) },
 		nil,
@@ -430,5 +461,22 @@ func TestControlAtlClientNotReading(t *testing.T) {
 			t.Fatalf("slots still held: %d %v %v %q", code, ran, err, errb.String())
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestAssistantCommandPath: the commands cobra may resolve a line to that
+// the assistant's gate runs; of learnings only the bare command, ls and
+// show.
+func TestAssistantCommandPath(t *testing.T) {
+	for _, p := range []string{"atl ls", "atl notes", "atl help", "atl learnings", "atl learnings ls", "atl learnings show"} {
+		if !AssistantCommandPath(p) {
+			t.Errorf("%q refused", p)
+		}
+	}
+	for _, p := range []string{"atl", "atl token", "atl repos pin", "atl learn", "atl learnings accept", "atl learnings reject",
+		"atl learnings edit", "atl learnings rm", "atl learnings show x", "atl ls ls", "ls", "atl  ls", "atl workspace new"} {
+		if AssistantCommandPath(p) {
+			t.Errorf("%q allowed", p)
+		}
 	}
 }

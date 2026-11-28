@@ -79,7 +79,7 @@ type ControlRequest struct {
 	Env      map[string]string `json:"env,omitempty"`      // hook, statusline: the caller's values of HookEnv / StatusLineEnv
 	ReadErr  string            `json:"read_err,omitempty"` // hook: reading the input failed after Body bytes
 	Landings []Landing         `json:"landings,omitempty"` // hook: where PreToolUse targets land in the container
-	Author   string            `json:"author,omitempty"`   // note: user or assistant
+	Author   string            `json:"author,omitempty"`   // note: the --author asked for (the gate writes agent)
 	Set      bool              `json:"set,omitempty"`      // notes: replace them with the body
 	Clear    bool              `json:"clear,omitempty"`    // notes: clear them (with Set: allow an empty body)
 	Args     []string          `json:"args,omitempty"`     // atl: the command line, without the binary

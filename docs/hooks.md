@@ -26,7 +26,11 @@ In a sandboxed task the gate runs them.
 
 On SessionStart (startup, resume, `/clear`, compaction) the hook injects fresh task context:
 title, status, branch, repos with base branch or read-only warning, `ATL_PORT_OFFSET`, and
-the notes. At most 2500 bytes; if notes do not fit, the newest end is kept.
+the notes. At most 2500 bytes; if notes do not fit, the newest end is kept. The learnings
+you accepted come as a "User preferences" section after the task block, with a budget of
+its own on top (`[learn] inject_budget`, 800 bytes, at most 4000; see
+[learning.md](learning.md#5-delivery)): at most 6502 bytes in all. The assistant gets that
+section alone as its start context (`atl hook AssistantStart`).
 
 `context` / `ATL_CONTEXT` (or `[sandbox] context` in sandboxed tasks) is added as an
 "Environment notes" section, max 1000 bytes. A longer value makes `atl` and `atl doctor`

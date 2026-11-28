@@ -150,6 +150,23 @@ func TestNotesApp(t *testing.T) {
 	if err != nil || v.Notes != "theirs" {
 		t.Fatalf("Get = %+v, %v", v, err)
 	}
+	// who wrote each line: the TUI editor (SetNotes) and atl notes on the
+	// host (ReplaceNotes) are the user, the assistant's gate
+	// (ReplaceNotesKept) the assistant
+	if _, err := e.app.SetNotes(ctx, "closed", "mine\ntheirs", "theirs"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.app.ReplaceNotesKept(ctx, "closed", "mine\ntheirs\nkept"); err != nil {
+		t.Fatal(err)
+	}
+	blame, err := e.app.Store.NotesBlame(ctx, task.ID)
+	var got []string
+	for _, b := range blame {
+		got = append(got, b.Author+" "+b.Text)
+	}
+	if want := "user mine|user theirs|assistant kept"; err != nil || strings.Join(got, "|") != want {
+		t.Fatalf("NotesBlame = %q, %v; want %q", got, err, want)
+	}
 }
 
 func TestParseTranscript(t *testing.T) {

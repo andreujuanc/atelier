@@ -1,6 +1,7 @@
 package hook
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/andreujuanc/atelier/internal/config"
 	"github.com/andreujuanc/atelier/internal/sandbox"
+	"github.com/andreujuanc/atelier/internal/store"
 )
 
 // assistantGuardMain runs the AssistantGuard event: no database, no store.
@@ -19,6 +21,50 @@ import (
 func assistantGuardMain(p config.Paths, stdin io.Reader, stderr io.Writer) int {
 	data, err := io.ReadAll(io.LimitReader(stdin, int64(maxInput)+1))
 	return assistantGuardInput(p, data, err, nil, stderr)
+}
+
+// assistantStartMain runs the AssistantStart event next to atl: the
+// input is read and not used; the assistant's start context is written to
+// stdout (writeAssistantContext). It always exits 0.
+func assistantStartMain(p config.Paths, stdin io.Reader, stdout, stderr io.Writer) int {
+	io.Copy(io.Discard, io.LimitReader(stdin, int64(maxInput)))
+	writeAssistantContext(p, stdout, stderr)
+	return 0
+}
+
+// writeAssistantContext writes the assistant's start context, the "User
+// preferences" section (assistantContext of the injection snapshot), to w
+// as one SessionStart JSON object; nothing when the section is empty, or
+// on an error (logged).
+func writeAssistantContext(p config.Paths, w, stderr io.Writer) {
+	st, err := store.OpenWithTimeout(p.DB, dbBusyTimeout)
+	if err != nil {
+		logError(p, stderr, EventAssistantStart, "", err)
+		return
+	}
+	defer st.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
+	defer cancel()
+	snapshot, err := st.Injection(ctx)
+	if err != nil {
+		logError(p, stderr, EventAssistantStart, "", fmt.Errorf("session context: %w", err))
+		return
+	}
+	if text := assistantContext(snapshot); text != "" {
+		if err := writeStartOutput(w, text); err != nil {
+			logError(p, stderr, EventAssistantStart, "", fmt.Errorf("session context: %w", err))
+		}
+	}
+}
+
+// assistantContext is the assistant's start context: the "User
+// preferences" section alone (prefsBlock of snapshot, at most
+// contextPrefsLen bytes and a newline); "" when it is empty.
+func assistantContext(snapshot string) string {
+	if b := prefsBlock(snapshot); b != "" {
+		return b + "\n"
+	}
+	return ""
 }
 
 // assistantGuardInput runs the AssistantGuard event on its input data
@@ -160,9 +206,10 @@ func AssistantGuard(in Input, p config.Paths) (exit int, msg string, err error) 
 // AssistantServer answers, in the assistant's gate, what atl in the
 // assistant's container sends as a hook: the assistant's guard
 // (AssistantGuard), checked where atl runs against the gate's own paths and
-// against where the container says the targets land. The assistant has no
-// other hook and no status line; its notes and every other atl command go
-// through the gate's atl operation (sandbox.OpAtl), so the rest is refused.
+// against where the container says the targets land, and its start context
+// (AssistantStart). The assistant has no other hook and no status line;
+// its notes and every other atl command go through the gate's atl
+// operation (sandbox.OpAtl), so the rest is refused.
 type AssistantServer struct{ p config.Paths }
 
 var _ sandbox.Task = (*AssistantServer)(nil)
@@ -176,12 +223,19 @@ func (s *AssistantServer) Do(req sandbox.ControlRequest, body []byte, stdout, st
 	defer func() {
 		if r := recover(); r != nil {
 			logError(s.p, io.Discard, req.Op, "", fmt.Errorf("assistant gate: panic: %v\n%s", r, debug.Stack()))
-			code = assistantRefuse(stderr, "", "internal error")
+			code = 0
+			if req.Event != EventAssistantStart {
+				code = assistantRefuse(stderr, "", "internal error")
+			}
 		}
 	}()
 	if req.Op != sandbox.OpHook {
 		fmt.Fprintf(stderr, "atelier gate: %s is not served by the assistant's gate\n", req.Op)
 		return 2
+	}
+	if req.Event == EventAssistantStart {
+		writeAssistantContext(s.p, stdout, stderr)
+		return 0
 	}
 	if req.Event != EventAssistantGuard {
 		return 0 // nothing to record: the assistant is no task session

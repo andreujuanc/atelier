@@ -1040,7 +1040,7 @@ func walBoundedAcrossOpens(t *testing.T, path, real string) {
 			t.Fatal(err)
 		}
 		text = fmt.Sprintf("%04d %s", i, strings.Repeat(string(rune('a'+i%26)), write))
-		if _, err := st.ReplaceNotes(ctx, task.ID, text); err != nil {
+		if _, err := st.ReplaceNotes(ctx, task.ID, model.AuthorUser, text); err != nil {
 			t.Fatal(err)
 		}
 		if err := st.Close(); err != nil {
@@ -1133,7 +1133,7 @@ func TestCloseCheckpointBounded(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.ReplaceNotes(ctx, task.ID, fmt.Sprintf("%04d %s", i, strings.Repeat(string(rune('a'+i%26)), 32<<10))); err != nil {
+		if _, err := st.ReplaceNotes(ctx, task.ID, model.AuthorUser, fmt.Sprintf("%04d %s", i, strings.Repeat(string(rune('a'+i%26)), 32<<10))); err != nil {
 			t.Fatal(err)
 		}
 		start := time.Now()

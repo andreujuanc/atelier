@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/app"
+	"github.com/andreujuanc/atelier/internal/learn"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/palette"
 )
@@ -229,7 +230,11 @@ func (m *Model) render() string {
 	if l.header {
 		lines = append(lines, m.headerLine(w))
 	}
-	lines = append(lines, m.bodyLines(l, w)...)
+	if m.learn != nil {
+		lines = append(lines, m.learnBody(l, w)...)
+	} else {
+		lines = append(lines, m.bodyLines(l, w)...)
+	}
 	if over := m.overlay(w, len(lines)); over != nil {
 		lines = composite(lines, over, w)
 	}
@@ -335,6 +340,14 @@ func (m *Model) headerLine(w int) string {
 		left += "  " + okStyle.Render("✓") + dimStyle.Render(" atl "+clean(m.updated)+", restarting")
 	case m.available != "":
 		left += "  " + markStyle.Render("↑ atl "+clean(m.available)) + " " + keyStyle.Render("U") + descStyle.Render(" update")
+	}
+	if m.proposed > 0 {
+		noun := "learnings"
+		if m.proposed == 1 {
+			noun = "learning"
+		}
+		left += "  " + markStyle.Render(fmt.Sprintf("%d %s to review", m.proposed, noun)) + " " +
+			dimStyle.Render("(") + keyStyle.Render("L") + dimStyle.Render(")")
 	}
 	counts := map[model.SessionState]int{}
 	open := 0
@@ -680,7 +693,7 @@ func orDash(s string) string {
 func (m *Model) statusLines(w, rows int) []string {
 	st := clean(m.status)
 	plain := m.mode != modeFilter && m.mode != modeRename &&
-		(m.mode != modeNotes || m.notes == nil || m.notes.ask == askNone)
+		(m.mode != modeNotes || m.notes == nil || m.notes.ask == askNone) && !m.learnAsking()
 	if !plain || !m.statusErr || st == "" || rows <= 1 || w <= 1 {
 		return []string{m.statusLine(w)}
 	}
@@ -726,6 +739,8 @@ func (m *Model) statusLine(w int) string {
 			q = "quit and discard " + what + " to the notes of " + clean(m.notes.slug) + "? y/n"
 		}
 		return trunc(markStyle.Render("? "+q), w)
+	case m.learnAsking():
+		return trunc(markStyle.Render("? quit and discard your edit to learning "+strconv.FormatInt(m.learn.edit.id, 10)+"? y/n"), w)
 	case m.mode == modeRename:
 		return trunc(m.renameInput.View(), w)
 	}
@@ -965,6 +980,20 @@ func (m *Model) helpLine(w int) string {
 		items = []helpItem{{"space", "tick/untick"}, {"enter", "confirm (box ticked)"}, {"esc/n", "cancel"}}
 	case modeRestart:
 		items = []helpItem{{"space", "tick/untick"}, {"enter", "force restart (box ticked)"}, {"esc/n", "cancel"}}
+	case modeLearnings:
+		items = m.learnHelp()
+	case modeLearnEdit:
+		if m.learnAsking() {
+			items = []helpItem{{"y", "quit atl (the edit is lost)"}, {"", "any other key: back to editing"}}
+			break
+		}
+		items = []helpItem{{"", "editing the learning:"}, {"enter/ctrl+s", "save"}, {"esc", "cancel"}, {"", "one line, at most " + strconv.Itoa(learn.MaxLearningText) + " characters"}}
+	case modeAsk:
+		yes := ""
+		if m.ask != nil {
+			yes = m.ask.yesKey
+		}
+		items = []helpItem{{"enter/y", yes}, {"esc/n", "cancel"}}
 	default:
 		s := helpStyled(listHelp, w)
 		for _, l := range legends {
@@ -997,7 +1026,12 @@ func (m *Model) overlay(w, h int) *dialog {
 	case m.mode == modeRestart && m.restart != nil:
 		return m.restart.dialog(w, h, m.spinner())
 	case m.mode == modeHelp:
-		return helpDialog(w, h)
+		if m.learn != nil {
+			return helpDialog(learnHelpSections, false, w, h)
+		}
+		return helpDialog(helpSections, true, w, h)
+	case m.mode == modeAsk && m.ask != nil:
+		return m.ask.dialog(w, h)
 	}
 	return nil
 }
@@ -1091,6 +1125,7 @@ var helpSections = []helpSection{
 	{"Tasks", []helpItem{{"n", "new task"}, {"t", "rename (the title)"}, {"1-5", "status: backlog … cancelled"},
 		{"d", "done (closes, asks first)"}, {"c", "cancel (closes, asks first)"}, {"a", "add repos (or ro → rw)"},
 		{"m", "edit the notes"}, {"p", "open pull requests"}, {"D", "diff in a pager"}}},
+	{"Learning", []helpItem{{"L", "review learnings"}, {"l", "run atl learn (asks first)"}}},
 	{"Sessions", []helpItem{{"enter", "open (attach or pick)"}, {"s", "new session"}, {"r", "resume stopped sessions"},
 		{"A", "the atelier assistant"}}},
 	{"Moving", []helpItem{{"↑/↓ j/k", "move"}, {"pgup/pgdn", "page"}, {"/", "filter by slug or title"},
@@ -1122,20 +1157,21 @@ func helpColumn(secs []helpSection, w int) []string {
 
 // helpDialog lists every key of the task list with what it does: in one
 // column, or two when one does not fit the height (h rows).
-func helpDialog(w, h int) *dialog {
+func helpDialog(secs []helpSection, legend bool, w, h int) *dialog {
 	iw := dialogWidth(64, w)
-	out := helpColumn(helpSections, iw)
+	out := helpColumn(secs, iw)
 	if len(out)+4 > h-2 && w >= 80 {
 		iw = dialogWidth(96, w)
 		cw := (iw - 3) / 2
-		left, right := helpColumn(helpSections[:1], cw), helpColumn(helpSections[1:], cw)
+		half := (len(secs) + 1) / 2
+		left, right := helpColumn(secs[:half], cw), helpColumn(secs[half:], cw)
 		out = nil
 		for i := 0; i < max(len(left), len(right)); i++ {
 			out = append(out, fit(at(left, i), cw)+"   "+at(right, i))
 		}
 	}
 	for _, l := range legends {
-		if ansi.StringWidth(l) <= iw {
+		if legend && ansi.StringWidth(l) <= iw {
 			out = append(out, "", l)
 			break
 		}

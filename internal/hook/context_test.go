@@ -61,7 +61,7 @@ func ctxTask(t *testing.T, f *fixture, n int) *model.Task {
 	if err := os.MkdirAll(f.p.WorktreePath("ctx", "api"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.st.SetNotes(ctx, task.ID, noteLines(1, n), ""); err != nil {
+	if _, err := f.st.SetNotes(ctx, task.ID, model.AuthorUser, noteLines(1, n), ""); err != nil {
 		t.Fatal(err)
 	}
 	return task

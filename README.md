@@ -160,12 +160,20 @@ running, idle, stopped). Colours follow the terminal's light or dark background.
 | `p` | open PRs (`atl pr`) |
 | `D` | diff |
 | `A` | the atelier assistant, about the selected task |
+| `L` | the learnings: review what `atl learn` proposes (the top bar says `2 learnings to review (L)` when some wait) |
+| `l` | run `atl learn` (asks first: it calls a model) on the terminal; `enter` at its end comes back |
 | `1`-`5` | set status: backlog, active, review, done, cancelled |
 | `/` | filter by slug or title |
 | `w` | switch workspace |
 | `U` | update atl (shown in the top bar when a newer release exists) |
 | `?` | every key, with what it does (any key closes it) |
 | `q` | quit (waits for running operations; `ctrl+c` again forces) |
+
+Learnings (`L`): proposed first, then accepted, by score; the selected one's quotes below,
+newest first (`?`: a quote that shares no word with the text). `a` accept, `x` reject (asks;
+it is not proposed again), `e` edit (`enter` or `ctrl+s` save, `esc` cancel), `d` delete (asks; the next
+`atl learn` may propose it again: reject stops it), `h` also candidates and rejected, `r`
+refresh, `l` run `atl learn`, `?` keys, `esc`/`q` back. Changes are refused while `atl learn` runs.
 
 Repo picker: type to filter, `↑`/`↓` move, `space` cycles none → rw → ro, `enter`
 confirms, `esc` clears the filter, else cancels.
@@ -193,9 +201,16 @@ atl fetch [task] [--repo R]          # git fetch origin in each repo of the task
 atl pr <task>                        # gh pr create per rw repo with pushed commits; status → review
 atl done <task> [--force]            # remove worktrees, Docker objects, fully pushed branches
 atl cancel <task> [--force]
-atl note <task> <text...> [--author user|assistant]   # append a dated line to the notes
+atl note <task> <text...> [--author user|assistant|agent]   # append a dated line to the notes
 atl notes <task> [--set < file | --clear]
 atl transcript <task> [--session ID] [--tail N]       # condensed Claude transcript
+atl learn [--task T] [--retry-skipped]   # pre-clean each task, group what you said into learnings, score them (cheap model, own container; docs/learning.md)
+atl learn --dry-run [--task T] [--json]   # what learning reads per task: your prompts, notes; no model
+atl learnings [ls] [--all] [--json]  # proposed and accepted learnings (--all: candidates, rejected)
+atl learnings show <id> [--json]     # a learning and its occurrences (your quotes)
+atl learnings accept|reject <id>
+atl learnings edit <id> < file       # reword it (one line)
+atl learnings rm <id>                # forget it and its occurrences
 atl assistant [task]                 # the atelier assistant (own container per workspace)
 atl repos                            # git repos in the repos dir
 atl repos pin <repo>                 # accept a changed origin URL
@@ -230,6 +245,7 @@ Strict TOML: every key optional, unknown keys are an error. `~/` expands in `rep
 | `[sandbox] mounts` | none | host paths every task gets read-only ([docs/sandbox.md](docs/sandbox.md#host-files-for-every-task)) |
 | `[sandbox] context` | none | text added to sandboxed sessions' start context (max 1000 bytes) |
 | `[sandbox] registries` | none | registries tasks may pull from besides Docker Hub, ghcr.io, quay.io, mcr.microsoft.com, gcr.io, registry.k8s.io, public.ecr.aws (`"localhost:5000"`, `"*.pkg.dev"`; [docs/sandbox.md](docs/sandbox.md#registries-tasks-may-pull-from)) |
+| `[learn] ...` | [docs/learning.md](docs/learning.md#defaults-to-tune) | `prompt_cap` 2048 (bytes), `reply_snippet` 200 (chars), `task_cap` 65536 (bytes; oldest prompts dropped past it), `notes_cap` 16384 (bytes; others' lines dropped before yours), `weight_strong`/`_normal`/`_mild`, `half_life_proposed`/`_accepted` (days), `propose_score`, `propose_tasks`, `fade_ratio` (0.75: a proposal fades below this × `propose_score`), `outdated_score`, `inject_budget` (800 bytes: the accepted learnings in the start context), `parallelism`, `preclean_model`/`_effort`, `analyse_model`/`_effort`, `max_call_usd` (0.25: what one model call may spend) |
 
 ```toml
 repos = "~/src/work"

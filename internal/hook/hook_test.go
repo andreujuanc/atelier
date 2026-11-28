@@ -915,6 +915,12 @@ func TestTranscriptPath(t *testing.T) {
 	if g := f.get(t, s.ID); g.ClaudeSessionID != "c4" || g.State != model.StateIdle {
 		t.Fatalf("row = %+v", g)
 	}
+	// Every path reported is one of the session's transcript files.
+	m, err := f.st.ListSessionTranscripts(ctx, []int64{s.ID})
+	if got := strings.Join(m[s.ID], ","); err != nil || len(m[s.ID]) != 6 ||
+		!strings.Contains(got, "/t/other.jsonl") || !strings.Contains(got, "/t/zz.jsonl") || !strings.Contains(got, "/t/c3.jsonl") {
+		t.Fatalf("session transcripts = %q, %v", got, err)
+	}
 
 	// A session row created by SessionStart (claude not launched by atl)
 	// gets the path at creation.

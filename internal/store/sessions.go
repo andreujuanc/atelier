@@ -427,3 +427,44 @@ func (s *Store) SetTranscriptPathIfEmpty(ctx context.Context, id int64, path str
 		WHERE id = ? AND transcript_path = ''`, path, id)
 	return err
 }
+
+// AddSessionTranscript records path as one of session id's transcript files
+// (session_transcripts) without changing transcript_path: a path a hook
+// reports that is not the latest. Nothing past maxSessionTranscripts, and
+// an unknown id is not an error. Its first_seen is the row's last_event_at,
+// as the v8 triggers'.
+func (s *Store) AddSessionTranscript(ctx context.Context, id int64, path string) error {
+	if path == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO session_transcripts (session_id, path, first_seen)
+		SELECT id, ?, last_event_at FROM sessions WHERE id = ?
+		AND (SELECT count(*) FROM session_transcripts WHERE session_id = ?) < ?`,
+		path, id, id, maxSessionTranscripts)
+	return err
+}
+
+// ListSessionTranscripts returns, by session id, every transcript file the
+// sessions sessionIDs have had, oldest first (transcript_path among them).
+func (s *Store) ListSessionTranscripts(ctx context.Context, sessionIDs []int64) (map[int64][]string, error) {
+	ids, err := json.Marshal(sessionIDs)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT session_id, path FROM session_transcripts
+		WHERE session_id IN (SELECT value FROM json_each(?)) ORDER BY first_seen, path`, string(ids))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64][]string{}
+	for rows.Next() {
+		var id int64
+		var path string
+		if err := rows.Scan(&id, &path); err != nil {
+			return nil, err
+		}
+		out[id] = append(out[id], path)
+	}
+	return out, rows.Err()
+}

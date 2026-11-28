@@ -108,11 +108,38 @@ func (a *App) seedClaudeDirAt(dir, trusted, who string) error {
 	return nil
 }
 
+// seedLearnerClaudeDir prepares the Claude dir dir of atl learn's container
+// (see startLearner): none of the user's setup, whose settings (an env
+// block, hooks) would act on the learner's calls; whatever of it is there
+// (claudeCopied) is removed. Only the state file's onboarding and trust
+// keys (writeClaudeState, for trusted) are written.
+func (a *App) seedLearnerClaudeDir(dir, trusted string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	d, err := nofollow.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	for _, name := range claudeCopied {
+		if err := d.RemoveAll(name); err != nil {
+			return fmt.Errorf("the learner: remove %s: %w", name, err)
+		}
+	}
+	if err := writeClaudeState(d, trusted, os.Getenv("ANTHROPIC_API_KEY"), ""); err != nil {
+		return fmt.Errorf("the learner: Claude state file: %w", err)
+	}
+	return nil
+}
+
 // pruneClaudeDir removes the task's Claude dir when the task closes, except
 // the transcripts (projects/), which atl show and atl transcript still read
-// for closed tasks. Nothing runs in the task any more. What the task may
-// have left in projects/ for atl to trip over later (symlinks, pipes) goes
-// too: only plain files and directories stay. Failures are warnings.
+// for closed tasks, and the input history (history.jsonl, a plain file),
+// which atl learn needs to tell pasted text from typed (closed tasks count).
+// Nothing runs in the task any more. What the task may have left in
+// projects/ for atl to trip over later (symlinks, pipes) goes too: only
+// plain files and directories stay. Failures are warnings.
 func (a *App) pruneClaudeDir(t *model.Task) {
 	dir := a.Paths.ClaudeDir(t.Slug)
 	entries, err := os.ReadDir(dir)
@@ -124,7 +151,7 @@ func (a *App) pruneClaudeDir(t *model.Task) {
 		return
 	}
 	for _, e := range entries {
-		if e.Name() == "projects" && e.IsDir() {
+		if (e.Name() == "projects" && e.IsDir()) || (e.Name() == "history.jsonl" && e.Type().IsRegular()) {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {

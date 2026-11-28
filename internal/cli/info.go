@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -330,12 +331,19 @@ func (c *cli) transcriptCmd() *cobra.Command {
 func (c *cli) noteCmd() *cobra.Command {
 	var author string
 	cmd := &cobra.Command{
-		Use:   "note <task> <text...> [--author user|assistant]",
+		Use:   "note <task> <text...> [--author user|assistant|agent]",
 		Short: "Append a dated line (- YYYY-MM-DD [author] text) to a task's notes",
 		Args:  args(cobra.MinimumNArgs(2)),
 		RunE: func(cmd *cobra.Command, a []string) error {
+			if c.forAssistant {
+				// The assistant's notes are its own, whatever --author says (its
+				// gate also refuses any other: sandbox.CheckAssistantArgs).
+				author = model.AuthorAssistant
+			} else if w := hostWriter(); w != "" {
+				author = w
+			}
 			if !model.ValidAuthor(author) {
-				return usagef("--author must be user or assistant, not %q", author)
+				return usagef("--author must be user, assistant or agent, not %q", author)
 			}
 			body := strings.TrimSpace(strings.Join(a[1:], " "))
 			if body == "" {
@@ -355,8 +363,26 @@ func (c *cli) noteCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&author, "author", model.AuthorUser, "user or assistant")
+	cmd.Flags().StringVar(&author, "author", model.AuthorUser, "user, assistant or agent (from a task session, always agent; from the assistant, always assistant)")
 	return cmd
+}
+
+// hostWriter is who runs atl on the host (the sandbox off) when it is not
+// the user: the assistant (sandbox.AssistantEnv) or a task's session or
+// script (ATL_SESSION, ATL_TASK); "" otherwise. Their notes are recorded as
+// theirs, whatever --author says, as their gates do with the sandbox on:
+// otherwise an agent's routine `atl note` would count as the user's words
+// (atl learn). Inside a container the gate decides.
+func hostWriter() string {
+	switch {
+	case sandbox.Inside():
+		return ""
+	case os.Getenv(sandbox.AssistantEnv) != "":
+		return model.AuthorAssistant
+	case os.Getenv("ATL_SESSION") != "" || os.Getenv("ATL_TASK") != "":
+		return model.AuthorAgent
+	}
+	return ""
 }
 
 func (c *cli) notesCmd() *cobra.Command {
@@ -387,9 +413,12 @@ func (c *cli) notesCmd() *cobra.Command {
 					return err
 				}
 			}
-			if c.forAssistant {
+			switch w := hostWriter(); {
+			case c.forAssistant || w == model.AuthorAssistant:
 				text, err = ap.ReplaceNotesKept(cmd.Context(), t.Slug, text)
-			} else {
+			case w != "":
+				text, err = ap.ReplaceNotesAs(cmd.Context(), t.Slug, w, text)
+			default:
 				text, err = ap.ReplaceNotes(cmd.Context(), t.Slug, text)
 			}
 			if err != nil {

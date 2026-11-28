@@ -71,7 +71,8 @@ A request runs only if both checks pass:
 | output | 16 MiB (stdout and stderr together), then cut |
 
 Allowed: `ls`, `show`, `transcript`, `repos`, `diff`, `new`, `add`, `status`, `session`,
-`resume`, `pr`, `note`, `notes`, `rename`, `doctor`, `help`. Help is
+`resume`, `pr`, `note`, `notes`, `rename`, `doctor`, `help`, and of `learnings` only
+`atl learnings`, `atl learnings ls`, `atl learnings show` (with `--all`, `--json`). Help is
 `atl help <command>` or `atl <command> --help`.
 
 Refused, with a one-line reason:
@@ -86,28 +87,31 @@ Refused, with a one-line reason:
 | `atl pr` on a closed task (refused by atl) | it would move the task to `review` |
 | `--for-assistant` in any spelling | the gate sets it |
 | `atl repos pin` (`repos` with any argument) | accepting a changed origin URL is your decision |
+| `atl learnings accept`/`reject`/`edit`/`rm` (one of them among the arguments, in any place), or `learnings` with another first argument | deciding on learnings is yours |
 | `-w` / `--workspace` in any spelling | the workspace is the gate's own |
 | `-f` / `--force` in any spelling | no allowed command has it |
 | `--author` other than `assistant` (`--author user`, `--author=user`), or `atl note` without `--author assistant` | its notes must not read as yours |
 
 Text that looks like one of those flags is refused too.
 
-The gate also answers the assistant's `AssistantGuard` hook. No answer from the gate means
-the edit is refused.
+The gate also answers the assistant's hooks: `AssistantGuard` (no answer from the gate means
+the edit is refused) and `AssistantStart`, its start context: the learnings you accepted
+([learning.md](learning.md#5-delivery)), nothing when there are none.
 
 ## Permissions
 
 | rule | commands |
 |---|---|
-| allowed | `atl ls`, `show`, `transcript`, `repos` (not `repos pin`), `help`; Read, Grep, Glob (the old `atl --help *` rule is removed) |
+| allowed | `atl ls`, `show`, `transcript`, `repos` (not `repos pin`), `help`, `learnings`, `learnings ls`, `learnings show`; Read, Grep, Glob (the old `atl --help *` rule is removed) |
 | ask first | `atl new`, `add`, `status`, `session`, `resume`, `pr`, `note`, `notes`, `rename` (all of `atl notes`: it reads notes with `atl show <task> --notes`); `done`, `cancel`, `open` too, which only matters with the sandbox off (its gate refuses them) |
-| denied | `git commit`/`push`/`checkout`/`reset`/`rebase`/`merge`/`stash`/…, `rm`, `mv`, `cp`, `sed -i`, `tee` |
+| denied | `git commit`/`push`/`checkout`/`reset`/`rebase`/`merge`/`stash`/…, `rm`, `mv`, `cp`, `sed -i`, `tee`; `atl learnings accept`/`reject`/`edit`/`rm` |
 | hook | Edit/Write/MultiEdit/NotebookEdit outside its dir, or on its own `CLAUDE.md`, `.mcp.json`, `.claude/`: blocked (fails closed) |
+| start-context hook | `atl hook AssistantStart` (SessionStart): the "User preferences" section alone, the learnings you accepted; nothing when there are none |
 
 With the sandbox on, these rules and Claude Code's permission prompt run inside the
 container: an assistant that ignores them (steered by notes or transcripts a task wrote, say)
 is held back only by its gate's allowlist. It can still, without asking you: create tasks,
 add repos, rename, move open tasks between open statuses, start and resume sessions, open
 PRs, add notes, and replace or clear notes (kept in the notes history); and edit anything in
-its own dir. It cannot close, reopen or open a task, push, re-pin a repo's origin, reach
-Docker or another workspace. Read what it asks to run before you approve.
+its own dir. It cannot close, reopen or open a task, push, re-pin a repo's origin, decide on
+learnings, reach Docker or another workspace. Read what it asks to run before you approve.

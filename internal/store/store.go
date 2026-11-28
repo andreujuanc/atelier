@@ -106,6 +106,112 @@ WHERE notes = '' AND EXISTS (SELECT 1 FROM task_notes n WHERE n.task_id = tasks.
 	// session's Claude still had in flight when it last went idle, one line
 	// each, as its Stop hook reported it ('': none, or not reported).
 	`ALTER TABLE sessions ADD COLUMN background TEXT NOT NULL DEFAULT '';`,
+	// v7: who first wrote each notes line (see Store.NotesBlame): the
+	// sha256 of the line (lineHashV1), which copy of it, author and
+	// time. The lines of the notes from before are recorded as unknown's
+	// (migrationSteps).
+	`CREATE TABLE notes_line_authors (
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  line_hash BLOB NOT NULL,
+  copy INTEGER NOT NULL,
+  author TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (task_id, line_hash, copy)
+);`,
+	// v8: every transcript file a session has had (transcript_path keeps
+	// only the latest: /clear, resume and compaction can start a new one),
+	// at most maxSessionTranscripts per session. The triggers record each
+	// path transcript_path is set to; AddSessionTranscript the others a
+	// hook reports. The current paths are recorded now.
+	`CREATE TABLE session_transcripts (
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  first_seen INTEGER NOT NULL,
+  PRIMARY KEY (session_id, path)
+);
+CREATE TRIGGER session_transcripts_insert AFTER INSERT ON sessions WHEN NEW.transcript_path != ''
+BEGIN
+  INSERT OR IGNORE INTO session_transcripts (session_id, path, first_seen) VALUES (NEW.id, NEW.transcript_path, NEW.last_event_at);
+END;
+CREATE TRIGGER session_transcripts_update AFTER UPDATE OF transcript_path ON sessions WHEN NEW.transcript_path != ''
+BEGIN
+  INSERT OR IGNORE INTO session_transcripts (session_id, path, first_seen)
+    SELECT NEW.id, NEW.transcript_path, NEW.last_event_at
+    WHERE (SELECT count(*) FROM session_transcripts WHERE session_id = NEW.id) < 100;
+END;
+INSERT INTO session_transcripts (session_id, path, first_seen)
+  SELECT id, transcript_path, last_event_at FROM sessions WHERE transcript_path != '';`,
+	// v9: the last pre-clean of each task (atl learn): the extract's
+	// input_hash, the key of what produced it (learn.CacheKey: input,
+	// prompt version, model, effort), the occurrences kept (JSON), and
+	// its cost. Only a call that succeeded is stored.
+	`CREATE TABLE learn_digests (
+  task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  input_hash TEXT NOT NULL,
+  cache_key TEXT NOT NULL,
+  occurrences_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  cost_usd REAL NOT NULL DEFAULT 0
+);`,
+	// v10: learnings (atl learn's Analyse groups occurrences into them;
+	// atl learnings reviews them) and their occurrences, each by its
+	// stable key (learn.OccurrenceKey): a key that is here is not
+	// analysed again. item_id is the item it quotes (learn.ItemID).
+	// session is atelier's session id, 0 for a notes line; no foreign
+	// key, so the evidence outlives a session row. at, decided_at: unix
+	// ms (decided_at 0: not decided). learning_skips: the keys Analyse
+	// left unassigned (tries: in how many runs); from 2 tries not sent
+	// again while analyse_version is the current learn.AnalyseVersion.
+	`CREATE TABLE learnings (
+  id INTEGER PRIMARY KEY,
+  text TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('candidate','proposed','accepted','rejected')),
+  edited INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  decided_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE learning_occurrences (
+  key TEXT PRIMARY KEY,
+  learning_id INTEGER NOT NULL REFERENCES learnings(id) ON DELETE CASCADE,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL DEFAULT '',
+  session INTEGER NOT NULL DEFAULT 0,
+  at INTEGER NOT NULL,
+  strength TEXT NOT NULL CHECK (strength IN ('strong','normal','mild')),
+  polarity TEXT NOT NULL CHECK (polarity IN ('reinforce','contradict')),
+  quote TEXT NOT NULL,
+  text TEXT NOT NULL
+);
+CREATE INDEX learning_occurrences_learning ON learning_occurrences(learning_id);
+CREATE INDEX learning_occurrences_task ON learning_occurrences(task_id);
+CREATE TABLE learning_skips (
+  key TEXT PRIMARY KEY,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  analyse_version TEXT NOT NULL,
+  tries INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX learning_skips_task ON learning_skips(task_id);`,
+	// v11: the injection snapshot (one row): the "User preferences"
+	// section of the start context, rendered from the accepted learnings
+	// by every change of them (Store.Injection), so the hook only reads
+	// it. No row: nothing to inject.
+	`CREATE TABLE learn_injection (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  text TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);`,
+}
+
+// maxSessionTranscripts caps the session_transcripts rows of one session
+// (the v8 trigger has it as a literal).
+const maxSessionTranscripts = 100
+
+// migrationSteps holds, by index in migrations, Go code to run right after
+// that migration's SQL, in the same transaction: what SQL cannot do.
+// Never edit an entry, only add.
+var migrationSteps = map[int]func(context.Context, *sql.Tx) error{
+	6: backfillNoteLinesV1, // v7
 }
 
 // DefaultBusyTimeout is how long Open waits on a locked database.
@@ -312,6 +418,11 @@ func (s *Store) migrate(ctx context.Context) error {
 	for i := v; i < len(migrations); i++ {
 		if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
 			return fmt.Errorf("migration %d: %w", i+1, err)
+		}
+		if step := migrationSteps[i]; step != nil {
+			if err := step(ctx, tx); err != nil {
+				return fmt.Errorf("migration %d: %w", i+1, err)
+			}
 		}
 	}
 	// PRAGMA does not accept bound parameters; the value is an int we control.

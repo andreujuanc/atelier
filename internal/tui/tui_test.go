@@ -19,7 +19,9 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/andreujuanc/atelier/internal/app"
+	"github.com/andreujuanc/atelier/internal/learn"
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/store"
 )
 
 // Compile-time check that the adapter satisfies Backend over *app.App.
@@ -59,6 +61,15 @@ type fakeBackend struct {
 	// choices are OpenOrChoose's sessions per slug (none: it attaches).
 	choices map[string][]app.SessionChoice
 	openErr error
+	// learnings is what Learnings returns (by id); occs the occurrences
+	// per learning; learnErr the error of Decide/Edit/DeleteLearning;
+	// proposedN ProposedLearnings' count (not recorded: every tick asks).
+	learnings  []app.LearningView
+	occs       map[int64][]store.LearningOccurrence
+	learnErr   error
+	proposedN  int
+	countCalls int
+	learnCfg   learn.Config
 }
 
 func (f *fakeBackend) rec(name string, args ...any) { f.calls = append(f.calls, call{name, args}) }
@@ -1726,7 +1737,8 @@ func TestShutdownDoesNotWaitForDirtyCheck(t *testing.T) {
 
 // Every backend call that may run when the TUI stops (and write to App.Out)
 // goes through the tracker: once it is closed, none reaches the backend
-// (nil here, so an untracked call panics). TaskDir only builds a path.
+// (nil here, so an untracked call panics). TaskDir only builds a path;
+// LearnConfig only reads the loaded config.
 func TestTrackedBackendTracksEveryCall(t *testing.T) {
 	tr := &tracker{}
 	tr.close()
@@ -1735,7 +1747,7 @@ func TestTrackedBackendTracksEveryCall(t *testing.T) {
 	bt := reflect.TypeOf((*Backend)(nil)).Elem()
 	for i := 0; i < bt.NumMethod(); i++ {
 		name := bt.Method(i).Name
-		if name == "TaskDir" {
+		if name == "TaskDir" || name == "LearnConfig" {
 			continue
 		}
 		fn := tb.MethodByName(name)

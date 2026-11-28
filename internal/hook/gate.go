@@ -302,22 +302,19 @@ func (s *TaskServer) fail(stderr io.Writer, err error) int {
 	return 1
 }
 
-// note appends body as a note line (see app.AppendNote).
-func (s *TaskServer) note(req sandbox.ControlRequest, body []byte, stdout, stderr io.Writer) int {
+// note appends body as a note line (see app.AppendNote) by
+// model.AuthorAgent. The requested author is ignored, not refused: atl in
+// the container sends its --author, which defaults to user, so an agent's
+// plain `atl note` would otherwise fail; whatever it asks, a note from a
+// task container is the agent's.
+func (s *TaskServer) note(_ sandbox.ControlRequest, body []byte, stdout, stderr io.Writer) int {
 	text := strings.TrimSpace(model.SanitizeNotes(string(body)))
 	if text == "" {
 		return s.fail(stderr, errors.New("note is empty"))
 	}
-	author := req.Author
-	if author == "" {
-		author = model.AuthorUser
-	}
-	if !model.ValidAuthor(author) {
-		return s.fail(stderr, fmt.Errorf("invalid note author %q (want user or assistant)", author))
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 	defer cancel()
-	if _, err := s.d.st.AppendNote(ctx, s.d.scope, author, text); err != nil {
+	if _, err := s.d.st.AppendNote(ctx, s.d.scope, model.AuthorAgent, text); err != nil {
 		return s.fail(stderr, err)
 	}
 	fmt.Fprintln(stdout, "note added")
@@ -325,7 +322,8 @@ func (s *TaskServer) note(req sandbox.ControlRequest, body []byte, stdout, stder
 }
 
 // notes prints the notes, or with Set replaces them with body, or with
-// Clear alone clears them, printing what `atl notes` prints.
+// Clear alone clears them, printing what `atl notes` prints. A write is the
+// agent's (model.AuthorAgent).
 func (s *TaskServer) notes(req sandbox.ControlRequest, body []byte, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 	defer cancel()
@@ -346,7 +344,7 @@ func (s *TaskServer) notes(req sandbox.ControlRequest, body []byte, stdout, stde
 			return s.fail(stderr, errors.New("stdin is empty: nothing to set (use --clear to clear the notes)"))
 		}
 	}
-	text, err := s.d.st.ReplaceNotes(ctx, s.d.scope, text)
+	text, err := s.d.st.ReplaceNotes(ctx, s.d.scope, model.AuthorAgent, text)
 	if err != nil {
 		return s.fail(stderr, err)
 	}

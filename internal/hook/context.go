@@ -12,17 +12,28 @@ import (
 	"unicode/utf8"
 
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/learn"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/store"
 )
 
 // Session context limits.
 const (
-	contextMaxLen = 2500 // bytes (so also at most this many characters)
+	// contextMaxLen bounds the task context (bytes, so also at most this
+	// many characters), not counting the "User preferences" section,
+	// which has a budget of its own on top (contextPrefsLen).
+	contextMaxLen = 2500
 	contextEnvLen = 1000 // bytes of ATL_CONTEXT text
 	// contextMinNotes is the least room worth a notes section: with less,
 	// the notes are left out (`atl notes <slug>` still has them).
 	contextMinNotes = 40
+	// contextPrefsLen bounds the "User preferences" section's text (the
+	// injection snapshot, cut to [learn] inject_budget when it was
+	// rendered); it adds at most this plus its blank line and final
+	// newline.
+	contextPrefsLen = learn.MaxInjectBudget
+	// contextTotalLen bounds the whole start context.
+	contextTotalLen = contextMaxLen + contextPrefsLen + 2
 )
 
 // envContextVar names the environment variable whose text is appended to
@@ -45,6 +56,11 @@ func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p co
 	if err != nil {
 		return err
 	}
+	return writeStartOutput(w, text)
+}
+
+// writeStartOutput writes text to w as one SessionStart JSON object.
+func writeStartOutput(w io.Writer, text string) error {
 	var out sessionStartOutput
 	out.HookSpecificOutput.HookEventName = EventSessionStart
 	out.HookSpecificOutput.AdditionalContext = text
@@ -56,8 +72,9 @@ func writeSessionContext(ctx context.Context, w io.Writer, st *store.Store, p co
 	return err
 }
 
-// sessionContext loads task id and its notes (one task query, one repos
-// query, one notes query) and renders them.
+// sessionContext loads task id, its notes and the injection snapshot (one
+// task query, one repos query, one notes query, one snapshot query) and
+// renders them.
 func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID int64, envText string, sandboxed bool, roMounts []string, now time.Time) (string, error) {
 	t, err := st.GetTask(ctx, taskID)
 	if err != nil {
@@ -67,7 +84,78 @@ func sessionContext(ctx context.Context, st *store.Store, p config.Paths, taskID
 	if err != nil {
 		return "", err
 	}
-	return renderSandboxContext(*t, notes, p, envText, sandboxed, roMounts, now), nil
+	prefs, err := loadInjection(ctx, st)
+	if err != nil {
+		// Logged; the session still gets its task context, without the section.
+		logError(p, io.Discard, EventSessionStart, "", fmt.Errorf("session context: user preferences: %w", err))
+		prefs = ""
+	}
+	return renderStartContext(*t, notes, p, envText, prefs, sandboxed, roMounts, now), nil
+}
+
+// loadInjection reads the injection snapshot (store.Injection); tests
+// change it.
+var loadInjection = func(ctx context.Context, st *store.Store) (string, error) { return st.Injection(ctx) }
+
+// prefsHead is the first line of the "User preferences" section.
+const prefsHead = "User preferences (learned across tasks, approved by the user):"
+
+// Preferences renders the injection snapshot (store.Injection) from
+// texts, the accepted learnings, highest score first: prefsHead, then a
+// line "- <text>" for each (sanitised as oneLine does; a text left empty
+// is skipped), lines joined by newlines, no final newline. When they do
+// not all fit in budget bytes, it keeps the lines that do (in order: it
+// stops at the first that does not) and ends with "- … (N more: atl
+// learnings)", within budget too. "" when there are no texts, or not even
+// the head and that line fit.
+func Preferences(texts []string, budget int) string {
+	var lines []string
+	for _, t := range texts {
+		if l := oneLine(t); l != "" {
+			lines = append(lines, "- "+l)
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	size, n := len(prefsHead), 0
+	for n < len(lines) && size+1+len(lines[n]) <= budget {
+		size += 1 + len(lines[n])
+		n++
+	}
+	if n == len(lines) {
+		return prefsHead + "\n" + strings.Join(lines, "\n")
+	}
+	for ; n >= 0; n-- {
+		more := fmt.Sprintf("- … (%d more: atl learnings)", len(lines)-n)
+		kept := append(append([]string{prefsHead}, lines[:n]...), more)
+		if s := strings.Join(kept, "\n"); len(s) <= budget {
+			return s
+		}
+	}
+	return ""
+}
+
+// prefsBlock sanitises the injection snapshot for the context as
+// notesBlock does, and cuts it to contextPrefsLen bytes at a line end
+// (atl wrote it within the budget: this only bounds what the hook passes
+// on).
+func prefsBlock(s string) string {
+	s = notesBlock(s)
+	if len(s) > contextPrefsLen {
+		s = s[:strings.LastIndexByte(s[:contextPrefsLen+1], '\n')+1]
+		s = strings.TrimRight(s, " \n")
+	}
+	return s
+}
+
+// prefsSection is the "User preferences" section of the start context:
+// a blank line, then the snapshot; "" when it is empty.
+func prefsSection(snapshot string) string {
+	if b := prefsBlock(snapshot); b != "" {
+		return "\n" + b + "\n"
+	}
+	return ""
 }
 
 // sandboxNote tells a session that runs in the task's own container (see
@@ -145,6 +233,15 @@ func notesMarker(slug string) string {
 // (mountsLine): at most mountsLineMax bytes, and less where it would leave
 // the notes less than the useful part notesTail keeps of them.
 func renderSandboxContext(t model.Task, notes string, p config.Paths, envText string, sandboxed bool, roMounts []string, now time.Time) string {
+	return renderStartContext(t, notes, p, envText, "", sandboxed, roMounts, now)
+}
+
+// renderStartContext is renderSandboxContext with the "User preferences"
+// section (prefsSection of snapshot, the injection snapshot) right after
+// the task block (and the mounts line), before the environment notes and
+// the notes. It has its own budget: the rest stays within contextMaxLen
+// as without it, the whole within contextTotalLen.
+func renderStartContext(t model.Task, notes string, p config.Paths, envText, snapshot string, sandboxed bool, roMounts []string, now time.Time) string {
 	slug := oneLine(t.Slug)
 	branch := t.Branch
 	if branch == "" {
@@ -185,19 +282,31 @@ func renderSandboxContext(t model.Task, notes string, p config.Paths, envText st
 	const title = "\nNotes:\n"
 	text := notesBlock(notes)
 	fixed := top + head.String()
+	mounts := ""
 	if sandboxed && len(roMounts) > 0 {
 		// Out of the notes' room, leaving them what notesTail needs.
 		budget := contextMaxLen - len(fixed) - len(footer)
 		if text != "" {
 			budget -= len(title) + min(len(text), len(notesMarker(slug))+contextMinNotes) + 1
 		}
-		fixed = top + mountsLine(roMounts, min(budget, mountsLineMax)) + head.String()
+		mounts = mountsLine(roMounts, min(budget, mountsLineMax))
+		fixed = top + mounts + head.String()
 	}
+	// The preferences go after the task block, out of no other part's room.
+	block, prefs := len(top)+len(mounts), prefsSection(snapshot)
 	if len(fixed)+len(footer) > contextMaxLen {
-		// Pathological (huge title or many repos): no room for notes.
-		return truncateBytes(fixed, contextMaxLen-len(footer)-len("…\n")) + "…\n" + footer
+		// Pathological (huge title or many repos): no room for notes. The
+		// cut ends at a line end, its marker on a line of its own, and the
+		// preferences come whole after the task block's part that is kept.
+		cut := truncateBytes(fixed, contextMaxLen-len(footer)-len("…\n"))
+		cut = cut[:strings.LastIndexByte(cut, '\n')+1]
+		if len(cut) <= block {
+			return cut + "…\n" + prefs + footer
+		}
+		return cut[:block] + prefs + cut[block:] + "…\n" + footer
 	}
 	room := contextMaxLen - len(fixed) - len(footer) - len(title)
+	fixed = fixed[:block] + prefs + fixed[block:]
 	if body := notesTail(text, room, slug); body != "" {
 		return fixed + title + body + "\n" + footer
 	}

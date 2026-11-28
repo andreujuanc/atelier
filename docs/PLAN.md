@@ -30,13 +30,14 @@ internal/hook            `atl hook <event>` handler, state machine, ro guard    
 internal/palette         session-state colours shared by tui and `atl statusline`
 internal/gen             CLAUDE.md + .claude/settings.json generation           (M4)
 internal/project         project TOML load (M5), script runner + env (M7)
+internal/learn           learning: config, static extract (prompts typed, notes blame), input hash (L1)
 internal/cli             cobra commands                                         (M5)
 internal/tui             Bubble Tea UI                                          (M6)
 test/e2e.sh              end-to-end script (+ test/stubs/claude, test/stubs/gh) (M8)
 ```
 
 Dependency direction (no cycles): `model ← config ← store`; `gitx`, `tmux` depend on nothing internal;
-`gen ← model`; `palette ← model`; `hook ← store, config, model, palette`; `project ← config`; `app ← everything above`;
+`gen ← model`; `palette ← model`; `learn ← model`; `workspace ← learn`; `hook ← store, config, model, palette`; `project ← config`; `app ← everything above`;
 `tui ← app, palette`; `cli ← app, hook, tui`.
 
 ## 2. Data model
@@ -128,11 +129,14 @@ CREATE TABLE sessions (
 CREATE INDEX sessions_task ON sessions(task_id);
 -- migration v2: ALTER TABLE sessions ADD COLUMN launch_seq INTEGER NOT NULL DEFAULT 0 (bumped by ClaimStopped / SetSessionLaunch)
 -- migration v5: ALTER TABLE tasks ADD COLUMN notes TEXT NOT NULL DEFAULT '' (one notes text per task; see §7)
+-- migration v7: notes_line_authors(task_id FK ON DELETE CASCADE, line_hash BLOB, copy, author, at, PK (task_id, line_hash, copy)): who first wrote each notes line (see §7)
+-- migration v8: session_transcripts(session_id FK ON DELETE CASCADE, path, first_seen, PK (session_id, path)): every transcript file a session had (triggers on sessions.transcript_path + AddSessionTranscript; max 100 per session)
 CREATE INDEX sessions_claude ON sessions(claude_session_id);
 ```
 
 Connection pragmas: `journal_mode=WAL`, `busy_timeout=3000`, `foreign_keys=ON`, `synchronous=NORMAL`.
-Migrations are an ordered `[]string`; `Open` applies those with index ≥ user_version inside a tx.
+Migrations are an ordered `[]string`; `Open` applies those with index ≥ user_version inside a tx, each followed by its Go step
+(`migrationSteps`, by index) if it has one.
 
 ## 3. Interfaces between packages
 
@@ -487,7 +491,7 @@ Task reference `<task>` = slug, numeric id, or unique slug prefix. Exit codes: 0
 | `atl resume <task>` | `App.Resume`; prints count |
 | `atl status <task> <status>` | `App.SetStatus` |
 | `atl rename <task> <new title...>` | `App.Rename` (words joined with spaces, like `atl note`); prints the new title. Empty/whitespace-only, control characters or over 200 runes → usage error (exit 2; `atl new` rejects an over-long title the same way) |
-| `atl note <task> <text...> [--author user\|assistant]` | `App.AppendNote`: appends `- YYYY-MM-DD [author] text` to the notes; prints `note added` |
+| `atl note <task> <text...> [--author user\|assistant\|agent]` | `App.AppendNote`: appends `- YYYY-MM-DD [author] text` to the notes; prints `note added` |
 | `atl notes <task> [--set] [--clear]` | prints the notes text (nothing when empty); `--set` → `App.ReplaceNotes` from stdin, `--clear` alone → `App.ReplaceNotes(“”)` without reading stdin. The task is resolved before stdin is read. `--set` with stdin empty after `SanitizeNotes` → error (exit 1) unless `--clear` is also given (then it clears). The "reading from stdin; end with ctrl-d" hint goes to stderr only when stdin is a terminal (`isTerminal`: a char device other than /dev/null, /dev/zero, /dev/full, /dev/random, /dev/urandom; ioctl-free). Prints `notes replaced (N bytes)` / `notes cleared` |
 | `atl show <task> [--json \| --notes]` | task detail; `--notes` prints only the notes text (read-only spelling of `atl notes <task>`); `--json` + `--notes` → usage error |
 | `atl diff <task>` | `App.Diff` through pager |
@@ -589,13 +593,21 @@ Part A — data the assistant reads:
 - Notes (migration v5, replacing the dated list): ONE free-form text per task, `tasks.notes TEXT NOT NULL DEFAULT ''`.
   v5 folds task_notes rows into it, oldest first (created_at, id), one `- YYYY-MM-DD [author] body` line each (local date,
   newlines in a body kept); its UPDATE only fills empty notes (idempotent); task_notes is kept.
-  Store: `GetNotes(id)`, `SetNotes(id, text, base) (stored, error)` (CAS in a BEGIN IMMEDIATE tx; mismatch →
-  `*model.NotesConflictError{Current}`, `errors.Is(err, model.ErrNotesConflict)`), `ReplaceNotes(id, text)` (no compare),
+  Store: `GetNotes(id)`, `SetNotes(id, author, text, base) (stored, error)` (CAS in a BEGIN IMMEDIATE tx; mismatch →
+  `*model.NotesConflictError{Current}`, `errors.Is(err, model.ErrNotesConflict)`), `ReplaceNotes(id, author, text)` (no compare),
   `AppendNote(id, author, body) (line, error)` (atomic; adds "\n" first unless empty or already newline-terminated).
   Text is stored as `model.SanitizeNotes` (invalid UTF-8 → U+FFFD, \r\n/\r → \n, control chars except \n \t dropped,
   trailing whitespace trimmed); writes over `model.MaxNotesLen` (64 KiB) → `model.ErrNotesTooLarge`. App: `Notes`, `SetNotes`,
   `ReplaceNotes`, `AppendNote`; `TaskView.Notes` (Get), `TaskDetail.Notes`.
-- `atl note <task> <text...> [--author user|assistant]` appends; `atl notes <task>` prints; `atl notes <task> --set` replaces
+  Who wrote what (migration v7): each write that changes the notes does, in its tx, `INSERT OR IGNORE` into
+  `notes_line_authors` (task, sha256 of the line's frozen canonical form `canonLineV1`, k for its k-th copy, author, at) for
+  each non-blank line (an append: only the copies it adds): first writer wins, rows never change or go (only with the task). v7
+  records the lines it finds, raw and as sanitising splits them, as `unknown`. Cap: 10000 rows per (task, author); past it the
+  author's new lines blame `unknown`, and while another author is past it the user's whole-text writes record nothing.
+  Authors: `user` (host CLI, TUI), `agent` (task gate, forced), `assistant` (assistant gate, forced). `NotesBlame(id)
+  []model.BlamedLine`: each line with its row's author/at (matched by count, not position), `unknown` if none, `Blank` for
+  lines blank in canonical form.
+- `atl note <task> <text...> [--author user|assistant|agent]` appends; `atl notes <task>` prints; `atl notes <task> --set` replaces
   from stdin (empty → error unless `--clear`); `atl notes <task> --clear` clears. TUI: notes area under the details, `m` edits in place (§5).
 
 Part B — the assistant:

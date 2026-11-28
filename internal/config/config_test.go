@@ -190,7 +190,7 @@ func TestRunLayout(t *testing.T) {
 			rel, err := filepath.Rel(root, path)
 			return err == nil && rel != "." && filepath.IsLocal(rel)
 		}
-		for _, d := range []string{p.RunDir("a"), p.ClaudeDir("a"), p.ClaudeToken(), p.AssistantRunDir(), p.AssistantClaudeDir(), p.OriginPin("api")} {
+		for _, d := range []string{p.RunDir("a"), p.ClaudeDir("a"), p.ClaudeToken(), p.AssistantRunDir(), p.AssistantClaudeDir(), p.LearnerClaudeDir(), p.OriginPin("api")} {
 			if !under(d) {
 				t.Errorf("%s is not under the run root %s", d, root)
 			}
@@ -209,7 +209,7 @@ func TestRunLayout(t *testing.T) {
 			t.Error("the same slug in another tasks dir shares the Claude dir")
 		}
 		if filepath.Dir(p.ClaudeDir("a")) != filepath.Dir(p.AssistantClaudeDir()) || p.ClaudeDir("assistant") == p.AssistantClaudeDir() ||
-			p.RunDir("assistant") == p.AssistantRunDir() {
+			p.RunDir("assistant") == p.AssistantRunDir() || p.ClaudeDir("learner") == p.LearnerClaudeDir() || p.LearnerClaudeDir() == p.AssistantClaudeDir() {
 			t.Error("a task's dirs can be the assistant's")
 		}
 	}

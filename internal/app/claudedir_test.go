@@ -94,3 +94,46 @@ func TestPruneClaudeDirPastUnreadableDir(t *testing.T) {
 		t.Errorf("no warning for the unreadable dir: %q", out.String())
 	}
 }
+
+// TestPruneClaudeDirKeepsHistory: closing a task keeps its input history
+// (atl learn tells pasted text from typed with it) as a plain file, and
+// removes the rest of the Claude dir but projects/; a history.jsonl that is
+// a symlink goes.
+func TestPruneClaudeDirKeepsHistory(t *testing.T) {
+	root := t.TempDir()
+	var out bytes.Buffer
+	a := &App{Paths: config.Paths{Workspace: root, StateDir: filepath.Join(root, "state")}, Out: &out}
+	for _, c := range []struct {
+		slug string
+		link bool
+	}{{"plain", false}, {"linked", true}} {
+		task := &model.Task{Slug: c.slug}
+		dir := a.Paths.ClaudeDir(task.Slug)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		hist := filepath.Join(dir, "history.jsonl")
+		if c.link {
+			if err := os.Symlink("/etc/passwd", hist); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.WriteFile(hist, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		other := filepath.Join(dir, ".claude.json")
+		if err := os.WriteFile(other, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		a.pruneClaudeDir(task)
+		_, err := os.Lstat(hist)
+		if c.link && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s: symlinked history.jsonl kept: %v", c.slug, err)
+		}
+		if !c.link && readFile(t, hist) != "{}\n" {
+			t.Errorf("%s: history.jsonl removed", c.slug)
+		}
+		if _, err := os.Lstat(other); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s: .claude.json kept: %v", c.slug, err)
+		}
+	}
+}

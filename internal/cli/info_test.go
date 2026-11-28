@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/andreujuanc/atelier/internal/model"
+	"github.com/andreujuanc/atelier/internal/sandbox"
 	"github.com/andreujuanc/atelier/internal/store"
 )
 
@@ -489,6 +490,15 @@ func TestForAssistant(t *testing.T) {
 		strings.Index(s, "the user's plan") > strings.Index(s, "the assistant's text") {
 		t.Errorf("history:\n%s", s)
 	}
+	// a note run for the assistant is the assistant's, whatever --author says
+	for _, au := range []string{"user", "agent", "assistant"} {
+		if code, _, errs := atl(t, "note", "--for-assistant", "beta", "by "+au, "--author", au); code != 0 {
+			t.Fatalf("note --author %s: %d %s", au, code, errs)
+		}
+	}
+	if _, out, _ := atl(t, "notes", "beta"); strings.Count(out, "[assistant] by ") != 3 || strings.Contains(out, "[user]") || strings.Contains(out, "[agent]") {
+		t.Errorf("notes after the assistant's notes: %q", out)
+	}
 }
 
 // TestShowSanitizesSessionFields: a session's Claude id and transcript path
@@ -517,5 +527,75 @@ func TestShowSanitizesSessionFields(t *testing.T) {
 	if code != 0 || strings.ContainsAny(out, "\x1b\x07") ||
 		!strings.Contains(out, "claude id   cid]0;pwned\n") || !strings.Contains(out, "transcript  /tmp/t[2J.jsonl\n") {
 		t.Fatalf("show: %d %q %s", code, out, errs)
+	}
+}
+
+// TestNoteHostWriter: with the sandbox off, a task session's (or script's)
+// notes are an agent's and the assistant's its own, whatever --author says,
+// so neither counts as the user's words (atl learn); the user's own atl
+// note, with none of their variables, is the user's.
+func TestNoteHostWriter(t *testing.T) {
+	setup(t)
+	if code, _, errs := atl(t, "new", "Fix", "--repo", "api", "--no-fetch"); code != 0 {
+		t.Fatalf("new: %d %s", code, errs)
+	}
+	note := func(text string, env map[string]string) {
+		t.Helper()
+		for _, k := range []string{"ATL_SESSION", "ATL_TASK", sandbox.AssistantEnv} {
+			t.Setenv(k, env[k])
+		}
+		if code, _, errs := atl(t, "note", "fix", "--author", "user", text); code != 0 {
+			t.Fatalf("note %q: %d %s", text, code, errs)
+		}
+	}
+	note("from a session", map[string]string{"ATL_SESSION": "1", "ATL_TASK": "fix"})
+	note("from a script", map[string]string{"ATL_TASK": "fix"})
+	note("from the assistant", map[string]string{sandbox.AssistantEnv: "1"})
+	note("from the user", nil)
+
+	// atl notes --set from a session: the lines it adds are the agent's.
+	_, before, _ := atl(t, "notes", "fix")
+	t.Setenv("ATL_SESSION", "1")
+	var out, errb bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if code := runIn(ctx, []string{"notes", "fix", "--set"}, strings.NewReader(before+"set by a session\n"), &out, &errb); code != 0 {
+		t.Fatalf("notes --set: %d %s", code, errb.String())
+	}
+	t.Setenv("ATL_SESSION", "")
+
+	st, err := store.Open(testDB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	task, err := st.GetTaskBySlug(context.Background(), "fix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines, err := st.NotesBlame(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"[agent] from a session":         model.AuthorAgent,
+		"[agent] from a script":          model.AuthorAgent,
+		"[assistant] from the assistant": model.AuthorAssistant,
+		"[user] from the user":           model.AuthorUser,
+		"set by a session":               model.AuthorAgent,
+	}
+	seen := 0
+	for _, l := range lines {
+		for suffix, author := range want {
+			if strings.HasSuffix(l.Text, suffix) {
+				seen++
+				if l.Author != author {
+					t.Errorf("%q: author %s, want %s", l.Text, l.Author, author)
+				}
+			}
+		}
+	}
+	if seen != len(want) {
+		t.Errorf("found %d of %d lines in %+v", seen, len(want), lines)
 	}
 }

@@ -52,7 +52,9 @@ stopped sessions with `claude --resume`.
 ## Notes
 
 One free-form text per task, shown under the task's details in the TUI. Agents and the
-assistant append with `atl note`; you edit with `m`.
+assistant append with `atl note`; you edit with `m`. A note from a task session is tagged
+`[agent]`, whatever `--author` says, and atl records who wrote each line (you, an agent or the
+assistant) apart from the text, so a `[user]` tag an agent writes does not make it yours.
 
 Editor keys:
 

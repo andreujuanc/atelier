@@ -47,6 +47,12 @@ const (
 	// modeRestart: an `a` run waits for what runs in the task before it
 	// restarts its sessions (restartState).
 	modeRestart
+	// modeLearnings: the learnings view (L) has the keyboard (Model.learn).
+	modeLearnings
+	// modeLearnEdit: a learning's text is being edited in the view.
+	modeLearnEdit
+	// modeAsk: a yes/no question (Model.ask), e.g. before atl learn runs.
+	modeAsk
 )
 
 // confirmState is the done/cancel dialog: confirming (space ticks the box,
@@ -180,6 +186,11 @@ type Model struct {
 	dirtyTimeout time.Duration
 	// diffCmd returns the command that shows a task's diff (paged).
 	diffCmd func(slug string) *exec.Cmd
+	// learnCmd returns the command that runs atl learn (l).
+	learnCmd func() *exec.Cmd
+	// execing marks the children run on the terminal (signalGuard);
+	// nil: not watched.
+	execing *execState
 	// flushOut, if set, returns once every App.Out line written so far has
 	// been delivered to the program (as warnMsg): an op's result message
 	// sent after it is then handled after the op's output lines.
@@ -297,6 +308,17 @@ type Model struct {
 	updating   bool
 	updated    string
 	restarting bool
+
+	// learn is the learnings view (L), nil while closed; learnBusy: a
+	// change of a learning in flight ("accept learning 3").
+	learn     *learnView
+	learnBusy string
+	// ask is the open yes/no question (modeAsk).
+	ask *askState
+	// proposed is how many learnings wait for review (the top bar's
+	// hint); counting: a count is in flight.
+	proposed int
+	counting bool
 }
 
 // Forced reports whether the user forced the quit (second ctrl+c) while
@@ -326,6 +348,7 @@ func New(ctx context.Context, be Backend) *Model {
 			return tea.Tick(d, func(time.Time) tea.Msg { return msg })
 		},
 		diffCmd:      func(slug string) *exec.Cmd { return exec.Command("atl", "diff", slug) },
+		learnCmd:     func() *exec.Cmd { return exec.Command("atl", "learn") },
 		filterInput:  fi,
 		renameInput:  ri,
 		busy:         map[int64]string{},
@@ -341,7 +364,7 @@ func (m *Model) Init() tea.Cmd {
 	m.listing, m.recovering, m.dirtying = true, true, true
 	return tea.Batch(m.listCmd(), m.recoverCmd(), m.projectsCmd(), m.dirtyCmd(),
 		m.after(listEvery, listTickMsg{}), m.after(recoverEvery, recoverTickMsg{}),
-		m.updateCheckCmd(), tea.RequestBackgroundColor)
+		m.updateCheckCmd(), m.countCmd(), tea.RequestBackgroundColor)
 }
 
 // --- commands ---
@@ -664,6 +687,7 @@ func firstLine(s string) string {
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cmd := m.update(msg)
 	m.syncNotesSize()
+	m.syncLearnEditSize()
 	if m.forceQuit {
 		return m, tea.Quit
 	}
@@ -756,6 +780,8 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			(m.detail == nil || m.detail.Task.ID != t.Task.ID || m.now().Sub(m.detailAt) >= detailEvery) {
 			cmds = append(cmds, m.detailCmd(t.Task.ID, t.Task.Slug))
 		}
+		// The top bar's count of learnings to review (one query).
+		cmds = append(cmds, m.countCmd())
 		return tea.Batch(cmds...)
 	case recoverTickMsg:
 		cmds := []tea.Cmd{m.after(recoverEvery, recoverTickMsg{})}
@@ -851,9 +877,24 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return m.assistantOpened(msg)
 	case execDoneMsg:
 		return m.execDone(msg)
+	case learnCountMsg:
+		return m.learnCounted(msg)
+	case learningsMsg:
+		return m.learningsLoaded(msg)
+	case learningMsg:
+		return m.learningLoaded(msg)
+	case learnChangedMsg:
+		return m.learnChanged(msg)
 	}
 
 	switch m.mode {
+	case modeLearnEdit:
+		if m.learn != nil && m.learn.edit != nil {
+			var cmd tea.Cmd
+			m.learn.edit.ta, cmd = m.learn.edit.ta.Update(msg)
+			return cmd
+		}
+		return nil
 	case modeFilter:
 		var cmd tea.Cmd
 		m.filterInput, cmd = m.filterInput.Update(msg)
@@ -1065,6 +1106,9 @@ func (m *Model) assistantOpened(msg assistantMsg) tea.Cmd {
 
 // execDone reports a command run with the terminal handed over (exec).
 func (m *Model) execDone(msg execDoneMsg) tea.Cmd {
+	if msg.op == "learn" {
+		return m.learnDone(msg)
+	}
 	if msg.err != nil {
 		prefix := strings.TrimSpace(msg.op + " " + msg.slug)
 		text := prefix + ": " + msg.err.Error()
@@ -1140,7 +1184,7 @@ func (m *Model) exec(op, slug string, c *exec.Cmd) tea.Cmd {
 	if c.Stderr == nil {
 		c.Stderr = buf
 	}
-	return tea.ExecProcess(c, func(err error) tea.Msg {
+	return guardedExec(m.execing, cmdExec{c}, func(err error) tea.Msg {
 		return execDoneMsg{op: op, slug: slug, stderr: buf, err: err}
 	})
 }
@@ -1151,6 +1195,9 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.switching = false
 		if m.mode == modeNotes && m.notes != nil {
 			return m.notesQuit()
+		}
+		if m.mode == modeLearnEdit {
+			return m.learnEditQuit()
 		}
 		if m.mode == modeNotesLoading {
 			m.cancelNotesLoad()
@@ -1164,7 +1211,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	// ("jjj"): in normal mode and the session picker (j/k move there too)
 	// replay them one key at a time (the mode may change on the way, e.g.
 	// "/abc"). Pastes arrive as tea.PasteMsg and are ignored there.
-	replay := m.mode == modeNormal || m.mode == modeSessions
+	replay := m.mode == modeNormal || m.mode == modeSessions || m.mode == modeLearnings
 	if rs := []rune(msg.Text); replay && len(rs) > 1 && msg.Mod&(tea.ModAlt|tea.ModCtrl) == 0 {
 		var cmds []tea.Cmd
 		for _, r := range rs {
@@ -1191,9 +1238,19 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.renameKey(msg)
 	case modeSessions:
 		return m.sessionsKey(msg)
+	case modeLearnings:
+		return m.learningsKey(key)
+	case modeLearnEdit:
+		return m.learnEditKey(msg)
+	case modeAsk:
+		return m.askKey(key)
 	case modeHelp:
 		// Any key closes the key reference; it never acts on a task.
+		// Back where it was opened (the task list or the learnings view).
 		m.mode = modeNormal
+		if m.learn != nil {
+			m.mode = modeLearnings
+		}
 		return nil
 	}
 	return m.normalKey(key)
@@ -1477,6 +1534,10 @@ func (m *Model) normalKey(key string) tea.Cmd {
 		return nil
 	case "A":
 		return m.assistant()
+	case "L":
+		return m.openLearnings()
+	case "l":
+		return m.askLearn(modeNormal)
 	case "U":
 		if m.quitRequested {
 			m.setStatus(m.quitText(m.opsRunning()))
@@ -1655,6 +1716,9 @@ func (m *Model) busyOps() []string {
 	if m.updating {
 		ops = append(ops, "update atl")
 	}
+	if m.learnBusy != "" {
+		ops = append(ops, m.learnBusy)
+	}
 	sort.Strings(ops)
 	return ops
 }
@@ -1669,6 +1733,9 @@ func (m *Model) opsRunning() int {
 		n++
 	}
 	if m.updating {
+		n++
+	}
+	if m.learnBusy != "" {
 		n++
 	}
 	return n

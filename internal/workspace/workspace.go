@@ -16,6 +16,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/learn"
 	"github.com/andreujuanc/atelier/internal/sandbox"
 )
 
@@ -115,6 +116,9 @@ type Config struct {
 	Context    string         `toml:"context,omitempty"`
 	TmuxSocket string         `toml:"tmux_socket,omitempty"`
 	Sandbox    *SandboxConfig `toml:"sandbox,omitempty"`
+	// Learn is the [learn] table: learn.Defaults with the keys it sets
+	// (validated); nil without the table.
+	Learn *learn.Config `toml:"learn,omitempty"`
 }
 
 // SandboxConfig is atelier.toml's [sandbox] table.
@@ -139,7 +143,12 @@ func ReadConfig(dir string) (Config, error) {
 	if err != nil {
 		return c, err
 	}
+	def := learn.Defaults()
+	c.Learn = &def // decoded into: the keys [learn] sets replace the defaults
 	md, err := toml.Decode(string(data), &c)
+	if !md.IsDefined("learn") {
+		c.Learn = nil
+	}
 	if err != nil {
 		return c, fmt.Errorf("parse %s: %w", path, err)
 	}
@@ -163,6 +172,11 @@ func ReadConfig(dir string) (Config, error) {
 			if err := sandbox.CheckRegistry(r); err != nil {
 				return c, fmt.Errorf("%s: sandbox.registries: %v", path, err)
 			}
+		}
+	}
+	if c.Learn != nil {
+		if err := c.Learn.Validate(); err != nil {
+			return c, fmt.Errorf("%s: %v", path, err)
 		}
 	}
 	return c, nil
