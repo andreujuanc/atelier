@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/andreujuanc/atelier/internal/config"
+	"github.com/andreujuanc/atelier/internal/learn"
 	"github.com/andreujuanc/atelier/internal/model"
 	"github.com/andreujuanc/atelier/internal/store"
 )
@@ -116,9 +117,6 @@ func TestSessionStartContext(t *testing.T) {
 			"Repos:\n- api (rw, worktree " + f.p.WorktreePath("ctx", "api") + ", branched from origin/dev)\n" +
 				"- docs (ro, " + f.p.RepoPath("docs") + ", READ-ONLY: do not modify by any means)\n",
 			"\nATL_PORT_OFFSET=300\n",
-			"\nNotes:\n- 2026-04-02 [user] note 1\n- 2026-04-03 [assistant] note 2\n- 2026-04-04 [user] note 3\n" +
-				"- 2026-04-05 [assistant] note 4\n- 2026-04-06 [user] note 5\n- 2026-04-07 [assistant] note 6\n" +
-				"- 2026-04-08 [user] note 7\n\n",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("context lacks %q:\n%s", want, got)
@@ -127,8 +125,11 @@ func TestSessionStartContext(t *testing.T) {
 		if strings.Contains(got, "truncated") {
 			t.Errorf("short notes truncated:\n%s", got)
 		}
-		if !strings.HasSuffix(got, "\nUse `atl note ctx \"...\"` to leave a status note for later sessions.\n") {
-			t.Errorf("bad final line:\n%s", got)
+		if !strings.HasSuffix(got, "\nATL_PORT_OFFSET=300\n"+cheatSheet("ctx", false)+
+			"\nNotes:\n- 2026-04-02 [user] note 1\n- 2026-04-03 [assistant] note 2\n- 2026-04-04 [user] note 3\n"+
+			"- 2026-04-05 [assistant] note 4\n- 2026-04-06 [user] note 5\n- 2026-04-07 [assistant] note 6\n"+
+			"- 2026-04-08 [user] note 7\n") {
+			t.Errorf("bad end (the host's cheat sheet, then the notes, last):\n%s", got)
 		}
 		const prefix = "# atelier task context (auto-generated, current as of "
 		first := strings.SplitN(got, "\n", 2)[0]
@@ -217,7 +218,8 @@ func TestSessionStartContext(t *testing.T) {
 			t.Fatalf("exit=%d stderr=%q", code, errOut)
 		}
 		got := sessionStartContext(t, out)
-		want := "\nATL_PORT_OFFSET=300\n\nEnvironment notes (ATL_CONTEXT):\nNo runtimes here.\nRun tests via docker.\n\nNotes:\n"
+		want := "\nATL_PORT_OFFSET=300\n\nEnvironment notes (ATL_CONTEXT):\nNo runtimes here.\nRun tests via docker.\n" +
+			cheatSheet("ctx", false) + "\nNotes:\n"
 		if !strings.Contains(got, want) {
 			t.Errorf("context lacks %q:\n%s", want, got)
 		}
@@ -279,31 +281,38 @@ func TestSessionStartContext(t *testing.T) {
 	})
 }
 
-func TestRenderContextLimits(t *testing.T) {
+// TestRenderContextNotes: the notes come sanitised, last (after the cheat
+// sheet), and get the room the rest leaves under contextMaxChars: whole
+// when they fit, else their newest end after a marker.
+func TestRenderContextNotes(t *testing.T) {
 	p := config.Paths{Tasks: "/t", Repos: "/r"}
 	base := model.Task{Slug: "s", Title: "T", Status: model.StatusActive, Branch: "atl/s",
 		Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "main"}}}
-	footer := "\nUse `atl note s \"...\"` to leave a status note for later sessions.\n"
+	cheat := cheatSheet("s", false)
 	const marker = "… (earlier notes truncated; `atl notes s` for all)\n"
 	// notesOf returns the notes section of a context ("" if none).
 	notesOf := func(t *testing.T, got string) string {
 		t.Helper()
-		i := strings.Index(got, "\nNotes:\n")
+		i := strings.Index(got, cheat+"\nNotes:\n")
 		if i < 0 {
+			if strings.Contains(got, "\nNotes:\n") {
+				t.Fatalf("notes section not right after the cheat sheet:\n%s", got)
+			}
 			return ""
 		}
-		rest := got[i+len("\nNotes:\n"):]
-		if !strings.HasSuffix(rest, "\n"+footer) {
-			t.Fatalf("notes section not followed by the footer:\n%q", rest)
+		rest := got[i+len(cheat+"\nNotes:\n"):]
+		if !strings.HasSuffix(rest, "\n") {
+			t.Fatalf("notes section not last, ending with a newline:\n%q", rest)
 		}
-		return strings.TrimSuffix(rest, "\n"+footer)
+		return strings.TrimSuffix(rest, "\n")
 	}
-	manyRepos := func(n int) model.Task {
-		task := base
+	// datedLines returns n notes lines, each with its index and pad.
+	datedLines := func(n int, pad string) []string {
+		var lines []string
 		for i := 0; i < n; i++ {
-			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-with-a-long-name-%02d", i), Mode: model.ModeRO})
+			lines = append(lines, fmt.Sprintf("- 2026-03-%02d [user] N%04d %s", i%28+1, i, pad))
 		}
-		return task
+		return lines
 	}
 
 	t.Run("sanitised, newlines and indentation kept", func(t *testing.T) {
@@ -326,88 +335,153 @@ func TestRenderContextLimits(t *testing.T) {
 
 	t.Run("blank notes: no section", func(t *testing.T) {
 		for _, n := range []string{"", " \n\t\n", "\x1b"} {
-			if got := renderContext(base, n, p, "", now); strings.Contains(got, "Notes") || !strings.HasSuffix(got, footer) {
+			if got := renderContext(base, n, p, "", now); strings.Contains(got, "Notes") || !strings.HasSuffix(got, "\nATL_PORT_OFFSET=0\n"+cheat) {
 				t.Errorf("%q:\n%s", n, got)
 			}
 		}
 	})
 
-	t.Run("fits exactly, one more byte truncates", func(t *testing.T) {
-		room := contextMaxLen - len(renderContext(base, "", p, "", now)) - len("\nNotes:\n") - 1
-		exact := strings.Repeat("a", room)
+	t.Run("fits exactly, one more char truncates", func(t *testing.T) {
+		room := contextMaxChars - chars(renderContext(base, "", p, "", now)) - chars("\nNotes:\n") - 1
+		exact := strings.Repeat("é", room) // 2 bytes, 1 char
 		got := renderContext(base, exact, p, "", now)
-		if len(got) != contextMaxLen || notesOf(t, got) != exact {
-			t.Fatalf("exact fit: len %d", len(got))
+		if chars(got) != contextMaxChars || notesOf(t, got) != exact {
+			t.Fatalf("exact fit: %d chars", chars(got))
 		}
 		got = renderContext(base, "b\n"+exact, p, "", now)
-		if len(got) > contextMaxLen || notesOf(t, got) != marker+exact[len(marker):] {
-			t.Errorf("one line over: len %d:\n%s", len(got), notesOf(t, got))
+		if chars(got) > contextMaxChars || notesOf(t, got) != marker+string([]rune(exact)[chars(marker):]) {
+			t.Errorf("one line over: %d chars:\n%s", chars(got), notesOf(t, got))
 		}
 	})
 
-	t.Run("keeps the end, cut at a line start", func(t *testing.T) {
-		task := manyRepos(12)
-		var lines []string
-		for i := 0; i < 60; i++ {
-			lines = append(lines, fmt.Sprintf("- 2026-03-%02d [user] N%02d %s", i%28+1, i, strings.Repeat("x", 40)))
-		}
-		got := renderContext(task, strings.Join(lines, "\n"), p, "", now)
-		if len(got) > contextMaxLen || !utf8.ValidString(got) {
-			t.Fatalf("len %d > %d", len(got), contextMaxLen)
-		}
-		if !strings.HasSuffix(got, footer) || !strings.Contains(got, "repo-with-a-long-name-11 (ro, /r/repo-with-a-long-name-11") ||
-			!strings.Contains(got, "ATL_PORT_OFFSET=0") {
-			t.Errorf("fixed part or footer lost:\n%s", got)
-		}
+	t.Run("huge notes: newest kept from a line start, oldest dropped", func(t *testing.T) {
+		lines := datedLines(1000, strings.Repeat("x", 60)) // ~ 64 KiB
+		got := renderContext(base, strings.Join(lines, "\n"), p, "", now)
 		n := notesOf(t, got)
-		if !strings.HasPrefix(n, marker+"- 2026-03-") || !strings.HasSuffix(n, "N59 "+strings.Repeat("x", 40)) || strings.Contains(n, "N00 ") {
-			t.Errorf("not the end of the notes from a line start:\n%s", n)
+		if chars(got) > contextMaxChars || !strings.HasPrefix(n, marker+"- 2026-03-") || !strings.HasSuffix(n, lines[999]) ||
+			strings.Contains(n, "N0000 ") || !strings.HasSuffix(got, cheat+"\nNotes:\n"+n+"\n") {
+			t.Fatalf("%d chars:\n%s", chars(got), n)
 		}
-		// every kept line is whole, and nearly all the room is used
 		for _, l := range strings.Split(strings.TrimPrefix(n, marker), "\n") {
 			if len(l) != len(lines[0]) {
 				t.Errorf("partial line %q", l)
 			}
 		}
-		if len(got) < contextMaxLen-len(lines[0])-1 {
-			t.Errorf("too much room left: len %d", len(got))
+		if chars(got) < contextMaxChars-len(lines[0])-1 {
+			t.Errorf("too much room left: %d chars", chars(got))
 		}
 	})
 
-	t.Run("one huge line: cut on a rune boundary", func(t *testing.T) {
-		notes := "first line\n" + strings.Repeat("é", 3000) + "Z"
-		got := renderContext(base, notes, p, "", now)
-		n := notesOf(t, got)
-		if len(got) > contextMaxLen || !utf8.ValidString(got) || !strings.HasPrefix(n, marker+"é") || !strings.HasSuffix(n, "éZ") ||
-			strings.Contains(n, "first line") {
-			t.Errorf("len %d:\n%s", len(got), n)
-		}
-		if len(got) < contextMaxLen-1 {
-			t.Errorf("rune cut too short: len %d", len(got))
+	t.Run("huge multibyte notes: counted in chars, cut on a rune boundary", func(t *testing.T) {
+		// é: 2 bytes, 1 char; 😀: 4 bytes, 2 chars (UTF-16).
+		for _, r := range []string{"é", "😀"} {
+			notes := "first line\n" + strings.Repeat(r, 40000) + "Z"
+			got := renderContext(base, notes, p, "", now)
+			n := notesOf(t, got)
+			if chars(got) > contextMaxChars || chars(got) < contextMaxChars-2 || !utf8.ValidString(got) ||
+				!strings.HasPrefix(n, marker+r) || !strings.HasSuffix(n, r+"Z") || strings.Contains(n, "first line") {
+				t.Errorf("%s: %d chars, %d bytes", r, chars(got), len(got))
+			}
 		}
 	})
 
-	t.Run("huge fixed part still fits", func(t *testing.T) {
+	t.Run("max everything: within the cap, every section whole", func(t *testing.T) {
 		task := base
+		task.Slug = strings.Repeat("s", model.MaxSlugLen)
+		task.Title = strings.Repeat("😀", model.MaxTitleLen)
+		task.Repos = append(task.Repos, model.TaskRepo{Name: "docs", Mode: model.ModeRO})
+		var mounts []string
+		for i := 0; i < 30; i++ {
+			mounts = append(mounts, fmt.Sprintf("/home/someone/shared/readonly-thing-%02d", i))
+		}
+		env := strings.Repeat("ü", contextEnvLen)
+		for _, sandboxed := range []bool{false, true} {
+			for _, notes := range []string{strings.Join(datedLines(1000, strings.Repeat("x", 60)), "\n"), strings.Repeat("😀", 30000)} {
+				got := renderStartContext(task, notes, p, env, maxSnapshot(), sandboxed, mounts, now)
+				if chars(got) > contextMaxChars || !strings.Contains(got, "- Title: "+task.Title+"\n") ||
+					!strings.Contains(got, prefsSection(maxSnapshot())) || !strings.Contains(got, "\nEnvironment notes (ATL_CONTEXT):\n"+envBlock(env)+"\n") ||
+					!strings.Contains(got, cheatSheet(task.Slug, sandboxed)) || strings.Contains(got, "…\n\nATL_PORT_OFFSET") ||
+					(sandboxed && !strings.Contains(got, sandboxNote)) {
+					t.Errorf("sandboxed %v: %d chars", sandboxed, chars(got))
+				}
+			}
+		}
+	})
+
+	t.Run("many repos: the task block is cut, the rest whole", func(t *testing.T) {
+		task := base
+		for i := 0; i < 500; i++ {
+			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-with-a-long-name-%03d", i), Mode: model.ModeRO})
+		}
+		task.PortOffset = 700
+		for _, sandboxed := range []bool{false, true} {
+			got := renderStartContext(task, "- 2026-03-01 [user] hi", p, "env", maxSnapshot(), sandboxed, []string{"/x"}, now)
+			if chars(got) > contextMaxChars || !strings.Contains(got, "READ-ONLY: do not modify by any means)\n…\n\nATL_PORT_OFFSET=700\n") ||
+				strings.Contains(got, "repo-with-a-long-name-499") || !strings.Contains(got, prefsSection(maxSnapshot())) ||
+				!strings.Contains(got, "\nEnvironment notes (ATL_CONTEXT):\nenv\n") || !strings.Contains(got, cheatSheet("s", sandboxed)) ||
+				(sandboxed && !strings.Contains(got, sandboxNote+"\n"+mountsHead+"/x\n")) {
+				t.Errorf("sandboxed %v: %d chars:\n%s", sandboxed, chars(got), got)
+			}
+		}
+	})
+
+	t.Run("large task block kept whole", func(t *testing.T) {
+		task := base
+		task.Title = strings.Repeat("t", model.MaxTitleLen)
 		for i := 0; i < 80; i++ {
 			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-%02d", i), Mode: model.ModeRO})
 		}
 		got := renderContext(task, "- 2026-03-01 [user] hi", p, "", now)
-		if len(got) > contextMaxLen || !strings.HasSuffix(got, footer) || strings.Contains(got, "Notes") {
+		if !strings.Contains(got, "- Title: "+task.Title+"\n") || !strings.Contains(got, "- repo-79 (ro, /r/repo-79,") ||
+			notesOf(t, got) != "- 2026-03-01 [user] hi" || strings.Contains(got, "…") {
 			t.Errorf("len %d:\n%s", len(got), got)
 		}
 	})
+}
 
-	t.Run("too little room for notes: section dropped", func(t *testing.T) {
-		task := manyRepos(0)
-		for len(renderContext(task, "", p, "", now)) < contextMaxLen-len("\nNotes:\n")-len(marker)-contextMinNotes+5 {
-			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("r%03d", len(task.Repos)), Mode: model.ModeRO})
-		}
-		got := renderContext(task, strings.Repeat("long notes line\n", 50), p, "", now)
-		if len(got) > contextMaxLen || !strings.HasSuffix(got, footer) || strings.Contains(got, "Notes") {
-			t.Errorf("len %d:\n%s", len(got), got)
-		}
-	})
+// maxSnapshot is the largest injection snapshot.
+func maxSnapshot() string {
+	big := Preferences([]string{strings.Repeat("z", learn.MaxLearningText)}, learn.MaxInjectBudget)
+	for len(big)+learn.MaxLearningText+3 < learn.MaxInjectBudget {
+		big += "\n- " + strings.Repeat("y", learn.MaxLearningText)
+	}
+	return big
+}
+
+// TestContextFixedFits: at their largest, the sections other than the task
+// block and the notes leave the task block room for a big one (longest
+// title and slug, 12 repos, long workspace paths), so only a pathological
+// one is ever cut; with 4 repos, the notes still get some room.
+func TestContextFixedFits(t *testing.T) {
+	p := config.Paths{Tasks: "/home/someone-with-a-long-name/atelier/workspaces/a-workspace/tasks",
+		Repos: "/home/someone-with-a-long-name/atelier/workspaces/a-workspace/repos"}
+	slug := strings.Repeat("s", model.MaxSlugLen)
+	task := model.Task{Slug: slug, Title: strings.Repeat("😀", model.MaxTitleLen), Status: model.StatusActive, PortOffset: 1300}
+	for i := 0; i < 6; i++ {
+		task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-%d", i), Mode: model.ModeRW, BaseBranch: "release/2026-11"},
+			model.TaskRepo{Name: fmt.Sprintf("docs-%d", i), Mode: model.ModeRO})
+	}
+	var mounts []string
+	for i := 0; i < 30; i++ {
+		mounts = append(mounts, fmt.Sprintf("/home/someone/shared/readonly-thing-%02d", i))
+	}
+	got := renderStartContext(task, "", p, strings.Repeat("e", contextEnvLen), maxSnapshot(), true, mounts, now)
+	if strings.Contains(got, "…\n\nATL_PORT_OFFSET") || chars(got) > contextMaxChars {
+		t.Errorf("worst case without notes, 12 repos: %d chars of %d:\n%s", chars(got), contextMaxChars, got)
+	}
+	t.Logf("worst case without notes, 12 repos: %d chars", chars(got))
+	task.Repos = task.Repos[:4]
+	got = renderStartContext(task, "", p, strings.Repeat("e", contextEnvLen), maxSnapshot(), true, mounts, now)
+	if room := contextMaxChars - chars(got) - len("\nNotes:\n") - 1; room < 1000 {
+		t.Errorf("worst case without notes, 4 repos: %d chars, notes room %d", chars(got), room)
+	}
+	t.Logf("worst case without notes, 4 repos: %d chars", chars(got))
+	usual := model.Task{Slug: "fix-login", Title: "Fix the login redirect", Status: model.StatusActive, PortOffset: 300,
+		Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "main"}, {Name: "docs", Mode: model.ModeRO}}}
+	for _, sandboxed := range []bool{false, true} {
+		c := renderStartContext(usual, "", p, "", Preferences([]string{strings.Repeat("p", 150)}, 800), sandboxed, nil, now)
+		t.Logf("usual context, sandboxed %v: %d chars, notes room %d", sandboxed, chars(c), contextMaxChars-chars(c)-len("\nNotes:\n")-1)
+	}
 }
 
 func TestRenderContextEnv(t *testing.T) {
@@ -415,7 +489,7 @@ func TestRenderContextEnv(t *testing.T) {
 	base := model.Task{Slug: "s", Title: "T", Status: model.StatusActive, Branch: "atl/s", PortOffset: 100,
 		Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "main"}}}
 	notes := "- 2026-03-01 [user] hi"
-	footer := "\nUse `atl note s \"...\"` to leave a status note for later sessions.\n"
+	cheat := cheatSheet("s", false)
 	const head = "\nEnvironment notes (ATL_CONTEXT):\n"
 	section := func(t *testing.T, got string) string {
 		t.Helper()
@@ -431,14 +505,14 @@ func TestRenderContextEnv(t *testing.T) {
 		return rest[:j]
 	}
 
-	t.Run("placed after ATL_PORT_OFFSET, before notes", func(t *testing.T) {
+	t.Run("placed after ATL_PORT_OFFSET, before the cheat sheet and notes", func(t *testing.T) {
 		got := renderContext(base, notes, p, "Use docker for tests.", now)
-		want := "\nATL_PORT_OFFSET=100\n" + head + "Use docker for tests.\n\nNotes:\n- 2026-03-01 [user] hi\n" + footer
+		want := "\nATL_PORT_OFFSET=100\n" + head + "Use docker for tests.\n" + cheat + "\nNotes:\n- 2026-03-01 [user] hi\n"
 		if !strings.HasSuffix(got, want) {
 			t.Errorf("got:\n%s", got)
 		}
 		got = renderContext(base, "", p, "x", now)
-		if !strings.HasSuffix(got, "\nATL_PORT_OFFSET=100\n"+head+"x\n"+footer) {
+		if !strings.HasSuffix(got, "\nATL_PORT_OFFSET=100\n"+head+"x\n"+cheat) {
 			t.Errorf("no notes:\n%s", got)
 		}
 	})
@@ -481,44 +555,10 @@ func TestRenderContextEnv(t *testing.T) {
 			t.Errorf("cut too short: %d", len(s))
 		}
 	})
-
-	t.Run("overall cap: notes dropped first", func(t *testing.T) {
-		task := base
-		for i := 0; i < 8; i++ {
-			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-with-a-long-name-%02d", i), Mode: model.ModeRO})
-		}
-		var lines []string
-		for i := 0; i < 5; i++ {
-			lines = append(lines, fmt.Sprintf("- 2026-03-%02d [user] N%d ", 16+i, i)+strings.Repeat("x", 400))
-		}
-		many := strings.Join(lines, "\n")
-		env := strings.Repeat("env text ", 200)
-		got := renderContext(task, many, p, env, now)
-		if len(got) > contextMaxLen || !utf8.ValidString(got) || !strings.HasSuffix(got, footer) {
-			t.Fatalf("len %d > %d or footer lost:\n%s", len(got), contextMaxLen, got)
-		}
-		if s := section(t, got); len(s) > contextEnvLen || !strings.HasSuffix(s, "…") || !strings.HasPrefix(s, "env text env") {
-			t.Errorf("section cut wrongly (len %d): %q", len(s), s)
-		}
-		// the little room left keeps the end of the newest line, after the marker
-		if strings.Contains(got, "N0 ") || !strings.Contains(got, "\nNotes:\n… (earlier notes truncated; `atl notes s` for all)\nxxx") ||
-			!strings.HasSuffix(got, "xxx\n"+footer) || len(got) < contextMaxLen-1 {
-			t.Errorf("notes not cut from the start, newest kept:\n%s", got)
-		}
-
-		// A fixed part too big for notes: notes go, the cap and footer hold.
-		for i := 8; i < 30; i++ {
-			task.Repos = append(task.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-with-a-long-name-%02d", i), Mode: model.ModeRO})
-		}
-		got = renderContext(task, many, p, env, now)
-		if len(got) > contextMaxLen || !utf8.ValidString(got) || !strings.HasSuffix(got, footer) || strings.Contains(got, "Notes") {
-			t.Errorf("pathological: len %d:\n%s", len(got), got)
-		}
-	})
 }
 
 // TestRenderSandboxContext: a sandboxed session is told to use a repo's own
-// container setup, and the note leaves room under the cap for the rest.
+// container setup; a session on the host is not.
 func TestRenderSandboxContext(t *testing.T) {
 	p := config.Paths{Tasks: "/home/someone/atelier/workspaces/alpha/tasks", Repos: "/home/someone/atelier/workspaces/alpha/repos"}
 	task := model.Task{Slug: "shop-checkout-fix", Title: "Fix the checkout total rounding", Status: model.StatusActive,
@@ -535,27 +575,11 @@ func TestRenderSandboxContext(t *testing.T) {
 	if plain := renderSandboxContext(task, "", p, "", false, []string{"/x"}, now); strings.Contains(plain, "Sandbox:") || strings.Contains(plain, mountsHead) {
 		t.Errorf("note without the sandbox:\n%s", plain)
 	}
-
-	// Room left for notes: most of the cap without ATL_CONTEXT, and still
-	// a notes section with half its allowance used.
-	room := func(env string) int {
-		return contextMaxLen - len(renderSandboxContext(task, "", p, env, true, nil, now)) - len("\nNotes:\n") - 1
-	}
-	marker := "… (earlier notes truncated; `atl notes shop-checkout-fix` for all)\n"
-	if r := room(""); r < 600 {
-		t.Errorf("note is %d bytes: only %d left for notes", len(sandboxNote), r)
-	}
-	if r := room(strings.Repeat("e", contextEnvLen/2)); r < len(marker)+contextMinNotes {
-		t.Errorf("note is %d bytes: only %d left for notes with a %d-byte ATL_CONTEXT", len(sandboxNote), r, contextEnvLen/2)
-	}
-	t.Logf("note %d bytes; room for notes %d, %d with a %d-byte ATL_CONTEXT", len(sandboxNote), room(""),
-		room(strings.Repeat("e", contextEnvLen/2)), contextEnvLen/2)
 }
 
 // TestRenderSandboxMounts: a sandboxed session is told, in one line after
 // the sandbox note, which host paths it has read-only and may bind-mount
-// read-only; a long list is cut, saying how many more; the line never takes
-// the notes' useful part.
+// read-only; a long list is cut to mountsLineMax, saying how many more.
 func TestRenderSandboxMounts(t *testing.T) {
 	p := config.Paths{Tasks: "/home/someone/atelier/workspaces/alpha/tasks", Repos: "/home/someone/atelier/workspaces/alpha/repos"}
 	task := model.Task{Slug: "shop-checkout-fix", Title: "Fix the checkout total rounding", Status: model.StatusActive,
@@ -564,18 +588,17 @@ func TestRenderSandboxMounts(t *testing.T) {
 			{Name: "shop-web", Mode: model.ModeRW, BaseBranch: "main"}, {Name: "shop-docs", Mode: model.ModeRO}}}
 	now := time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC)
 	normal := []string{"/home/someone/.work.npmrc", "/home/someone/certs/corp-ca.pem"}
-	marker := notesMarker(task.Slug)
 	var notes strings.Builder
 	for i := 0; i < 40; i++ {
 		fmt.Fprintf(&notes, "note %02d: something the last session found out\n", i)
 	}
 
-	// A normal list, with a usual ATL_SANDBOX_CONTEXT and long notes: the
-	// whole list, right after the note, and notes (cut, newest kept).
+	// A normal list, with a usual ATL_SANDBOX_CONTEXT and notes: the whole
+	// list, right after the note, and the whole notes.
 	env := strings.Repeat("e", 200)
 	got := renderSandboxContext(task, notes.String(), p, env, true, normal, now)
 	want := "\n" + sandboxNote + "\n" + mountsHead + normal[0] + ", " + normal[1] + "\n\nEnvironment notes"
-	if !strings.Contains(got, want) || len(got) > contextMaxLen || !strings.Contains(got, "\nNotes:\n"+marker) || !strings.Contains(got, "note 39") {
+	if !strings.Contains(got, want) || !strings.Contains(got, "\nNotes:\nnote 00") || !strings.Contains(got, "note 39") {
 		t.Errorf("normal list (len %d):\n%s", len(got), got)
 	}
 	if strings.Count(got, mountsHead) != 1 {
@@ -587,7 +610,7 @@ func TestRenderSandboxMounts(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		long = append(long, fmt.Sprintf("/home/someone/shared/readonly-thing-%02d", i))
 	}
-	got = renderSandboxContext(task, "", p, "", true, long, now)
+	got = renderSandboxContext(task, notes.String(), p, "", true, long, now)
 	line := ""
 	for _, l := range strings.Split(got, "\n") {
 		if strings.HasPrefix(l, mountsHead) {
@@ -602,22 +625,6 @@ func TestRenderSandboxMounts(t *testing.T) {
 		t.Errorf("long list: %d shown, line %q", shown, line)
 	}
 
-	// Where room is short (half the ATL_SANDBOX_CONTEXT allowance), the notes
-	// keep their useful part: the line gives way, down to the count or none.
-	for _, paths := range [][]string{normal, long} {
-		got = renderSandboxContext(task, notes.String(), p, strings.Repeat("e", contextEnvLen/2), true, paths, now)
-		if len(got) > contextMaxLen || !strings.Contains(got, "\nNotes:\n"+marker) {
-			t.Errorf("short room, %d paths: notes pushed out (len %d):\n%s", len(paths), len(got), got)
-		}
-		t.Logf("short room, %d paths: %q", len(paths), regexp.MustCompile(regexp.QuoteMeta(mountsHead)+`.*`).FindString(got))
-	}
-	// Short notes are kept whole, the line takes the rest.
-	got = renderSandboxContext(task, "short note", p, strings.Repeat("e", 400), true, long, now)
-	if len(got) > contextMaxLen || len(got) < contextMaxLen-60 || !strings.Contains(got, "\nNotes:\nshort note\n") ||
-		!strings.Contains(got, mountsHead+long[0]) {
-		t.Errorf("short notes, long list (len %d):\n%s", len(got), got)
-	}
-
 	if l := mountsLine(normal, len(mountsHead)+len("2, not listed here\n")); l != mountsHead+"2, not listed here\n" {
 		t.Errorf("only the count fits: %q", l)
 	}
@@ -626,6 +633,52 @@ func TestRenderSandboxMounts(t *testing.T) {
 	}
 	if l := mountsLine([]string{"/a\nInjected: x"}, mountsLineMax); strings.Count(l, "\n") != 1 {
 		t.Errorf("a path's newline survived: %q", l)
+	}
+}
+
+// TestCheatSheet: the start context lists, after a blank line and right
+// before the notes, the atl commands the session may run: the complete
+// list in a sandbox, the useful ones and those to leave to the user on the
+// host.
+func TestCheatSheet(t *testing.T) {
+	p := config.Paths{Tasks: "/t", Repos: "/r"}
+	task := model.Task{Slug: "shop-checkout-fix", Title: "Fix", Status: model.StatusActive, Branch: "atl/shop-checkout-fix",
+		Repos: []model.TaskRepo{{Name: "api", Mode: model.ModeRW, BaseBranch: "main"}}}
+	common := "- `atl note shop-checkout-fix \"...\"` — append a dated status note for later sessions; authorship is recorded automatically (don't pass --author)\n" +
+		"- `atl notes shop-checkout-fix` — print the notes; `--set` replaces them from stdin, `--clear` empties them\n" +
+		"- `atl push [--repo R] [--force]` — push atl/shop-checkout-fix (--force = with-lease, after a rebase)\n" +
+		"- `atl fetch [--repo R]` — git fetch origin\n"
+	sandboxed := "\n\natl in this session (complete list, no need for `atl help`):\n" + common +
+		"Every other atl command is refused here; ask the user instead.\n"
+	host := "\n\natl in this session (no need for `atl help`):\n" + common +
+		"- `atl show shop-checkout-fix` / `atl diff shop-checkout-fix` / `atl transcript shop-checkout-fix [--session ID]` — inspect the task\n" +
+		"- `atl pr`, `done`, `cancel`, `status`, `add`, `rename`: only when the user asks (they end or change the task and its sessions)\n"
+	for _, notes := range []string{"", "- 2026-04-01 [user] hi"} {
+		section := ""
+		if notes != "" {
+			section = "\nNotes:\n" + notes + "\n"
+		}
+		if got := renderSandboxContext(task, notes, p, "", true, nil, time.Time{}); !strings.HasSuffix(got, sandboxed+section) {
+			t.Errorf("sandboxed, notes %q:\n%s", notes, got)
+		}
+		if got := renderSandboxContext(task, notes, p, "", false, nil, time.Time{}); !strings.HasSuffix(got, host+section) || strings.Contains(got, "refused here") {
+			t.Errorf("host, notes %q:\n%s", notes, got)
+		}
+	}
+
+	// contextCheatLen is the longest sheet; a longer slug than atl makes
+	// is left out.
+	if n := strings.Count(cheatHost, slugPlaceholder); n != cheatHostSlugs {
+		t.Errorf("cheatHost names the slug %d times, cheatHostSlugs is %d", n, cheatHostSlugs)
+	}
+	longest := strings.Repeat("s", model.MaxSlugLen)
+	if s, h := cheatSheet(longest, true), cheatSheet(longest, false); len(s) > contextCheatLen || len(h) != contextCheatLen {
+		t.Errorf("sheets %d and %d bytes, contextCheatLen %d", len(s), len(h), contextCheatLen)
+	}
+	for _, sb := range []bool{true, false} {
+		if s := cheatSheet(longest+"s", sb); len(s) > contextCheatLen || strings.Contains(s, longest) || !strings.Contains(s, "`atl note <slug> ") {
+			t.Errorf("over-long slug, sandboxed %v:\n%s", sb, s)
+		}
 	}
 }
 

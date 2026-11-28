@@ -82,16 +82,16 @@ func TestPrefsBlock(t *testing.T) {
 	if got := prefsBlock(strings.Repeat("y", contextPrefsLen+1)); got != "" {
 		t.Errorf("one line over the cap: %d bytes", len(got))
 	}
-	if contextPrefsLen != learn.MaxInjectBudget || contextTotalLen != contextMaxLen+learn.MaxInjectBudget+2 {
+	if contextPrefsLen != learn.MaxInjectBudget {
 		t.Error("limits out of step with learn.MaxInjectBudget")
 	}
 }
 
 // TestRenderStartContextPrefs: the "User preferences" section comes right
 // after the task block (sandbox note and mounts line included), before
-// the environment notes and the notes, and takes nothing from them: the
-// rest is what it is without it, within contextMaxLen, the whole within
-// contextTotalLen.
+// the environment notes and the notes, and takes room only from the
+// notes (which come last): what comes before them is what it is without
+// it, the whole within contextMaxChars.
 func TestRenderStartContextPrefs(t *testing.T) {
 	p := config.Paths{Tasks: "/t", Repos: "/r"}
 	task := model.Task{Slug: "s", Title: "T", Status: model.StatusActive, Branch: "atl/s", PortOffset: 300,
@@ -104,6 +104,13 @@ func TestRenderStartContextPrefs(t *testing.T) {
 		big += "\n- " + strings.Repeat(string(rune('a'+i%26)), learn.MaxLearningText)
 	}
 	notes := strings.Repeat("a long enough notes line\n", 200)
+	// beforeNotes is s without its notes section.
+	beforeNotes := func(s string) string {
+		if i := strings.Index(s, "\nNotes:\n"); i >= 0 {
+			return s[:i]
+		}
+		return s
+	}
 	for _, c := range []struct {
 		name      string
 		notes     string
@@ -122,7 +129,7 @@ func TestRenderStartContextPrefs(t *testing.T) {
 		got := renderStartContext(task, c.notes, p, c.env, c.snap, c.sandboxed, c.mounts, now)
 		sec := "\n" + c.snap + "\n"
 		i := strings.Index(got, sec)
-		if i < 0 || got[:i]+got[i+len(sec):] != without {
+		if i < 0 || beforeNotes(got[:i]+got[i+len(sec):]) != beforeNotes(without) {
 			t.Errorf("%s: section missing, or the rest changed:\n%s", c.name, got)
 			continue
 		}
@@ -131,11 +138,12 @@ func TestRenderStartContextPrefs(t *testing.T) {
 			t.Errorf("%s: not after the task block:\n%s", c.name, got)
 		}
 		if strings.Contains(before, "Notes:") || strings.Contains(before, "Environment notes") ||
-			(c.env != "" && !strings.HasPrefix(after, "\nEnvironment notes")) || (c.env == "" && !strings.HasPrefix(after, "\nNotes:\n")) {
-			t.Errorf("%s: not before the environment notes and the notes:\n%s", c.name, got)
+			(c.env != "" && !strings.HasPrefix(after, "\nEnvironment notes")) || (c.env == "" && !strings.HasPrefix(after, "\natl in this session")) {
+			t.Errorf("%s: not before the environment notes, the cheat sheet and the notes:\n%s", c.name, got)
 		}
-		if len(without) > contextMaxLen || len(got) > contextTotalLen || len(got) != len(without)+len(sec) {
-			t.Errorf("%s: %d bytes, %d without the section", c.name, len(got), len(without))
+		if chars(got) > contextMaxChars || chars(without) > contextMaxChars ||
+			(chars(without)+chars(sec) <= contextMaxChars && got != without[:i]+sec+without[i:]) {
+			t.Errorf("%s: %d chars, %d without the section", c.name, chars(got), chars(without))
 		}
 	}
 	if got := renderStartContext(task, notes, p, "", snapshot, true, []string{"/x"}, now); !strings.Contains(got, "/x\n"+section) {
@@ -144,38 +152,23 @@ func TestRenderStartContextPrefs(t *testing.T) {
 	if got := renderStartContext(task, notes, p, "", "", false, nil, now); got != renderContext(task, notes, p, "", now) {
 		t.Error("an empty snapshot changed the context")
 	}
-	// Pathological: no room for notes. The task block is cut at a line
-	// end, the marker on its own line before the section, which is whole.
-	footer := "\nUse `atl note s \"...\"` to leave a status note for later sessions.\n"
-	huge := task
-	huge.Title = strings.Repeat("t", 3000)
-	got := renderStartContext(huge, notes, p, "", snapshot, false, nil, now)
-	if !strings.HasSuffix(got, "\n\u2026\n"+section+footer) || strings.Contains(got, "ttt") ||
-		len(got) > contextTotalLen || len(got)-len(section) > contextMaxLen {
-		t.Errorf("huge title: %d bytes:\n%s", len(got), got)
-	}
-	// Many repos: the task block is cut likewise.
+	// A big task block (longest title, many repos) and long environment
+	// notes: the section comes after the whole block, the notes keep their
+	// end.
 	many := task
+	many.Title = strings.Repeat("t", model.MaxTitleLen)
 	for i := 0; i < 60; i++ {
 		many.Repos = append(many.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-%02d", i), Mode: model.ModeRO})
 	}
-	got = renderStartContext(many, notes, p, "", snapshot, false, nil, now)
-	if !strings.HasSuffix(got, "READ-ONLY: do not modify by any means)\n\u2026\n"+section+footer) || len(got)-len(section) > contextMaxLen {
-		t.Errorf("many repos: %d bytes:\n%s", len(got), got)
-	}
-	// The task block fits, the environment notes do not: the section comes
-	// whole after the block, the marker after what is kept of the rest.
-	some := task
-	for i := 0; i < 25; i++ {
-		some.Repos = append(some.Repos, model.TaskRepo{Name: fmt.Sprintf("repo-%02d", i), Mode: model.ModeRO})
-	}
 	env := strings.Repeat("env line\n", 110)
-	without := renderSandboxContext(some, notes, p, env, false, nil, now)
-	got = renderStartContext(some, notes, p, env, snapshot, false, nil, now)
+	without := renderSandboxContext(many, notes, p, env, false, nil, now)
+	got := renderStartContext(many, notes, p, env, snapshot, false, nil, now)
 	i := strings.Index(got, section)
-	if i < 0 || !strings.HasSuffix(got[:i], "\nATL_PORT_OFFSET=300\n") || !strings.HasPrefix(got[i+len(section):], "\nEnvironment notes") ||
-		!strings.HasSuffix(got, "env line\n\u2026\n"+footer) || got[:i]+got[i+len(section):] != without || len(without) > contextMaxLen {
-		t.Errorf("env cut: %d bytes:\n%s", len(got), got)
+	if i < 0 || !strings.HasSuffix(got[:i], "READ-ONLY: do not modify by any means)\n\nATL_PORT_OFFSET=300\n") ||
+		!strings.HasPrefix(got[i+len(section):], "\nEnvironment notes") || beforeNotes(got[:i]+got[i+len(section):]) != beforeNotes(without) ||
+		!strings.Contains(got, many.Title) || !strings.Contains(got, cheatSheet("s", false)+"\nNotes:\n"+notesMarker("s")) ||
+		!strings.HasSuffix(got, "line\na long enough notes line\n") || chars(got) > contextMaxChars || chars(got) < contextMaxChars-30 {
+		t.Errorf("big task block: %d chars:\n%s", chars(got), got)
 	}
 }
 
@@ -242,8 +235,7 @@ func TestStartContextPrefs(t *testing.T) {
 	}
 
 	code, out, errs := runHook(t, EventSessionStart, Input{SessionID: "c1", Cwd: f.p.TaskDir("fix"), Source: "startup"}, nil)
-	if got := sessionStartContext(t, out); code != 0 || errs != "" || !strings.Contains(got, "ATL_PORT_OFFSET=0\n"+want+"\nNotes:") &&
-		!strings.Contains(got, "ATL_PORT_OFFSET=0\n"+want+"\nUse `atl note") {
+	if got := sessionStartContext(t, out); code != 0 || errs != "" || !strings.Contains(got, "ATL_PORT_OFFSET=0\n"+want+"\natl in this session") {
 		t.Errorf("task session: %d %q\n%s", code, errs, got)
 	}
 

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/andreujuanc/atelier/internal/config"
@@ -17,24 +18,80 @@ import (
 	"github.com/andreujuanc/atelier/internal/store"
 )
 
-// Session context limits.
+// hookContextLimit is Claude Code's cap on a hook's additionalContext,
+// in characters (https://code.claude.com/docs/en/hooks). Over it, Claude
+// Code replaces the whole context with a file path and a preview of its
+// first 2,000 characters; no setting raises it.
+const hookContextLimit = 10000
+
+// Session context limits. The whole context fits in contextMaxChars; the
+// notes come last and get the room the rest leaves. The other sections
+// have their own caps (the text they bound comes from outside the task),
+// which at their largest still leave the task block room for a dozen repos
+// (TestContextFixedFits); a task block beyond its room is cut.
 const (
-	// contextMaxLen bounds the task context (bytes, so also at most this
-	// many characters), not counting the "User preferences" section,
-	// which has a budget of its own on top (contextPrefsLen).
-	contextMaxLen = 2500
-	contextEnvLen = 1000 // bytes of ATL_CONTEXT text
+	// contextMaxChars bounds the whole start context, in chars (see
+	// chars). It stays a little under hookContextLimit, in case Claude
+	// Code's count differs at the edge (">" or ">=", line ends): the cap is
+	// on the string, not on its JSON encoding.
+	contextMaxChars = hookContextLimit - 100
 	// contextMinNotes is the least room worth a notes section: with less,
-	// the notes are left out (`atl notes <slug>` still has them).
+	// the notes are left out (`atl notes <slug>`, in the cheat sheet, still
+	// has them).
 	contextMinNotes = 40
+	contextEnvLen   = 1000 // bytes of ATL_CONTEXT text
 	// contextPrefsLen bounds the "User preferences" section's text (the
 	// injection snapshot, cut to [learn] inject_budget when it was
 	// rendered); it adds at most this plus its blank line and final
 	// newline.
 	contextPrefsLen = learn.MaxInjectBudget
-	// contextTotalLen bounds the whole start context.
-	contextTotalLen = contextMaxLen + contextPrefsLen + 2
+	// contextCheatLen bounds the atl cheat sheet of the start context
+	// (cheatSheet): its longest variant with a slug of model.MaxSlugLen
+	// bytes.
+	contextCheatLen = len(cheatHost) + cheatHostSlugs*(model.MaxSlugLen-len(slugPlaceholder))
 )
+
+// slugPlaceholder stands for the task slug in the cheat sheet templates.
+const slugPlaceholder = "<slug>"
+
+// cheatCommon lists the atl commands every task session may run,
+// sandboxed or not (the sandbox gate allows these).
+const cheatCommon = "- `atl note <slug> \"...\"` — append a dated status note for later sessions; " +
+	"authorship is recorded automatically (don't pass --author)\n" +
+	"- `atl notes <slug>` — print the notes; `--set` replaces them from stdin, `--clear` empties them\n" +
+	"- `atl push [--repo R] [--force]` — push atl/<slug> (--force = with-lease, after a rebase)\n" +
+	"- `atl fetch [--repo R]` — git fetch origin\n"
+
+// cheatSandboxed is the cheat sheet of a sandboxed session: the complete
+// list of what its gate lets it run, so agents need not run `atl help`.
+const cheatSandboxed = "\natl in this session (complete list, no need for `atl help`):\n" + cheatCommon +
+	"Every other atl command is refused here; ask the user instead.\n"
+
+// cheatHost is the cheat sheet of a session on the host, which can run
+// every atl command: the useful ones, and those to leave to the user.
+const cheatHost = "\natl in this session (no need for `atl help`):\n" + cheatCommon +
+	"- `atl show <slug>` / `atl diff <slug>` / `atl transcript <slug> [--session ID]` — inspect the task\n" +
+	"- `atl pr`, `done`, `cancel`, `status`, `add`, `rename`: only when the user asks " +
+	"(they end or change the task and its sessions)\n"
+
+// cheatHostSlugs is how many times cheatHost names the slug.
+const cheatHostSlugs = 6
+
+// cheatSheet is the atl cheat sheet of the start context (with a blank
+// line before it), right before the notes: cheatSandboxed or cheatHost
+// for slug. A slug
+// longer than model.MaxSlugLen (atl makes none) stays slugPlaceholder, so
+// the sheet stays within contextCheatLen.
+func cheatSheet(slug string, sandboxed bool) string {
+	if len(slug) > model.MaxSlugLen {
+		slug = slugPlaceholder
+	}
+	tmpl := cheatHost
+	if sandboxed {
+		tmpl = cheatSandboxed
+	}
+	return strings.ReplaceAll(tmpl, slugPlaceholder, slug)
+}
 
 // envContextVar names the environment variable whose text is appended to
 // every task session's start context (e.g. set per devcontainer).
@@ -177,19 +234,21 @@ const sandboxNote = "Sandbox: you run in the task's own container. " +
 	"goes in a Docker service. " +
 	"No git credentials here (`git push`, `gh` fail): use `atl push`, `atl fetch`."
 
-// renderContext renders the SessionStart task context: plain markdown of
-// at most contextMaxLen bytes. envText (the raw ATL_CONTEXT value) is
-// sanitised and, if not blank, rendered as its own section after
-// ATL_PORT_OFFSET. The notes text comes last (before the footer) and is the
-// first thing cut: when it does not fit, its END is kept (appended notes
-// are the newest), cut at a line start (or a rune boundary when one line
-// is too long) after a truncation marker.
+// renderContext renders the SessionStart task context, plain markdown of
+// at most contextMaxChars chars: the task block, then the environment
+// notes, the atl cheat sheet and the notes. envText (the raw ATL_CONTEXT
+// value) is sanitised and, if not blank, rendered as its own section after
+// ATL_PORT_OFFSET. The notes come last and get all the room the rest
+// leaves: when they do not fit, their END is kept (appended notes are the
+// newest), cut at a line start (or a rune boundary when one line is too
+// long) after a truncation marker; with less than contextMinNotes chars of
+// room for them, they are left out.
 func renderContext(t model.Task, notes string, p config.Paths, envText string, now time.Time) string {
 	return renderSandboxContext(t, notes, p, envText, false, nil, now)
 }
 
 // mountsLineMax bounds the line that names the host paths a sandboxed task
-// has read-only (see mountsLine).
+// has read-only (see mountsLine): $ATL_SANDBOX_MOUNTS can list any number.
 const mountsLineMax = 240
 
 // mountsHead starts the line that names the host paths a sandboxed task has
@@ -223,15 +282,9 @@ func mountsLine(paths []string, limit int) string {
 	return ""
 }
 
-// notesMarker is the line before notes that were cut from the start.
-func notesMarker(slug string) string {
-	return "… (earlier notes truncated; `atl notes " + slug + "` for all)\n"
-}
-
 // renderSandboxContext is renderContext with, if sandboxed, the sandbox
 // note after ATL_PORT_OFFSET, followed by the line that names roMounts
-// (mountsLine): at most mountsLineMax bytes, and less where it would leave
-// the notes less than the useful part notesTail keeps of them.
+// (mountsLine, at most mountsLineMax bytes).
 func renderSandboxContext(t model.Task, notes string, p config.Paths, envText string, sandboxed bool, roMounts []string, now time.Time) string {
 	return renderStartContext(t, notes, p, envText, "", sandboxed, roMounts, now)
 }
@@ -239,16 +292,19 @@ func renderSandboxContext(t model.Task, notes string, p config.Paths, envText st
 // renderStartContext is renderSandboxContext with the "User preferences"
 // section (prefsSection of snapshot, the injection snapshot) right after
 // the task block (and the mounts line), before the environment notes and
-// the notes. It has its own budget: the rest stays within contextMaxLen
-// as without it, the whole within contextTotalLen.
+// the notes. A task block too long to leave the other sections their room
+// (pathological: very many repos or long paths) is cut at a line end, its
+// ATL_PORT_OFFSET line kept, a "…" line in place of the rest.
 func renderStartContext(t model.Task, notes string, p config.Paths, envText, snapshot string, sandboxed bool, roMounts []string, now time.Time) string {
 	slug := oneLine(t.Slug)
 	branch := t.Branch
 	if branch == "" {
 		branch = "atl/" + t.Slug
 	}
-	var head strings.Builder
-	w := func(format string, a ...any) { fmt.Fprintf(&head, format, a...) }
+	var b strings.Builder
+	w := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
+	// next returns what was written since the last call.
+	next := func() string { s := b.String(); b.Reset(); return s }
 	w("# atelier task context (auto-generated, current as of %s)\n\n", now.Format(time.RFC3339))
 	w("- Title: %s\n", oneLine(t.Title))
 	w("- Slug: %s\n", slug)
@@ -268,52 +324,38 @@ func renderStartContext(t model.Task, notes string, p config.Paths, envText, sna
 		}
 		w("- %s (rw, worktree %s%s)\n", name, oneLine(p.WorktreePath(t.Slug, r.Name)), from)
 	}
+	block := next()
 	w("\nATL_PORT_OFFSET=%d\n", t.PortOffset)
+	port := next()
 	if sandboxed {
 		w("\n%s\n", sandboxNote)
+		b.WriteString(mountsLine(roMounts, mountsLineMax))
 	}
-	top := head.String()
-	head.Reset()
+	b.WriteString(prefsSection(snapshot))
 	if env := envBlock(envText); env != "" {
 		w("\nEnvironment notes (%s):\n%s\n", envContextVar, env)
 	}
+	b.WriteString(cheatSheet(slug, sandboxed))
+	rest := next()
 
-	footer := fmt.Sprintf("\nUse `atl note %s \"...\"` to leave a status note for later sessions.\n", slug)
+	if room := contextMaxChars - chars(port) - chars(rest); chars(block) > room {
+		cut := truncateChars(block, room-chars("…\n"))
+		block = cut[:strings.LastIndexByte(cut, '\n')+1] + "…\n"
+	}
+	out := block + port + rest
 	const title = "\nNotes:\n"
-	text := notesBlock(notes)
-	fixed := top + head.String()
-	mounts := ""
-	if sandboxed && len(roMounts) > 0 {
-		// Out of the notes' room, leaving them what notesTail needs.
-		budget := contextMaxLen - len(fixed) - len(footer)
-		if text != "" {
-			budget -= len(title) + min(len(text), len(notesMarker(slug))+contextMinNotes) + 1
-		}
-		mounts = mountsLine(roMounts, min(budget, mountsLineMax))
-		fixed = top + mounts + head.String()
+	if body := notesTail(notesBlock(notes), contextMaxChars-chars(out)-chars(title), slug); body != "" {
+		out += title + body + "\n"
 	}
-	// The preferences go after the task block, out of no other part's room.
-	block, prefs := len(top)+len(mounts), prefsSection(snapshot)
-	if len(fixed)+len(footer) > contextMaxLen {
-		// Pathological (huge title or many repos): no room for notes. The
-		// cut ends at a line end, its marker on a line of its own, and the
-		// preferences come whole after the task block's part that is kept.
-		cut := truncateBytes(fixed, contextMaxLen-len(footer)-len("…\n"))
-		cut = cut[:strings.LastIndexByte(cut, '\n')+1]
-		if len(cut) <= block {
-			return cut + "…\n" + prefs + footer
-		}
-		return cut[:block] + prefs + cut[block:] + "…\n" + footer
-	}
-	room := contextMaxLen - len(fixed) - len(footer) - len(title)
-	fixed = fixed[:block] + prefs + fixed[block:]
-	if body := notesTail(text, room, slug); body != "" {
-		return fixed + title + body + "\n" + footer
-	}
-	return fixed + footer
+	return out
 }
 
-// notesTail returns text if it fits in room bytes counting a final
+// notesMarker is the line before notes that were cut from the start.
+func notesMarker(slug string) string {
+	return "… (earlier notes truncated; `atl notes " + slug + "` for all)\n"
+}
+
+// notesTail returns text if it fits in room chars counting a final
 // newline, else its end after a truncation marker line, both together
 // within room: the kept part starts at a line start when there is one in
 // it, else at a rune boundary. "" when room is too small for a useful part.
@@ -322,25 +364,56 @@ func notesTail(text string, room int, slug string) string {
 		return ""
 	}
 	room-- // the newline after the section
-	if len(text) <= room {
+	if chars(text) <= room {
 		return text
 	}
 	marker := notesMarker(slug)
-	keep := room - len(marker)
+	keep := room - chars(marker)
 	if keep < contextMinNotes {
 		return ""
 	}
-	start := len(text) - keep
-	for start < len(text) && !utf8.RuneStart(text[start]) {
-		start++
+	// The longest end of text within keep chars.
+	start := len(text)
+	for n := 0; start > 0; {
+		r, size := utf8.DecodeLastRuneInString(text[:start])
+		if n += runeChars(r); n > keep {
+			break
+		}
+		start -= size
 	}
 	tail := text[start:]
-	// Prefer a line boundary unless the line start is in the last bytes
+	// Prefer a line boundary unless the line start is in the last chars
 	// (one huge line): then keep its end from a rune boundary.
-	if i := strings.IndexByte(tail, '\n'); i >= 0 && len(tail)-i-1 >= contextMinNotes {
+	if i := strings.IndexByte(tail, '\n'); i >= 0 && chars(tail[i+1:]) >= contextMinNotes {
 		tail = tail[i+1:]
 	}
 	return marker + tail
+}
+
+// chars returns the length of s as JavaScript (and so Claude Code) counts
+// it: in UTF-16 code units, a rune outside the BMP (an emoji) counting 2.
+func chars(s string) int {
+	n := 0
+	for _, r := range s {
+		n += runeChars(r)
+	}
+	return n
+}
+
+// runeChars is the length of r in UTF-16 code units (1 for invalid UTF-8,
+// which ranging over a string yields as utf8.RuneError).
+func runeChars(r rune) int {
+	return max(utf16.RuneLen(r), 1)
+}
+
+// truncateChars cuts s to at most n chars (see chars) on a rune boundary.
+func truncateChars(s string, n int) string {
+	for i, r := range s {
+		if n -= runeChars(r); n < 0 {
+			return s[:i]
+		}
+	}
+	return s
 }
 
 // notesBlock sanitises the notes text for the context: line breaks are

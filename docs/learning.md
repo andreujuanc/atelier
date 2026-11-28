@@ -286,9 +286,10 @@ As built (`atl learnings`, `internal/cli/learnings.go`):
 ### 5. Delivery
 
 A "User preferences" section in the SessionStart context (`internal/hook/context.go`),
-with its own budget (`inject_budget`, 800 bytes; at most 4000) on top of the existing
-2500 bytes, right after the task block (and the read-only mounts line), before the
-environment notes and the notes:
+with its own budget (`inject_budget`, 800 bytes; at most 4000), right after the task block
+(and the read-only mounts line), before the environment notes, the atl cheat sheet and the
+notes. It always comes whole: under the context's overall cap (see
+[hooks.md](hooks.md#start-context)), its room comes out of the notes', which come last:
 
 ```
 User preferences (learned across tasks, approved by the user):
